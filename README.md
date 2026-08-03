@@ -1,0 +1,460 @@
+# MSX-AI
+
+MSX-AI is an MCP server for live MSX development. It can control openMSX
+directly or communicate with an ASM agent over a transport-neutral TCP/IP byte
+stream. The physical-target path can inspect and patch RAM/VRAM, pause and
+resume cooperative software, access hardware ports, and render screenshots
+from captured VRAM.
+
+The project is intentionally independent from a particular AI interface or
+network adapter. MCP is the current public interface; the application loader,
+framed protocol, screenshot renderer, and MSX-side command core are separate
+layers.
+
+~~~~text
+AI client / MCP
+       |
+       v
+server/msx_mcp_server.py
+       |
+       +-- openMSX control API ----------------------> emulated MSX
+       |
+       `-- framed agent protocol
+                 |
+                 `-- TCP/IP byte stream
+                           |
+                           `-- transparent bridge --> MSX UART
+                                                        |
+                                                        `-- MSXAI.COM
+~~~~
+
+## Current capabilities
+
+- Isolated openMSX sessions in headless or visible shared-window mode.
+- One canonical `MSXAI.COM` containing both supported UART drivers.
+- A true MemMan TSR by default: it returns to MSX-DOS and remains reachable
+  while cooperative DOS programs or games run.
+- An optional foreground monitor for direct upload, call, run, stop, slot, and
+  mapper workflows.
+- Runtime driver selection for a standard MSX 8251 RS-232 interface or a
+  generic 16C550-compatible UART.
+- A stream-safe protocol with sequence numbers, CRC-16/CCITT-FALSE,
+  request/response correlation, retries, resynchronization, and negotiated
+  payload limits.
+- RAM, VRAM, direct I/O-port access, pause/resume, and host-rendered
+  screenshots through the physical agent.
+- Rendering for standard SCREEN 0-8 and SCREEN 10-12 modes, including display
+  pages, scroll, palettes, and sprites.
+- A backend-neutral loader for `msx-ai-app-v1` manifests, MSX-DOS COM files,
+  BLOAD binaries, and flat 16/32 KiB ROM images.
+
+## Hardware control boundary
+
+The current resident agent is cooperative. It relies on maskable interrupts
+and the BIOS `H.KEYI`/`H.TIMI` hook chain. It can pause and modify software
+that leaves that path operational, including ordinary DOS programs launched
+after the TSR is installed.
+
+Software that keeps `DI` active, replaces the interrupt path, or otherwise
+prevents the BIOS hooks from running cannot be pre-empted by a software-only
+agent. Unconditional control would require an independent NMI, bus-master, or
+equivalent hardware path. A transparent TCP/UART bridge does not create that
+capability by itself.
+
+## Requirements
+
+- Python 3.10 or newer.
+- [openMSX](https://openmsx.org/) for the emulator backend. Version 21.0 is the
+  currently tested version.
+- Bas Wijnen's `z80asm` for assembling uploaded source and the ASM agent.
+- Legally obtained MSX system ROMs for machine configurations that require
+  proprietary firmware.
+- For the default physical resident mode: MSX-DOS 2 or Nextor, a compatible
+  memory mapper, and the MemMan 2.4+ API. A verified public-domain MemMan 2.42
+  runtime is embedded in `MSXAI.COM` and is installed automatically when it
+  is not already present.
+- A supported MSX UART connected to a transparent TCP/IP bridge for a physical
+  target.
+
+ROM images and bootable disk images are not distributed by this repository.
+
+The emulator defaults can be overridden with these environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `OPENMSX_BIN` | Path to the openMSX executable |
+| `Z80ASM` | Path to the `z80asm` executable |
+| `MSX_AI_OPENMSX_HOME` | Isolated openMSX data/configuration directory |
+| `MSX_AI_DOS_HDD` | Bootable MSX-DOS/Nextor hard-disk image |
+| `MSX_AI_BASIC_MACHINE` | Machine used by the `basic`, `disk`, and `dos` profiles |
+| `MSX_AI_MSX2PLUS_MACHINE` | Machine used by the `msx2plus` profile |
+| `MSX_AI_DISK_EXTENSION` | Storage extension used by the `disk` profile |
+| `MSX_AI_DOS_EXTENSION` | Storage extension used by the `dos` profile |
+
+The repository includes machine XML definitions but not their ROM files. Place
+local ROMs below `.openmsx-home/share/systemroms/`, or point
+`MSX_AI_OPENMSX_HOME` at another isolated configuration. This command helps
+diagnose missing firmware:
+
+~~~~sh
+openmsx -machine Gradiente_Expert20 -testconfig
+~~~~
+
+## MCP setup
+
+The project-local `.mcp.json` uses a relative path:
+
+~~~~json
+{
+  "mcpServers": {
+    "msx-ai": {
+      "command": "python3",
+      "args": ["server/msx_mcp_server.py"]
+    }
+  }
+}
+~~~~
+
+Clients with a global configuration should use the absolute path to
+`server/msx_mcp_server.py`.
+
+## openMSX workflows
+
+`msx_boot` starts an isolated headless emulator by default. Every headless
+process is muted at openMSX's host mixer for its complete lifetime. This does
+not change PSG, SCC, OPLL, MSX I/O ports, emulated timing, or sound routines
+executed inside the MSX. Startup fails closed if the host mute cannot be
+verified.
+
+Visible instances are not forcibly muted. Use `window=true`, or start a
+shared instance and attach to it:
+
+~~~~sh
+./open-msx.command basic
+~~~~
+
+Then call `msx_attach`. Attaching does not change the existing instance's
+power, throttle, renderer, or audio settings.
+
+Available profiles are:
+
+- `basic`: Gradiente Expert 2.0 in BASIC.
+- `disk`: the same machine with the DDX 3.0 disk extension.
+- `dos`: the same machine with Sunrise IDE/Nextor and a local hard-disk image.
+- `msx2plus`: Sony HB-F1XDJ MSX2+ configuration.
+
+### TCP agent test bench
+
+`msx_tcp_bench_start` starts one isolated openMSX process, imports the
+canonical `MSXAI.COM`, selects the 8251 driver, and connects it to the MCP
+server through RS232-Net/TCP. All physical-agent operations then use the TCP
+protocol; they do not use openMSX debugger memory APIs.
+
+For an interactive resident test, call it with:
+
+~~~~json
+{"window": true, "mode": "resident"}
+~~~~
+
+The MSX displays the installation banner and returns to the DOS prompt. Run a
+DOS program or game in the visible window, then use `msx_status`,
+`msx_pause`, `msx_memory_read`, `msx_memory_write`, `msx_screenshot`,
+and `msx_resume`.
+
+For direct ASM upload and on-screen command tracing:
+
+~~~~json
+{"window": true, "mode": "monitor", "debug": true}
+~~~~
+
+Then use `msx_asm_load` with `execute="call"` or `execute="run"`.
+`debug=true` is intentionally rejected in resident mode.
+
+Headless test-bench instances are host-muted; visible ones retain normal sound.
+The integration harness serializes its cases and never runs more than one
+openMSX process at a time.
+
+## Building the physical agent
+
+Build the single production executable:
+
+~~~~sh
+make agent
+~~~~
+
+The canonical output is:
+
+~~~~text
+work/agent/MSXAI.COM
+~~~~
+
+The build also creates an internal relocatable `MSXAI.TSR` and materializes
+verified MemMan utilities under the ignored `work/agent/` tree. Those are
+build inputs, not alternative agent executables.
+
+Copy only `MSXAI.COM` to the MSX-DOS system. Driver selection is explicit and
+case-insensitive:
+
+| Command | Result |
+|---|---|
+| `MSXAI /DRIVER:8251` | Install/reconfigure the default resident TSR for a standard 8251 interface |
+| `MSXAI /DRIVER:16C550` | Install/reconfigure the default resident TSR for a generic 16C550 interface |
+| `MSXAI /DRIVER:8251 /MONITOR` | Start the non-resident foreground monitor with the 8251 driver |
+| `MSXAI /DRIVER:16C550 /MONITOR` | Start the non-resident foreground monitor with the 16C550 driver |
+| `MSXAI /DRIVER:8251 /MONITOR DEBUG ON` | Start the foreground monitor with visible command tracing |
+| `MSXAI /UNINSTALL` | Remove the named resident TSR safely through MemMan |
+| `MSXAI /?` or `MSXAI /HELP` | Display command-line help |
+
+Exactly one `/DRIVER` is required for install or monitor mode.
+`/UNINSTALL` must be used alone. Running the resident command again finds the
+existing named TSR and changes its selected driver through MemMan instead of
+installing a duplicate. Changing the live driver can disconnect the current
+link, so reconnect through the newly selected interface.
+
+### Supported UART drivers
+
+| Driver | Current configuration | Notes |
+|---|---|---|
+| `8251` | Ports `80h/81h`, standard timer ports `84h/85h/87h`, 4800 baud, 8N1 | Reference path used by the openMSX RS232-Net integration tests |
+| `16C550` | Ports `80h-87h`, 115200 baud, 8N1, 16-byte FIFO, automatic RTS/CTS | Generic register-compatible path; hardware flow control is required |
+
+BaDCaT SMD is an intended 16C550-compatible device, not a dependency or a
+separate build. The agent contains no BaDCaT-specific AT commands, networking
+UI assumptions, or product branches. Physical BaDCaT validation is pending
+arrival of the hardware.
+
+See [agent/README.md](agent/README.md) for the lifecycle, memory model, raw and
+framed protocols, transport ABI, and driver implementation details.
+
+## Resident and foreground modes
+
+| Behavior | Default resident | `/MONITOR` |
+|---|---:|---:|
+| Returns to DOS | Yes | No |
+| Observe a normally launched DOS program/game | Yes | No |
+| Pause/read/patch/screenshot/resume | Yes | Yes |
+| Agent-side `call` and `run` | No | Yes |
+| Agent-side `stop` | No | Yes |
+| Slot and mapper selection | No | Yes, pages 0 and 1 |
+| On-screen `DEBUG ON` trace | No | Optional |
+
+The resident reports execution state `running` while DOS or an application is
+active. `pause` saves the complete interrupted CPU context and remains paused
+until an explicit `resume`, including across temporary transport silence.
+`stop` is rejected because discarding the interrupted DOS/application context
+would be unsafe.
+
+The foreground monitor is intended for injected development payloads. It owns
+the foreground process, can launch code asynchronously, and can abandon that
+code back to its own monitor.
+
+## Resident memory and hardware safety
+
+During a MemMan hook call the TSR occupies CPU page 1. Resident-mode RAM access
+therefore follows these rules:
+
+- Page 0 (`0x0000-0x3FFF`) is accessed through the DOS RAM slot with BIOS
+  inter-slot routines.
+- Page 1 (`0x4000-0x7FFF`) is unavailable and rejected.
+- Pages 2 and 3 (`0x8000-0xFFFF`) are directly accessible.
+- Page 3 contains live BIOS, DOS, stack, hook, and system state. Arbitrary
+  writes can immediately crash or corrupt the machine.
+
+Slot and mapper commands are unavailable in resident mode. An inter-slot return
+restores slot state, and changing the interrupted program's mapper segment is
+not safe. Both capabilities remain available only in the foreground monitor.
+
+Direct I/O is an expert escape hatch. Writing the active UART, VDP ports, mapper
+ports, or unrelated hardware can terminate the protocol session or damage live
+machine state.
+
+## TCP/IP transport
+
+The external contract is a transparent, ordered, full-duplex byte stream over
+TCP/IP. The MSX-side driver knows only UART bytes; the host protocol does not
+depend on how the adapter was configured.
+
+~~~~text
+MCP/backend operations
+        |
+protocol v3 frames
+        |
+TCP/IP (host listens or connects)
+        |
+transparent network/UART adapter
+        |
+selected MSX byte driver
+~~~~
+
+Use `msx_agent_listen` when the adapter is a TCP client. Use
+`msx_agent_connect` when the adapter exposes a TCP server. The older
+`msx_real_listen` name remains as a compatibility alias. `msx_status`
+reports `network_transport`, `network_role`, `agent_transport`, and
+`agent_transport_id` separately.
+
+## Protocol v3
+
+The host performs a small raw-v2 capability bootstrap and upgrades capable
+agents to this transport-independent frame:
+
+~~~~text
+"MX" | version | type | flags | sequence:u16le | opcode | status |
+length:u16le | payload | crc16:u16le
+~~~~
+
+CRC covers the complete frame except the CRC field and uses
+CRC-16/CCITT-FALSE. A retry reuses the identical encoded request and sequence
+number. The agent de-duplicates state-changing commands and searches for the
+next valid magic/header/CRC combination after damaged input.
+
+The negotiated payload limit of the current agent is 320 bytes. Eight
+consecutive ESC bytes reset a framed protocol session after a lost peer; a
+single noise byte cannot downgrade it.
+
+## Screenshots from VRAM
+
+`msx_screenshot` captures VRAM and VDP/BIOS state, renders the image on the
+host, and returns a PNG MCP image content block. It does not require a visible
+openMSX renderer. On a running physical target, `atomic=true` pauses the
+application for a consistent capture and resumes it afterward.
+
+Supported standard modes:
+
+- Text and tile modes: SCREEN 0-4.
+- Bitmap modes: SCREEN 5-8.
+- YJK/YAE modes: SCREEN 10-12.
+- Sprites, display pages, vertical/horizontal scroll, and palette overrides.
+
+SCREEN 9 is a vendor-specific Korean mode and is reported as unsupported.
+
+The V9938/V9958 palette interface is write-only. Games that change it directly
+without maintaining the BIOS palette mirror may require an explicit 16-entry
+RGB `palette` argument for exact colors. The same limitation applies to
+software that changes VDP registers without updating the readable BIOS
+shadows. `DEBUG ON` changes the foreground display and therefore appears in a
+capture. Raster effects, borders/overscan, analog artifacts, and exact
+interlaced-field timing are not reconstructed.
+
+## Loading applications
+
+`msx_app_load` uses one parser and validation path for both backends. It
+recognizes:
+
+- `.com`: loaded at `0x0100`.
+- BLOAD `.bin`: start, end, and entry addresses come from the `0xFE` header.
+- Flat 16/32 KiB `.rom`: requires an `AB` header.
+- `.json`/`.msxapp`: a `msx-ai-app-v1` manifest containing RAM/VRAM
+  segments.
+
+Manifest payloads can use `hex`, `base64`, a relative `file`, or `fill`.
+Paths cannot escape the manifest directory; optional SHA-256 values and all
+address ranges are validated before target state changes.
+
+Execution constraints depend on the runtime:
+
+- openMSX and the foreground monitor support `execute="call"` and
+  `execute="run"`.
+- The default resident supports safe transfers with `execute="none"`, but
+  rejects page 1 and agent-side call/run. Launch DOS software normally after
+  installing the TSR.
+- Copying a game or ROM into VRAM does not make it executable.
+- Bank-switched cartridge images require an explicitly mapper-aware backend;
+  the generic loader does not emulate arbitrary cartridge hardware.
+
+## Main MCP tools
+
+| Group | Tools |
+|---|---|
+| Session | `msx_boot`, `msx_attach`, `msx_tcp_bench_start`, `msx_agent_listen`, `msx_agent_connect`, `msx_status`, `msx_shutdown` |
+| Execution | `msx_asm_load`, `msx_app_load`, `msx_pause`, `msx_resume`, `msx_stop` |
+| Memory/video | `msx_memory_read`, `msx_memory_write`, `msx_screen`, `msx_screenshot` |
+| Hardware | `msx_io_read`, `msx_io_write`, `msx_slot_select`, `msx_mapper_select` |
+| openMSX input | `msx_type`, `msx_type_line`, `msx_key`, `msx_run_basic` |
+| openMSX/DOS | `msx_dos_asm_run`, `msx_disk_put_text`, `msx_reset`, `msx_cmd` |
+
+Keyboard injection, physical reset, and raw openMSX console commands remain
+openMSX-only. Physical operations use the agent byte stream rather than
+openMSX APIs.
+
+## Validation
+
+Run the deterministic suite:
+
+~~~~sh
+make test
+~~~~
+
+Run the opt-in end-to-end suite:
+
+~~~~sh
+make test-integration
+~~~~
+
+The integration suite uses one openMSX process at a time and validates:
+
+- default MemMan installation returning to DOS;
+- intervention in a normally launched DOS COM program;
+- repeated pause/resume, RAM/VRAM access, and a PNG rendered from agent-captured
+  VRAM;
+- foreground ASM upload/run/stop with visible `DEBUG ON` tracing;
+- reconfiguration without a duplicate TSR;
+- safe uninstall and an idempotent second uninstall.
+
+It requires local machine ROMs and the ignored bootable image at
+`work/system-disks/msxdos.dsk`. Headless instances remain host-muted without
+changing emulated MSX sound behavior.
+
+## Repository layout
+
+~~~~text
+agent/                    universal ASM agent, lifecycle, and UART drivers
+agent/transports/         hardware-specific byte-stream implementations
+server/msx_client.py      openMSX control client
+server/msx_mcp_server.py  MCP JSON-RPC server and backend adapters
+server/msx_protocol.py    protocol-v3 codec and incremental parser
+server/msx_v3.py          framed stream session, retries, and correlation
+server/msx_real.py        physical-agent stream/TCP client
+server/msx_screenshot.py  host-side VRAM renderer
+server/msx_application.py backend-neutral application parser/loader
+tests/                    deterministic and opt-in integration tests
+third_party/memman/       pinned public-domain MemMan assets and hashes
+tools/                    reproducible MemMan/TSR build helpers
+work/                     ignored binaries, disks, captures, and local data
+~~~~
+
+## Publication safety
+
+Generated and machine-specific data are intentionally ignored:
+
+- `work/` and assembled binaries;
+- ROMs, disk images, savestates, replays, persistent CMOS/SRAM, and captures;
+- local openMSX settings, caches, editor state, logs, and temporary files.
+
+The test files are part of the project and should be published; they define the
+protocol, renderer, lifecycle, and safety contracts. The many historical COM
+variants are not source artifacts and should not be published.
+
+Review `git status` and `git ls-files` before release. Publish from Git or
+`git archive`, not by zipping the working directory, because ignored local
+media remains on disk. Do not force-add proprietary ROMs or disk images.
+
+The embedded MemMan assets have their own provenance and checksums in
+`third_party/memman/NOTICE`.
+
+## License
+
+MSX-AI is released under the [MIT License](LICENSE). Third-party components
+retain the terms documented in their respective notices.
+
+## Known limitations
+
+- Resident control is cooperative and depends on the BIOS interrupt hook chain.
+- Resident RAM page 1 is unavailable; arbitrary page-3 writes are dangerous.
+- Slot/mapper selection and agent-side call/run/stop are foreground-monitor
+  features only.
+- Exact physical screenshots may require palette/register overrides when
+  software does not maintain BIOS shadows.
+- SCREEN 9 is not implemented.
+- Generic bank-switched cartridge mappers are not implemented.
+- Actual BaDCaT SMD hardware validation is pending.
+- Keyboard injection and physical reset are currently openMSX-only.

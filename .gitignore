@@ -1,0 +1,60 @@
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db
+
+# Local editor, assistant, and environment configuration
+.claude/
+.codex/
+.agents/
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# openMSX runtime artifacts (regenerated every run, not source)
+.openmsx-home/savestates/
+.openmsx-home/replays/
+.openmsx-home/persistent/
+.openmsx-home/screenshots/
+.openmsx-home/recordings/
+.openmsx-home/share/.filecache
+.openmsx-home/share/imgui.ini
+.openmsx-home/share/settings.local.xml
+
+# User-supplied software and game media. Keep the directory documentation.
+.openmsx-home/share/software/*
+!.openmsx-home/share/software/README
+
+# Generated working files: disk images, assembled binaries, and exports
+work/
+*.com
+*.COM
+*.labels
+*.log
+*.tmp
+
+# Emulator media/state placed outside the standard local directories by mistake
+*.rom
+*.ROM
+*.dsk
+*.DSK
+*.oms
+*.omr
+
+# Firmware ROMs are supplied separately and are never committed.
+.openmsx-home/share/systemroms/

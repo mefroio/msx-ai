@@ -1,0 +1,15 @@
+MemMan 2.42 binary redistribution notice
+
+This directory contains Base64-encoded copies of MEMMAN.COM, TL.COM, and TK.COM
+from the MemMan 2.42 package distributed at:
+
+https://msxhub.com/MEMMAN/2.4-2
+
+According to the MemMan 2.42 specification included with that package, these
+three programs are Public Domain.
+
+LT.COM and the TSRFRAME files are not Public Domain and are intentionally not
+included here.
+
+The Base64 representation keeps the binary assets in a text-reviewable form.
+SHA256SUMS records the hashes of the decoded .COM files.
