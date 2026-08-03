@@ -57,6 +57,14 @@ class CanonicalAgentBuildTest(unittest.TestCase):
         self.assertFalse(msx_mcp_server._dos_prompt_visible(
             "A:\\>\ninstalling resident agent"))
 
+    def test_basic_prompt_must_be_last_visible_row(self):
+        self.assertTrue(msx_mcp_server._basic_prompt_visible(
+            "Microsoft MSX BASIC\nOk\n"))
+        self.assertTrue(msx_mcp_server._basic_prompt_visible(
+            "Microsoft MSX BASIC\nOk\n\nCopy   Files  Bload\" List   Run"))
+        self.assertFalse(msx_mcp_server._basic_prompt_visible(
+            "Ok\nprogram still running"))
+
 
 class _FakeMachine:
     def __init__(self, screen="MSX-DOS 2\nA:\\>"):
@@ -152,7 +160,11 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                 build.assert_called_once_with()
                 self.assertEqual(
                     machine.imported_agent, b"canonical-universal-agent")
-                self.assertEqual(machine.typed, ["MSXAI /DRIVER:8251"])
+                self.assertEqual(machine.typed, ["MSXAITST /DRIVER:8251"])
+                self.assertLess(
+                    machine.commands.index("set power off"),
+                    next(index for index, command in enumerate(machine.commands)
+                         if command.startswith("diskmanipulator import hda1")))
                 self.assertIn(
                     msx_mcp_server.RESIDENT_INSTALL_SECONDS,
                     machine.advances)

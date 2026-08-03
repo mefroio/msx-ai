@@ -52,11 +52,25 @@ CAPABILITY_NAMES = {
     0x40: "hardware-io",
     CAPABILITY_MAPPING: "mapping",
 }
+FEATURE_KEYBUF_INPUT = 0x01
+AGENT_FEATURE_NAMES = {
+    FEATURE_KEYBUF_INPUT: "keybuf-input",
+}
 AGENT_TRANSPORT_NAMES = {
     0: "uart-8251",
     1: "uart-16c550",
 }
 AGENT_RUNTIME_MODES = {0: "resident", 1: "foreground-monitor"}
+
+KEYBUF_START = 0xFBF0
+KEYBUF_SIZE = 40
+KEYBUF_END = KEYBUF_START + KEYBUF_SIZE
+KEYBUF_CAPACITY = KEYBUF_SIZE - 1
+PUTPNT = 0xF3F8
+GETPNT = 0xF3FA
+KEYBUF_INPUT_TIMEOUT = 10.0
+KEYBUF_POLL_INTERVAL = 0.02
+KEYBUF_LINE_SETTLE = 0.05
 
 
 class RealMSXError(RuntimeError):
@@ -72,6 +86,10 @@ class RealMSXTimeoutError(RealMSXError):
 
 
 class RealMSXRangeError(RealMSXError, ValueError):
+    pass
+
+
+class RealMSXKeyboardTimeoutError(RealMSXTimeoutError):
     pass
 
 
@@ -95,6 +113,7 @@ class RealMSX:
         self.network_role = None
         self.protocol_version = None
         self.capabilities = 0
+        self.feature_bits = 0
         self.resident_base = None
         self.vram_size = VRAM_SIZE
         self.vram_banks = VRAM_SIZE // VRAM_BANK_SIZE
@@ -203,6 +222,7 @@ class RealMSX:
         """Reset negotiated state when a new byte stream is attached."""
         self.protocol_version = None
         self.capabilities = 0
+        self.feature_bits = 0
         self.resident_base = None
         self.vram_size = VRAM_SIZE
         self.vram_banks = VRAM_SIZE // VRAM_BANK_SIZE
@@ -303,7 +323,7 @@ class RealMSX:
             raise RealMSXProtocolError(f"agent rejected command (error {code})")
         raise RealMSXProtocolError(f"unexpected agent response: {first!r}")
 
-    def _request_v3(self, opcode, payload=b""):
+    def _request_v3(self, opcode, payload=b"", *, timeout=None, retries=None):
         if self._v3 is None:
             raise RealMSXProtocolError("framed v3 session is not active")
         if isinstance(opcode, str):
@@ -311,7 +331,8 @@ class RealMSX:
                 raise ValueError("opcode must be one character")
             opcode = ord(opcode)
         try:
-            return self._v3.request(opcode, payload)
+            return self._v3.request(
+                opcode, payload, timeout=timeout, retries=retries)
         except V3SessionError as exc:
             raise RealMSXProtocolError(f"framed agent request failed: {exc}") from exc
 
@@ -464,6 +485,7 @@ class RealMSX:
             self.runtime_mode_id,
             (None if self.runtime_mode_id is None
              else f"unknown-{self.runtime_mode_id}"))
+        self.feature_bits = reply[14] if len(reply) >= 15 else 0
         return {
             "protocol": version,
             "bootstrap_protocol": self.bootstrap_protocol_version,
@@ -482,6 +504,9 @@ class RealMSX:
             "debug": self.debug,
             "runtime_mode": self.runtime_mode,
             "runtime_mode_id": self.runtime_mode_id,
+            "features": [name for bit, name in AGENT_FEATURE_NAMES.items()
+                         if self.feature_bits & bit],
+            "feature_bits": self.feature_bits,
             "vdp_generation": self.vdp_generation,
             "vram_size": self.vram_size,
             "vram_banks": self.vram_banks,
@@ -567,6 +592,182 @@ class RealMSX:
                 self._send(b"k")
                 self._expect_ack()
         return "monitor"
+
+    # ---- BIOS keyboard ring ---------------------------------------
+    @staticmethod
+    def _keybuf_pointer(pointer, name):
+        if not KEYBUF_START <= pointer < KEYBUF_END:
+            raise RealMSXProtocolError(
+                f"BIOS {name} pointer 0x{pointer:04X} is outside "
+                f"KEYBUF 0x{KEYBUF_START:04X}-0x{KEYBUF_END - 1:04X}")
+        return pointer
+
+    def _keybuf_state_from_ram(self):
+        raw = self.peek(PUTPNT, 4)
+        put = self._keybuf_pointer(int.from_bytes(raw[:2], "little"), "PUTPNT")
+        get = self._keybuf_pointer(int.from_bytes(raw[2:], "little"), "GETPNT")
+        pending = ((put - KEYBUF_START) - (get - KEYBUF_START)) % KEYBUF_SIZE
+        if pending > KEYBUF_CAPACITY:
+            raise RealMSXProtocolError(
+                f"invalid BIOS keyboard queue length {pending}")
+        return put, get, pending
+
+    def _keybuf_write_legacy(self, data, timeout=None):
+        """Fallback for older agents without the atomic v3 keybuf opcode."""
+        # Own the whole pause/read/write/publish/resume cycle.  Every protocol
+        # primitive also takes this RLock, so concurrent screenshots or memory
+        # operations cannot resume the target in the middle of the fallback.
+        with self._lock:
+            original_v3_timeout = self._v3.timeout if self._v3 is not None else None
+            original_stream_timeout = self.conn.gettimeout()
+            if timeout is not None:
+                operation_count = 1 if not data else 9
+                attempts = (self._v3.retries + 1) if self._v3 is not None else 1
+                per_attempt = max(0.001, float(timeout) /
+                                  (operation_count * attempts))
+                if self._v3 is not None:
+                    self._v3.timeout = min(self._v3.timeout, per_attempt)
+                else:
+                    self.conn.settimeout(min(original_stream_timeout, per_attempt))
+            try:
+                if not data:
+                    return 0, self._keybuf_state_from_ram()[2]
+                state = self.status()["state"]
+                if state != "running":
+                    raise RealMSXError(
+                        "keyboard input requires a running resident target, "
+                        f"got {state!r}")
+                self.pause()
+                transaction_error = None
+                try:
+                    put, _get, pending = self._keybuf_state_from_ram()
+                    accepted = min(len(data), KEYBUF_CAPACITY - pending)
+                    if accepted:
+                        first = min(accepted, KEYBUF_END - put)
+                        self.poke(put, data[:first])
+                        if first < accepted:
+                            self.poke(KEYBUF_START, data[first:accepted])
+                        new_put = KEYBUF_START + (
+                            (put - KEYBUF_START + accepted) % KEYBUF_SIZE)
+                        # Publish last: CHGET never observes half a batch.
+                        self.poke(PUTPNT, new_put.to_bytes(2, "little"))
+                    return accepted, pending + accepted
+                except BaseException as exc:
+                    transaction_error = exc
+                    raise
+                finally:
+                    try:
+                        self.resume()
+                    except Exception:
+                        if transaction_error is None:
+                            raise
+            finally:
+                if self._v3 is not None:
+                    self._v3.timeout = original_v3_timeout
+                self.conn.settimeout(original_stream_timeout)
+
+    def keybuf_write(self, data, timeout=None):
+        """Atomically enqueue up to 39 BIOS keyboard bytes.
+
+        Return ``(accepted, pending)``.  New agents execute one idempotent v3
+        operation inside the resident hook; older peers use a protected
+        pause/write/publish/resume transaction for compatibility.
+        """
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("keyboard data must be bytes-like")
+        data = bytes(data)
+        if len(data) > KEYBUF_CAPACITY:
+            raise RealMSXRangeError(
+                f"keyboard batch exceeds {KEYBUF_CAPACITY} bytes")
+        if self._v3 is not None and self.feature_bits & FEATURE_KEYBUF_INPUT:
+            request_timeout = None
+            if timeout is not None:
+                timeout = float(timeout)
+                if timeout <= 0:
+                    raise RealMSXKeyboardTimeoutError(
+                        "keyboard input timeout expired before request")
+                request_timeout = max(
+                    0.001, timeout / (self._v3.retries + 1))
+            with self._lock:
+                reply = self._request_v3(
+                    "t", data, timeout=request_timeout)
+            if len(reply) != 2:
+                raise RealMSXProtocolError(
+                    f"invalid keybuf response: {reply!r}")
+            accepted, pending = reply
+            if accepted > len(data) or pending > KEYBUF_CAPACITY:
+                raise RealMSXProtocolError(
+                    f"invalid keybuf counts accepted={accepted}, pending={pending}")
+            return accepted, pending
+        return self._keybuf_write_legacy(data, timeout=timeout)
+
+    def wait_keybuf_empty(self, timeout=KEYBUF_INPUT_TIMEOUT):
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RealMSXKeyboardTimeoutError(
+                    "timeout waiting for software to consume BIOS keyboard input; "
+                    "the target may read the key matrix directly")
+            _accepted, pending = self.keybuf_write(b"", timeout=remaining)
+            if pending == 0:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RealMSXKeyboardTimeoutError(
+                    "timeout waiting for software to consume BIOS keyboard input; "
+                    "the target may read the key matrix directly")
+            time.sleep(min(KEYBUF_POLL_INTERVAL, remaining))
+
+    @staticmethod
+    def _encode_keyboard_text(text):
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        normalized = text.replace("\r\n", "\r").replace("\n", "\r")
+        try:
+            return normalized.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "real-agent keyboard input currently supports ASCII only") from exc
+
+    def type(self, text, timeout=KEYBUF_INPUT_TIMEOUT):
+        """Type text through the BIOS ring and wait until it is consumed."""
+        payload = self._encode_keyboard_text(text)
+        deadline = time.monotonic() + float(timeout)
+        offset = 0
+        while offset < len(payload):
+            remaining = payload[offset:]
+            batch_size = min(len(remaining), KEYBUF_CAPACITY)
+            carriage_return = remaining.find(b"\r", 0, batch_size)
+            if carriage_return >= 0:
+                batch_size = carriage_return + 1
+            batch = remaining[:batch_size]
+            batch_offset = 0
+            while batch_offset < len(batch):
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    raise RealMSXKeyboardTimeoutError(
+                        "timeout while typing through the BIOS keyboard buffer")
+                accepted, _pending = self.keybuf_write(
+                    batch[batch_offset:], timeout=remaining_time)
+                batch_offset += accepted
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    raise RealMSXKeyboardTimeoutError(
+                        "timeout while typing through the BIOS keyboard buffer")
+                self.wait_keybuf_empty(remaining_time)
+                if accepted == 0 and batch_offset < len(batch):
+                    continue
+            offset += len(batch)
+            if batch.endswith(b"\r"):
+                time.sleep(KEYBUF_LINE_SETTLE)
+        return len(payload)
+
+    def type_line(self, text, timeout=KEYBUF_INPUT_TIMEOUT):
+        """Type one text line followed by the MSX Return key."""
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        return self.type(text + "\r", timeout=timeout)
 
     # ---- RAM --------------------------------------------------------
     def poke(self, addr, data):
@@ -828,20 +1029,54 @@ class RealMSX:
         return summary
 
     # ---- screen -----------------------------------------------------
-    def read_screen(self):
-        """Decode SCREEN 0/1 text through monitor RAM/VRAM reads."""
-        r1, r2 = self.peek(0xF3E0, 2)
-        width = 40 if (r1 & 0x10) else 32
-        base = (r2 & 0x0F) << 10
-        data = self.vpeek(base, width * 24)
+    def read_screen(self, timeout=None):
+        """Decode SCREEN 0/1 text through monitor RAM/VRAM reads.
+
+        When ``timeout`` is supplied, divide it across every possible framed
+        request and retry in this capture. A stalled link therefore cannot turn
+        one prompt poll into several full default-timeout waits.
+        """
+        with self._lock:
+            original_v3_timeout = (
+                self._v3.timeout if self._v3 is not None else None)
+            original_stream_timeout = self.conn.gettimeout()
+            if timeout is not None:
+                timeout = float(timeout)
+                if timeout <= 0:
+                    raise RealMSXKeyboardTimeoutError(
+                        "screen capture timeout expired before request")
+                chunk_size = (
+                    self._v3.max_payload if self._v3 is not None else 255)
+                operation_count = 1 + (
+                    (40 * 24 + chunk_size - 1) // chunk_size)
+                attempts = (
+                    self._v3.retries + 1 if self._v3 is not None else 1)
+                per_attempt = max(
+                    0.001, timeout / (operation_count * attempts))
+                if self._v3 is not None:
+                    self._v3.timeout = min(
+                        self._v3.timeout, per_attempt)
+                else:
+                    self.conn.settimeout(min(
+                        original_stream_timeout, per_attempt))
+            try:
+                r1, r2 = self.peek(0xF3E0, 2)
+                width = 40 if (r1 & 0x10) else 32
+                base = (r2 & 0x0F) << 10
+                data = self.vpeek(base, width * 24)
+            finally:
+                if self._v3 is not None:
+                    self._v3.timeout = original_v3_timeout
+                self.conn.settimeout(original_stream_timeout)
         rows = []
         for row in range(24):
             raw = data[row * width:(row + 1) * width]
-            rows.append("".join(chr(b) if 32 <= b < 127 else " " for b in raw).rstrip())
+            rows.append("".join(
+                chr(b) if 32 <= b < 127 else " " for b in raw).rstrip())
         return rows
 
-    def screen_text(self):
-        return "\n".join(self.read_screen())
+    def screen_text(self, timeout=None):
+        return "\n".join(self.read_screen(timeout=timeout))
 
     def close(self):
         for sock in (self.conn, self.srv):

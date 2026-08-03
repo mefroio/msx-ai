@@ -83,6 +83,42 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r"ld \(chain_keyi\),a.*hook_dispatch_frame:.*"
             r"call receive_dispatch")
 
+    def test_framed_keybuf_input_is_atomic_resident_only_and_advertised(self):
+        dispatch = self.source.split("frame_dispatch:", 1)[1].split(
+            "frame_require_length:", 1)[0]
+        self.assertRegex(dispatch, r"(?s)cp 't'.*jp z,frame_cmd_keybuf_input")
+
+        hello = self.source.split("frame_cmd_hello:", 1)[1].split(
+            "frame_cmd_status:", 1)[0]
+        self.assertIn("call current_features", hello)
+        self.assertIn("ld hl,15", hello)
+
+        features = self.source.split("current_features:", 1)[1].split(
+            "cmd_status:", 1)[0]
+        self.assertIn("cp RUNTIME_RESIDENT", features)
+        self.assertIn("ld a,FEATURE_KEYBUF_INPUT", features)
+
+        keybuf = self.source.split("frame_cmd_keybuf_input:", 1)[1].split(
+            "frame_cmd_ram_read:", 1)[0]
+        self.assertRegex(
+            keybuf,
+            r"(?s)ld a,\(runtime_mode\).*cp RUNTIME_RESIDENT.*"
+            r"ld a,\(in_hook\).*ld a,\(run_state\).*cp 1")
+        self.assertIn("cp KEYBUF_SIZE", keybuf)
+        self.assertIn("ld a,KEYBUF_SIZE - 1", keybuf)
+        self.assertIn("ld hl,KEYBUF", keybuf)
+        self.assertIn("ld (PUTPNT),hl", keybuf)
+        self.assertLess(
+            keybuf.index("frame_keybuf_copy_loop:"),
+            keybuf.index("ld (PUTPNT),hl"))
+        self.assertGreater(
+            keybuf.index("ld (frame_response_buffer),a"),
+            keybuf.index("ld (PUTPNT),hl"))
+        self.assertIn("buffers alias", keybuf)
+        self.assertIn("ld (frame_response_buffer + 1),a", keybuf)
+        for forbidden in ("call bdos_proxy", "call CHGET", "call CHPUT"):
+            self.assertNotIn(forbidden, keybuf)
+
     def test_memman_exclusive_keyi_never_chains_the_old_serial_handler(self):
         hooks = self.source.split(
             "; ---------------------------------------------------------------- H.KEYI", 1

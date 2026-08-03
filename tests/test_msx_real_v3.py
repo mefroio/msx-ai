@@ -3,6 +3,7 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
@@ -29,7 +30,8 @@ class FakeV3Resident:
 
     def __init__(self, sock, *, max_payload=64, corrupt_once=(), drop_once=(),
                  vram_size=0x20000, legacy_hello=False, start_framed=False,
-                 runtime_mode=1):
+                 runtime_mode=1, keybuf_feature=True,
+                 consume_keybuf=True):
         self.sock = sock
         self.max_payload = max_payload
         self.corrupt_once = set(corrupt_once)
@@ -40,6 +42,8 @@ class FakeV3Resident:
         self.legacy_hello = legacy_hello
         self.start_framed = start_framed
         self.runtime_mode = runtime_mode
+        self.keybuf_feature = bool(keybuf_feature)
+        self.consume_keybuf = bool(consume_keybuf)
         self.capabilities = 0xFF if runtime_mode != 0 else 0x77
         self.vdp_generation = 0 if vram_size == 0x4000 else 2
 
@@ -51,6 +55,8 @@ class FakeV3Resident:
         self.state = 0
         self.last_call = None
         self.last_run = None
+        self.keybuf = bytearray()
+        self.typed = bytearray()
 
         self.bootstrap_queries = 0
         self.upgrades = 0
@@ -172,8 +178,24 @@ class FakeV3Resident:
                 response_payload += bytes([self.vram_size // 0x4000])
                 response_payload += self.vram_size.to_bytes(3, "little")
                 response_payload += bytes([self.runtime_mode])
+                response_payload += bytes([
+                    1 if self.keybuf_feature and self.runtime_mode == 0 else 0])
         elif opcode == "q":
             response_payload = bytes([self.state, 3])
+        elif opcode == "t" and self.keybuf_feature:
+            if self.runtime_mode != 0 or self.state != 1:
+                status = FrameStatus.INVALID_STATE
+                flags = FrameFlag.ERROR
+            elif len(payload) > 39:
+                status = FrameStatus.OUT_OF_RANGE
+                flags = FrameFlag.ERROR
+            else:
+                accepted = min(len(payload), 39 - len(self.keybuf))
+                self.keybuf += payload[:accepted]
+                self.typed += payload[:accepted]
+                if self.consume_keybuf:
+                    self.keybuf.clear()
+                response_payload = bytes([accepted, len(self.keybuf)])
         elif opcode == "p" and len(payload) >= 2:
             address = self._le16(payload[:2])
             self.ram[address:address + len(payload) - 2] = payload[2:]
@@ -248,6 +270,8 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(self.info["vram_banks"], 8)
         self.assertEqual(self.info["runtime_mode"], "foreground-monitor")
         self.assertEqual(self.info["runtime_mode_id"], 1)
+        self.assertEqual(self.info["features"], [])
+        self.assertEqual(self.info["feature_bits"], 0)
         self.assertFalse(self.info["bootstrap_recovered"])
         self.assertIn("framed-v3", self.info["capabilities"])
         self.assertIn("hardware-io", self.info["capabilities"])
@@ -302,6 +326,86 @@ class RealMSXV3Test(unittest.TestCase):
             self.msx.slot_select(1, 0x02)
         with self.assertRaisesRegex(RealMSXError, "unavailable in resident"):
             self.msx.mapper_select(1, 31)
+
+    def test_resident_keyboard_input_is_chunked_and_preserves_cr_boundaries(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(resident, runtime_mode=0)
+        info = self.msx.info()
+        self.agent.state = 1
+
+        text = "10 PRINT \"A LONG BASIC LINE THAT EXCEEDS THE RING BUFFER\"\rRUN\r"
+        self.assertEqual(self.msx.type(text), len(text))
+        self.assertEqual(bytes(self.agent.typed), text.encode("ascii"))
+        requests = [r.payload for r in self.agent.requests
+                    if r.opcode == ord("t") and r.payload]
+        self.assertTrue(all(len(payload) <= 39 for payload in requests))
+        self.assertTrue(all(
+            b"\r" not in payload[:-1] for payload in requests))
+        self.assertEqual(info["features"], ["keybuf-input"])
+
+    def test_screen_text_distributes_timeout_and_restores_default(self):
+        original_timeout = self.msx._v3.timeout
+        observed_timeouts = []
+
+        def fake_peek(_address, _length):
+            observed_timeouts.append(self.msx._v3.timeout)
+            return bytes([0x10, 0x00])
+
+        def fake_vpeek(_address, length):
+            observed_timeouts.append(self.msx._v3.timeout)
+            return b" " * length
+
+        budget = 1.2
+        operations = 1 + ((40 * 24 + 63) // 64)
+        expected_per_attempt = budget / (
+            operations * (self.msx._v3.retries + 1))
+        with (mock.patch.object(self.msx, "peek", side_effect=fake_peek),
+              mock.patch.object(self.msx, "vpeek", side_effect=fake_vpeek)):
+            self.msx.screen_text(timeout=budget)
+
+        self.assertEqual(len(observed_timeouts), 2)
+        self.assertTrue(all(
+            timeout <= expected_per_attempt
+            for timeout in observed_timeouts))
+        self.assertEqual(self.msx._v3.timeout, original_timeout)
+
+    def test_keybuf_partial_acceptance_and_retry_are_idempotent(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.03).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, consume_keybuf=False,
+            drop_once=(ord("t"),))
+        self.msx.info()
+        self.agent.state = 1
+        self.agent.keybuf[:] = b"x" * 38
+
+        self.assertEqual(self.msx.keybuf_write(b"abc"), (1, 39))
+        self.assertEqual(bytes(self.agent.typed), b"a")
+        writes = [r for r in self.agent.requests if r.opcode == ord("t")]
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(writes[0], writes[1])
+
+    def test_old_v3_agent_uses_safe_ram_fallback(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, keybuf_feature=False)
+        info = self.msx.info()
+        self.agent.state = 1
+        self.agent.ram[0xF3F8:0xF3FC] = b"\xf0\xfb\xf0\xfb"
+
+        self.assertEqual(self.msx.keybuf_write(b"ABC\r"), (4, 4))
+        self.assertEqual(self.agent.ram[0xFBF0:0xFBF4], b"ABC\r")
+        self.assertEqual(self.agent.ram[0xF3F8:0xF3FA], b"\xf4\xfb")
+        self.assertEqual(self.agent.state, 1)
+        self.assertEqual(info["features"], [])
 
     def test_negotiated_vram_chunks_honor_bank_boundary(self):
         payload = bytes((index * 17) & 0xFF for index in range(180))
@@ -398,6 +502,15 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[0], requests[1])
         self.assertEqual(requests[0].opcode, ord("q"))
+
+    def test_keyboard_timeout_budget_is_split_across_v3_attempts(self):
+        self.msx.feature_bits = 1
+        with mock.patch.object(
+                self.msx, "_request_v3", return_value=b"\x01\x01") as request:
+            self.assertEqual(
+                self.msx.keybuf_write(b"A", timeout=3.0), (1, 1))
+
+        request.assert_called_once_with("t", b"A", timeout=1.0)
 
     def test_new_connection_restarts_with_raw_bootstrap(self):
         self.msx.close()

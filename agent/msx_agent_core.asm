@@ -55,12 +55,18 @@ MODE:           equ 0FAFCh      ; bits 2:1 encode installed VRAM capacity
 SCRMOD:         equ 0FCAFh
 REG1SAV:        equ 0F3E0h
 REG2SAV:        equ 0F3E1h
+PUTPNT:         equ 0F3F8h      ; first free byte in the BIOS keyboard ring
+GETPNT:         equ 0F3FAh      ; next byte consumed by BIOS CHGET
+KEYBUF:         equ 0FBF0h
+KEYBUF_END:     equ 0FC18h      ; exclusive end of the 40-byte ring
+KEYBUF_SIZE:    equ 40
 PROTO_VERSION:  equ 2
 FRAMED_VERSION: equ 3
 FRAMED_MAX:     equ 0140h      ; 320-byte payload, safe under Nextor TPA
 CAPABILITIES:   equ 0FFh       ; core + framed v3 + hardware/mapping
 CAPABILITY_RUN: equ 008h
 CAPABILITY_MAPPING: equ 080h
+FEATURE_KEYBUF_INPUT: equ 001h ; optional v3 HELLO feature byte, bit 0
 ; The hook stack has no recursion, no local frame buffers and never calls user
 ; code. A static high-water audit stays below 64 bytes; 224 bytes leaves more
 ; than three times that headroom while keeping the universal build below BDOS.
@@ -1191,6 +1197,16 @@ current_capabilities:
     and 0FFh - CAPABILITY_RUN - CAPABILITY_MAPPING
     ret
 
+current_features:
+    ld a,(runtime_mode)
+    cp RUNTIME_RESIDENT
+    jr nz,current_features_none
+    ld a,FEATURE_KEYBUF_INPUT
+    ret
+current_features_none:
+    xor a
+    ret
+
 cmd_status:
     ld a,'K'
     call ser_put
@@ -1871,6 +1887,8 @@ frame_dispatch:
     jp z,frame_cmd_hello
     cp 'q'
     jp z,frame_cmd_status
+    cp 't'
+    jp z,frame_cmd_keybuf_input
     cp 'r'
     jp z,frame_cmd_ram_read
     cp 'p'
@@ -2138,7 +2156,10 @@ frame_cmd_hello:
     inc hl
     ld a,(runtime_mode)
     ld (hl),a
-    ld hl,14
+    inc hl
+    call current_features
+    ld (hl),a
+    ld hl,15
     ld (frame_response_length),hl
     xor a
     ld (frame_response_status),a
@@ -2158,6 +2179,149 @@ frame_cmd_status:
     xor a
     ld (frame_response_status),a
     jp frame_cache_and_send
+
+; Request payload: zero to query the queue, otherwise 1..39 keyboard bytes.
+; Response payload: accepted byte count, then bytes pending in the BIOS ring.
+; The v3 response cache makes a retransmission idempotent: a lost reply cannot
+; enqueue the same characters twice.  This command deliberately writes only
+; the BIOS work area; calling BIOS, BDOS or BASIC from the hook would re-enter
+; interrupted code and is therefore forbidden.
+frame_cmd_keybuf_input:
+    ld a,(runtime_mode)
+    cp RUNTIME_RESIDENT
+    jp nz,frame_reply_bad_state
+    ld a,(in_hook)
+    or a
+    jp z,frame_reply_bad_state
+    ld a,(run_state)
+    cp 1
+    jp nz,frame_reply_bad_state
+    ld hl,(frame_length)
+    ld a,h
+    or a
+    jp nz,frame_reply_range
+    ld a,l
+    cp KEYBUF_SIZE
+    jp nc,frame_reply_range
+    ld c,a                     ; requested byte count
+    call keybuf_pending
+    jp c,frame_reply_range     ; corrupt BIOS work-area pointers
+    xor a
+    ld (frame_request_status),a ; temporary accepted count; buffers alias
+    ld a,c
+    or a
+    jr z,frame_keybuf_reply
+
+    ; Keep one sentinel byte free so PUTPNT == GETPNT always means empty.
+    ld a,KEYBUF_SIZE - 1
+    sub b                      ; A = currently free bytes
+    jr z,frame_keybuf_reply
+    cp c
+    jr c,frame_keybuf_accept_ready
+    ld a,c
+frame_keybuf_accept_ready:
+    ld (frame_request_status),a
+    ld c,a
+    ld hl,(PUTPNT)
+    ld de,frame_request_buffer
+frame_keybuf_copy_loop:
+    ld a,c
+    or a
+    jr z,frame_keybuf_publish
+    ld a,(de)
+    ld (hl),a
+    inc de
+    inc hl
+    ld a,h
+    cp KEYBUF_END >> 8
+    jr nz,frame_keybuf_no_wrap
+    ld a,l
+    cp KEYBUF_END & 0FFh
+    jr nz,frame_keybuf_no_wrap
+    ld hl,KEYBUF
+frame_keybuf_no_wrap:
+    dec c
+    jr frame_keybuf_copy_loop
+frame_keybuf_publish:
+    ; Publish exactly once, after every byte is present.  CHGET cannot observe
+    ; a partially copied request when the interrupted program resumes.
+    ld (PUTPNT),hl
+    call keybuf_pending
+    jp c,frame_reply_range
+frame_keybuf_reply:
+    ; Request and response storage alias.  Do not overwrite byte zero until
+    ; every accepted request byte has been copied to KEYBUF.
+    ld a,(frame_request_status)
+    ld (frame_response_buffer),a
+    ld a,b
+    ld (frame_response_buffer + 1),a
+    ld hl,2
+    ld (frame_response_length),hl
+    xor a
+    ld (frame_response_status),a
+    jp frame_cache_and_send
+
+; Return B = queued byte count, carry set if either BIOS pointer is outside the
+; documented FBF0h..FC17h ring.  Walking at most 39 positions is compact and
+; avoids fragile 16-bit modulo arithmetic in the resident image.
+keybuf_pending:
+    ld hl,(PUTPNT)
+    call keybuf_pointer_valid
+    ret c
+    push hl
+    ld hl,(GETPNT)
+    call keybuf_pointer_valid
+    jr c,keybuf_pending_invalid_pop
+    ex de,hl                   ; DE = GETPNT
+    pop hl                     ; HL = PUTPNT
+    ex de,hl                   ; HL = GETPNT, DE = PUTPNT
+    ld b,0
+keybuf_pending_loop:
+    ld a,h
+    cp d
+    jr nz,keybuf_pending_advance
+    ld a,l
+    cp e
+    jr z,keybuf_pending_done
+keybuf_pending_advance:
+    inc hl
+    ld a,h
+    cp KEYBUF_END >> 8
+    jr nz,keybuf_pending_count
+    ld a,l
+    cp KEYBUF_END & 0FFh
+    jr nz,keybuf_pending_count
+    ld hl,KEYBUF
+keybuf_pending_count:
+    inc b
+    jr keybuf_pending_loop
+keybuf_pending_done:
+    or a
+    ret
+keybuf_pending_invalid_pop:
+    pop hl
+    scf
+    ret
+
+keybuf_pointer_valid:          ; HL=pointer, preserve HL, carry iff invalid
+    push hl
+    ld de,KEYBUF
+    or a
+    sbc hl,de
+    jr c,keybuf_pointer_invalid
+    ld a,h
+    or a
+    jr nz,keybuf_pointer_invalid
+    ld a,l
+    cp KEYBUF_SIZE
+    jr nc,keybuf_pointer_invalid
+    pop hl
+    or a
+    ret
+keybuf_pointer_invalid:
+    pop hl
+    scf
+    ret
 
 frame_cmd_ram_read:
     ld de,4

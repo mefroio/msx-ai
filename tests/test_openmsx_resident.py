@@ -241,7 +241,8 @@ mailbox: dw 0
 
         machine.type_line("CLS")
         machine.advance(0.3)
-        machine.type_line("MSXAI /DRIVER:8251")
+        bench_agent = pathlib.Path(msx_mcp_server.BENCH_AGENT_NAME).stem
+        machine.type_line(f"{bench_agent} /DRIVER:8251")
         machine.advance(3.0)
         reconfigured = machine.screen_text()
         reconfigured_compact = "".join(reconfigured.split())
@@ -262,7 +263,7 @@ mailbox: dw 0
         # that the named TSR was removed rather than merely disconnected.
         machine.type_line("CLS")
         machine.advance(0.3)
-        machine.type_line("MSXAI /UNINSTALL")
+        machine.type_line(f"{bench_agent} /UNINSTALL")
         machine.advance(msx_mcp_server.RESIDENT_INSTALL_SECONDS)
         removed = machine.screen_text()
         self.assertNotIn("resident loader failed", removed.lower(), removed)
@@ -270,12 +271,37 @@ mailbox: dw 0
 
         machine.type_line("CLS")
         machine.advance(0.3)
-        machine.type_line("MSXAI /UNINSTALL")
+        machine.type_line(f"{bench_agent} /UNINSTALL")
         machine.advance(1.0)
         absent = machine.screen_text()
         self.assertIn(
             "Residentagentisnotinstalled", "".join(absent.split()), absent)
         self.assertTrue(msx_mcp_server._dos_prompt_visible(absent), absent)
+
+    def test_resident_types_and_runs_basic_only_through_agent_tcp(self):
+        self.start_bench(mode="resident")
+        status = self.status()
+        self.assertEqual(status["runtime_mode"], "resident")
+        self.assertIn("keybuf-input", status["features"])
+
+        # The first source line exceeds the BIOS ring's 39-byte capacity.  The
+        # host must split it without letting BASIC discard a following line at
+        # the Return boundary.  msx_run_basic also enters BASIC from DOS here.
+        program = (
+            '10 A$="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"\n'
+            '20 PRINT "MCP TYPE OK ";LEN(A$)')
+        screen = self.call_tool(
+            "msx_run_basic", program=program, clear=True)[0]["text"]
+        self.assertIn("MCP TYPE OK", screen, screen)
+        self.assertIn("36", screen, screen)
+
+        # Exercise raw msx_type followed by msx_type_line on the same resident
+        # connection; no openMSX input API participates in either operation.
+        self.call_tool("msx_type", text="PRINT ")
+        screen = self.call_tool(
+            "msx_type_line", text='"RESIDENT TYPE OK"')[0]["text"]
+        self.assertIn("RESIDENT TYPE OK", screen, screen)
+        self.assertEqual(self.status()["state"], "running")
 
     def test_foreground_monitor_runs_code_and_debug_is_visible(self):
         machine = self.start_bench(mode="monitor", debug=True)

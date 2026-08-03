@@ -43,6 +43,9 @@ server/msx_mcp_server.py
   payload limits.
 - RAM, VRAM, direct I/O-port access, pause/resume, and host-rendered
   screenshots through the physical agent.
+- BIOS keyboard-buffer input through the resident agent, enabling the same
+  `msx_type`, `msx_type_line`, and `msx_run_basic` MCP workflows on openMSX
+  and physical targets.
 - Rendering for standard SCREEN 0-8 and SCREEN 10-12 modes, including display
   pages, scroll, palettes, and sprites.
 - A backend-neutral loader for `msx-ai-app-v1` manifests, MSX-DOS COM files,
@@ -233,6 +236,7 @@ framed protocols, transport ABI, and driver implementation details.
 | Returns to DOS | Yes | No |
 | Observe a normally launched DOS program/game | Yes | No |
 | Pause/read/patch/screenshot/resume | Yes | Yes |
+| BIOS keyboard input | Yes | No |
 | Agent-side `call` and `run` | No | Yes |
 | Agent-side `stop` | No | Yes |
 | Slot and mapper selection | No | Yes, pages 0 and 1 |
@@ -311,6 +315,12 @@ The negotiated payload limit of the current agent is 320 bytes. Eight
 consecutive ESC bytes reset a framed protocol session after a lost peer; a
 single noise byte cannot downgrade it.
 
+The optional `keybuf-input` HELLO feature enables opcode `t`. It atomically
+enqueues bytes in the BIOS keyboard ring and returns accepted/pending counts.
+The host waits for each line to be consumed before sending the next one, so a
+BASIC line editor cannot discard commands queued after Return. Cached v3
+responses also prevent a retried request from typing duplicate characters.
+
 ## Screenshots from VRAM
 
 `msx_screenshot` captures VRAM and VDP/BIOS state, renders the image on the
@@ -369,12 +379,19 @@ Execution constraints depend on the runtime:
 | Execution | `msx_asm_load`, `msx_app_load`, `msx_pause`, `msx_resume`, `msx_stop` |
 | Memory/video | `msx_memory_read`, `msx_memory_write`, `msx_screen`, `msx_screenshot` |
 | Hardware | `msx_io_read`, `msx_io_write`, `msx_slot_select`, `msx_mapper_select` |
-| openMSX input | `msx_type`, `msx_type_line`, `msx_key`, `msx_run_basic` |
+| Input | `msx_type`, `msx_type_line`, `msx_run_basic` (both backends); `msx_key` (openMSX) |
 | openMSX/DOS | `msx_dos_asm_run`, `msx_disk_put_text`, `msx_reset`, `msx_cmd` |
 
-Keyboard injection, physical reset, and raw openMSX console commands remain
+Resident keyboard injection feeds the standard BIOS ring and therefore works
+with DOS, BASIC, and software that calls BIOS character input. Games that read
+the keyboard matrix directly do not observe those synthetic bytes. Physical
+reset, individual matrix-key presses, and raw openMSX console commands remain
 openMSX-only. Physical operations use the agent byte stream rather than
-openMSX APIs.
+openMSX APIs. On a physical target, `msx_run_basic` enters BASIC automatically
+only from an unambiguous DOS prompt. Reusing an already-visible BASIC prompt
+requires `allow_existing_basic=true`, an explicit safety opt-in that prevents a
+screen merely ending in `Ok` from being treated as permission to overwrite a
+running application.
 
 ## Validation
 

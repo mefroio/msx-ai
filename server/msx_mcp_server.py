@@ -10,12 +10,12 @@ patch RAM/VRAM, control execution and render screenshots from captured VRAM.
 Nothing here touches the user's own openMSX setups: OPENMSX_HOME points at the
 project-local .openmsx-home built for msx-ai.
 """
-import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re
+import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re, time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import base64
 from msx_client import OpenMSX, OpenMSXError, PROJ
-from msx_real import RealMSX, CAPABILITY_NAMES
+from msx_real import RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES
 from msx_application import load_application
 import msx_screenshot
 
@@ -35,9 +35,13 @@ MSX2PLUS_MACHINE = os.environ.get(
 DISK_EXTENSION = os.environ.get("MSX_AI_DISK_EXTENSION", "DDX_3.0")
 DOS_EXTENSION = os.environ.get("MSX_AI_DOS_EXTENSION", "SunriseIDE_Nextor")
 RESIDENT_INSTALL_SECONDS = 15
+RESIDENT_PROMPT_GRACE_SECONDS = 15
+BENCH_AGENT_NAME = "MSXAITST.COM"
+REAL_BASIC_PROMPT_TIMEOUT_SECONDS = 10.0
+REAL_BASIC_PROMPT_POLL_SECONDS = 0.10
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 
 def _build_agent_artifact():
@@ -64,6 +68,22 @@ def _dos_prompt_visible(screen):
     """Return whether the last non-blank text row is an MSX-DOS prompt."""
     rows = [row.strip() for row in str(screen).splitlines() if row.strip()]
     return bool(rows and re.fullmatch(r"[A-Za-z]:\\[^>]*>", rows[-1]))
+
+
+def _basic_prompt_visible(screen):
+    """Return whether BASIC's last content row is its `Ok` prompt.
+
+    MSX BASIC may reserve the final physical row for programmable function-key
+    labels.  The default/Nextor label bar includes both LIST and RUN; it is not
+    program output and therefore must not hide an otherwise current prompt.
+    """
+    physical_rows = str(screen).splitlines()
+    if physical_rows:
+        footer = physical_rows[-1].strip().lower()
+        if "list" in footer and "run" in footer:
+            physical_rows = physical_rows[:-1]
+    rows = [row.strip() for row in physical_rows if row.strip()]
+    return bool(rows and rows[-1].lower() == "ok")
 
 # --------------------------------------------------------------------------
 # Emulator session (lazy, single instance kept alive across tool calls)
@@ -160,7 +180,10 @@ class Session:
         root = pathlib.Path(runtime.name)
         disk = root / "msxdos.dsk"
         home = root / "openmsx-home"
-        agent_com = root / "MSXAI.COM"
+        # Keep the bench copy distinct from a possibly stale MSXAI.COM in the
+        # base image. This exists only inside the disposable runtime disk; the
+        # canonical/public artifact remains MSXAI.COM.
+        agent_com = root / BENCH_AGENT_NAME
         machine = None
         real = None
         try:
@@ -180,12 +203,9 @@ class Session:
                 extensions=[DOS_EXTENSION, "rs232_proto"],
                 harddisk=str(disk), home=home,
             ).start(headless=not window)
-            if window:
-                machine.cmd("set renderer SDLGL-PP")
-            machine.power_on()
-            if window:
-                machine.cmd("set throttle on")
-            machine.advance(14)
+            # Import while the emulated machine is off. openMSX may otherwise
+            # retain stale filesystem sectors for a disk mounted by MSX-DOS.
+            machine.cmd("set power off")
             machine.cmd(f"diskmanipulator import hda1 {{{agent_com}}}")
             for preload in preload_files:
                 preload = pathlib.Path(preload).resolve()
@@ -193,9 +213,13 @@ class Session:
                     raise OpenMSXError(
                         f"bench preload file not found: {preload}")
                 machine.cmd(f"diskmanipulator import hda1 {{{preload}}}")
-            machine.cmd("reset")
+            if window:
+                machine.cmd("set renderer SDLGL-PP")
+            machine.power_on()
+            if window:
+                machine.cmd("set throttle on")
             machine.advance(14)
-            command = "MSXAI /DRIVER:8251"
+            command = f"{pathlib.Path(BENCH_AGENT_NAME).stem} /DRIVER:8251"
             if mode == "monitor":
                 command += " /MONITOR"
             if debug:
@@ -206,6 +230,11 @@ class Session:
 
             if mode == "resident":
                 screen = machine.screen_text()
+                grace = RESIDENT_PROMPT_GRACE_SECONDS
+                while not _dos_prompt_visible(screen) and grace > 0:
+                    machine.advance(1)
+                    grace -= 1
+                    screen = machine.screen_text()
                 if not _dos_prompt_visible(screen):
                     raise OpenMSXError(
                         "resident agent did not return to an MSX-DOS prompt:\n"
@@ -286,6 +315,24 @@ def _screen():
     return SESSION.require().screen_text()
 
 
+def _wait_for_real_screen(m, predicate,
+                          timeout=REAL_BASIC_PROMPT_TIMEOUT_SECONDS):
+    """Poll a screen captured through the agent until predicate matches."""
+    deadline = time.monotonic() + float(timeout)
+    screen = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return screen
+        screen = m.screen_text(timeout=remaining)
+        if predicate(screen):
+            return screen
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return screen
+        time.sleep(min(REAL_BASIC_PROMPT_POLL_SECONDS, remaining))
+
+
 def t_boot(profile="basic", window=False):
     if profile not in ("basic", "disk", "dos", "msx2plus"):
         raise ValueError(
@@ -361,6 +408,9 @@ def t_status():
             "debug": getattr(m, "debug", None),
             "runtime_mode": getattr(m, "runtime_mode", None),
             "runtime_mode_id": getattr(m, "runtime_mode_id", None),
+            "features": [name for bit, name in AGENT_FEATURE_NAMES.items()
+                         if getattr(m, "feature_bits", 0) & bit],
+            "feature_bits": getattr(m, "feature_bits", 0),
             "vdp_generation": getattr(m, "vdp_generation", None),
             "vram_size": m.vram_size,
             "vram_banks": getattr(m, "vram_banks", None),
@@ -620,20 +670,18 @@ def t_screenshot(atomic=True, page=None, sprites=True, palette=None):
 
 
 def t_type_line(text):
-    if SESSION.profile == "real":
-        raise OpenMSXError("keyboard injection is not implemented by the real agent")
     m = SESSION.require()
     m.type_line(text)
-    m.advance(0.6)
+    if SESSION.profile != "real":
+        m.advance(0.6)
     return _screen()
 
 
 def t_type(text):
-    if SESSION.profile == "real":
-        raise OpenMSXError("keyboard injection is not implemented by the real agent")
     m = SESSION.require()
     m.type(text)
-    m.advance(0.4)
+    if SESSION.profile != "real":
+        m.advance(0.4)
     return _screen()
 
 
@@ -646,21 +694,63 @@ def t_key(key):
     return _screen()
 
 
-def t_run_basic(program, clear=True):
-    if SESSION.profile == "real":
-        raise OpenMSXError("BASIC entry is not implemented by the resident agent")
+def t_run_basic(program, clear=True, allow_existing_basic=False):
+    if not isinstance(program, str):
+        raise TypeError("program must be a string")
+    if not isinstance(clear, bool):
+        raise TypeError("clear must be a boolean")
+    if not isinstance(allow_existing_basic, bool):
+        raise TypeError("allow_existing_basic must be a boolean")
     m = SESSION.require()
+    real = SESSION.profile == "real"
+    # A resident is normally installed from DOS.  Enter BASIC automatically
+    # only when the last visible row is an unambiguous DOS prompt; never type
+    # BASIC over an arbitrary application or game.
+    if real:
+        screen = m.screen_text()
+        if _dos_prompt_visible(screen):
+            m.type_line("BASIC")
+            screen = _wait_for_real_screen(m, _basic_prompt_visible)
+            if not _basic_prompt_visible(screen):
+                raise OpenMSXError(
+                    "BASIC did not reach its Ok prompt after leaving MSX-DOS. "
+                    "Last captured screen:\n" + screen)
+        elif not allow_existing_basic:
+            raise OpenMSXError(
+                "msx_run_basic requires a visible MSX-DOS prompt by default; "
+                "refusing to type over an unverified target. "
+                "Set allow_existing_basic=true only after confirming that the "
+                "target is waiting at an MSX BASIC Ok prompt")
+        elif not _basic_prompt_visible(screen):
+            raise OpenMSXError(
+                "allow_existing_basic was requested, but the visible screen "
+                "does not end at an MSX BASIC Ok prompt; refusing to type over "
+                "a running application or game")
     if clear:
         m.type_line("NEW")
-        m.advance(0.4)
+        if real:
+            screen = _wait_for_real_screen(m, _basic_prompt_visible)
+            if not _basic_prompt_visible(screen):
+                raise OpenMSXError(
+                    "BASIC did not return to Ok after NEW. "
+                    "Last captured screen:\n" + screen)
+        else:
+            m.advance(0.4)
     for line in program.splitlines():
         line = line.rstrip()
         if not line:
             continue
         m.type_line(line)
-        m.advance(0.3)
+        # MSX BASIC does not print a fresh `Ok` after storing a numbered line.
+        # RealMSX.type_line() already waits for the BIOS queue to be consumed
+        # and gives the interpreter a short post-CR settle time.
+        if not real:
+            m.advance(0.3)
     m.type_line("RUN")
-    m.advance(2.5)
+    if real:
+        time.sleep(2.5)
+    else:
+        m.advance(2.5)
     return _screen()
 
 
@@ -935,19 +1025,29 @@ TOOLS = {
                                   "items": {"type": "integer", "minimum": 0,
                                             "maximum": 255}}}})),
     "msx_type_line": (t_type_line,
-        "OpenMSX only: type one line of text and press RETURN. Returns the screen.",
+        "Type one line and press RETURN. A real resident agent injects the "
+        "ASCII bytes atomically through the BIOS keyboard ring; software that "
+        "reads the hardware key matrix directly will not observe them. Returns "
+        "the text screen.",
         _s({"text": {"type": "string"}}, ["text"])),
     "msx_type": (t_type,
-        "OpenMSX only: type raw text without pressing RETURN.",
+        "Type raw text without adding RETURN. A real resident agent uses the "
+        "BIOS keyboard ring and waits for each batch to be consumed.",
         _s({"text": {"type": "string"}}, ["text"])),
     "msx_key": (t_key,
         "OpenMSX only: press ESC, RET, STOP, SPACE, SELECT or TAB.",
         _s({"key": {"type": "string"}}, ["key"])),
     "msx_run_basic": (t_run_basic,
-        "OpenMSX only: enter a full BASIC program, then RUN it and return the "
-        "screen output. Does NEW first unless clear=false.",
+        "Enter a full BASIC program one line at a time, then RUN it and return "
+        "the text screen. On a real resident target, enters BASIC automatically "
+        "when the current screen ends at a DOS prompt. An already-visible BASIC "
+        "prompt requires explicit allow_existing_basic=true so an arbitrary "
+        "application displaying 'Ok' is not modified. Does NEW first unless "
+        "clear=false.",
         _s({"program": {"type": "string"},
-            "clear": {"type": "boolean", "default": True}}, ["program"])),
+            "clear": {"type": "boolean", "default": True},
+            "allow_existing_basic": {
+                "type": "boolean", "default": False}}, ["program"])),
     "msx_reset": (t_reset,
         "OpenMSX only: reset the MSX and return the boot screen.", _s({})),
     "msx_app_load": (t_app_load,

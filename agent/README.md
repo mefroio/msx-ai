@@ -71,6 +71,7 @@ passes to MemMan or the foreground monitor.
 | Monitors DOS-launched software | Yes | No |
 | RAM/VRAM and direct I/O | Yes, with resident memory restrictions | Yes, outside protected monitor memory |
 | Pause/resume | Yes | Yes |
+| BIOS keyboard-buffer input | Yes | No |
 | Direct call/run/stop | No | Yes |
 | Slot/mapper selection | No | Yes, pages 0 and 1 |
 | `DEBUG ON` | Rejected | Optional |
@@ -165,6 +166,15 @@ The control path remains cooperative. Code that holds `DI`, removes the BIOS
 hook chain, or prevents maskable interrupts cannot be interrupted by this
 software-only agent.
 
+The framed `t` command injects ASCII/key codes into the standard 40-byte BIOS
+keyboard ring (`KEYBUF`) while the hook already has interrupts disabled. It
+publishes `PUTPNT` only after copying the accepted bytes and never calls BIOS,
+BDOS, or BASIC from the hook. Its two-byte response reports accepted and
+pending counts. Host code stops batches at each Return and waits for pending
+input to reach zero before sending another line, because BASIC may clear the
+remaining keyboard buffer after accepting a line. Software that scans the
+hardware keyboard matrix directly is outside this mechanism.
+
 ## Memory model
 
 MemMan relocates the TSR within a managed segment. When a hook or talk entry is
@@ -247,6 +257,13 @@ be recomputed because they are side-effect free.
 The current negotiated payload limit is 320 bytes. Request and response storage
 share one buffer to keep the resident compact. A split lookup-table
 implementation accelerates CRC processing.
+
+The v3 HELLO appends an optional feature byte after the runtime-mode byte. Bit
+0 advertises `keybuf-input`; older 9-byte and 14-byte HELLO responses remain
+valid. Opcode `t` accepts zero bytes as a queue-status query or up to 39 input
+bytes and returns `[accepted, pending]`. The one unused ring position preserves
+the BIOS convention that equal get/put pointers mean empty. Because the result
+is cached by sequence, response loss and retry cannot type a batch twice.
 
 If a TCP/serial peer disappears, eight consecutive ESC bytes reset only the
 framed session. A new host can repeat the raw hello and v3 upgrade without
