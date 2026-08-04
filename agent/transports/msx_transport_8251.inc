@@ -5,7 +5,7 @@
 
 UART8251_ID:            equ 0
 UART8251_CONTROL_LEVEL: equ 1
-UART8251_FLAGS:         equ 1       ; bit 0: H.KEYI is exclusive
+UART8251_FLAGS:         equ TRANSPORT_FLAG_KEYI_EXCLUSIVE | TRANSPORT_FLAG_TIMI_ONLY | TRANSPORT_FLAG_FRAME_WAKE_ACK
 UART8251_STATE_SIZE:    equ 1
 
 UART8251_DATA:          equ 080h
@@ -20,6 +20,14 @@ UART8251_TIMER_TX_MODE: equ 076h    ; counter 1, LSB/MSB, mode 3, binary
 UART8251_TIMER_DIVISOR: equ 6       ; 1.8432 MHz / 6 / 16 = 19,200 baud
 
 uart8251_init:
+    ; Preserve the firmware mask, then disable every asynchronous UART source
+    ; before enabling the receiver. The resident polls RxRDY only from H.TIMI.
+    ld a,(UART8251_COMMSK)
+    ld (transport_state + UART8251_SAVED_COMMSK),a
+    ld a,0FFh
+    ld (UART8251_COMMSK),a
+    out (082h),a
+
     ; The standard MSX RS-232 interface clocks the 8251 from counters 0 and 1
     ; of an 8253/8254 at ports 84h..87h. Leaving those counters at firmware or
     ; power-on values makes receive delivery intermittent. Program both sides
@@ -50,12 +58,6 @@ uart8251_init:
     ld a,037h                   ; TxEN|DTR|RxEN|ER|RTS
     out (UART8251_STATUS),a
 
-    ; Enable the standard MSX RS-232 RxRDY interrupt (active-low mask bit 0).
-    ld a,(UART8251_COMMSK)
-    ld (transport_state + UART8251_SAVED_COMMSK),a
-    ld a,0FEh                  ; own only RxRDY; mask TX/modem IRQ sources
-    ld (UART8251_COMMSK),a
-    out (082h),a
     ret
 
 uart8251_restore:

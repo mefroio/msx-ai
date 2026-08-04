@@ -185,6 +185,28 @@ class _ConnectedStream:
         return self.stream.close()
 
 
+class _RecordingTimeoutStream:
+    def __init__(self):
+        self.timeout = None
+        self.writes = []
+        self.closed = False
+
+    def recv(self, _size):
+        raise socket.timeout
+
+    def sendall(self, data):
+        self.writes.append(bytes(data))
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def gettimeout(self):
+        return self.timeout
+
+    def close(self):
+        self.closed = True
+
+
 class RealMSXTransportTest(unittest.TestCase):
     def setUp(self):
         client, agent = socket.socketpair()
@@ -225,19 +247,61 @@ class RealMSXTransportTest(unittest.TestCase):
         self.assertEqual(self.agent.hello_queries, 1)
         self.assertFalse(self.msx.bootstrap_recovered)
 
-    def test_bootstrap_recovers_raw_agent_after_escape_errors(self):
+    def test_bootstrap_stops_after_a_dropped_raw_hello(self):
         self.msx.close()
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.03).attach_socket(client)
         self.agent = FakeResidentAgent(resident, drop_hello_queries=1)
 
-        info = self.msx.info()
+        with self.assertRaisesRegex(
+                RealMSXError, "safe bootstrap probe timed out"):
+            self.msx.info()
 
-        self.assertEqual(info["protocol"], 2)
-        self.assertEqual(self.agent.hello_queries, 2)
-        self.assertEqual(self.agent.unknown_commands, len(msx_real.RECONNECT_ESCAPE))
-        self.assertTrue(self.msx.bootstrap_recovered)
+        self.assertEqual(self.agent.hello_queries, 1)
+        self.assertEqual(self.agent.unknown_commands, 1)
+        self.assertFalse(self.msx.bootstrap_recovered)
+
+    def test_failed_bootstrap_quarantines_repeated_info_without_more_writes(self):
+        self.msx.close()
+        self.agent.close()
+        stream = _RecordingTimeoutStream()
+        self.msx = RealMSX(socket_timeout=0.01).attach_stream(stream)
+
+        with self.assertRaisesRegex(
+                RealMSXError, "safe bootstrap probe timed out"):
+            self.msx.info()
+
+        self.assertTrue(self.msx.write_quarantined)
+        self.assertEqual(stream.writes, [msx_real.RECONNECT_ESCAPE[:1]])
+        with self.assertRaisesRegex(RealMSXError, "write-quarantined"):
+            self.msx.info()
+        self.assertEqual(stream.writes, [msx_real.RECONNECT_ESCAPE[:1]])
+
+    def test_same_stream_reattach_preserves_v3_quarantine_until_close(self):
+        self.msx.close()
+        self.agent.close()
+        stream = _RecordingTimeoutStream()
+        self.msx = RealMSX(socket_timeout=0.01).attach_stream(stream)
+        reason = RuntimeError("indeterminate v3 request")
+        self.msx._v3 = mock.Mock(
+            write_quarantined=True, quarantine_reason=reason)
+
+        self.msx.attach_stream(stream)
+
+        self.assertIsNone(self.msx._v3)
+        self.assertTrue(self.msx.write_quarantined)
+        self.assertIs(self.msx.quarantine_reason, reason)
+        with self.assertRaisesRegex(RealMSXError, "write-quarantined"):
+            self.msx._send(b"?")
+        self.assertEqual(stream.writes, [])
+
+        self.msx.close()
+        replacement = _RecordingTimeoutStream()
+        self.msx.attach_stream(replacement)
+        self.assertFalse(self.msx.write_quarantined)
+        self.msx._send(b"?")
+        self.assertEqual(replacement.writes, [b"?"])
 
     def test_new_stream_clears_all_negotiated_metadata(self):
         self.msx.close()
@@ -248,6 +312,8 @@ class RealMSXTransportTest(unittest.TestCase):
         self.msx.simulation = "stale-simulation"
         self.msx.agent_transport_id = 1
         self.msx.runtime_mode_id = 1
+        self.msx.bootstrap_feature_bits = 0x18
+        self.msx.bootstrap_features_known = True
         client, resident = socket.socketpair()
         self.agent = FakeResidentAgent(resident)
 
@@ -258,6 +324,8 @@ class RealMSXTransportTest(unittest.TestCase):
         self.assertIsNone(self.msx.simulation)
         self.assertIsNone(self.msx.agent_transport_id)
         self.assertIsNone(self.msx.runtime_mode_id)
+        self.assertEqual(self.msx.bootstrap_feature_bits, 0)
+        self.assertFalse(self.msx.bootstrap_features_known)
 
     def test_pause_and_resume_reject_monitor_state(self):
         with self.assertRaises(RealMSXError):

@@ -187,12 +187,11 @@ mailbox: dw 0
             self.read_memory("ram", 0x010B, 2), "little")
         self.assertGreater(after_snapshot, second)
 
-        self.call_tool("msx_pause")
-        paused = int.from_bytes(self.read_memory("ram", 0x010B, 2), "little")
-        machine.advance(0.5)
-        self.assertEqual(
-            int.from_bytes(self.read_memory("ram", 0x010B, 2), "little"),
-            paused)
+        pause = self.tool_result("msx_pause")
+        self.assertTrue(pause.get("isError"))
+        self.assertIn(
+            "persistent manual pause is disabled",
+            pause["content"][0]["text"])
         # Use a mailbox the fixture never writes. Replacing the live counter
         # itself would race with an instruction interrupted between its load
         # and store, which is a property of the test program, not the agent.
@@ -204,9 +203,8 @@ mailbox: dw 0
         self.assertIn("ASM agent/TCP", screenshot[0]["text"])
         self.assertTrue(base64.b64decode(screenshot[1]["data"]).startswith(
             b"\x89PNG\r\n\x1a\n"))
-        self.assertEqual(self.status()["state"], "paused")
+        self.assertEqual(self.status()["state"], "running")
 
-        self.call_tool("msx_resume")
         machine.advance(0.4)
         try:
             mailbox = self.read_memory("ram", 0x010D, 2)
@@ -216,15 +214,15 @@ mailbox: dw 0
         self.assertEqual(mailbox, b"\x34\x12")
         self.assertGreater(
             int.from_bytes(self.read_memory("ram", 0x010B, 2), "little"),
-            paused)
+            after_snapshot)
 
-        # Exercise repeated hook entry/unwind and UART re-arming in this same
-        # process. This caught failures that a single happy-path pause missed.
+        # Exercise repeated bounded lease entry/unwind and UART re-arming in
+        # this same process. This catches failures that a single atomic read
+        # misses without relying on the intentionally disabled manual pause.
         try:
             for _ in range(16):
-                self.call_tool("msx_pause")
-                self.assertEqual(self.status()["state"], "paused")
-                self.call_tool("msx_resume")
+                self.assertEqual(
+                    self.read_memory("ram", 0x010D, 2), b"\x34\x12")
                 self.assertEqual(self.status()["state"], "running")
         except Exception:
             print(self.machine_diagnostics(machine), file=sys.stderr)

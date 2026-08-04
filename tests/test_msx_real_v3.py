@@ -18,7 +18,10 @@ from msx_protocol import (  # noqa: E402
     GarbageDataError,
 )
 from msx_real import (  # noqa: E402
+    FEATURE_SNAPSHOT_LEASE,
+    FEATURE_TIMI_POLL_SAFE,
     FRAME_WAKE_ACK,
+    INTFLG,
     RECONNECT_ESCAPE,
     UART8251_FRAME_WAKE_DELAY,
     RealMSX,
@@ -34,7 +37,10 @@ class FakeV3Resident:
                  vram_size=0x20000, legacy_hello=False, start_framed=False,
                  runtime_mode=1, keybuf_feature=True,
                  consume_keybuf=True, debug=False,
-                 debug_peer_feature=False, frame_wake_ack_feature=False,
+                 debug_peer_feature=False, frame_wake_ack_feature=None,
+                 timi_poll_safe_feature=None,
+                 bootstrap_features_supported=True,
+                 bootstrap_feature_bits=None,
                  transport_id=1):
         self.sock = sock
         self.max_payload = max_payload
@@ -50,7 +56,14 @@ class FakeV3Resident:
         self.consume_keybuf = bool(consume_keybuf)
         self.debug = bool(debug)
         self.debug_peer_feature = bool(debug_peer_feature)
-        self.frame_wake_ack_feature = bool(frame_wake_ack_feature)
+        self.frame_wake_ack_feature = (
+            True if frame_wake_ack_feature is None
+            else bool(frame_wake_ack_feature))
+        self.timi_poll_safe_feature = (
+            runtime_mode == 0 if timi_poll_safe_feature is None
+            else bool(timi_poll_safe_feature))
+        self.bootstrap_features_supported = bool(bootstrap_features_supported)
+        self.bootstrap_feature_bits = bootstrap_feature_bits
         self.transport_id = int(transport_id)
         self.capabilities = 0xFF if runtime_mode != 0 else 0x77
         self.vdp_generation = 0 if vram_size == 0x4000 else 2
@@ -68,8 +81,11 @@ class FakeV3Resident:
         self.debug_peer_labels = []
 
         self.bootstrap_queries = 0
+        self.bootstrap_feature_queries = 0
+        self.bootstrap_probe_rejections = 0
         self.upgrades = 0
         self.reconnects = 0
+        self.reconnect_credits = 0
         self.requests = []
         self.error = None
         self._response_cache = {}
@@ -104,37 +120,84 @@ class FakeV3Resident:
             data += part
         return bytes(data)
 
-    def _run(self):
-        if self.start_framed:
-            window = bytearray()
-            while not window.endswith(RECONNECT_ESCAPE):
-                window += self._recv_exact(1)
-                del window[:-len(RECONNECT_ESCAPE)]
-            self.reconnects += 1
-            self.sock.sendall(
-                b"M\x02" + bytes([self.capabilities]) + b"\xc8")
+    def _feature_bits(self):
+        features = 1 if self.keybuf_feature and self.runtime_mode == 0 else 0
+        if self.runtime_mode == 0:
+            features |= FEATURE_SNAPSHOT_LEASE
+        if (self.debug_peer_feature and self.runtime_mode == 1 and
+                self.debug):
+            features |= 2
+        if self.frame_wake_ack_feature:
+            features |= 8
+        if self.timi_poll_safe_feature:
+            features |= FEATURE_TIMI_POLL_SAFE
+        return features
 
-        # The monitor always starts in the v2 bootstrap, even after a new TCP
-        # connection.  Framed bytes are legal only after the explicit F ACK.
+    def _send_raw_hello(self):
+        self.sock.sendall(
+            b"M\x02" + bytes([self.capabilities]) + b"\xc8")
+
+    def _accept_credited_reconnect(self, first_byte=None):
+        marker = bytearray()
+        if first_byte is not None:
+            marker += first_byte
+            self.sock.sendall(FRAME_WAKE_ACK)
+            self.reconnect_credits += 1
+        while len(marker) < len(RECONNECT_ESCAPE):
+            byte = self._recv_exact(1)
+            if byte != RECONNECT_ESCAPE[:1]:
+                raise AssertionError(
+                    f"unexpected reconnect byte {byte!r}")
+            marker += byte
+            self.sock.sendall(FRAME_WAKE_ACK)
+            self.reconnect_credits += 1
+        self.assert_reconnect_marker(marker)
+        self.reconnects += 1
+        self._send_raw_hello()
+
+    @staticmethod
+    def assert_reconnect_marker(marker):
+        if bytes(marker) != RECONNECT_ESCAPE:
+            raise AssertionError(f"invalid reconnect marker {bytes(marker)!r}")
+
+    def _run_raw_bootstrap(self):
+        # Raw mode rejects the one-byte ESC probe before the host sends '?'.
         while True:
             command = self._recv_exact(1)
-            if command == b"?":
+            if command == RECONNECT_ESCAPE[:1]:
+                self.bootstrap_probe_rejections += 1
+                self.sock.sendall(b"E\x01")
+            elif command == b"?":
                 self.bootstrap_queries += 1
-                self.sock.sendall(
-                    b"M\x02" + bytes([self.capabilities]) + b"\xc8")
+                self._send_raw_hello()
+            elif command == b"N":
+                self.bootstrap_feature_queries += 1
+                if self.bootstrap_features_supported:
+                    features = (
+                        self._feature_bits()
+                        if self.bootstrap_feature_bits is None
+                        else int(self.bootstrap_feature_bits))
+                    self.sock.sendall(b"K" + bytes([features]))
+                else:
+                    self.sock.sendall(b"E\x01")
             elif command == b"F":
                 self.upgrades += 1
                 self.sock.sendall(
                     b"K\x03" + self.max_payload.to_bytes(2, "little"))
-                break
+                return
             else:
                 raise AssertionError(f"unexpected bootstrap byte {command!r}")
 
+    def _run_framed(self):
         parser = FrameParser(max_payload=self.max_payload)
         while True:
             data = self.sock.recv(4096)
             if not data:
-                return
+                return False
+            if (self.frame_wake_ack_feature and
+                    data == RECONNECT_ESCAPE[:1]):
+                self._accept_credited_reconnect(first_byte=data)
+                return True
             if self.frame_wake_ack_feature and data == b"M":
                 self.sock.sendall(FRAME_WAKE_ACK)
             for request in parser.feed(data):
@@ -147,6 +210,15 @@ class FakeV3Resident:
                     wire = self._dispatch(request).encode()
                     self._response_cache[key] = wire
                 self._send_response(request.opcode, wire)
+
+    def _run(self):
+        if self.start_framed:
+            self._accept_credited_reconnect()
+
+        while True:
+            self._run_raw_bootstrap()
+            if not self._run_framed():
+                return
 
     def _send_response(self, opcode, wire):
         if opcode in self.drop_once and opcode not in self.dropped:
@@ -189,15 +261,7 @@ class FakeV3Resident:
                 response_payload += bytes([self.vram_size // 0x4000])
                 response_payload += self.vram_size.to_bytes(3, "little")
                 response_payload += bytes([self.runtime_mode])
-                features = (
-                    1 if self.keybuf_feature and self.runtime_mode == 0 else 0)
-                if (self.debug_peer_feature and self.runtime_mode == 1 and
-                        self.debug):
-                    features |= 2
-                if (self.frame_wake_ack_feature and
-                        self.transport_id == 0):
-                    features |= 8
-                response_payload += bytes([features])
+                response_payload += bytes([self._feature_bits()])
         elif opcode == "q":
             response_payload = bytes([self.state, 3])
         elif opcode == "I" and self.debug_peer_feature:
@@ -275,8 +339,12 @@ class RealMSXV3Test(unittest.TestCase):
         self.agent.close()
 
     def test_automatic_upgrade_and_negotiated_hello(self):
+        self.assertEqual(self.agent.bootstrap_probe_rejections, 1)
         self.assertEqual(self.agent.bootstrap_queries, 1)
+        self.assertEqual(self.agent.bootstrap_feature_queries, 1)
         self.assertEqual(self.agent.upgrades, 1)
+        self.assertTrue(self.msx.bootstrap_features_known)
+        self.assertEqual(self.msx.bootstrap_feature_bits, 8)
         self.assertEqual(self.info["bootstrap_protocol"], 2)
         self.assertEqual(self.info["protocol"], 3)
         self.assertEqual(self.info["max_payload"], 64)
@@ -291,8 +359,8 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(self.info["vram_banks"], 8)
         self.assertEqual(self.info["runtime_mode"], "foreground-monitor")
         self.assertEqual(self.info["runtime_mode_id"], 1)
-        self.assertEqual(self.info["features"], [])
-        self.assertEqual(self.info["feature_bits"], 0)
+        self.assertEqual(self.info["features"], ["frame-wake-ack"])
+        self.assertEqual(self.info["feature_bits"], 8)
         self.assertFalse(self.info["bootstrap_recovered"])
         self.assertIn("framed-v3", self.info["capabilities"])
         self.assertIn("hardware-io", self.info["capabilities"])
@@ -305,16 +373,19 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(self.agent.bootstrap_queries, 1)
         self.assertEqual(self.agent.upgrades, 1)
 
-    def test_8251_negotiation_retains_first_byte_wake_delay(self):
+    def test_legacy_8251_negotiation_retains_first_byte_wake_delay(self):
         self.msx.close()
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
-        self.agent = FakeV3Resident(resident, transport_id=0)
+        self.agent = FakeV3Resident(
+            resident, transport_id=0, frame_wake_ack_feature=False,
+            bootstrap_features_supported=False)
 
         info = self.msx.info()
 
         self.assertEqual(info["agent_transport"], "uart-8251")
+        self.assertEqual(UART8251_FRAME_WAKE_DELAY, 0.050)
         self.assertEqual(
             self.msx._v3.frame_wake_delay, UART8251_FRAME_WAKE_DELAY)
         self.assertIsNone(self.msx._v3.frame_wake_ack)
@@ -333,6 +404,84 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(self.msx._v3.frame_wake_ack, FRAME_WAKE_ACK)
         self.assertEqual(self.msx._v3.frame_wake_delay, 0.0)
         self.assertEqual(self.msx.status()["state"], "monitor")
+
+    def test_16c550_negotiation_uses_explicit_frame_wake_ack(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, transport_id=1, frame_wake_ack_feature=True)
+
+        info = self.msx.info()
+
+        self.assertEqual(info["agent_transport"], "uart-16c550")
+        self.assertIn("frame-wake-ack", info["features"])
+        self.assertEqual(self.msx._v3.frame_wake_ack, FRAME_WAKE_ACK)
+        self.assertEqual(self.msx._v3.frame_wake_delay, 0.0)
+
+    def test_safe_resident_negotiates_single_attempt_write_quarantine(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, frame_wake_ack_feature=True,
+            timi_poll_safe_feature=True)
+
+        info = self.msx.info()
+
+        self.assertEqual(info["runtime_mode"], "resident")
+        self.assertIn("frame-wake-ack", info["features"])
+        self.assertIn("timi-poll-safe", info["features"])
+        self.assertEqual(
+            info["feature_bits"] & FEATURE_TIMI_POLL_SAFE,
+            FEATURE_TIMI_POLL_SAFE)
+        self.assertTrue(self.msx.bootstrap_features_known)
+        self.assertEqual(self.msx.bootstrap_feature_bits, info["feature_bits"])
+        self.assertEqual(self.agent.bootstrap_feature_queries, 1)
+        self.assertEqual(self.agent.bootstrap_probe_rejections, 1)
+        self.assertEqual(self.msx._v3.retries, 0)
+        self.assertTrue(self.msx._v3.quarantine_on_timeout)
+        self.assertFalse(self.msx._v3.write_quarantined)
+
+    def test_timi_poll_safe_requires_resident_mode_and_wake_ack(self):
+        for runtime_mode, wake_ack, message in (
+                (1, True, "outside resident mode"),
+                (0, False, "requires frame-wake-ack during bootstrap")):
+            with self.subTest(runtime_mode=runtime_mode, wake_ack=wake_ack):
+                self.msx.close()
+                self.agent.close()
+                client, resident = socket.socketpair()
+                self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+                self.agent = FakeV3Resident(
+                    resident, runtime_mode=runtime_mode,
+                    frame_wake_ack_feature=wake_ack,
+                    timi_poll_safe_feature=True)
+
+                with self.assertRaisesRegex(RealMSXError, message):
+                    self.msx.info()
+
+    def test_v3_upgrade_rejects_bootstrap_safety_downgrade(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, frame_wake_ack_feature=True,
+            timi_poll_safe_feature=False,
+            bootstrap_feature_bits=8 | FEATURE_TIMI_POLL_SAFE)
+
+        with self.assertRaisesRegex(
+                RealMSXError, "changed its safety features"):
+            self.msx.info()
+
+        request_count = len(self.agent.requests)
+        self.assertFalse(self.msx._v3.write_quarantined)
+        self.assertTrue(self.msx.write_quarantined)
+        with self.assertRaisesRegex(RealMSXError, "write-quarantined"):
+            self.msx.info()
+        self.assertEqual(len(self.agent.requests), request_count)
 
     def test_debug_peer_ip_is_announced_once_after_v3_hello(self):
         self.msx.close()
@@ -428,7 +577,31 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertTrue(all(len(payload) <= 39 for payload in requests))
         self.assertTrue(all(
             b"\r" not in payload[:-1] for payload in requests))
-        self.assertEqual(info["features"], ["keybuf-input"])
+        self.assertEqual(
+            info["features"],
+            ["keybuf-input", "snapshot-lease", "frame-wake-ack",
+             "timi-poll-safe"])
+
+    def test_resident_special_keys_use_keybuf_or_bios_interrupt_flag(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(resident, runtime_mode=0)
+        self.msx.info()
+        self.agent.state = 1
+
+        self.assertEqual(self.msx.press("ESC"), "ESC")
+        self.assertEqual(bytes(self.agent.typed), b"\x1b")
+
+        self.assertEqual(self.msx.press("STOP"), "STOP")
+        self.assertEqual(self.agent.ram[INTFLG], 4)
+        self.assertEqual(self.msx.press("control+c"), "CTRL+C")
+        self.assertEqual(self.agent.ram[INTFLG], 3)
+        self.assertEqual(self.msx.press("CTRL+STOP"), "CTRL+STOP")
+        self.assertEqual(self.agent.ram[INTFLG], 3)
+        with self.assertRaisesRegex(ValueError, "unsupported real-agent key"):
+            self.msx.press("FIRE")
 
     def test_screen_text_distributes_timeout_and_restores_default(self):
         original_timeout = self.msx._v3.timeout
@@ -456,7 +629,7 @@ class RealMSXV3Test(unittest.TestCase):
             for timeout in observed_timeouts))
         self.assertEqual(self.msx._v3.timeout, original_timeout)
 
-    def test_keybuf_partial_acceptance_and_retry_are_idempotent(self):
+    def test_safe_resident_keybuf_timeout_is_not_retried(self):
         self.msx.close()
         self.agent.close()
         client, resident = socket.socketpair()
@@ -468,28 +641,29 @@ class RealMSXV3Test(unittest.TestCase):
         self.agent.state = 1
         self.agent.keybuf[:] = b"x" * 38
 
-        self.assertEqual(self.msx.keybuf_write(b"abc"), (1, 39))
+        with self.assertRaisesRegex(
+                RealMSXError, "framed agent request failed"):
+            self.msx.keybuf_write(b"abc")
         self.assertEqual(bytes(self.agent.typed), b"a")
         writes = [r for r in self.agent.requests if r.opcode == ord("t")]
-        self.assertEqual(len(writes), 2)
-        self.assertEqual(writes[0], writes[1])
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(self.msx.write_quarantined)
 
-    def test_old_v3_agent_uses_safe_ram_fallback(self):
+    def test_old_resident_without_bootstrap_safety_is_rejected(self):
         self.msx.close()
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
         self.agent = FakeV3Resident(
-            resident, runtime_mode=0, keybuf_feature=False)
-        info = self.msx.info()
-        self.agent.state = 1
-        self.agent.ram[0xF3F8:0xF3FC] = b"\xf0\xfb\xf0\xfb"
+            resident, runtime_mode=0, keybuf_feature=False,
+            bootstrap_features_supported=False)
 
-        self.assertEqual(self.msx.keybuf_write(b"ABC\r"), (4, 4))
-        self.assertEqual(self.agent.ram[0xFBF0:0xFBF4], b"ABC\r")
-        self.assertEqual(self.agent.ram[0xF3F8:0xF3FA], b"\xf4\xfb")
-        self.assertEqual(self.agent.state, 1)
-        self.assertEqual(info["features"], [])
+        with self.assertRaisesRegex(
+                RealMSXError, "lacks safe pre-v3 negotiation"):
+            self.msx.info()
+
+        self.assertEqual(self.agent.bootstrap_feature_queries, 1)
+        self.assertEqual(self.agent.upgrades, 0)
 
     def test_negotiated_vram_chunks_honor_bank_boundary(self):
         payload = bytes((index * 17) & 0xFF for index in range(180))
@@ -539,7 +713,9 @@ class RealMSXV3Test(unittest.TestCase):
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
-        self.agent = FakeV3Resident(resident, legacy_hello=True)
+        self.agent = FakeV3Resident(
+            resident, legacy_hello=True, frame_wake_ack_feature=False,
+            bootstrap_features_supported=False)
 
         info = self.msx.info()
         self.assertEqual(info["vram_size"], 0x20000)
@@ -605,7 +781,9 @@ class RealMSXV3Test(unittest.TestCase):
         self.agent = FakeV3Resident(resident, max_payload=96)
         info = self.msx.info()
 
+        self.assertEqual(self.agent.bootstrap_probe_rejections, 1)
         self.assertEqual(self.agent.bootstrap_queries, 1)
+        self.assertEqual(self.agent.bootstrap_feature_queries, 1)
         self.assertEqual(self.agent.upgrades, 1)
         self.assertEqual(info["bootstrap_protocol"], 2)
         self.assertEqual(info["protocol"], 3)
@@ -616,11 +794,17 @@ class RealMSXV3Test(unittest.TestCase):
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.05).attach_socket(client)
-        self.agent = FakeV3Resident(resident, max_payload=80, start_framed=True)
+        self.agent = FakeV3Resident(
+            resident, max_payload=80, start_framed=True,
+            frame_wake_ack_feature=True)
 
         info = self.msx.info()
         self.assertEqual(self.agent.reconnects, 1)
+        self.assertEqual(
+            self.agent.reconnect_credits, len(RECONNECT_ESCAPE))
+        self.assertEqual(self.agent.bootstrap_feature_queries, 1)
         self.assertTrue(info["bootstrap_recovered"])
+        self.assertIn("frame-wake-ack", info["features"])
         self.assertEqual(info["protocol"], 3)
         self.assertEqual(info["max_payload"], 80)
 

@@ -5,7 +5,7 @@
 
 UART16C550_ID:            equ 1
 UART16C550_CONTROL_LEVEL: equ 1
-UART16C550_FLAGS:         equ 1       ; bit 0: H.KEYI is exclusive
+UART16C550_FLAGS:         equ TRANSPORT_FLAG_KEYI_EXCLUSIVE | TRANSPORT_FLAG_TIMI_ONLY | TRANSPORT_FLAG_FRAME_WAKE_ACK
 UART16C550_STATE_SIZE:    equ 5
 
 UART16C550_DATA:          equ 080h
@@ -56,7 +56,7 @@ uart16c550_init:
     out (UART16C550_LCR),a
     ld a,02Fh                  ; DTR|RTS|OUT1|OUT2|automatic RTS/CTS
     out (UART16C550_MCR),a
-    ld a,1                     ; received-data interrupt
+    xor a                      ; FIFO is polled from H.TIMI; no asynchronous IRQ
     out (UART16C550_IER),a
     ret
 

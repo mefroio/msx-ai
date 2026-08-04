@@ -22,8 +22,11 @@ from msx_protocol import (  # noqa: E402
 )
 from msx_v3 import (  # noqa: E402
     RemoteOutOfRangeError,
+    V3DisconnectedError,
     V3Session,
     V3TimeoutError,
+    V3TransportError,
+    V3WriteQuarantinedError,
 )
 
 
@@ -357,6 +360,133 @@ class V3SessionTest(unittest.TestCase):
                     V3Session(stream, frame_wake_ack_timeout=value)
         with self.assertRaises(TypeError):
             V3Session(stream, frame_wake_ack_timeout=True)
+
+    def test_quarantine_on_transport_failure_must_be_boolean(self):
+        with self.assertRaises(TypeError):
+            V3Session(
+                PacedFakeStream(), quarantine_on_transport_failure=1)
+
+    def test_final_timeout_quarantines_later_writes_when_enabled(self):
+        stream = WakeAckFakeStream(ack=b"A", ack_on_attempt=999)
+        session = V3Session(
+            stream, timeout=0.001, retries=0, frame_wake_ack=b"A",
+            quarantine_on_transport_failure=True)
+
+        with self.assertRaises(V3TimeoutError) as timed_out:
+            session.request(0x20, b"first")
+
+        self.assertTrue(session.write_quarantined)
+        self.assertIs(session.quarantine_reason, timed_out.exception)
+        self.assertEqual(stream.chunks, [b"M"])
+
+        with self.assertRaises(V3WriteQuarantinedError) as quarantined:
+            session.request(0x21, b"second")
+
+        self.assertIs(quarantined.exception.reason, timed_out.exception)
+        self.assertEqual(stream.chunks, [b"M"])
+
+    def test_quarantine_is_opt_in_and_default_retries_remain_available(self):
+        stream = WakeAckFakeStream(ack=b"A", ack_on_attempt=2)
+        session = V3Session(
+            stream, timeout=0.5, retries=1, frame_wake_ack=b"A")
+
+        self.assertEqual(session.request(0x20, b"retry"), b"RETRY")
+        self.assertFalse(session.write_quarantined)
+        self.assertIsNone(session.quarantine_reason)
+        self.assertEqual(stream.chunks[:2], [b"M", b"M"])
+
+    def test_successful_request_does_not_quarantine_enabled_session(self):
+        stream = PacedFakeStream()
+        session = V3Session(
+            stream, quarantine_on_transport_failure=True)
+
+        self.assertEqual(session.request(0x20, b"ok"), b"OK")
+        self.assertFalse(session.write_quarantined)
+        self.assertIsNone(session.quarantine_reason)
+
+    def test_disconnect_after_send_quarantines_follow_up_write(self):
+        class DisconnectAfterSend:
+            def __init__(self):
+                self.chunks = []
+
+            def settimeout(self, _value):
+                pass
+
+            def sendall(self, data):
+                self.chunks.append(bytes(data))
+
+            def recv(self, _size):
+                return b""
+
+        stream = DisconnectAfterSend()
+        session = V3Session(
+            stream, quarantine_on_transport_failure=True)
+
+        with self.assertRaises(V3DisconnectedError) as disconnected:
+            session.request(0x20, b"first")
+
+        self.assertTrue(session.write_quarantined)
+        self.assertIs(session.quarantine_reason, disconnected.exception)
+        self.assertEqual(len(stream.chunks), 1)
+
+        with self.assertRaises(V3WriteQuarantinedError):
+            session.request(0x21, b"second")
+        self.assertEqual(len(stream.chunks), 1)
+
+    def test_partial_send_failure_quarantines_follow_up_write(self):
+        class PartialSendFailure:
+            def __init__(self):
+                self.chunks = []
+
+            def settimeout(self, _value):
+                pass
+
+            def sendall(self, data):
+                self.chunks.append(bytes(data[:1]))
+                raise OSError("link failed after a partial write")
+
+            def recv(self, _size):
+                raise AssertionError("receive must not follow a failed send")
+
+        stream = PartialSendFailure()
+        session = V3Session(
+            stream, quarantine_on_transport_failure=True)
+
+        with self.assertRaises(V3TransportError) as failed:
+            session.request(0x20, b"first")
+
+        self.assertTrue(session.write_quarantined)
+        self.assertIs(session.quarantine_reason, failed.exception)
+        self.assertEqual(stream.chunks, [b"M"])
+
+        with self.assertRaises(V3WriteQuarantinedError):
+            session.request(0x21, b"second")
+        self.assertEqual(stream.chunks, [b"M"])
+
+    def test_transport_failure_remains_reusable_when_quarantine_disabled(self):
+        class DisconnectAfterSend:
+            def __init__(self):
+                self.writes = 0
+
+            def settimeout(self, _value):
+                pass
+
+            def sendall(self, _data):
+                self.writes += 1
+
+            def recv(self, _size):
+                return b""
+
+        stream = DisconnectAfterSend()
+        session = V3Session(stream)
+
+        for opcode in (0x20, 0x21):
+            with self.assertRaises(V3DisconnectedError):
+                session.request(opcode)
+
+        self.assertFalse(session.write_quarantined)
+        self.assertIsNone(session.quarantine_reason)
+        self.assertEqual(stream.writes, 2)
 
     def test_generic_stream_roundtrip_sequence_and_lock(self):
         stream = ResponsiveFakeStream(delay=0.02)

@@ -2,15 +2,16 @@
 ; MSX-AI universal MCP agent
 ; ============================================================================
 ; The default path installs a relocatable MemMan TSR in CPU page 1 and returns
-; to MSX-DOS. H.KEYI/H.TIMI keep the UART service reachable while ordinary DOS
-; programs and cooperative games run. /MONITOR selects the older foreground
-; supervisor below BDOS for explicit upload/call/run workflows.
+; to MSX-DOS. The BIOS H.TIMI chain keeps the UART service reachable while
+; ordinary DOS programs and cooperative games run. /MONITOR selects the older
+; foreground supervisor below BDOS for explicit upload/call/run workflows.
 ;
 ; The single wrapper includes every supported byte-stream driver. The loader
 ; selects one explicitly from the MSX-DOS command line and binds six resident
 ; JP vectors once, so protocol throughput has no per-byte selection branch.
 ; Protocol v2 (all lengths are 1..255):
 ;   ?                         -> 'M', version, capabilities, resident-page
+;   N                         -> 'K', feature bits for safe pre-v3 negotiation
 ;   q                         -> 'K', state (0=monitor,1=running,2=paused), version
 ;   r ah al n                 -> n raw RAM bytes
 ;   p ah al n data...         -> 'K'
@@ -30,10 +31,10 @@
 ; Framed v3 adds a resident-only bounded snapshot pause:
 ;   S lease                   -> OK, pause; 'g' resumes before lease expiry
 ;
-; This cooperative monitor requires maskable interrupts and the BIOS H.KEYI
-; chain to remain active.  Arbitrary games that replace the BIOS ISR or keep DI
-; require a hardware/NMI monitor; programs developed through this MCP backend
-; should leave the standard interrupt chain enabled.
+; This cooperative monitor requires maskable interrupts and the BIOS H.TIMI
+; chain to remain active. UART receive IRQs stay masked: a game that replaces
+; the BIOS ISR, pages system RAM out, or keeps DI must time out safely instead
+; of being entered asynchronously. Such games require hardware/NMI control.
 ; ============================================================================
 
 ; The foreground monitor uses a fixed upper-TPA address.  The default resident
@@ -72,6 +73,7 @@ FEATURE_KEYBUF_INPUT: equ 001h ; optional v3 HELLO feature byte, bit 0
 FEATURE_DEBUG_PEER:  equ 002h ; foreground DEBUG peer label, bit 1
 FEATURE_SNAPSHOT_LEASE: equ 004h ; bounded resident snapshot pause, bit 2
 FEATURE_FRAME_WAKE_ACK: equ 008h ; parser-ready ACK after framed magic byte
+FEATURE_TIMI_POLL_SAFE: equ 010h ; resident is polled only from BIOS H.TIMI
 DEBUG_PEER_MAX:      equ 63
 ; The hook stack has no recursion, no local frame buffers and never calls user
 ; code. A static high-water audit stays below 64 bytes; 224 bytes leaves more
@@ -83,6 +85,13 @@ RUNTIME_MONITOR:  equ 1
 LOADER_ACTION_INSTALL: equ 0
 LOADER_ACTION_UNINSTALL: equ 1
 TRANSPORT_FLAG_KEYI_EXCLUSIVE: equ 1
+TRANSPORT_FLAG_TIMI_ONLY:      equ 2
+TRANSPORT_FLAG_FRAME_WAKE_ACK: equ 4
+
+; Every hook-side byte wait gets a hard ceiling. During a snapshot pause the
+; lease counts complete ceilings, guaranteeing prompt recovery if the peer
+; disappears while still allowing active 19,200-baud traffic to flow.
+HOOK_IO_BUDGET: equ 01000h
 
 FRAME_REQUEST:    equ 1
 FRAME_RESPONSE:   equ 2
@@ -858,12 +867,13 @@ receive_dispatch:
     call ser_get
     jp dispatch
 
-; ---------------------------------------------------------------- H.KEYI ----
-; The BIOS calls these hooks with interrupts disabled. Preserve the complete
-; Z80 context. The selected driver declares whether it exclusively owns H.KEYI;
-; a non-exclusive future transport chains the previous hook whenever it did not
-; consume a frame. H.TIMI always chains after normal protocol work. Pause
-; deliberately remains inside this saved context until resume.
+; ------------------------------------------------------------ BIOS hooks ----
+; The MemMan resident polls and dispatches only from H.TIMI. Its H.KEYI entry is
+; a guard: TIMI-only transports never touch the UART or parser there, but an
+; exclusive transport suppresses an older firmware hook that could otherwise
+; consume Rx data before H.TIMI. UART receive IRQs are masked, so MCP traffic
+; cannot enter a game during transient slot or VDP state. H.TIMI always chains
+; after normal protocol work. Pause remains here until resume.
 if MSXAI_TSR_BUILD
 resident_keyi_hook:
     push af
@@ -940,6 +950,13 @@ hook_initial_chain:
     ld a,1
 hook_chain_ready:
     ld (chain_keyi),a
+    ld a,(hook_kind)
+    or a
+    jr nz,hook_poll_transport
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_TIMI_ONLY
+    jr nz,hook_done             ; TIMI-only drivers never dispatch from H.KEYI
+hook_poll_transport:
     call transport_rx_ready
     or a
     jr z,hook_done
@@ -1050,6 +1067,13 @@ hook_initial_chain:
     ld a,1
 hook_chain_ready:
     ld (chain_keyi),a
+    ld a,(hook_kind)
+    or a
+    jr nz,hook_poll_transport
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_TIMI_ONLY
+    jr nz,hook_done             ; TIMI-only drivers never dispatch from H.KEYI
+hook_poll_transport:
     call transport_rx_ready
     or a
     jr z,hook_done
@@ -1189,6 +1213,8 @@ dispatch:                       ; A = command
     ; probe immediately; tracing starts with the negotiated MCP operations.
     cp '?'
     jr z,cmd_hello
+    cp 'N'
+    jr z,cmd_bootstrap_features
     call debug_trace_command
     cp 'q'
     jp z,cmd_status
@@ -1237,6 +1263,14 @@ cmd_hello:
     ld a,(resident_page)
     jp ser_put
 
+cmd_bootstrap_features:
+    ; Pre-v3 negotiation lets a new host select strict wake ACK and no-retry
+    ; policy before its first framed byte. Older agents answer E,1 instead.
+    ld a,'K'
+    call ser_put
+    call current_features
+    jp ser_put
+
 current_capabilities:
     ld a,CAPABILITIES
     ld b,a
@@ -1251,9 +1285,9 @@ current_capabilities:
 
 current_features:
     ld b,0
-    ld a,(active_transport_id)
-    cp UART8251_ID
-    jr nz,current_features_transport_ready
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_FRAME_WAKE_ACK
+    jr z,current_features_transport_ready
     ld b,FEATURE_FRAME_WAKE_ACK
 current_features_transport_ready:
     ld a,(runtime_mode)
@@ -1268,6 +1302,12 @@ current_features_transport_ready:
 current_features_resident:
     ld a,b
     or FEATURE_KEYBUF_INPUT | FEATURE_SNAPSHOT_LEASE
+    ld b,a
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_TIMI_ONLY
+    ld a,b
+    ret z
+    or FEATURE_TIMI_POLL_SAFE
     ret
 
 cmd_status:
@@ -1758,13 +1798,12 @@ frame_seek_magic:
     cp 'M'
     jr nz,frame_seek_magic
 frame_have_magic_m:
-    ; The 8251 has no receive FIFO. Confirm that the hook is already inside the
-    ; framed parser before the host releases the rest of a 19,200-baud frame.
-    ; The 16C550 does not need this round trip because its FIFO is protected by
-    ; RTS/CTS, so only the 8251 advertises and emits the ready byte.
-    ld a,(active_transport_id)
-    cp UART8251_ID
-    jr nz,frame_wait_second_magic
+    ; Confirm that H.TIMI has entered the framed parser before the host releases
+    ; the remainder. This is mandatory for the FIFO-less 8251 and gives every
+    ; polled transport the same deterministic wake-up contract.
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_FRAME_WAKE_ACK
+    jr z,frame_wait_second_magic
     ld a,FRAME_WAKE_ACK
     call ser_put
 frame_wait_second_magic:
@@ -1776,6 +1815,14 @@ frame_wait_second_magic:
     jr frame_seek_magic
 
 frame_reconnect_byte:
+    ; Credit every reconnect byte. A fresh host can therefore recover a safe
+    ; resident left in framed mode without ever releasing an unpaced ESC burst.
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_FRAME_WAKE_ACK
+    jr z,frame_reconnect_count_byte
+    ld a,FRAME_WAKE_ACK
+    call ser_put
+frame_reconnect_count_byte:
     ld a,(frame_reconnect_count)
     inc a
     cp RECONNECT_LENGTH
@@ -3111,15 +3158,15 @@ include 'agent/transports/msx_transport_8251.inc'
 include 'agent/transports/msx_transport_16c550.inc'
 
 ; In foreground monitor mode serial I/O waits indefinitely. Inside a BIOS hook
-; a missing byte/peer must not freeze the MSX forever; after ~one busy-loop
-; period, abandon the frame and restore the interrupted application context.
+; a missing byte/peer gets one explicitly bounded polling period; expiration
+; abandons the frame and restores the interrupted application context.
 ser_put:
     push af
     ld a,(in_hook)
     or a
     jr z,ser_put_wait
     push bc
-    ld bc,0
+    ld bc,HOOK_IO_BUDGET
 ser_put_hook_wait:
     call transport_tx_ready
     or a
@@ -3145,7 +3192,7 @@ ser_get:
     or a
     jr z,ser_get_wait
     push bc
-    ld bc,0
+    ld bc,HOOK_IO_BUDGET
 ser_get_hook_wait:
     call transport_rx_ready
     or a
@@ -3178,6 +3225,11 @@ hook_transport_timeout:
     ld (post_action_pending),a
     ld (last_response_valid),a
 hook_timeout_no_pending_action:
+    ; A credited reconnect marker is atomic from the host's perspective. If
+    ; either side stalls partway through it, never carry that prefix into the
+    ; next hook pass (including while a snapshot lease is paused).
+    xor a
+    ld (frame_reconnect_count),a
     ld a,(run_state)
     cp 2
     jr nz,hook_timeout_state_done
@@ -3213,7 +3265,7 @@ last_response_small:
     ds 16,0
 
 if MSXAI_TSR_BUILD
-; TsrKill calls this only after MemMan has detached both hooks.
+; TsrKill calls this only after MemMan has detached both registered hooks.
 tsr_kill:
     di
     call transport_restore

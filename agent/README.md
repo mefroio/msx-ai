@@ -70,7 +70,7 @@ passes to MemMan or the foreground monitor.
 | Returns to MSX-DOS | Yes | No |
 | Monitors DOS-launched software | Yes | No |
 | RAM/VRAM and direct I/O | Yes, with resident memory restrictions | Yes, outside protected monitor memory |
-| Pause/resume | Yes | Yes |
+| Pause/resume | Bounded snapshot lease; persistent manual pause disabled | Yes |
 | BIOS keyboard-buffer input | Yes | No |
 | Direct call/run/stop | No | Yes |
 | Slot/mapper selection | No | Yes, pages 0 and 1 |
@@ -102,9 +102,15 @@ Changing drivers can drop the active host connection. Reconnect through the
 newly selected interface.
 
 `MSXAI /UNINSTALL` discovers the named TSR and overlays the embedded MemMan
-`TK.COM` directly with that ID. MemMan detaches both hooks before the
-agent's kill entry restores UART state. No uninstall helper is written to disk.
-Repeating the command is safe and reports that the agent is not installed.
+`TK.COM` directly with that ID. MemMan detaches the registered `H.KEYI` guard
+and `H.TIMI` service hook before the agent's kill entry restores UART state. No
+uninstall helper is written to disk. Repeating the command is safe and reports
+that the agent is not installed.
+
+Replacing the COM file does not patch a TSR already loaded in MSX memory. After
+copying a rebuilt `MSXAI.COM`, run `MSXAI /UNINSTALL` and install it again with
+the selected `/DRIVER`. This uninstall/reinstall step is required to activate
+the `timi-poll-safe` resident correction.
 
 MemMan versions older than 2.4 are rejected. A loader failure removes only
 temporary files proven to have been created by the current invocation and
@@ -139,8 +145,9 @@ advertises the `debug-peer-label` feature; the screen prints
 
 For repeatable openMSX testing, the repository-level
 `open-msx-mcp.command` launcher builds and installs this canonical executable,
-starts the foreground monitor with `DEBUG ON`, and waits for an IPv4 MCP
-listener at `127.0.0.1:6603`.
+makes it available on a disposable runtime disk, and waits for an IPv4 MCP
+listener at `127.0.0.1:6603`. It leaves the agent at the DOS prompt for the
+user to start explicitly in resident mode or with `/MONITOR DEBUG ON`.
 
 Tracing is deliberately limited:
 
@@ -154,16 +161,21 @@ Resident mode never draws protocol activity on the target screen.
 
 ## Execution and hooks
 
-The agent installs handlers for `H.KEYI` and `H.TIMI`. The selected UART
-owns its receive interrupt path; the timer hook provides another cooperative
-service opportunity. The hook saves normal and alternate Z80 register sets and
-moves protocol dispatch to a dedicated agent stack before processing a frame.
+The MemMan resident polls and dispatches protocol work only from `H.TIMI`. Both
+UART drivers mask receive interrupts while selected, so incoming bytes cannot
+asynchronously enter a game during temporary slot, stack, or VDP state. A
+minimal `H.KEYI` guard performs no UART I/O and no protocol parsing; it only
+suppresses an older serial firmware hook that would otherwise read receive data
+before `H.TIMI`. Each timer entry saves the normal and alternate Z80 register
+sets, moves protocol dispatch to a dedicated agent stack, and applies a fixed
+I/O wait budget. `H.TIMI` always continues its previous chain after service.
 
-The resident reports state `running` while DOS or a DOS-launched application
-is active. A manual lowercase-`s` pause preserves the interrupted CPU context
-until an explicit resume. The bounded uppercase-`S` snapshot pause instead
-auto-resumes after its lease expires. A truncated frame unwinds safely instead
-of leaving the MSX frozen inside the parser.
+The resident reports state `running` while DOS or a DOS-launched application is
+active. The safe host profile rejects persistent lowercase-`s`/`msx_pause` and
+uses only the bounded uppercase-`S` snapshot lease. The lease preserves the
+interrupted CPU context, refreshes on valid traffic, and auto-resumes after
+bounded transport silence. A partial request or missing peer times out and
+unwinds instead of leaving the MSX inside the parser.
 
 Direct `call`, `run`, and `stop` are not advertised by the resident TSR:
 
@@ -171,9 +183,12 @@ Direct `call`, `run`, and `stop` are not advertised by the resident TSR:
 - `stop` cannot safely discard the interrupted DOS/application context;
 - use `/MONITOR` when the host must launch or abandon injected code.
 
-The control path remains cooperative. Code that holds `DI`, removes the BIOS
-hook chain, or prevents maskable interrupts cannot be interrupted by this
-software-only agent.
+The control path remains cooperative. Code that holds `DI`, replaces the BIOS
+ISR, removes `H.TIMI` from the chain, or pages required system state out does not
+service the resident. The host performs no retry after a bounded timeout or
+indeterminate link failure and quarantines further writes, so incompatibility
+results in no response rather than asynchronous intervention. Unconditional
+access requires hardware NMI, bus-master, or equivalent supervisor support.
 
 The framed `t` command injects ASCII/key codes into the standard 40-byte BIOS
 keyboard ring (`KEYBUF`) while the hook already has interrupts disabled. It
@@ -183,6 +198,14 @@ pending counts. Host code stops batches at each Return and waits for pending
 input to reach zero before sending another line, because BASIC may clear the
 remaining keyboard buffer after accepting a line. Software that scans the
 hardware keyboard matrix directly is outside this mechanism.
+
+The host-side `msx_key` tool maps ESC, Return, Tab, Select, and Space to the
+same atomic keyboard-ring operation. STOP and Ctrl+STOP are BIOS events, not
+character bytes: the real backend writes `04h` or `03h` respectively to the
+documented `INTFLG` byte at `FC9Bh` through the framed RAM-write command.
+Ctrl+C is exposed as a convenience alias for the Ctrl+STOP break event. This
+interrupts MSX-BASIC and other cooperative BIOS software without claiming to
+emulate a physical key matrix.
 
 ## Memory model
 
@@ -221,11 +244,12 @@ The compact raw protocol remains the discovery and compatibility layer:
 
 ~~~~text
 ?                         hello/capabilities
+N                         pre-v3 feature query -> K, feature byte
 q                         state/status
 r/p                       RAM read/write
 v/w                       VRAM read/write
 c/j                       call/run (foreground monitor only)
-s/g                       pause/resume
+s/g                       legacy/manual pause/resume (not exposed by safe resident host)
 k                         stop (foreground monitor only)
 i/o                       direct I/O read/write
 l/m                       slot/mapper select (foreground monitor only)
@@ -238,7 +262,10 @@ The MemMan TSR cannot remove itself from inside its active hook. Use a separate
 the kill entry.
 
 Raw transfers use a one-byte length. New hosts upgrade immediately to v3 for
-larger negotiated chunks, explicit status codes, CRC, and retry safety.
+larger negotiated chunks, explicit status codes, CRC, and request correlation.
+Before sending `F`, a current host sends `N`; the agent returns `K` followed by
+the feature bitmap. An older raw agent treats `N` as unknown and returns
+`E,01`.
 
 ### Framed v3
 
@@ -269,9 +296,12 @@ implementation accelerates CRC processing.
 
 The v3 HELLO appends an optional feature byte after the runtime-mode byte. Bit
 0 advertises `keybuf-input`; bit 1 advertises the foreground-debug-only
-`debug-peer-label`; bit 2 advertises the resident-only `snapshot-lease` pause;
-bit 3 advertises the 8251-only `frame-wake-ack`; older 9-byte and 14-byte HELLO
-responses remain valid.
+`debug-peer-label`; bit 2 advertises the resident-only `snapshot-lease`; bit 3
+advertises the transport-independent `frame-wake-ack`; and bit 4 advertises
+resident-only `timi-poll-safe`. The safe feature is valid only together with
+`frame-wake-ack`. Raw command `N` exposes the same bitmap before `F`, allowing
+the first framed request to use the negotiated wake and no-retry policy. Older
+9-byte and 14-byte framed HELLO responses remain valid.
 Opcode `t` accepts zero bytes as a queue-status query or up to 39 input bytes
 and returns `[accepted, pending]`. Opcode `I` accepts 1..63 printable ASCII
 bytes and displays the host-provided peer label. The one unused ring position
@@ -284,19 +314,38 @@ servicing a running program from a hook. After acknowledging it, the agent
 enters the paused command loop. Every successfully serviced frame reloads the
 current lease, while each complete transport timeout decrements only that
 current value. Opcode `g` resumes immediately; reaching zero auto-resumes if
-`g` or its acknowledgement was lost. Lowercase `s` stores a zero lease and
-therefore remains persistent until `g`.
+`g` or its acknowledgement was lost. Lowercase `s` stores a zero lease, but the
+safe resident host deliberately refuses that persistent operation.
 
 With `frame-wake-ack`, consuming the first `M` of a framed request produces raw
 byte `0x06`. The host waits for that byte before releasing `X` and the remaining
-frame at full line rate. This proves that H.KEYI/MemMan has entered the parser
-and prevents an overrun in the 8251's one-byte receive register. It is not used
-by the FIFO/RTS-CTS-protected 16C550 driver.
+frame. This proves that an `H.TIMI` service opportunity has entered the parser
+and prevents an overrun in the 8251's one-byte receive register. Both the 8251
+and 16C550 advertise the same wake contract, keeping framing independent of the
+selected byte-stream driver.
 
-If a TCP/serial peer disappears, eight consecutive ESC bytes reset only the
-framed session. A new host can repeat the raw hello and v3 upgrade without
-resetting the MSX. One accidental ESC byte is not enough to downgrade the
-session.
+The reconnect marker uses the same credit. For each of its eight consecutive
+`ESC` bytes, the agent emits `0x06` and the host sends the next byte only after
+that ACK. The eighth byte resets framed state and makes the agent emit a fresh
+raw HELLO. At initial attachment, an agent already in raw mode rejects the first
+single-`ESC` probe with `E,01`, after which the host sends `?` normally. Silence
+after that first probe means a legacy framed peer: the host does not send the
+remaining seven uncredited bytes.
+
+For `timi-poll-safe`, the host sets framed retries to zero. A terminal timeout,
+disconnect, or send/receive failure with indeterminate delivery
+write-quarantines the attachment, so no retry, resume, status, or reconnect byte
+is sent into an uncertain target state. If `S` was acknowledged, the bounded
+agent lease is responsible for automatic recovery. On success, `g` restores the
+application before any host-side PNG rendering or encoding begins.
+
+A resident must advertise both `timi-poll-safe` and `frame-wake-ack` through
+raw `N` before the host sends `F`. A legacy resident that rejects `N`, or a
+legacy framed peer that cannot credit the initial `ESC`, fails closed before
+any v3 RAM/VRAM operation. Rebuild, uninstall, and reinstall `MSXAI.COM` to
+update a resident. Only a legacy foreground monitor that begins in raw mode
+retains the compatibility upgrade path. One accidental `ESC` remains
+insufficient to downgrade a session.
 
 ## VRAM and screenshots
 
@@ -353,34 +402,61 @@ The current host network contract is TCP over IPv4 only; IPv6 is not supported.
 - 8251 data/status ports `80h/81h`;
 - standard 8253/8254 timer ports `84h`, `85h`, and `87h`;
 - explicitly programmed 19200 baud, asynchronous 8N1 x16;
-- the standard `COMMSK` receive-ready interrupt path.
+- `COMMSK=FFh` while active, masking every asynchronous UART interrupt source.
 
-The driver saves `COMMSK`, masks unrelated UART interrupt sources, and
-restores the previous value on reconfiguration or uninstall. It also clears
-latched parity, overrun, and framing errors while polling receive state. A plain
-8251 has no receive FIFO or automatic flow control. The configured 19200 baud
-is the 8251A asynchronous maximum in x16 mode; reliable resident operation at
-that rate uses the negotiated frame-wake ACK. Faster rates require the separate
-16C550 transport and its FIFO/flow-control safeguards.
+The driver saves `COMMSK`, masks every UART IRQ before enabling the receiver,
+and restores the previous value on reconfiguration or uninstall. Receive state
+is polled only from `H.TIMI`; latched parity, overrun, and framing errors are
+cleared while polling. A plain 8251 has no receive FIFO or automatic flow
+control. The configured 19200 baud is the 8251A asynchronous maximum in x16
+mode; reliable resident operation at that rate uses the negotiated frame-wake
+ACK. Faster rates require the separate 16C550 transport and its FIFO/flow-control
+safeguards. The prior UART mode and timer setup cannot be reconstructed from
+the readable state saved here, so uninstall restores `COMMSK` but leaves the
+interface configured for 19,200-baud 8N1.
 
 ### Generic 16C550-compatible UART
 
-`/DRIVER:16C550` uses ports `80h-87h` and configures:
+`/DRIVER:16C550` uses ports `80h-87h`, assumes a 1.8432 MHz UART reference
+clock, and configures:
 
-- 115200 baud, 8N1;
+- divisor 1 for 115200 baud, 8N1;
 - the 16-byte FIFO with an 8-byte receive trigger;
-- received-data interrupts;
+- `IER=0` while active, with receive state polled from `H.TIMI`;
 - DTR, RTS, OUT1, and OUT2;
 - automatic RTS/CTS through MCR AFE.
 
 AFE and a correctly wired and respected RTS/CTS path are required at this
 speed. The driver saves readable LCR, IER, MCR, DLL, and DLM state and restores
 them on reconfiguration or uninstall. FIFO state is write-only, so restore
-leaves it disabled.
+leaves it disabled. Framed CRC and bounded timeouts are the current safeguards
+for corrupt or missing bytes, but the driver does not yet expose LSR overrun,
+parity, framing, or break telemetry. The hook's serial deadline is an
+instruction-loop budget, not a CPU-independent wall-clock timer; sustained-rate
+claims therefore require tests on the target CPU mode and adapter.
 
-BaDCaT SMD is an intended example of a compatible 16C550 device. It is not a
-separate build and the code contains no BaDCaT-specific command or networking
-assumption. Physical validation remains pending arrival of that hardware.
+The configured 115200 baud describes the UART line, not guaranteed application
+throughput. The
+[published BaDCaT specification](https://sites.google.com/view/badcatelectronics/msx/badcat-wifi-modem)
+lists 57,600 bps effective throughput. End-to-end MCP throughput, flow-control
+behavior, and screenshot times remain subject to physical measurement.
+
+The 8251 and 16C550 implementations are transport-neutral UART byte drivers.
+Neither contains TCP commands, adapter setup, or assumptions about which
+transparent TCP/IPv4 bridge carries the ordered byte stream. TCP listen/connect
+roles and endpoint configuration belong to the host and adapter layers.
+
+A cartridge ROM contains firmware but does not emulate the 16C550 register
+file, FIFO and timing, RTS/CTS behavior, or TCP bridge. An emulator needs a
+compatible UART device model and transparent byte-stream peer in addition to
+any ROM image.
+
+`/DRIVER:16C550` selects the generic register and flow-control contract above,
+not a product. BaDCaT SMD is one intended physical validation target, not a
+separate build, protocol dependency, or required TCP transport. Another
+transparent IPv4 bridge can use the same driver when it presents the compatible
+UART interface and preserves RTS/CTS. Physical BaDCaT validation remains
+pending arrival of that hardware.
 
 ### Adding another transport
 
@@ -424,7 +500,7 @@ The integration suite owns at most one openMSX process at a time. It validates:
 - the single universal COM and runtime 8251 selection;
 - MemMan installation returning to DOS;
 - intervention in a DOS-launched program;
-- persistent pause, patch, resume, and repeated hook entry;
+- bounded snapshot pause, patch, resume, and repeated `H.TIMI` entry;
 - an agent-VRAM PNG capture;
 - foreground call/run/stop and visible `DEBUG ON`;
 - reconfiguration without a duplicate TSR;

@@ -49,9 +49,9 @@ UART8251_BAUD = 19200
 # One conservative bootstrap/reconnect delay is needed before framed HELLO
 # advertises the explicit parser-ready ACK. Normal negotiated 8251 frames use
 # that ACK and therefore do not depend on this scheduler timing heuristic.
-UART8251_FRAME_WAKE_DELAY = 0.010
+UART8251_FRAME_WAKE_DELAY = 0.050
 FRAME_WAKE_ACK = b"\x06"
-FRAME_WAKE_BOOTSTRAP_TIMEOUT = 0.100
+FRAME_WAKE_BOOTSTRAP_TIMEOUT = 0.250
 
 STATE_NAMES = {0: "monitor", 1: "running", 2: "paused"}
 CAPABILITY_RUN = 0x08
@@ -70,6 +70,7 @@ FEATURE_KEYBUF_INPUT = 0x01
 FEATURE_DEBUG_PEER = 0x02
 FEATURE_SNAPSHOT_LEASE = 0x04
 FEATURE_FRAME_WAKE_ACK = 0x08
+FEATURE_TIMI_POLL_SAFE = 0x10
 DEBUG_PEER_MAX = 63
 SNAPSHOT_LEASE_TIMEOUTS = 8
 SNAPSHOT_PAUSE_ATTEMPTS = 2
@@ -79,6 +80,7 @@ AGENT_FEATURE_NAMES = {
     FEATURE_DEBUG_PEER: "debug-peer-label",
     FEATURE_SNAPSHOT_LEASE: "snapshot-lease",
     FEATURE_FRAME_WAKE_ACK: "frame-wake-ack",
+    FEATURE_TIMI_POLL_SAFE: "timi-poll-safe",
 }
 AGENT_TRANSPORT_NAMES = {
     0: "uart-8251",
@@ -92,9 +94,22 @@ KEYBUF_END = KEYBUF_START + KEYBUF_SIZE
 KEYBUF_CAPACITY = KEYBUF_SIZE - 1
 PUTPNT = 0xF3F8
 GETPNT = 0xF3FA
+INTFLG = 0xFC9B
 KEYBUF_INPUT_TIMEOUT = 10.0
 KEYBUF_POLL_INTERVAL = 0.02
 KEYBUF_LINE_SETTLE = 0.05
+SPECIAL_KEY_BYTES = {
+    "ESC": 0x1B,
+    "RET": 0x0D,
+    "SPACE": 0x20,
+    "SELECT": 0x18,
+    "TAB": 0x09,
+}
+SPECIAL_KEY_INTFLG = {
+    "CTRL+C": 0x03,
+    "CTRL+STOP": 0x03,
+    "STOP": 0x04,
+}
 
 
 class RealMSXError(RuntimeError):
@@ -152,9 +167,12 @@ class RealMSX:
         self.simulation = None
         self.bootstrap_recovered = False
         self.bootstrap_protocol_version = None
+        self.bootstrap_feature_bits = 0
+        self.bootstrap_features_known = False
         self._debug_peer_sent = False
         self._snapshot_pause_owned = False
         self._v3 = None
+        self._attachment_quarantine_reason = None
         self._lock = threading.RLock()
 
     # ---- connection -------------------------------------------------
@@ -243,9 +261,18 @@ class RealMSX:
             raise TypeError(
                 "stream must provide "
                 + ", ".join(f"{name}()" for name in missing))
-        if self.conn is not None and self.conn is not stream:
+        same_stream = self.conn is stream
+        if self.conn is not None and not same_stream:
             raise RealMSXError("an MSX agent stream is already attached")
+        if same_stream:
+            # Materialize a session-local quarantine before protocol reset
+            # discards the V3Session that owns its original reason.
+            self.write_quarantined
         self.conn = stream
+        if not same_stream:
+            # Object identity is the only transport-neutral proof available
+            # here that this attachment cannot be the quarantined byte stream.
+            self._attachment_quarantine_reason = None
         self.peer = peer
         self.network_transport = str(network_transport)
         self.network_role = str(network_role)
@@ -280,6 +307,8 @@ class RealMSX:
         self.simulation = None
         self.bootstrap_recovered = False
         self.bootstrap_protocol_version = None
+        self.bootstrap_feature_bits = 0
+        self.bootstrap_features_known = False
         self._debug_peer_sent = False
         self._snapshot_pause_owned = False
         self._v3 = None
@@ -305,14 +334,46 @@ class RealMSX:
 
     def _send(self, data):
         self._require_connection()
+        if self.write_quarantined:
+            raise RealMSXProtocolError(
+                "cannot write to a write-quarantined attachment; close it "
+                "and attach a fresh stream")
         try:
             self.conn.sendall(data)
         except OSError as exc:
             raise RealMSXError(f"agent send failed: {exc}") from exc
 
     def _send_reconnect_escape(self):
-        """Send the framed reset marker with an 8251-safe first-byte gap."""
-        if self.agent_transport_id in (None, 0):
+        """Send one framed reset marker using negotiated byte credits."""
+        if self.write_quarantined:
+            raise RealMSXProtocolError(
+                "cannot reconnect a write-quarantined attachment")
+        credited = bool(self.feature_bits & FEATURE_FRAME_WAKE_ACK)
+        if credited:
+            original_timeout = self.conn.gettimeout()
+            marker_started = False
+            try:
+                try:
+                    self.conn.settimeout(min(
+                        self.socket_timeout, FRAME_WAKE_BOOTSTRAP_TIMEOUT))
+                    for marker_byte in RECONNECT_ESCAPE:
+                        # sendall() may transfer an unknown prefix before it
+                        # reports failure, so mark the stream indeterminate
+                        # before the first write is attempted.
+                        marker_started = True
+                        self._send(bytes([marker_byte]))
+                        ack = self._recv_exact(1)
+                        if ack != FRAME_WAKE_ACK:
+                            raise RealMSXProtocolError(
+                                "agent did not credit a reconnect byte: "
+                                f"{ack!r}")
+                finally:
+                    self.conn.settimeout(original_timeout)
+            except BaseException as exc:
+                if marker_started:
+                    self._quarantine_attachment_writes(exc)
+                raise
+        elif self.agent_transport_id in (None, 0):
             self._send(RECONNECT_ESCAPE[:1])
             time.sleep(UART8251_FRAME_WAKE_DELAY)
             self._send(RECONNECT_ESCAPE[1:])
@@ -392,6 +453,10 @@ class RealMSX:
         raise RealMSXProtocolError(f"unexpected agent response: {first!r}")
 
     def _request_v3(self, opcode, payload=b"", *, timeout=None, retries=None):
+        if self.write_quarantined:
+            raise RealMSXProtocolError(
+                "cannot write to a write-quarantined attachment; close it "
+                "and attach a fresh stream")
         if self._v3 is None:
             raise RealMSXProtocolError("framed v3 session is not active")
         if isinstance(opcode, str):
@@ -403,6 +468,38 @@ class RealMSX:
                 opcode, payload, timeout=timeout, retries=retries)
         except V3SessionError as exc:
             raise RealMSXProtocolError(f"framed agent request failed: {exc}") from exc
+
+    @property
+    def write_quarantined(self):
+        """Whether writes are suppressed after an indeterminate link failure."""
+
+        with self._lock:
+            if self._attachment_quarantine_reason is not None:
+                return True
+            session = self._v3
+            if (session is not None and
+                    getattr(session, "write_quarantined", False)):
+                reason = getattr(session, "quarantine_reason", None)
+                self._attachment_quarantine_reason = (
+                    reason if reason is not None else
+                    "indeterminate framed transport failure")
+                return True
+            return False
+
+    @property
+    def quarantine_reason(self):
+        """Return the attachment-level write-quarantine reason, if present."""
+
+        self.write_quarantined
+        with self._lock:
+            return self._attachment_quarantine_reason
+
+    def _quarantine_attachment_writes(self, reason):
+        """Permanently suppress writes on the current attached byte stream."""
+
+        with self._lock:
+            if self._attachment_quarantine_reason is None:
+                self._attachment_quarantine_reason = reason
 
     @staticmethod
     def _le16(value):
@@ -434,36 +531,75 @@ class RealMSX:
             "timeout waiting for MSX-AI raw bootstrap HELLO")
 
     def _bootstrap_hello(self):
-        """Read raw v2 HELLO, recovering a resident left in framed mode.
+        """Discover raw/framed state without releasing an uncredited burst.
 
-        The initial single-byte query preserves compatibility with older
-        agents. Each phase scans a bounded amount of UART noise for ``M,2``.
-        If the first query fails, the eight-ESC marker recovers framed v3; a
-        final query then recovers raw agents which answered those ESC bytes
-        with ordinary unknown-command errors.
+        Raw agents reject the first ESC with ``E,1`` and are then queried with
+        ``?``. A current framed agent credits each of all eight ESC bytes and
+        emits its raw HELLO. Silence stops the probe after that single byte;
+        legacy framed recovery is intentionally not attempted automatically.
         """
         self._require_connection()
         original_timeout = self.conn.gettimeout()
         probe_timeout = min(self.socket_timeout, BOOTSTRAP_PROBE_TIMEOUT)
+        probe_started = False
         try:
-            self._send(b"?")
             try:
-                reply = self._scan_bootstrap_hello(probe_timeout)
-                self.bootstrap_recovered = False
-                return reply
-            except RealMSXTimeoutError:
-                pass
+                self.conn.settimeout(probe_timeout)
+                # A send failure can still mean that the peer consumed this
+                # byte, so the attachment becomes indeterminate from here on.
+                probe_started = True
+                self._send(RECONNECT_ESCAPE[:1])
+                first = self._recv_exact(1)
+                if first == b"E":
+                    error_code = self._recv_exact(1)
+                    if error_code != b"\x01":
+                        raise RealMSXProtocolError(
+                            "unexpected raw bootstrap probe rejection: "
+                            f"E{error_code.hex()}")
+                    self._send(b"?")
+                    self.bootstrap_recovered = False
+                    return self._scan_bootstrap_hello(probe_timeout)
+                if first != FRAME_WAKE_ACK:
+                    raise RealMSXProtocolError(
+                        "unexpected safe bootstrap probe response: "
+                        f"{first!r}")
+                for marker_byte in RECONNECT_ESCAPE[1:]:
+                    self._send(bytes([marker_byte]))
+                    ack = self._recv_exact(1)
+                    if ack != FRAME_WAKE_ACK:
+                        raise RealMSXProtocolError(
+                            "agent did not credit a bootstrap reconnect byte: "
+                            f"{ack!r}")
+                self.bootstrap_recovered = True
+                return self._scan_bootstrap_hello(probe_timeout)
+            except RealMSXTimeoutError as exc:
+                raise RealMSXTimeoutError(
+                    "safe bootstrap probe timed out; no additional uncredited "
+                    "bytes were sent. Restart or update a legacy framed agent") \
+                    from exc
+            finally:
+                self.conn.settimeout(original_timeout)
+        except BaseException as exc:
+            if probe_started:
+                self._quarantine_attachment_writes(exc)
+            raise
 
-            self._send_reconnect_escape()
-            try:
-                reply = self._scan_bootstrap_hello(probe_timeout)
-            except RealMSXTimeoutError:
-                self._send(b"?")
-                reply = self._scan_bootstrap_hello(probe_timeout)
-            self.bootstrap_recovered = True
-            return reply
-        finally:
-            self.conn.settimeout(original_timeout)
+    def _query_bootstrap_features(self):
+        """Negotiate safety flags in raw mode before the first v3 frame."""
+
+        self._send(b"N")
+        reply = self._recv_exact(2)
+        if reply[:1] == b"K":
+            self.bootstrap_features_known = True
+            self.bootstrap_feature_bits = reply[1]
+        elif reply == b"E\x01":
+            self.bootstrap_features_known = False
+            self.bootstrap_feature_bits = 0
+        else:
+            raise RealMSXProtocolError(
+                f"invalid bootstrap feature response: {reply!r}")
+        self.feature_bits = self.bootstrap_feature_bits
+        return self.bootstrap_feature_bits
 
     def info(self):
         if self._v3 is not None:
@@ -486,6 +622,22 @@ class RealMSX:
         self.capabilities = capabilities
         self.resident_base = page << 8
         if capabilities & 0x20:
+            bootstrap_features = self._query_bootstrap_features()
+            bootstrap_safe = bool(
+                bootstrap_features & FEATURE_TIMI_POLL_SAFE)
+            bootstrap_ack = bool(
+                bootstrap_features & FEATURE_FRAME_WAKE_ACK)
+            bootstrap_resident = not bool(capabilities & CAPABILITY_RUN)
+            if bootstrap_safe and not bootstrap_resident:
+                raise RealMSXProtocolError(
+                    "agent advertised timi-poll-safe outside resident mode")
+            if bootstrap_safe and not bootstrap_ack:
+                raise RealMSXProtocolError(
+                    "timi-poll-safe requires frame-wake-ack during bootstrap")
+            if bootstrap_resident and not bootstrap_safe:
+                raise RealMSXProtocolError(
+                    "resident agent lacks safe pre-v3 negotiation; update "
+                    "MSXAI.COM, uninstall the old TSR and install it again")
             self._send(b"F")
             upgrade = self._recv_exact(4)
             if upgrade[:2] != b"K\x03":
@@ -498,20 +650,16 @@ class RealMSX:
             session_timeout = (
                 self.socket_timeout if v3_timeout is None
                 else min(self.socket_timeout, float(v3_timeout)))
-            known_8251_ack = (
-                self.agent_transport_id == 0 and
-                bool(self.feature_bits & FEATURE_FRAME_WAKE_ACK))
-            known_16c550 = self.agent_transport_id == 1
             self._v3 = V3Session(
-                self.conn, timeout=session_timeout, retries=2,
+                self.conn, timeout=session_timeout,
+                retries=(0 if bootstrap_safe else 2),
                 max_payload=4096, peer_max_payload=peer_max,
-                # The first framed HELLO carries the feature bit, so probe the
-                # ACK with a bounded fallback when the transport is not known.
-                # A recovered current 8251 session can require it immediately.
-                frame_wake_ack=(None if known_16c550 else FRAME_WAKE_ACK),
-                frame_wake_ack_optional=(
-                    not known_16c550 and not known_8251_ack),
-                frame_wake_ack_timeout=FRAME_WAKE_BOOTSTRAP_TIMEOUT)
+                # Current residents negotiate this ACK before F, so their
+                # first framed HELLO is strict and never retransmitted.
+                frame_wake_ack=FRAME_WAKE_ACK,
+                frame_wake_ack_optional=not bootstrap_ack,
+                frame_wake_ack_timeout=FRAME_WAKE_BOOTSTRAP_TIMEOUT,
+                quarantine_on_transport_failure=bootstrap_safe)
             return self._info_v3()
         return {
             "protocol": version,
@@ -558,6 +706,10 @@ class RealMSX:
         """Reset a damaged framed session and negotiate a fresh v3 session."""
         self._require_connection()
         with self._lock:
+            if self.write_quarantined:
+                raise RealMSXProtocolError(
+                    "cannot rebootstrap a write-quarantined attachment; "
+                    "attach a fresh stream")
             original_timeout = self.conn.gettimeout()
             probe_timeout = min(self.socket_timeout, BOOTSTRAP_PROBE_TIMEOUT)
             try:
@@ -637,8 +789,31 @@ class RealMSX:
             (None if self.runtime_mode_id is None
              else f"unknown-{self.runtime_mode_id}"))
         self.feature_bits = reply[14] if len(reply) >= 15 else 0
-        if (transport == 0 and
+        if self.bootstrap_features_known:
+            safety_mask = FEATURE_FRAME_WAKE_ACK | FEATURE_TIMI_POLL_SAFE
+            bootstrap_safety = self.bootstrap_feature_bits & safety_mask
+            framed_safety = self.feature_bits & safety_mask
+            if framed_safety != bootstrap_safety:
+                error = RealMSXProtocolError(
+                    "agent changed its safety features during the v3 "
+                    "upgrade: bootstrap=0x"
+                    f"{bootstrap_safety:02X}, framed=0x{framed_safety:02X}")
+                self._quarantine_attachment_writes(error)
+                raise error
+        timi_poll_safe = bool(
+            self.feature_bits & FEATURE_TIMI_POLL_SAFE)
+        if timi_poll_safe and self.runtime_mode != "resident":
+            error = RealMSXProtocolError(
+                "agent advertised timi-poll-safe outside resident mode")
+            self._quarantine_attachment_writes(error)
+            raise error
+        if (timi_poll_safe and not
                 self.feature_bits & FEATURE_FRAME_WAKE_ACK):
+            error = RealMSXProtocolError(
+                "timi-poll-safe requires the frame-wake-ack feature")
+            self._quarantine_attachment_writes(error)
+            raise error
+        if self.feature_bits & FEATURE_FRAME_WAKE_ACK:
             self._v3.frame_wake_ack = FRAME_WAKE_ACK
             self._v3.frame_wake_ack_optional = False
             self._v3.frame_wake_delay = 0.0
@@ -647,6 +822,11 @@ class RealMSX:
             self._v3.frame_wake_ack_optional = False
             self._v3.frame_wake_delay = (
                 UART8251_FRAME_WAKE_DELAY if transport == 0 else 0.0)
+        # A safe resident request is attempted exactly once. If that attempt
+        # expires, the stream is quarantined so a retry cannot re-enter a
+        # target whose mapping or interrupt state is no longer known.
+        self._v3.retries = 0 if timi_poll_safe else 2
+        self._v3.quarantine_on_transport_failure = timi_poll_safe
         self._send_debug_peer_label()
         return {
             "protocol": version,
@@ -743,6 +923,12 @@ class RealMSX:
 
     def pause(self):
         with self._lock:
+            if (self.runtime_mode == "resident" and
+                    self.feature_bits & FEATURE_TIMI_POLL_SAFE):
+                raise RealMSXError(
+                    "persistent manual pause is disabled for the safe "
+                    "resident; use an atomic snapshot operation with its "
+                    "bounded lease")
             state = self.status()["state"]
             if state == "paused":
                 return state
@@ -782,6 +968,16 @@ class RealMSX:
         """
         if not self._snapshot_pause_owned:
             return "running"
+        if self.write_quarantined:
+            # Sending g/status/reconnect bytes after an indeterminate timeout
+            # is precisely the unsafe retry pattern this profile forbids. The
+            # target-side lease is the authoritative recovery mechanism.
+            self._snapshot_pause_owned = False
+            reason = getattr(self._v3, "quarantine_reason", "timeout")
+            raise RealMSXError(
+                "snapshot session timed out and was write-quarantined; no "
+                "cleanup bytes were sent, and the bounded agent lease will "
+                f"resume the MSX automatically ({reason})")
         direct_error = None
         try:
             if self._v3 is None:
@@ -795,6 +991,16 @@ class RealMSX:
             return "running"
         except Exception as exc:
             direct_error = exc
+
+        if self.write_quarantined:
+            # The direct g may itself have timed out and activated quarantine.
+            # Do not follow it with the old reconnect/status recovery sequence.
+            self._snapshot_pause_owned = False
+            reason = getattr(self._v3, "quarantine_reason", direct_error)
+            raise RealMSXError(
+                "snapshot resume timed out and was write-quarantined; no "
+                "recovery bytes were sent, and the bounded agent lease will "
+                f"resume the MSX automatically ({reason})") from direct_error
 
         recovery_error = None
         for _attempt in range(2):
@@ -820,6 +1026,15 @@ class RealMSX:
                 return "running"
             except Exception as exc:
                 recovery_error = exc
+                if self.write_quarantined:
+                    self._snapshot_pause_owned = False
+                    reason = getattr(
+                        self._v3, "quarantine_reason", recovery_error)
+                    raise RealMSXError(
+                        "snapshot recovery became write-quarantined; no "
+                        "further recovery bytes were sent, and the bounded "
+                        "agent lease will resume the MSX automatically "
+                        f"({reason})") from recovery_error
 
         raise RealMSXError(
             "could not guarantee that the MSX resumed after its snapshot "
@@ -874,7 +1089,27 @@ class RealMSX:
                     "atomic capture requires an agent with the "
                     "snapshot-lease feature; update MSXAI.COM or retry with "
                     "atomic=false")
-            state = self.status()["state"]
+            if (self.runtime_mode == "resident" and not
+                    self.feature_bits & FEATURE_TIMI_POLL_SAFE):
+                raise RealMSXError(
+                    "atomic capture of running resident software requires the "
+                    "timi-poll-safe feature; update MSXAI.COM before taking "
+                    "an in-game screenshot")
+
+            # Bound even the initial status probe. This happens before the
+            # target is paused, so an absent peer must return control promptly.
+            original_status_timeout = self._v3.timeout
+            self._v3.timeout = min(
+                original_status_timeout, SNAPSHOT_REQUEST_TIMEOUT)
+            try:
+                state = self.status()["state"]
+            finally:
+                self._v3.timeout = original_status_timeout
+                if self.conn is not None:
+                    try:
+                        self.conn.settimeout(original_status_timeout)
+                    except (OSError, ValueError):
+                        pass
             if state == "paused":
                 # Preserve a caller-owned/manual pause.
                 yield False
@@ -1144,6 +1379,36 @@ class RealMSX:
         if not isinstance(text, str):
             raise TypeError("text must be a string")
         return self.type(text + "\r", timeout=timeout)
+
+    def press(self, key):
+        """Send one BIOS-visible special key through the real agent.
+
+        Character-producing keys use the BIOS keyboard ring. STOP events use
+        INTFLG, the documented BIOS work-area byte consumed by MSX-BASIC and
+        other cooperative software. This does not emulate the physical matrix
+        for software that reads the PPI directly.
+        """
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        normalized = key.strip().upper().replace("CONTROL+", "CTRL+")
+        if normalized == "RETURN":
+            normalized = "RET"
+        if normalized in SPECIAL_KEY_INTFLG:
+            self.poke(INTFLG, bytes([SPECIAL_KEY_INTFLG[normalized]]))
+            return normalized
+        try:
+            value = SPECIAL_KEY_BYTES[normalized]
+        except KeyError as exc:
+            supported = sorted(SPECIAL_KEY_BYTES.keys() |
+                               SPECIAL_KEY_INTFLG.keys())
+            raise ValueError(
+                f"unsupported real-agent key {key!r}; expected one of "
+                f"{', '.join(supported)}") from exc
+        accepted, _pending = self.keybuf_write(bytes([value]))
+        if accepted != 1:
+            raise RealMSXKeyboardTimeoutError(
+                "BIOS keyboard buffer is full; special key was not queued")
+        return normalized
 
     # ---- RAM --------------------------------------------------------
     def poke(self, addr, data):
@@ -1477,6 +1742,7 @@ class RealMSX:
         self.network_transport = None
         self.network_role = None
         self._reset_protocol_state()
+        self._attachment_quarantine_reason = None
 
 
 # Preferred semantic name for new integrations. Keep RealMSX as a public

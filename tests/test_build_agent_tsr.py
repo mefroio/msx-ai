@@ -88,8 +88,15 @@ class AgentTsrBuilderTest(unittest.TestCase):
             hook_start = HEADER_SIZE + rel_length + fields[8] + fields[9]
             hook_length = struct.unpack_from("<H", first_data, hook_start)[0]
             self.assertEqual(hook_length, 10)
-            hooks = struct.unpack_from("<HHHH", first_data, hook_start + 2)
-            self.assertEqual((hooks[0], hooks[2]), (H_KEYI, H_TIMI))
+            hooks = tuple(
+                struct.unpack_from("<HH", first_data, hook_start + offset)
+                for offset in (2, 6)
+            )
+            self.assertEqual(tuple(address for address, _ in hooks),
+                             (H_KEYI, H_TIMI))
+            for _, hook_handler in hooks:
+                self.assertGreaterEqual(hook_handler, fields[4])
+                self.assertLess(hook_handler, fields[4] + fields[8])
             self.assertEqual(first_data[first.transport_file_offset], 0xFE)
 
             metadata_text = first_metadata.decode("ascii")

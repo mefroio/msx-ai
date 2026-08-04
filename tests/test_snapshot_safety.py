@@ -1,4 +1,5 @@
 import contextlib
+import socket
 import sys
 import unittest
 from pathlib import Path
@@ -13,7 +14,10 @@ import msx_real  # noqa: E402
 import msx_screenshot  # noqa: E402
 from msx_client import OpenMSXError  # noqa: E402
 from msx_real import (  # noqa: E402
+    FEATURE_FRAME_WAKE_ACK,
     FEATURE_SNAPSHOT_LEASE,
+    FEATURE_TIMI_POLL_SAFE,
+    FRAME_WAKE_ACK,
     RECONNECT_ESCAPE,
     SNAPSHOT_LEASE_TIMEOUTS,
     UART8251_FRAME_WAKE_DELAY,
@@ -27,10 +31,17 @@ from msx_real import (  # noqa: E402
 class SnapshotLeaseTest(unittest.TestCase):
     def setUp(self):
         self.msx = RealMSX(socket_timeout=0.01)
-        self.msx._v3 = SimpleNamespace(timeout=15.0)
-        self.msx.feature_bits = FEATURE_SNAPSHOT_LEASE
+        self.msx._v3 = SimpleNamespace(
+            timeout=15.0, write_quarantined=False,
+            quarantine_reason=None)
+        self.msx.feature_bits = (
+            FEATURE_SNAPSHOT_LEASE | FEATURE_FRAME_WAKE_ACK |
+            FEATURE_TIMI_POLL_SAFE)
+        self.msx.runtime_mode = "resident"
 
     def test_lost_pause_ack_is_cleaned_up_by_direct_resume(self):
+        self.msx.runtime_mode = "foreground-monitor"
+        self.msx.feature_bits = FEATURE_SNAPSHOT_LEASE
         events = []
 
         def request(opcode, payload=b"", **_kwargs):
@@ -57,6 +68,8 @@ class SnapshotLeaseTest(unittest.TestCase):
         self.assertFalse(self.msx._snapshot_pause_owned)
 
     def test_failed_direct_resume_rebootstraps_and_guarantees_running(self):
+        self.msx.runtime_mode = "foreground-monitor"
+        self.msx.feature_bits = FEATURE_SNAPSHOT_LEASE
         statuses = iter((
             "running", "paused", "paused", "paused", "running"))
         events = []
@@ -165,6 +178,108 @@ class SnapshotLeaseTest(unittest.TestCase):
                     pass
         request.assert_not_called()
 
+    def test_old_resident_snapshot_agent_is_gated_before_status(self):
+        self.msx.feature_bits = FEATURE_SNAPSHOT_LEASE
+
+        with (mock.patch.object(self.msx, "status") as status,
+              mock.patch.object(self.msx, "_request_v3") as request):
+            with self.assertRaisesRegex(RealMSXError, "timi-poll-safe"):
+                with self.msx.snapshot_lease():
+                    self.fail("an unsafe resident must be rejected before I/O")
+
+        status.assert_not_called()
+        request.assert_not_called()
+
+    def test_quarantined_snapshot_timeout_sends_no_cleanup_bytes(self):
+        events = []
+
+        def status():
+            events.append("status")
+            return {"state": "running"}
+
+        def request(opcode, payload=b"", **_kwargs):
+            events.append((opcode, payload))
+            self.assertEqual(opcode, "S")
+            self.msx._v3.write_quarantined = True
+            self.msx._v3.quarantine_reason = "snapshot request timed out"
+            raise RealMSXProtocolError("snapshot request timed out")
+
+        with (mock.patch.object(self.msx, "status", side_effect=status),
+              mock.patch.object(self.msx, "_request_v3",
+                                side_effect=request),
+              mock.patch.object(self.msx, "_rebootstrap_v3") as rebootstrap):
+            with self.assertRaisesRegex(
+                    RealMSXProtocolError, "snapshot request timed out") as caught:
+                with self.msx.snapshot_lease():
+                    self.fail("a timed-out lease must not enter acquisition")
+
+        self.assertEqual(events, [
+            "status", ("S", bytes([SNAPSHOT_LEASE_TIMEOUTS]))])
+        rebootstrap.assert_not_called()
+        self.assertFalse(self.msx._snapshot_pause_owned)
+        self.assertIsInstance(caught.exception.__cause__, RealMSXError)
+        self.assertIn("no cleanup bytes were sent",
+                      str(caught.exception.__cause__))
+        self.assertIn("lease will resume", str(caught.exception.__cause__))
+
+    def test_quarantined_resume_timeout_sends_no_recovery_bytes(self):
+        statuses = iter(("running", "paused", "paused"))
+        requests = []
+
+        def request(opcode, payload=b"", **_kwargs):
+            requests.append((opcode, payload))
+            if opcode == "S":
+                return b""
+            self.assertEqual(opcode, "g")
+            self.msx._v3.write_quarantined = True
+            self.msx._v3.quarantine_reason = "resume request timed out"
+            raise RealMSXProtocolError("resume request timed out")
+
+        with (mock.patch.object(
+                  self.msx, "status",
+                  side_effect=lambda: {"state": next(statuses)}),
+              mock.patch.object(self.msx, "_request_v3",
+                                side_effect=request),
+              mock.patch.object(self.msx, "_rebootstrap_v3") as rebootstrap):
+            with self.assertRaisesRegex(RealMSXError, "resume timed out"):
+                with self.msx.snapshot_lease():
+                    pass
+
+        self.assertEqual(requests, [
+            ("S", bytes([SNAPSHOT_LEASE_TIMEOUTS])),
+            ("g", b""),
+        ])
+        rebootstrap.assert_not_called()
+        self.assertFalse(self.msx._snapshot_pause_owned)
+
+    def test_recovery_quarantine_stops_before_a_second_rebootstrap(self):
+        self.msx.runtime_mode = "foreground-monitor"
+        self.msx.feature_bits = FEATURE_SNAPSHOT_LEASE
+        self.msx._snapshot_pause_owned = True
+        rebootstrap_calls = 0
+
+        def request(opcode, payload=b"", **_kwargs):
+            self.assertEqual((opcode, payload), ("g", b""))
+            raise RealMSXProtocolError("direct resume failed")
+
+        def rebootstrap():
+            nonlocal rebootstrap_calls
+            rebootstrap_calls += 1
+            self.msx._v3.write_quarantined = True
+            self.msx._v3.quarantine_reason = "recovery transport failed"
+            raise RealMSXProtocolError("recovery transport failed")
+
+        with (mock.patch.object(self.msx, "_request_v3",
+                                side_effect=request),
+              mock.patch.object(self.msx, "_rebootstrap_v3",
+                                side_effect=rebootstrap)):
+            with self.assertRaisesRegex(
+                    RealMSXError, "recovery became write-quarantined"):
+                self.msx._resume_snapshot_pause()
+
+        self.assertEqual(rebootstrap_calls, 1)
+        self.assertFalse(self.msx._snapshot_pause_owned)
+
     def test_idle_foreground_monitor_needs_no_snapshot_feature(self):
         self.msx.feature_bits = 0
         self.msx.runtime_mode = "foreground-monitor"
@@ -184,6 +299,8 @@ class SnapshotLeaseTest(unittest.TestCase):
         request.assert_not_called()
 
     def test_acquisition_error_remains_primary_when_resume_also_fails(self):
+        self.msx.runtime_mode = "foreground-monitor"
+        self.msx.feature_bits = FEATURE_SNAPSHOT_LEASE
         class MidReadError(RuntimeError):
             pass
 
@@ -222,6 +339,8 @@ class SnapshotLeaseTest(unittest.TestCase):
                 self.timeout = value
 
         self.msx.conn = TimeoutStream()
+        self.msx.feature_bits = 0
+        self.msx.runtime_mode = "foreground-monitor"
         sent = []
         scan_framing = []
 
@@ -255,6 +374,7 @@ class SnapshotLeaseTest(unittest.TestCase):
         self.assertEqual(scan_framing, [None, None])
 
     def test_reconnect_marker_is_split_only_for_unknown_or_8251(self):
+        self.msx.feature_bits = 0
         for transport_id in (None, 0):
             sent = []
             self.msx.agent_transport_id = transport_id
@@ -274,6 +394,88 @@ class SnapshotLeaseTest(unittest.TestCase):
             self.msx._send_reconnect_escape()
         self.assertEqual(sent, [RECONNECT_ESCAPE])
         sleep.assert_not_called()
+
+    def test_credited_reconnect_sends_one_byte_per_ack(self):
+        class CreditStream:
+            timeout = 15.0
+
+            def gettimeout(self):
+                return self.timeout
+
+            def settimeout(self, value):
+                self.timeout = value
+
+        self.msx.conn = CreditStream()
+        self.msx.feature_bits |= FEATURE_FRAME_WAKE_ACK
+        sent = []
+        with (mock.patch.object(self.msx, "_send",
+                                side_effect=sent.append),
+              mock.patch.object(self.msx, "_recv_exact",
+                                return_value=FRAME_WAKE_ACK) as receive,
+              mock.patch.object(msx_real.time, "sleep") as sleep):
+            self.msx._send_reconnect_escape()
+
+        self.assertEqual(sent, [RECONNECT_ESCAPE[:1]] * 8)
+        self.assertEqual(receive.call_count, 8)
+        sleep.assert_not_called()
+
+    def test_partial_credited_reconnect_quarantines_after_v3_is_discarded(self):
+        class LostSecondCreditStream:
+            def __init__(self):
+                self.timeout = 15.0
+                self.writes = []
+                self.receive_count = 0
+
+            def gettimeout(self):
+                return self.timeout
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def sendall(self, data):
+                self.writes.append(bytes(data))
+
+            def recv(self, _size):
+                self.receive_count += 1
+                if self.receive_count == 1:
+                    return FRAME_WAKE_ACK
+                raise socket.timeout
+
+        stream = LostSecondCreditStream()
+        self.msx.conn = stream
+        self.msx.feature_bits |= FEATURE_FRAME_WAKE_ACK
+
+        with self.assertRaises(RealMSXTimeoutError):
+            self.msx._send_reconnect_escape()
+
+        self.assertEqual(stream.writes, [RECONNECT_ESCAPE[:1]] * 2)
+        self.assertTrue(self.msx.write_quarantined)
+        self.msx._v3 = None
+        self.assertTrue(self.msx.write_quarantined)
+        with self.assertRaisesRegex(
+                RealMSXProtocolError, "write-quarantined"):
+            self.msx._send_reconnect_escape()
+        self.assertEqual(stream.writes, [RECONNECT_ESCAPE[:1]] * 2)
+
+    def test_rebootstrap_refuses_a_quarantined_attachment_before_io(self):
+        class IdleStream:
+            timeout = 15.0
+
+            def gettimeout(self):
+                return self.timeout
+
+            def settimeout(self, value):
+                self.timeout = value
+
+        self.msx.conn = IdleStream()
+        self.msx._v3.write_quarantined = True
+        with (mock.patch.object(self.msx, "_drain_recovery_noise") as drain,
+              mock.patch.object(self.msx, "_send") as send):
+            with self.assertRaisesRegex(
+                    RealMSXProtocolError, "write-quarantined"):
+                self.msx._rebootstrap_v3()
+        drain.assert_not_called()
+        send.assert_not_called()
 
 
 class ScreenshotFlowTest(unittest.TestCase):
@@ -368,8 +570,10 @@ class ScreenshotFlowTest(unittest.TestCase):
 
     def test_old_agent_is_rejected_before_display_metadata_reads(self):
         legacy = RealMSX(socket_timeout=0.01)
-        legacy._v3 = object()
+        legacy._v3 = SimpleNamespace(
+            write_quarantined=False, quarantine_reason=None)
         legacy.feature_bits = 0
+        legacy.runtime_mode = "resident"
         msx_mcp_server.SESSION.msx = legacy
         msx_mcp_server.SESSION.profile = "real"
 
@@ -384,10 +588,13 @@ class ScreenshotFlowTest(unittest.TestCase):
         plan = self.plan()
         capture = self.capture(plan)
         target = RealMSX(socket_timeout=0.01)
-        target._v3 = SimpleNamespace(timeout=15.0, max_payload=320)
+        target._v3 = SimpleNamespace(
+            timeout=15.0, max_payload=320, write_quarantined=False,
+            quarantine_reason=None)
         target.feature_bits = FEATURE_SNAPSHOT_LEASE
         target.agent_transport_id = 1
         target.agent_transport = "uart-16c550"
+        target.runtime_mode = "foreground-monitor"
         msx_mcp_server.SESSION.msx = target
         msx_mcp_server.SESSION.profile = "real"
         statuses = iter(("running", "paused", "running"))

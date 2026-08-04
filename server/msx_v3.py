@@ -79,6 +79,18 @@ class V3TimeoutError(V3TransportError):
             f"{timeout:g}s")
 
 
+class V3WriteQuarantinedError(V3SessionError):
+    """The session suppressed a write after an indeterminate transport failure."""
+
+    def __init__(self, reason: V3TransportError):
+        self.reason = reason
+        super().__init__(
+            "v3 session writes are quarantined after an indeterminate "
+            "transport failure; "
+            "attach a fresh session before sending another request "
+            f"({reason})")
+
+
 class UnexpectedFrameError(V3SessionError):
     """A peer sent a frame type that is invalid for a host session."""
 
@@ -234,6 +246,7 @@ class V3Session:
                  frame_wake_ack_optional: bool = False,
                  frame_wake_ack_timeout: float =
                  DEFAULT_FRAME_WAKE_ACK_TIMEOUT,
+                 quarantine_on_transport_failure: bool = False,
                  queue_limit: int = 256):
         if not callable(getattr(stream, "recv", None)):
             raise TypeError("stream must provide recv(size)")
@@ -247,6 +260,9 @@ class V3Session:
             raise ValueError("queue_limit must be a positive integer")
         if not isinstance(frame_wake_ack_optional, bool):
             raise TypeError("frame_wake_ack_optional must be a boolean")
+        if not isinstance(quarantine_on_transport_failure, bool):
+            raise TypeError(
+                "quarantine_on_transport_failure must be a boolean")
 
         self.stream = stream
         self.timeout = _positive_float(timeout, "timeout")
@@ -268,6 +284,8 @@ class V3Session:
         if not math.isfinite(self.frame_wake_ack_timeout):
             raise ValueError(
                 "frame_wake_ack_timeout must be a finite positive number")
+        self.quarantine_on_transport_failure = (
+            quarantine_on_transport_failure)
 
         self._sequences = SequenceCounter(sequence_start)
         self._parser = FrameParser(max_payload=self.max_payload)
@@ -275,8 +293,53 @@ class V3Session:
         self._events: Deque[Frame] = deque(maxlen=queue_limit)
         self._orphan_responses: Deque[Frame] = deque(maxlen=queue_limit)
         self._protocol_errors: Deque[Exception] = deque(maxlen=queue_limit)
+        self._quarantine_reason: V3TransportError | None = None
 
         self._set_stream_timeout(self.timeout)
+
+    @property
+    def write_quarantined(self) -> bool:
+        """Return whether requests are locally blocked after a terminal failure."""
+
+        with self._lock:
+            return self._quarantine_reason is not None
+
+    @property
+    def quarantine_reason(self) -> V3TransportError | None:
+        """Return the transport failure that quarantined writes, if any."""
+
+        with self._lock:
+            return self._quarantine_reason
+
+    @property
+    def quarantine_on_terminal_timeout(self) -> bool:
+        """Compatibility alias for the transport-failure quarantine policy."""
+
+        return self.quarantine_on_transport_failure
+
+    @quarantine_on_terminal_timeout.setter
+    def quarantine_on_terminal_timeout(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TypeError(
+                "quarantine_on_terminal_timeout must be a boolean")
+        self.quarantine_on_transport_failure = value
+
+    @property
+    def quarantine_on_timeout(self) -> bool:
+        """Compatibility alias for the transport-failure quarantine policy."""
+
+        return self.quarantine_on_transport_failure
+
+    @quarantine_on_timeout.setter
+    def quarantine_on_timeout(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TypeError("quarantine_on_timeout must be a boolean")
+        self.quarantine_on_transport_failure = value
+
+    def _quarantine_transport_failure(self, reason: V3TransportError) -> None:
+        if (self.quarantine_on_transport_failure and
+                self._quarantine_reason is None):
+            self._quarantine_reason = reason
 
     def negotiate_max_payload(self, peer_max_payload: int) -> int:
         """Apply the peer's advertised payload limit and return the effective one."""
@@ -337,6 +400,8 @@ class V3Session:
             flags=flags,
         )
         with self._lock:
+            if self._quarantine_reason is not None:
+                raise V3WriteQuarantinedError(self._quarantine_reason)
             # Negotiation also holds this lock, so a concurrent limit update
             # cannot make an already-validated request oversized on the wire.
             if len(request.payload) > self.max_payload:
@@ -371,15 +436,29 @@ class V3Session:
                             return self._successful(response)
                         if attempt < attempts:
                             continue
-                        raise V3TimeoutError(
+                        timeout_error = V3TimeoutError(
                             sequence, request.opcode, attempts,
-                            request_timeout) from None
+                            request_timeout)
+                        self._quarantine_transport_failure(timeout_error)
+                        raise timeout_error from None
+                    except V3TransportError as exc:
+                        # sendall() may have transferred an unknown prefix, and
+                        # a receive-side failure happens after the complete
+                        # request was sent. Either leaves the remote parser in
+                        # an indeterminate state, so a safety-enabled session
+                        # must not emit a follow-up frame.
+                        self._quarantine_transport_failure(exc)
+                        raise
                     if (response.status == FrameStatus.CRC_ERROR and
                             attempt < attempts):
                         continue
                     return self._successful(response)
             finally:
-                self._set_stream_timeout(self.timeout)
+                try:
+                    self._set_stream_timeout(self.timeout)
+                except V3TransportError as exc:
+                    self._quarantine_transport_failure(exc)
+                    raise
 
         raise AssertionError("unreachable request state")
 
@@ -531,6 +610,7 @@ __all__ = [
     "DEFAULT_RECV_SIZE", "DEFAULT_FRAME_WAKE_ACK_TIMEOUT", "V3Session",
     "V3SessionError",
     "V3TransportError", "V3DisconnectedError", "V3TimeoutError",
+    "V3WriteQuarantinedError",
     "UnexpectedFrameError", "RemoteStatusError",
     "RemoteInvalidOpcodeError", "RemoteInvalidArgumentError",
     "RemoteInvalidStateError", "RemoteOutOfRangeError", "RemoteCRCError",

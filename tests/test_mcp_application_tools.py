@@ -66,6 +66,9 @@ class FakeRealMSX:
         if text == "BASIC":
             self.screen = "Microsoft MSX BASIC\nOk"
 
+    def press(self, key):
+        self.typed.append(("key", key))
+
     def screen_text(self, timeout=None):
         return self.screen
 
@@ -142,6 +145,14 @@ class MCPApplicationToolsTest(unittest.TestCase):
             ("type", "PRINT 1"),
             ("line", "RUN"),
         ])
+
+    def test_real_key_tool_dispatches_special_keys_through_agent_backend(self):
+        with mock.patch.object(msx_mcp_server.time, "sleep") as sleep:
+            self.assertEqual(
+                msx_mcp_server.t_key("CTRL+STOP"), self.backend.screen)
+
+        self.assertEqual(self.backend.typed, [("key", "CTRL+STOP")])
+        sleep.assert_called_once_with(0.1)
 
     def test_real_run_basic_enters_from_dos_and_sends_one_line_at_a_time(self):
         program = "10 PRINT \"MCP\"   \n\n20 END\n"

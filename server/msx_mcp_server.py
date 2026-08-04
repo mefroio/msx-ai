@@ -315,7 +315,8 @@ class Session:
 
     def shutdown(self):
         if self.msx is not None:
-            if self.profile == "real":
+            if (self.profile == "real" and
+                    not getattr(self.msx, "write_quarantined", False)):
                 try:
                     if self.msx.status()["state"] == "paused":
                         self.msx.resume()
@@ -771,11 +772,13 @@ def t_type(text):
 
 
 def t_key(key):
-    if SESSION.profile == "real":
-        raise OpenMSXError("keyboard injection is not implemented by the real agent")
     m = SESSION.require()
-    m.press(key.upper())
-    m.advance(0.6)
+    if SESSION.profile == "real":
+        m.press(key)
+        time.sleep(0.1)
+    else:
+        m.press(key.upper())
+        m.advance(0.6)
     return _screen()
 
 
@@ -1018,8 +1021,9 @@ TOOLS = {
         "msx_shutdown. Supported memory, "
         "hardware, execution, application, and screenshot operations use the "
         "TCP agent path, not openMSX debugger APIs. mode='resident' returns to "
-        "DOS and supports pause/inspect/patch/resume of cooperative DOS-launched "
-        "software; direct call/run/stop and slot/mapper selection require "
+        "DOS and supports bounded atomic inspect/patch/screenshot operations "
+        "on cooperative DOS-launched software; persistent pause is disabled. "
+        "Direct call/run/stop and slot/mapper selection require "
         "mode='monitor'. debug=true is valid only for monitor mode.",
         _s({"host": {"type": "string", "default": "127.0.0.1"},
             "port": {"type": "integer", "default": 0},
@@ -1037,12 +1041,12 @@ TOOLS = {
         "transport, and negotiated capabilities.",
         _s({})),
     "msx_pause": (t_pause,
-        "Pause the cooperative DOS environment/application under the resident "
-        "agent, or code launched by the foreground monitor. The complete "
-        "interrupted CPU context remains frozen until msx_resume.",
+        "Pause code launched by the foreground monitor. Safe resident mode "
+        "rejects persistent pause; use an atomic memory or screenshot operation "
+        "to acquire a bounded snapshot lease instead.",
         _s({})),
     "msx_resume": (t_resume,
-        "Resume code paused by the resident real-MSX monitor.", _s({})),
+        "Resume code paused by the foreground real-MSX monitor.", _s({})),
     "msx_stop": (t_stop,
         "Foreground-monitor only: abandon code launched by the agent and return "
         "to its upload monitor. Resident mode rejects this operation because it "
@@ -1129,7 +1133,10 @@ TOOLS = {
         "BIOS keyboard ring and waits for each batch to be consumed.",
         _s({"text": {"type": "string"}}, ["text"])),
     "msx_key": (t_key,
-        "OpenMSX only: press ESC, RET, STOP, SPACE, SELECT or TAB.",
+        "Press ESC, RET, STOP, SPACE, SELECT or TAB. A real resident agent "
+        "also accepts CTRL+STOP and the CTRL+C break alias, sending the event "
+        "through the BIOS keyboard ring or INTFLG over MCP/TCP; software that "
+        "reads the physical key matrix directly will not observe it.",
         _s({"key": {"type": "string"}}, ["key"])),
     "msx_run_basic": (t_run_basic,
         "Enter a full BASIC program one line at a time, then RUN it and return "

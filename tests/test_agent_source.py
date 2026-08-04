@@ -9,6 +9,7 @@ GENERIC_WRAPPER = ROOT / "agent" / "msx_agent.asm"
 GENERIC_TRANSPORT = ROOT / "agent" / "transports" / "msx_transport_8251.inc"
 UART16C550_TRANSPORT = (
     ROOT / "agent" / "transports" / "msx_transport_16c550.inc")
+TSR_BUILDER = ROOT / "tools" / "build_agent_tsr.py"
 MAKEFILE = ROOT / "Makefile"
 
 
@@ -35,6 +36,7 @@ class ResidentAgentSourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = CORE.read_text(encoding="utf-8")
+        cls.tsr_builder_source = TSR_BUILDER.read_text(encoding="utf-8")
 
     def test_split_crc_tables_are_complete_and_correct(self):
         low = _hex_bytes(
@@ -90,10 +92,34 @@ class ResidentAgentSourceTests(unittest.TestCase):
             "hook_done:", 1)[0]
         self.assertRegex(
             hook,
-            r"(?s)call transport_rx_ready.*jr z,hook_done.*"
+            r"(?s)ld \(chain_keyi\),a.*ld a,\(hook_kind\).*"
+            r"jr nz,hook_poll_transport.*hook_poll_transport:.*"
+            r"call transport_rx_ready.*jr z,hook_done.*"
             r"ld a,\(hook_kind\).*jr nz,hook_dispatch_frame.*"
-            r"ld \(chain_keyi\),a.*hook_dispatch_frame:.*"
-            r"call receive_dispatch")
+            r"hook_dispatch_frame:.*call receive_dispatch")
+        unwind = self.source.split("hook_done:", 1)[1].split("else", 1)[0]
+        self.assertRegex(
+            unwind,
+            r"(?s)ld a,\(chain_keyi\).*jr nz,memman_hook_continue.*"
+            r"memman_hook_continue:.*xor a.*ret")
+
+    def test_timi_only_keyi_guard_suppresses_firmware_without_polling(self):
+        memman_hooks = self.source.split(
+            "; ------------------------------------------------------------ BIOS hooks", 1
+        )[1].split("else", 1)[0]
+        hook = memman_hooks.split("resident_hook_saved_af:", 1)[1].split(
+            "hook_done:", 1)[0]
+        self.assertRegex(
+            hook,
+            r"(?s)and TRANSPORT_FLAG_KEYI_EXCLUSIVE.*"
+            r"xor a.*ld \(chain_keyi\),a.*"
+            r"and TRANSPORT_FLAG_TIMI_ONLY.*jr nz,hook_done.*"
+            r"hook_poll_transport:.*call transport_rx_ready")
+        unwind = memman_hooks.split("hook_done:", 1)[1]
+        self.assertRegex(
+            unwind,
+            r"(?s)ld a,\(chain_keyi\).*jr nz,memman_hook_continue.*"
+            r"ld a,1.*suppress remaining H\.KEYI.*ret")
 
     def test_framed_keybuf_input_is_atomic_resident_only_and_advertised(self):
         dispatch = self.source.split("frame_dispatch:", 1)[1].split(
@@ -131,47 +157,28 @@ class ResidentAgentSourceTests(unittest.TestCase):
         for forbidden in ("call bdos_proxy", "call CHGET", "call CHPUT"):
             self.assertNotIn(forbidden, keybuf)
 
-    def test_memman_exclusive_keyi_never_chains_the_old_serial_handler(self):
-        hooks = self.source.split(
-            "; ---------------------------------------------------------------- H.KEYI", 1
-        )[1].split("else", 1)[0]
-        policy = hooks.split("ld (in_hook),a", 1)[1].split(
-            "call transport_rx_ready", 1)[0]
-        self.assertIn("and TRANSPORT_FLAG_KEYI_EXCLUSIVE", policy)
-        self.assertIn("ld (chain_keyi),a", policy)
-        self.assertLess(
-            policy.index("and TRANSPORT_FLAG_KEYI_EXCLUSIVE"),
-            policy.index("ld (chain_keyi),a"))
+    def test_memman_registers_keyi_guard_and_timi_dispatch(self):
+        hook_spec = self.tsr_builder_source.split("hooks=(", 1)[1].split(
+            "record_size=", 1)[0]
+        self.assertIn("Hook(H_KEYI, offsets[\"resident_keyi_hook\"])",
+                      hook_spec)
+        self.assertIn("Hook(H_TIMI, offsets[\"resident_timi_hook\"])",
+                      hook_spec)
+        self.assertLess(hook_spec.index("Hook(H_KEYI"),
+                        hook_spec.index("Hook(H_TIMI"))
 
-    def test_memman_nested_hooks_return_through_quithook_without_resaving(self):
+    def test_memman_nested_timi_returns_through_quithook_without_resaving(self):
         hooks = self.source.split(
-            "; ---------------------------------------------------------------- H.KEYI", 1
+            "; ------------------------------------------------------------ BIOS hooks", 1
         )[1].split("else", 1)[0]
-        keyi_entry = hooks.split("resident_keyi_hook:", 1)[1].split(
-            "resident_timi_hook:", 1)[0]
         timi_entry = hooks.split("resident_timi_hook:", 1)[1].split(
             "; A nested MemMan hook", 1)[0]
-        self.assertRegex(
-            keyi_entry,
-            r"(?s)push af.*ld a,\(in_hook\).*or a.*"
-            r"jr nz,memman_nested_keyi_return.*ld a,1.*"
-            r"ld \(in_hook\),a.*ld \(hook_kind\),a")
         self.assertRegex(
             timi_entry,
             r"(?s)push af.*ld a,\(in_hook\).*or a.*"
             r"jr nz,memman_nested_timi_return.*ld a,1.*"
             r"ld \(in_hook\),a.*ld \(hook_kind\),a")
-
-        before_full_save = hooks.split("resident_hook_saved_af:", 1)[0]
-        self.assertNotIn("push bc", before_full_save)
-        nested_keyi = hooks.split("memman_nested_keyi_return:", 1)[1].split(
-            "memman_nested_timi_return:", 1)[0]
-        self.assertNotIn("ld (hook_kind),a", nested_keyi)
-        self.assertNotIn("ld (hook_dispatch_sp),sp", nested_keyi)
-        self.assertRegex(
-            nested_keyi,
-            r"(?s)and TRANSPORT_FLAG_KEYI_EXCLUSIVE.*"
-            r"pop af.*ex af,af'.*ld a,1.*ex af,af'.*ret")
+        self.assertNotIn("push bc", timi_entry)
         nested_timi = hooks.split("memman_nested_timi_return:", 1)[1].split(
             "resident_hook_saved_af:", 1)[0]
         self.assertNotIn("ld (hook_kind),a", nested_timi)
@@ -179,6 +186,20 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertRegex(
             nested_timi,
             r"(?s)pop af.*ex af,af'.*xor a.*ex af,af'.*ret")
+
+    def test_hook_serial_waits_use_an_explicit_bounded_budget(self):
+        budget = re.search(
+            r"(?m)^HOOK_IO_BUDGET:\s+equ\s+0([0-9A-Fa-f]+)h\s*$",
+            self.source)
+        self.assertIsNotNone(budget)
+        self.assertEqual(int(budget.group(1), 16), 0x1000)
+        put = self.source.split("ser_put:", 1)[1].split("ser_get:", 1)[0]
+        get = self.source.split("ser_get:", 1)[1].split(
+            "hook_transport_timeout:", 1)[0]
+        for section in (put, get):
+            self.assertIn("ld bc,HOOK_IO_BUDGET", section)
+            self.assertNotRegex(section, r"(?m)^\s*ld bc,0\s*$")
+            self.assertIn("jp hook_transport_timeout", section)
 
     def test_hook_stack_comment_matches_reserved_bytes(self):
         reserve = re.search(
@@ -292,6 +313,8 @@ class ResidentAgentSourceTests(unittest.TestCase):
 
         timeout = self.source.split("hook_transport_timeout:", 1)[1].split(
             "frame_request_buffer:", 1)[0]
+        before_state = timeout.split("ld a,(run_state)", 1)[0]
+        self.assertIn("ld (frame_reconnect_count),a", before_state)
         self.assertRegex(
             timeout,
             r"(?s)ld a,\(run_state\).*cp 2.*"
@@ -378,12 +401,35 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r"(?m)^FRAME_WAKE_ACK:\s+equ\s+006h\b")
         features = self.source.split("current_features:", 1)[1].split(
             "cmd_status:", 1)[0]
-        self.assertIn("FEATURE_FRAME_WAKE_ACK", features)
+        self.assertRegex(
+            features,
+            r"(?s)ld a,\(active_transport_flags\).*"
+            r"and TRANSPORT_FLAG_FRAME_WAKE_ACK.*"
+            r"ld b,FEATURE_FRAME_WAKE_ACK")
+        self.assertIn("FEATURE_TIMI_POLL_SAFE", features)
         magic = self.source.split("frame_have_magic_m:", 1)[1].split(
             "frame_reconnect_byte:", 1)[0]
         self.assertRegex(
             magic,
-            r"(?s)ld a,FRAME_WAKE_ACK.*call ser_put.*call ser_get")
+            r"(?s)ld a,\(active_transport_flags\).*"
+            r"and TRANSPORT_FLAG_FRAME_WAKE_ACK.*"
+            r"jr z,frame_wait_second_magic.*ld a,FRAME_WAKE_ACK.*"
+            r"call ser_put.*call ser_get")
+        reconnect = self.source.split("frame_reconnect_byte:", 1)[1].split(
+            "frame_rebootstrap:", 1)[0]
+        self.assertRegex(
+            reconnect,
+            r"(?s)and TRANSPORT_FLAG_FRAME_WAKE_ACK.*"
+            r"ld a,FRAME_WAKE_ACK.*call ser_put.*"
+            r"ld a,\(frame_reconnect_count\)")
+
+    def test_raw_features_are_available_before_v3_upgrade(self):
+        dispatch = self.source.split("dispatch:", 1)[1].split(
+            "cmd_status:", 1)[0]
+        self.assertRegex(
+            dispatch,
+            r"(?s)cp 'N'.*jr z,cmd_bootstrap_features.*"
+            r"cmd_bootstrap_features:.*ld a,'K'.*call current_features")
 
     def test_snapshot_lease_is_cleared_by_lifecycle_and_exit_paths(self):
         initialize = self.source.split("resident_initialize:", 1)[1].split(
@@ -437,7 +483,12 @@ class ResidentAgentSourceTests(unittest.TestCase):
                     source,
                     rf"(?m)^{prefix}_ID:\s+equ\s+{transport_id}\s*$")
                 self.assertIn(f"{prefix}_STATE_SIZE:", source)
-                self.assertIn(f"{prefix}_FLAGS:", source)
+                self.assertRegex(
+                    source,
+                    rf"(?m)^{prefix}_FLAGS:\s+equ\s+"
+                    r"TRANSPORT_FLAG_KEYI_EXCLUSIVE\s+\|\s+"
+                    r"TRANSPORT_FLAG_TIMI_ONLY\s+\|\s+"
+                    r"TRANSPORT_FLAG_FRAME_WAKE_ACK\s*$")
                 self.assertIn(f"{prefix}_CONTROL_LEVEL:", source)
                 label_prefix = prefix.lower().replace("uart", "uart")
                 for operation in ("init", "restore", "rx_ready", "tx_ready",
@@ -455,8 +506,19 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("out (UART8251_TIMER_CONTROL),a", init)
         self.assertIn("out (UART8251_TIMER_RX),a", init)
         self.assertIn("out (UART8251_TIMER_TX),a", init)
-        self.assertIn("ld a,0FEh", init)
-        self.assertNotIn("and 0FEh", init)
+        self.assertRegex(
+            init,
+            r"(?s)ld a,\(UART8251_COMMSK\).*"
+            r"ld \(transport_state \+ UART8251_SAVED_COMMSK\),a.*"
+            r"ld a,0FFh.*ld \(UART8251_COMMSK\),a.*out \(082h\),a")
+        self.assertNotIn("ld a,0FEh", init)
+        self.assertLess(init.index("ld a,0FFh"), init.index("ld a,037h"))
+        restore = source.split("uart8251_restore:", 1)[1].split(
+            "uart8251_rx_ready:", 1)[0]
+        self.assertRegex(
+            restore,
+            r"(?s)ld a,\(transport_state \+ UART8251_SAVED_COMMSK\).*"
+            r"ld \(UART8251_COMMSK\),a.*out \(082h\),a")
         receive = source.split("uart8251_rx_ready:", 1)[1].split(
             "uart8251_tx_ready:", 1)[0]
         self.assertIn("and 038h", receive)
@@ -469,6 +531,27 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("A BaDCaT SMD is one known device", source)
         self.assertIn("restores the prior UART setup", source)
         self.assertNotIn("restores the previous user", source)
+        init = source.split("uart16c550_init:", 1)[1].split(
+            "uart16c550_restore:", 1)[0]
+        self.assertRegex(
+            init,
+            r"(?s)ld a,083h.*out \(UART16C550_LCR\),a.*"
+            r"ld a,1\s+; 1\.8432 MHz / \(16 \* 1\) = 115200 baud.*"
+            r"out \(UART16C550_DATA\),a.*"
+            r"xor a.*out \(UART16C550_IER\),a")
+        self.assertIn("ld a,087h", init)
+        self.assertIn("ld a,02Fh", init)
+        self.assertRegex(
+            init,
+            r"(?s)ld a,02Fh.*out \(UART16C550_MCR\),a.*"
+            r"xor a.*out \(UART16C550_IER\),a.*ret")
+        self.assertNotIn("received-data interrupt", init)
+        restore = source.split("uart16c550_restore:", 1)[1].split(
+            "uart16c550_rx_ready:", 1)[0]
+        self.assertRegex(
+            restore,
+            r"(?s)ld a,\(transport_state \+ UART16C550_SAVED_IER\).*"
+            r"out \(UART16C550_IER\),a")
 
     def test_default_is_true_memman_resident_and_monitor_is_explicit(self):
         self.assertRegex(
