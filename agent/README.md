@@ -132,7 +132,15 @@ fixed address is not used by the default MemMan lifecycle.
 ## Debug tracing
 
 Debug is disabled by default. `DEBUG ON` prints each foreground protocol
-opcode as `[XX]`, where `XX` is the uppercase hexadecimal byte.
+opcode as `[XX]`, where `XX` is the uppercase hexadecimal byte. A v3 TCP host
+also sends its accepted IPv4 source endpoint once after HELLO when the agent
+advertises the `debug-peer-label` feature; the screen prints
+`MCP client: <ipv4>:<port>`.
+
+For repeatable openMSX testing, the repository-level
+`open-msx-mcp.command` launcher builds and installs this canonical executable,
+starts the foreground monitor with `DEBUG ON`, and waits for an IPv4 MCP
+listener at `127.0.0.1:6603`.
 
 Tracing is deliberately limited:
 
@@ -152,9 +160,10 @@ service opportunity. The hook saves normal and alternate Z80 register sets and
 moves protocol dispatch to a dedicated agent stack before processing a frame.
 
 The resident reports state `running` while DOS or a DOS-launched application
-is active. A pause preserves the interrupted CPU context until an explicit
-resume. Temporary transport silence does not resume it implicitly. A truncated
-frame unwinds safely instead of leaving the MSX frozen inside the parser.
+is active. A manual lowercase-`s` pause preserves the interrupted CPU context
+until an explicit resume. The bounded uppercase-`S` snapshot pause instead
+auto-resumes after its lease expires. A truncated frame unwinds safely instead
+of leaving the MSX frozen inside the parser.
 
 Direct `call`, `run`, and `stop` are not advertised by the resident TSR:
 
@@ -259,11 +268,30 @@ share one buffer to keep the resident compact. A split lookup-table
 implementation accelerates CRC processing.
 
 The v3 HELLO appends an optional feature byte after the runtime-mode byte. Bit
-0 advertises `keybuf-input`; older 9-byte and 14-byte HELLO responses remain
-valid. Opcode `t` accepts zero bytes as a queue-status query or up to 39 input
-bytes and returns `[accepted, pending]`. The one unused ring position preserves
-the BIOS convention that equal get/put pointers mean empty. Because the result
-is cached by sequence, response loss and retry cannot type a batch twice.
+0 advertises `keybuf-input`; bit 1 advertises the foreground-debug-only
+`debug-peer-label`; bit 2 advertises the resident-only `snapshot-lease` pause;
+bit 3 advertises the 8251-only `frame-wake-ack`; older 9-byte and 14-byte HELLO
+responses remain valid.
+Opcode `t` accepts zero bytes as a queue-status query or up to 39 input bytes
+and returns `[accepted, pending]`. Opcode `I` accepts 1..63 printable ASCII
+bytes and displays the host-provided peer label. The one unused ring position
+preserves the BIOS convention that equal get/put pointers mean empty. Because
+the result is cached by sequence, response loss and retry cannot repeat either
+side effect.
+
+Opcode `S` accepts exactly one non-zero lease byte while the resident is
+servicing a running program from a hook. After acknowledging it, the agent
+enters the paused command loop. Every successfully serviced frame reloads the
+current lease, while each complete transport timeout decrements only that
+current value. Opcode `g` resumes immediately; reaching zero auto-resumes if
+`g` or its acknowledgement was lost. Lowercase `s` stores a zero lease and
+therefore remains persistent until `g`.
+
+With `frame-wake-ack`, consuming the first `M` of a framed request produces raw
+byte `0x06`. The host waits for that byte before releasing `X` and the remaining
+frame at full line rate. This proves that H.KEYI/MemMan has entered the parser
+and prevents an overrun in the 8251's one-byte receive register. It is not used
+by the FIFO/RTS-CTS-protected 16C550 driver.
 
 If a TCP/serial peer disappears, eight consecutive ESC bytes reset only the
 framed session. A new host can repeat the raw hello and v3 upgrade without
@@ -316,6 +344,7 @@ transport_write
 The selected vector table maps those entries to namespaced driver routines.
 Drivers expose only byte readiness, read/write, lifecycle, control level, and
 flags. TCP client/server configuration remains outside the Z80 agent.
+The current host network contract is TCP over IPv4 only; IPv6 is not supported.
 
 ### Standard 8251 MSX RS-232
 
@@ -323,13 +352,16 @@ flags. TCP client/server configuration remains outside the Z80 agent.
 
 - 8251 data/status ports `80h/81h`;
 - standard 8253/8254 timer ports `84h`, `85h`, and `87h`;
-- explicitly programmed 4800 baud, asynchronous 8N1 x16;
+- explicitly programmed 19200 baud, asynchronous 8N1 x16;
 - the standard `COMMSK` receive-ready interrupt path.
 
 The driver saves `COMMSK`, masks unrelated UART interrupt sources, and
-restores the previous value on reconfiguration or uninstall. A plain 8251 has
-no receive FIFO or automatic flow control; 4800 baud is the reliability-first
-configuration validated by the openMSX RS232-Net integration suite.
+restores the previous value on reconfiguration or uninstall. It also clears
+latched parity, overrun, and framing errors while polling receive state. A plain
+8251 has no receive FIFO or automatic flow control. The configured 19200 baud
+is the 8251A asynchronous maximum in x16 mode; reliable resident operation at
+that rate uses the negotiated frame-wake ACK. Faster rates require the separate
+16C550 transport and its FIFO/flow-control safeguards.
 
 ### Generic 16C550-compatible UART
 

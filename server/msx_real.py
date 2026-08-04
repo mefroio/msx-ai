@@ -15,6 +15,8 @@ while the MSX-side UART/Wi-Fi implementation is negotiated independently.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import ipaddress
 import os
 import pathlib
 import shutil
@@ -36,8 +38,20 @@ RAM_SIZE = 0x10000
 VRAM_SIZE = 0x20000
 VRAM_BANK_SIZE = 0x4000
 RECONNECT_ESCAPE = b"\x1b" * 8
-BOOTSTRAP_PROBE_TIMEOUT = 0.5
+# A visible foreground DEBUG monitor may spend close to one second in host-side
+# rendering around connection time. Physical targets can be slower still.
+BOOTSTRAP_PROBE_TIMEOUT = 2.0
 BOOTSTRAP_SCAN_LIMIT = 64
+RECOVERY_SCAN_LIMIT = 1024
+RECOVERY_DRAIN_LIMIT = 0x4000
+RECOVERY_QUIET_SECONDS = 0.05
+UART8251_BAUD = 19200
+# One conservative bootstrap/reconnect delay is needed before framed HELLO
+# advertises the explicit parser-ready ACK. Normal negotiated 8251 frames use
+# that ACK and therefore do not depend on this scheduler timing heuristic.
+UART8251_FRAME_WAKE_DELAY = 0.010
+FRAME_WAKE_ACK = b"\x06"
+FRAME_WAKE_BOOTSTRAP_TIMEOUT = 0.100
 
 STATE_NAMES = {0: "monitor", 1: "running", 2: "paused"}
 CAPABILITY_RUN = 0x08
@@ -53,8 +67,18 @@ CAPABILITY_NAMES = {
     CAPABILITY_MAPPING: "mapping",
 }
 FEATURE_KEYBUF_INPUT = 0x01
+FEATURE_DEBUG_PEER = 0x02
+FEATURE_SNAPSHOT_LEASE = 0x04
+FEATURE_FRAME_WAKE_ACK = 0x08
+DEBUG_PEER_MAX = 63
+SNAPSHOT_LEASE_TIMEOUTS = 8
+SNAPSHOT_PAUSE_ATTEMPTS = 2
+SNAPSHOT_REQUEST_TIMEOUT = 1.0
 AGENT_FEATURE_NAMES = {
     FEATURE_KEYBUF_INPUT: "keybuf-input",
+    FEATURE_DEBUG_PEER: "debug-peer-label",
+    FEATURE_SNAPSHOT_LEASE: "snapshot-lease",
+    FEATURE_FRAME_WAKE_ACK: "frame-wake-ack",
 }
 AGENT_TRANSPORT_NAMES = {
     0: "uart-8251",
@@ -96,7 +120,7 @@ class RealMSXKeyboardTimeoutError(RealMSXTimeoutError):
 class RealMSX:
     """One byte-stream session with an MSX-AI physical-target agent.
 
-    The convenience connection methods currently use TCP/IP because that is
+    The convenience connection methods currently use TCP/IPv4 because that is
     the common external contract. The framed protocol and all monitor
     operations remain independent from the UART or network adapter installed
     in the MSX.
@@ -128,13 +152,15 @@ class RealMSX:
         self.simulation = None
         self.bootstrap_recovered = False
         self.bootstrap_protocol_version = None
+        self._debug_peer_sent = False
+        self._snapshot_pause_owned = False
         self._v3 = None
         self._lock = threading.RLock()
 
     # ---- connection -------------------------------------------------
     def listen(self):
         """Open a TCP listener for adapters that initiate the connection."""
-        listener = socket.socket()
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self.host, self.port))
@@ -155,6 +181,11 @@ class RealMSX:
             raise RealMSXError("listener is not open")
         self.srv.settimeout(float(timeout))
         conn, peer = self.srv.accept()
+        try:
+            self._configure_tcp_nodelay(conn)
+        except Exception:
+            conn.close()
+            raise
         self.attach_stream(
             conn, peer=peer, network_transport="tcp", network_role="listen")
         if handshake:
@@ -165,9 +196,16 @@ class RealMSX:
         """Connect to an adapter that exposes the agent as a TCP server."""
         target_host = self.host if host is None else host
         target_port = self.port if port is None else int(port)
+        if ":" in str(target_host):
+            raise RealMSXError("IPv6 is not supported; use an IPv4 endpoint")
         try:
+            target_ipv4 = socket.gethostbyname(target_host)
             conn = socket.create_connection(
-                (target_host, target_port), timeout=float(timeout))
+                (target_ipv4, target_port), timeout=float(timeout))
+        except socket.gaierror as exc:
+            raise RealMSXError(
+                f"could not resolve an IPv4 address for MSX agent host "
+                f"{target_host}: {exc}") from exc
         except socket.timeout as exc:
             raise RealMSXTimeoutError(
                 f"timeout connecting to MSX agent at "
@@ -177,6 +215,11 @@ class RealMSX:
                 f"could not connect to MSX agent at "
                 f"{target_host}:{target_port}: {exc}") from exc
         self.host, self.port = target_host, target_port
+        try:
+            self._configure_tcp_nodelay(conn)
+        except Exception:
+            conn.close()
+            raise
         self.attach_stream(
             conn, peer=conn.getpeername(), network_transport="tcp",
             network_role="connect")
@@ -237,6 +280,8 @@ class RealMSX:
         self.simulation = None
         self.bootstrap_recovered = False
         self.bootstrap_protocol_version = None
+        self._debug_peer_sent = False
+        self._snapshot_pause_owned = False
         self._v3 = None
 
     # ---- transport --------------------------------------------------
@@ -244,12 +289,35 @@ class RealMSX:
         if self.conn is None:
             raise RealMSXError("MSX agent is not connected")
 
+    @staticmethod
+    def _configure_tcp_nodelay(stream):
+        """Disable TCP coalescing on TCP-created agent streams when available."""
+        if getattr(stream, "family", None) != socket.AF_INET:
+            return
+        setsockopt = getattr(stream, "setsockopt", None)
+        if not callable(setsockopt):
+            return
+        try:
+            setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as exc:
+            raise RealMSXError(
+                f"could not enable TCP_NODELAY for MSX agent: {exc}") from exc
+
     def _send(self, data):
         self._require_connection()
         try:
             self.conn.sendall(data)
         except OSError as exc:
             raise RealMSXError(f"agent send failed: {exc}") from exc
+
+    def _send_reconnect_escape(self):
+        """Send the framed reset marker with an 8251-safe first-byte gap."""
+        if self.agent_transport_id in (None, 0):
+            self._send(RECONNECT_ESCAPE[:1])
+            time.sleep(UART8251_FRAME_WAKE_DELAY)
+            self._send(RECONNECT_ESCAPE[1:])
+        else:
+            self._send(RECONNECT_ESCAPE)
 
     def _recv_exact(self, n):
         self._require_connection()
@@ -386,7 +454,7 @@ class RealMSX:
             except RealMSXTimeoutError:
                 pass
 
-            self._send(RECONNECT_ESCAPE)
+            self._send_reconnect_escape()
             try:
                 reply = self._scan_bootstrap_hello(probe_timeout)
             except RealMSXTimeoutError:
@@ -402,6 +470,10 @@ class RealMSX:
             return self._info_v3()
         with self._lock:
             reply = self._bootstrap_hello()
+            return self._activate_bootstrap_hello(reply)
+
+    def _activate_bootstrap_hello(self, reply, *, v3_timeout=None):
+        """Validate a raw HELLO and upgrade the attached stream when possible."""
         if reply[0:1] != b"M":
             raise RealMSXProtocolError(
                 f"peer is not an MSX-AI physical-target agent: {reply!r}")
@@ -414,9 +486,8 @@ class RealMSX:
         self.capabilities = capabilities
         self.resident_base = page << 8
         if capabilities & 0x20:
-            with self._lock:
-                self._send(b"F")
-                upgrade = self._recv_exact(4)
+            self._send(b"F")
+            upgrade = self._recv_exact(4)
             if upgrade[:2] != b"K\x03":
                 raise RealMSXProtocolError(
                     f"agent rejected framed-v3 upgrade: {upgrade!r}")
@@ -424,9 +495,23 @@ class RealMSX:
             if peer_max <= 0:
                 raise RealMSXProtocolError(
                     f"agent advertised invalid v3 payload limit {peer_max}")
+            session_timeout = (
+                self.socket_timeout if v3_timeout is None
+                else min(self.socket_timeout, float(v3_timeout)))
+            known_8251_ack = (
+                self.agent_transport_id == 0 and
+                bool(self.feature_bits & FEATURE_FRAME_WAKE_ACK))
+            known_16c550 = self.agent_transport_id == 1
             self._v3 = V3Session(
-                self.conn, timeout=self.socket_timeout, retries=2,
-                max_payload=4096, peer_max_payload=peer_max)
+                self.conn, timeout=session_timeout, retries=2,
+                max_payload=4096, peer_max_payload=peer_max,
+                # The first framed HELLO carries the feature bit, so probe the
+                # ACK with a bounded fallback when the transport is not known.
+                # A recovered current 8251 session can require it immediately.
+                frame_wake_ack=(None if known_16c550 else FRAME_WAKE_ACK),
+                frame_wake_ack_optional=(
+                    not known_16c550 and not known_8251_ack),
+                frame_wake_ack_timeout=FRAME_WAKE_BOOTSTRAP_TIMEOUT)
             return self._info_v3()
         return {
             "protocol": version,
@@ -439,6 +524,72 @@ class RealMSX:
             "local_endpoint": self.local_endpoint,
             "peer": self.peer,
         }
+
+    def _drain_recovery_noise(self):
+        """Discard a bounded stale response up to a quiet stream boundary.
+
+        A timed-out 320-byte VRAM response can still be crossing an 8251 when
+        recovery starts. Draining before the raw escape marker prevents a
+        payload byte sequence resembling ``M,2`` from being mistaken for the
+        bootstrap HELLO that follows that marker.
+        """
+        self._require_connection()
+        original_timeout = self.conn.gettimeout()
+        drained = 0
+        try:
+            self.conn.settimeout(RECOVERY_QUIET_SECONDS)
+            while drained < RECOVERY_DRAIN_LIMIT:
+                try:
+                    chunk = self.conn.recv(
+                        min(4096, RECOVERY_DRAIN_LIMIT - drained))
+                except (socket.timeout, TimeoutError):
+                    break
+                except OSError as exc:
+                    raise RealMSXError(
+                        f"agent receive failed during recovery: {exc}") from exc
+                if not chunk:
+                    raise RealMSXError("agent disconnected during recovery")
+                drained += len(chunk)
+        finally:
+            self.conn.settimeout(original_timeout)
+        return drained
+
+    def _rebootstrap_v3(self):
+        """Reset a damaged framed session and negotiate a fresh v3 session."""
+        self._require_connection()
+        with self._lock:
+            original_timeout = self.conn.gettimeout()
+            probe_timeout = min(self.socket_timeout, BOOTSTRAP_PROBE_TIMEOUT)
+            try:
+                self._drain_recovery_noise()
+                # Once the marker is attempted, the old framed parser can no
+                # longer be trusted even if the automatic raw HELLO is lost.
+                self._v3 = None
+                self._debug_peer_sent = False
+                self._send_reconnect_escape()
+                try:
+                    reply = self._scan_bootstrap_hello(
+                        probe_timeout, byte_limit=RECOVERY_SCAN_LIMIT)
+                except RealMSXTimeoutError:
+                    # The marker may already have switched the agent to raw
+                    # mode while its unsolicited HELLO was truncated or lost.
+                    # Drain that partial reply, then query raw mode explicitly.
+                    self._drain_recovery_noise()
+                    self._send(b"?")
+                    reply = self._scan_bootstrap_hello(
+                        probe_timeout, byte_limit=RECOVERY_SCAN_LIMIT)
+                # The marker places the peer in raw bootstrap mode. Do not use
+                # info() here: another '?' would queue a second raw HELLO ahead
+                # of the framed-upgrade acknowledgement.
+                self.bootstrap_recovered = True
+                result = self._activate_bootstrap_hello(
+                    reply, v3_timeout=SNAPSHOT_REQUEST_TIMEOUT)
+                if self._v3 is None:
+                    raise RealMSXProtocolError(
+                        "agent did not renegotiate framed protocol v3")
+                return result
+            finally:
+                self.conn.settimeout(original_timeout)
 
     def _info_v3(self):
         with self._lock:
@@ -486,6 +637,17 @@ class RealMSX:
             (None if self.runtime_mode_id is None
              else f"unknown-{self.runtime_mode_id}"))
         self.feature_bits = reply[14] if len(reply) >= 15 else 0
+        if (transport == 0 and
+                self.feature_bits & FEATURE_FRAME_WAKE_ACK):
+            self._v3.frame_wake_ack = FRAME_WAKE_ACK
+            self._v3.frame_wake_ack_optional = False
+            self._v3.frame_wake_delay = 0.0
+        else:
+            self._v3.frame_wake_ack = None
+            self._v3.frame_wake_ack_optional = False
+            self._v3.frame_wake_delay = (
+                UART8251_FRAME_WAKE_DELAY if transport == 0 else 0.0)
+        self._send_debug_peer_label()
         return {
             "protocol": version,
             "bootstrap_protocol": self.bootstrap_protocol_version,
@@ -513,6 +675,39 @@ class RealMSX:
             "bootstrap_recovered": self.bootstrap_recovered,
             "peer": self.peer,
         }
+
+    def _send_debug_peer_label(self):
+        """Announce host-known peer metadata to foreground DEBUG exactly once."""
+        if (self._debug_peer_sent or self._v3 is None or not self.debug or
+                not self.feature_bits & FEATURE_DEBUG_PEER or
+                self.peer is None):
+            return
+        if isinstance(self.peer, (tuple, list)):
+            peer_host = str(self.peer[0])
+            if len(self.peer) >= 2:
+                peer_label = f"{peer_host}:{self.peer[1]}"
+            else:
+                peer_label = peer_host
+        else:
+            peer_host = str(self.peer)
+            peer_label = peer_host
+        try:
+            ipaddress.IPv4Address(peer_host)
+        except ipaddress.AddressValueError:
+            return
+        try:
+            payload = peer_label.encode("ascii")
+        except UnicodeEncodeError:
+            return
+        if (not payload or len(payload) > DEBUG_PEER_MAX or
+                any(byte < 0x20 or byte >= 0x7F for byte in payload)):
+            return
+        with self._lock:
+            reply = self._request_v3("I", payload)
+        if reply:
+            raise RealMSXProtocolError(
+                f"invalid debug peer-label response: {reply!r}")
+        self._debug_peer_sent = True
 
     def status(self):
         if self._v3 is not None:
@@ -575,6 +770,187 @@ class RealMSX:
                 self._send(b"g")
                 self._expect_ack()
         return "running"
+
+    def _resume_snapshot_pause(self):
+        """Release a host-owned snapshot pause without trusting prior state.
+
+        The first command is deliberately a direct ``g``. A status query can
+        itself be the frame whose reply is lost, so cleanup must not depend on
+        one before attempting to release the target. If the framed session is
+        damaged, reset it with the raw escape marker and verify the resulting
+        state before giving up.
+        """
+        if not self._snapshot_pause_owned:
+            return "running"
+        direct_error = None
+        try:
+            if self._v3 is None:
+                raise RealMSXProtocolError(
+                    "framed v3 session is unavailable during snapshot cleanup")
+            reply = self._request_v3("g")
+            if reply:
+                raise RealMSXProtocolError(
+                    f"invalid snapshot-resume response: {reply!r}")
+            self._snapshot_pause_owned = False
+            return "running"
+        except Exception as exc:
+            direct_error = exc
+
+        recovery_error = None
+        for _attempt in range(2):
+            try:
+                self._rebootstrap_v3()
+                state = self.status()["state"]
+                if state == "running":
+                    self._snapshot_pause_owned = False
+                    return "running"
+                if state != "paused":
+                    raise RealMSXError(
+                        "snapshot recovery expected a running or paused "
+                        f"target, got {state!r}")
+                reply = self._request_v3("g")
+                if reply:
+                    raise RealMSXProtocolError(
+                        f"invalid recovered snapshot-resume response: {reply!r}")
+                if self.status()["state"] != "running":
+                    raise RealMSXError(
+                        "agent acknowledged snapshot resume but did not report "
+                        "the running state")
+                self._snapshot_pause_owned = False
+                return "running"
+            except Exception as exc:
+                recovery_error = exc
+
+        raise RealMSXError(
+            "could not guarantee that the MSX resumed after its snapshot "
+            f"lease (direct resume failed: {direct_error}; recovery failed: "
+            f"{recovery_error})") from recovery_error
+
+    @contextmanager
+    def snapshot_lease(self, *, atomic=True,
+                       lease=SNAPSHOT_LEASE_TIMEOUTS):
+        """Own a bounded agent pause for one atomic data acquisition.
+
+        ``lease`` is measured in agent receive-timeout periods, not seconds.
+        Valid traffic refreshes the agent-side timeout, while silence after a
+        dead connection consumes the lease and eventually resumes the target.
+        Normal completion always sends ``g`` immediately.
+
+        A target that was already paused remains manually paused: this context
+        resumes only a pause that it acquired from an initially running state.
+        """
+        if not isinstance(atomic, bool):
+            raise TypeError("atomic must be a boolean")
+        if (isinstance(lease, bool) or not isinstance(lease, int) or
+                not 1 <= lease <= 0xFF):
+            raise ValueError("snapshot lease must be in range 1..255")
+        if not atomic:
+            yield False
+            return
+
+        with self._lock:
+            if self._snapshot_pause_owned:
+                raise RealMSXError(
+                    "a previous snapshot pause still requires cleanup")
+            has_snapshot_lease = (
+                self._v3 is not None and
+                bool(self.feature_bits & FEATURE_SNAPSHOT_LEASE))
+            # Feature-gate an old resident before even a status request: its
+            # live hook may be vulnerable to reentry while servicing that
+            # otherwise-small query. A foreground monitor has no resident hook
+            # and is safe to query while idle or already manually paused.
+            if (not has_snapshot_lease and
+                    self.runtime_mode == "foreground-monitor"):
+                state = self.status()["state"]
+                if state in ("monitor", "paused"):
+                    yield False
+                    return
+                raise RealMSXError(
+                    "atomic capture of running foreground code requires the "
+                    "snapshot-lease feature; stop or manually pause it, or "
+                    "retry with atomic=false")
+            if not has_snapshot_lease:
+                raise RealMSXError(
+                    "atomic capture requires an agent with the "
+                    "snapshot-lease feature; update MSXAI.COM or retry with "
+                    "atomic=false")
+            state = self.status()["state"]
+            if state == "paused":
+                # Preserve a caller-owned/manual pause.
+                yield False
+                return
+            if state == "monitor":
+                # No asynchronous application is running in this state.
+                yield False
+                return
+            if state != "running":
+                raise RealMSXError(
+                    f"cannot acquire an atomic snapshot while agent state is "
+                    f"{state!r}")
+
+            # Keep each retry comfortably inside the agent-side lease window.
+            # A complete 333-byte v3 frame takes about 0.18 seconds at 19,200
+            # baud; one second still leaves ample processing margin.
+            original_v3_timeout = self._v3.timeout
+            self._v3.timeout = min(
+                original_v3_timeout, SNAPSHOT_REQUEST_TIMEOUT)
+            try:
+                # Set ownership before S is sent. Even if its acknowledgement
+                # is lost, cleanup must assume that the target entered pause.
+                self._snapshot_pause_owned = True
+                try:
+                    for attempt in range(SNAPSHOT_PAUSE_ATTEMPTS):
+                        reply = self._request_v3("S", bytes([lease]))
+                        if reply:
+                            raise RealMSXProtocolError(
+                                f"invalid snapshot-lease response: {reply!r}")
+                        verified = self.status()["state"]
+                        if verified == "paused":
+                            break
+                        # A delayed cached ACK can arrive after lease expiry. A
+                        # fresh S sequence is then required to pause again.
+                        if (verified == "running" and
+                                attempt + 1 < SNAPSHOT_PAUSE_ATTEMPTS):
+                            continue
+                        if verified == "running":
+                            self._snapshot_pause_owned = False
+                        raise RealMSXError(
+                            "agent acknowledged snapshot lease but reported "
+                            f"state {verified!r}")
+                    yield True
+                    final_state = self.status()["state"]
+                    if final_state == "running":
+                        self._snapshot_pause_owned = False
+                        raise RealMSXError(
+                            "snapshot lease expired during acquisition; "
+                            "captured data was discarded because it is not "
+                            "atomic")
+                    if final_state != "paused":
+                        raise RealMSXError(
+                            "snapshot lease ended in unexpected agent state "
+                            f"{final_state!r}")
+                except BaseException as operation_error:
+                    if self._snapshot_pause_owned:
+                        try:
+                            self._resume_snapshot_pause()
+                        except BaseException as cleanup_error:
+                            # Keep acquisition failure as the primary error;
+                            # cleanup diagnostics remain available as cause.
+                            raise operation_error from cleanup_error
+                    raise
+                else:
+                    if self._snapshot_pause_owned:
+                        self._resume_snapshot_pause()
+            finally:
+                # Recovery may have replaced the V3Session. Restore the normal
+                # request timeout on whichever framed session is now current.
+                if self._v3 is not None:
+                    self._v3.timeout = original_v3_timeout
+                if self.conn is not None:
+                    try:
+                        self.conn.settimeout(original_v3_timeout)
+                    except (OSError, ValueError):
+                        pass
 
     def stop(self):
         """Abandon foreground-launched code and return to the upload monitor."""
@@ -1079,6 +1455,14 @@ class RealMSX:
         return "\n".join(self.read_screen(timeout=timeout))
 
     def close(self):
+        if self.conn is not None and self._snapshot_pause_owned:
+            try:
+                with self._lock:
+                    self._resume_snapshot_pause()
+            except Exception:
+                # The bounded lease remains the final target-side safeguard
+                # when the byte stream itself is no longer recoverable.
+                pass
         for sock in (self.conn, self.srv):
             if sock is not None:
                 try:

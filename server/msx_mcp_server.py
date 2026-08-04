@@ -15,7 +15,8 @@ import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import base64
 from msx_client import OpenMSX, OpenMSXError, PROJ
-from msx_real import RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES
+from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
+                      UART8251_BAUD)
 from msx_application import load_application
 import msx_screenshot
 
@@ -34,11 +35,16 @@ MSX2PLUS_MACHINE = os.environ.get(
     "MSX_AI_MSX2PLUS_MACHINE", "Sony_HB-F1XDJ_128K_Lite")
 DISK_EXTENSION = os.environ.get("MSX_AI_DISK_EXTENSION", "DDX_3.0")
 DOS_EXTENSION = os.environ.get("MSX_AI_DOS_EXTENSION", "SunriseIDE_Nextor")
+MCP_SLOT_EXPANDER = os.environ.get(
+    "MSX_AI_MCP_SLOT_EXPANDER", "slotexpander")
 RESIDENT_INSTALL_SECONDS = 15
 RESIDENT_PROMPT_GRACE_SECONDS = 15
-BENCH_AGENT_NAME = "MSXAITST.COM"
+BENCH_AGENT_NAME = "MSXAI.COM"
 REAL_BASIC_PROMPT_TIMEOUT_SECONDS = 10.0
 REAL_BASIC_PROMPT_POLL_SECONDS = 0.10
+UART_BITS_PER_BYTE = 10
+UART_SCREENSHOT_MARGIN = 1.15
+SLOW_SCREENSHOT_SECONDS = 10.0
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_VERSION = "0.5.0"
@@ -180,9 +186,9 @@ class Session:
         root = pathlib.Path(runtime.name)
         disk = root / "msxdos.dsk"
         home = root / "openmsx-home"
-        # Keep the bench copy distinct from a possibly stale MSXAI.COM in the
-        # base image. This exists only inside the disposable runtime disk; the
-        # canonical/public artifact remains MSXAI.COM.
+        # The disposable bench disk exposes exactly the same canonical name as
+        # a physical target. A stale copy is removed before import because
+        # diskmanipulator does not overwrite an existing same-name file.
         agent_com = root / BENCH_AGENT_NAME
         machine = None
         real = None
@@ -200,24 +206,38 @@ class Session:
             real = RealMSX(host=host, port=int(port)).listen()
             machine = OpenMSX(
                 machine=BASIC_MACHINE,
-                extensions=[DOS_EXTENSION, "rs232_proto"],
+                extensions=[
+                    MCP_SLOT_EXPANDER, DOS_EXTENSION, "rs232_proto"],
                 harddisk=str(disk), home=home,
             ).start(headless=not window)
             # Import while the emulated machine is off. openMSX may otherwise
             # retain stale filesystem sectors for a disk mounted by MSX-DOS.
             machine.cmd("set power off")
+            listing = machine.cmd("diskmanipulator dir hda1")
+            entry = re.search(
+                rf"(?im)^\s*{re.escape(BENCH_AGENT_NAME)}\s+\S+\s+(\d+)\s*$",
+                listing)
+            if entry is not None:
+                machine.cmd(
+                    f"diskmanipulator delete hda1 {BENCH_AGENT_NAME}")
             machine.cmd(f"diskmanipulator import hda1 {{{agent_com}}}")
+            listing = machine.cmd("diskmanipulator dir hda1")
+            entry = re.search(
+                rf"(?im)^\s*{re.escape(BENCH_AGENT_NAME)}\s+\S+\s+(\d+)\s*$",
+                listing)
+            expected_size = agent_com.stat().st_size
+            if entry is None or int(entry.group(1)) != expected_size:
+                observed = "missing" if entry is None else entry.group(1)
+                raise OpenMSXError(
+                    f"bench disk {BENCH_AGENT_NAME} verification failed: "
+                    f"expected {expected_size} bytes, found {observed}")
             for preload in preload_files:
                 preload = pathlib.Path(preload).resolve()
                 if not preload.is_file():
                     raise OpenMSXError(
                         f"bench preload file not found: {preload}")
                 machine.cmd(f"diskmanipulator import hda1 {{{preload}}}")
-            if window:
-                machine.cmd("set renderer SDLGL-PP")
             machine.power_on()
-            if window:
-                machine.cmd("set throttle on")
             machine.advance(14)
             command = f"{pathlib.Path(BENCH_AGENT_NAME).stem} /DRIVER:8251"
             if mode == "monitor":
@@ -247,7 +267,16 @@ class Session:
             machine.cmd(f"set rs232-net-address {host}:{real.port}")
             machine.cmd("set rs232-net-ip232 off")
             machine.cmd("plug msx-rs232 rs232-net")
-            peer = real.accept(timeout=float(timeout))
+            try:
+                peer = real.accept(timeout=float(timeout))
+            except Exception as exc:
+                try:
+                    failed_screen = machine.screen_text()
+                except Exception as screen_exc:
+                    failed_screen = f"<screen unavailable: {screen_exc}>"
+                raise OpenMSXError(
+                    f"{exc}\nMSX screen at TCP handshake failure:\n"
+                    f"{failed_screen}") from exc
             expected_runtime = (
                 "resident" if mode == "resident" else "foreground-monitor")
             if (real.runtime_mode is not None and
@@ -256,6 +285,12 @@ class Session:
                     f"agent handshake reported runtime {real.runtime_mode!r}; "
                     f"expected {expected_runtime!r}")
             real.simulation = "openmsx-rs232-net"
+
+            # Keep the renderer disabled during boot and the initial serial
+            # negotiation. A visible renderer can delay the foreground DEBUG
+            # bootstrap beyond the deliberately short raw-probe timeout.
+            if window:
+                machine.cmd("set renderer SDLGL-PP")
 
             self.msx = real
             self.profile = "real"
@@ -482,14 +517,8 @@ def t_mapper_select(page, segment):
 
 
 def _atomic_real(m, atomic, operation):
-    resume_after = bool(atomic) and m.status()["state"] == "running"
-    if resume_after:
-        m.pause()
-    try:
+    with m.snapshot_lease(atomic=atomic):
         return operation()
-    finally:
-        if resume_after:
-            m.resume()
 
 
 def t_memory_read(space, address, length, atomic=True):
@@ -625,10 +654,61 @@ def t_app_load(path, format=None, execute=None, verify=False):
     return json.dumps(result, sort_keys=True)
 
 
-def t_screenshot(atomic=True, page=None, sprites=True, palette=None):
+def _real_screenshot_estimate(m, plan):
+    """Return target bytes, estimated wire bytes and seconds for one capture."""
+    framed = m._v3 is not None
+    max_payload = m._v3.max_payload if framed else 255
+    metadata_sizes = [1, 8, 16, 3]
+    if plan.mode == 0:
+        metadata_sizes.append(1)
+    # A framed RAM read uses a 17-byte request and a 13-byte response header;
+    # raw v2 uses a four-byte command header and an unframed response.
+    wire_bytes = sum(
+        size + (30 if framed else 4) for size in metadata_sizes)
+    read_count = len(metadata_sizes)
+    for base, size in plan.ranges:
+        offset = 0
+        while offset < size:
+            address = base + offset
+            bank_remaining = 0x4000 - (address & 0x3FFF)
+            chunk = min(size - offset, max_payload, bank_remaining)
+            # v3 request/response framing contributes 31 bytes around every
+            # VRAM payload; the raw v2 VRAM read header is five bytes.
+            wire_bytes += chunk + (31 if framed else 5)
+            read_count += 1
+            offset += chunk
+    seconds = (wire_bytes * UART_BITS_PER_BYTE / UART8251_BAUD
+               * UART_SCREENSHOT_MARGIN)
+    return {
+        "target_bytes": plan.target_bytes,
+        "wire_bytes": wire_bytes,
+        "read_requests": read_count,
+        "seconds": seconds,
+    }
+
+
+def _guard_slow_real_screenshot(m, plan, allow_slow):
+    estimate = _real_screenshot_estimate(m, plan)
+    is_8251 = (getattr(m, "agent_transport_id", None) == 0 or
+               getattr(m, "agent_transport", None) == "uart-8251")
+    if (is_8251 and estimate["seconds"] > SLOW_SCREENSHOT_SECONDS and
+            not allow_slow):
+        raise OpenMSXError(
+            "slow 8251 screenshot refused before bulk VRAM acquisition: "
+            f"SCREEN {plan.mode} needs approximately "
+            f"{estimate['target_bytes']} target bytes, "
+            f"{estimate['read_requests']} reads and "
+            f"{estimate['seconds']:.1f} seconds at {UART8251_BAUD} baud. "
+            "Retry with allow_slow=true to opt in.")
+    return estimate
+
+
+def t_screenshot(atomic=True, page=None, sprites=True, palette=None,
+                 allow_slow=False):
     """Render a supported MSX screen mode to a PNG image content block."""
-    if not isinstance(atomic, bool) or not isinstance(sprites, bool):
-        raise TypeError("atomic and sprites must be booleans")
+    if (not isinstance(atomic, bool) or not isinstance(sprites, bool) or
+            not isinstance(allow_slow, bool)):
+        raise TypeError("atomic, sprites and allow_slow must be booleans")
     if page is not None:
         page = _int_in_range(page, "page", 0, 3)
     if palette is not None:
@@ -642,14 +722,21 @@ def t_screenshot(atomic=True, page=None, sprites=True, palette=None):
     m = SESSION.require()
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
-    resume_after = False
     try:
         if SESSION.profile == "real":
-            if atomic and m.status()["state"] == "running":
-                m.pause()
-                resume_after = True
-            _, mode = msx_screenshot.capture_realmsx(
-                m, path, palette=palette, sprites=sprites, page=page)
+            # Enter the bounded lease before the first metadata read. This
+            # feature-gates old vulnerable agents without touching their live
+            # hook and prevents a mode transition from mixing layouts.
+            with m.snapshot_lease(atomic=atomic):
+                plan = msx_screenshot.plan_realmsx_capture(
+                    m, sprites=sprites, page=page)
+                _guard_slow_real_screenshot(m, plan, allow_slow)
+                capture = msx_screenshot.acquire_realmsx_capture(
+                    m, sprites=sprites, page=page, plan=plan)
+            # The lease is released immediately after the last target byte.
+            # Rendering, PNG compression and Base64 encoding are host-only.
+            _, mode = msx_screenshot.render_realmsx_capture(
+                capture, path, palette=palette)
             source = "ASM agent/TCP"
         else:
             _, mode = msx_screenshot.capture_openmsx(
@@ -662,8 +749,6 @@ def t_screenshot(atomic=True, page=None, sprites=True, palette=None):
             os.unlink(path)
         except Exception:
             pass
-        if resume_after:
-            m.resume()
     return [{"type": "text", "text":
              f"[screenshot — SCREEN mode {mode} via {source}]"},
             {"type": "image", "data": data, "mimeType": "image/png"}]
@@ -912,8 +997,9 @@ TOOLS = {
             "timeout": {"type": "number", "default": 60}})),
     "msx_agent_listen": (t_agent_listen,
         "Listen for an MSX resident agent or transparent hardware adapter to "
-        "connect over TCP/IP. Use this when the adapter is configured as a TCP "
-        "client. The MCP protocol is independent of its UART hardware.",
+        "connect over TCP/IPv4. Use this after the user starts "
+        "open-msx-mcp.command, or when a hardware adapter is configured as a "
+        "TCP client. The MCP protocol is independent of its UART hardware.",
         _s({"host": {"type": "string", "default": "0.0.0.0"},
             "port": {"type": "integer", "default": 6603},
             "timeout": {"type": "number", "default": 60}})),
@@ -926,8 +1012,10 @@ TOOLS = {
             "timeout": {"type": "number", "default": 60}}, ["host"])),
     "msx_tcp_bench_start": (t_tcp_bench_start,
         "Start one isolated openMSX instance, install the resident ASM "
-        "agent, and connect to it through RS232-Net and TCP/IP. The emulator is "
-        "host-muted and remains alive until msx_shutdown. Supported memory, "
+        "agent, and connect to it through RS232-Net and TCP/IP. A headless "
+        "bench is host-muted; window=true enables its visible renderer with "
+        "normal sound after the TCP handshake. It remains alive until "
+        "msx_shutdown. Supported memory, "
         "hardware, execution, application, and screenshot operations use the "
         "TCP agent path, not openMSX debugger APIs. mode='resident' returns to "
         "DOS and supports pause/inspect/patch/resume of cooperative DOS-launched "
@@ -988,8 +1076,9 @@ TOOLS = {
            ["page", "segment"])),
     "msx_memory_read": (t_memory_read,
         "Read RAM or VRAM through the resident agent; returns hex. With atomic=true "
-        "(default), a running application is paused for a consistent snapshot and "
-        "then resumed. MemMan resident mode reserves RAM page 1 (0x4000-0x7FFF) "
+        "(default), a running application uses the bounded snapshot lease and "
+        "resumes immediately after the read. Older agents require atomic=false. "
+        "MemMan resident mode reserves RAM page 1 (0x4000-0x7FFF) "
         "but leaves pages 2 and 3 accessible.",
         _s({"space": {"type": "string", "enum": ["ram", "vram"]},
             "address": {"type": "integer", "minimum": 0},
@@ -999,7 +1088,8 @@ TOOLS = {
     "msx_memory_write": (t_memory_write,
         "Write hexadecimal bytes to RAM or VRAM through the resident agent. "
         "Set verify=true to read back and compare. With atomic=true (default), "
-        "a running application is paused for the complete write and then resumed. "
+        "a running application uses the bounded snapshot lease for the complete "
+        "write and then resumes. Older agents require atomic=false. "
         "MemMan resident mode reserves RAM page 1 while allowing pages 2 and 3; "
         "page 3 contains live BIOS/DOS state and arbitrary writes can crash the "
         "machine.",
@@ -1013,10 +1103,14 @@ TOOLS = {
         "Capture the current MSX screen as a PNG image by rendering VRAM host-side. "
         "Both backends support standard SCREEN 0-8 and 10-12, display pages, "
         "scroll and sprites without a visible renderer (SCREEN 9 is a vendor "
-        "specific Korean mode). An explicit 16xRGB palette overrides the VDP/"
+        "specific Korean mode). Atomic captures of a running real target use "
+        "a bounded snapshot lease and resume immediately after acquiring the "
+        "last target byte, before host rendering. Slow 8251 transfers are "
+        "refused unless allow_slow=true. An explicit 16xRGB palette overrides the VDP/"
         "BIOS palette mirror; this is useful for games that write the real "
         "VDP's write-only palette directly.",
         _s({"atomic": {"type": "boolean", "default": True},
+            "allow_slow": {"type": "boolean", "default": False},
             "page": {"type": "integer", "minimum": 0, "maximum": 3},
             "sprites": {"type": "boolean", "default": True},
             "palette": {"type": "array", "minItems": 16, "maxItems": 16,

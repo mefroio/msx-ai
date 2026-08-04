@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
@@ -94,7 +95,269 @@ class ResponsiveFakeStream:
             return data
 
 
+class PacedFakeStream:
+    """Collect split writes and optionally ignore complete request attempts."""
+
+    def __init__(self, respond_on_attempt=1):
+        self.respond_on_attempt = respond_on_attempt
+        self.timeout = None
+        self.chunks = []
+        self.requests = []
+        self.pending = b""
+        self.parser = FrameParser()
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def sendall(self, data):
+        self.chunks.append(bytes(data))
+        frames = self.parser.feed(data)
+        if not frames:
+            return
+        if len(frames) != 1:
+            raise AssertionError("one request attempt produced multiple frames")
+        request = frames[0]
+        self.requests.append(request)
+        if len(self.requests) >= self.respond_on_attempt:
+            self.pending = Frame(
+                FrameType.RESPONSE, request.sequence, request.opcode,
+                request.payload.upper()).encode()
+
+    def recv(self, size):
+        if not self.pending:
+            raise socket.timeout
+        data = self.pending[:size]
+        self.pending = self.pending[size:]
+        return data
+
+
+class WakeAckFakeStream(PacedFakeStream):
+    """A stream whose peer acknowledges the leading frame magic byte."""
+
+    def __init__(self, ack=b"A", ack_on_attempt=1, respond_on_attempt=1):
+        super().__init__(respond_on_attempt=respond_on_attempt)
+        self.ack = ack
+        self.ack_on_attempt = ack_on_attempt
+        self.wake_attempts = 0
+        self.ack_pending = False
+
+    def sendall(self, data):
+        if data == b"M":
+            self.chunks.append(bytes(data))
+            if self.parser.feed(data):
+                raise AssertionError("leading magic byte completed a frame")
+            self.wake_attempts += 1
+            self.ack_pending = self.wake_attempts >= self.ack_on_attempt
+            return
+        super().sendall(data)
+
+    def recv(self, size):
+        if self.ack_pending:
+            self.ack_pending = False
+            return self.ack
+        return super().recv(size)
+
+
+class ClockedWakeAckFakeStream(WakeAckFakeStream):
+    """Advance a test clock by the configured timeout when no ACK arrives."""
+
+    def __init__(self, clock, *, timeout_scale=1):
+        super().__init__(ack_on_attempt=999)
+        self.clock = clock
+        self.timeout_scale = timeout_scale
+        self.timeouts = []
+
+    def settimeout(self, value):
+        super().settimeout(value)
+        self.timeouts.append(value)
+
+    def recv(self, size):
+        if not self.ack_pending and not self.pending:
+            self.clock[0] += self.timeout * self.timeout_scale
+            raise socket.timeout
+        return super().recv(size)
+
+
 class V3SessionTest(unittest.TestCase):
+    def test_frame_wake_delay_defaults_to_one_unsplit_write(self):
+        stream = PacedFakeStream()
+        session = V3Session(stream, timeout=0.5)
+
+        with mock.patch("msx_v3.time.sleep") as sleep:
+            result = session.request(0x20, b"hello")
+
+        self.assertEqual(result, b"HELLO")
+        self.assertEqual(len(stream.chunks), 1)
+        self.assertTrue(stream.chunks[0].startswith(b"MX"))
+        sleep.assert_not_called()
+
+    def test_frame_wake_delay_sends_magic_then_remainder(self):
+        stream = PacedFakeStream()
+        session = V3Session(
+            stream, timeout=0.5, frame_wake_delay=0.002)
+
+        with mock.patch("msx_v3.time.sleep") as sleep:
+            result = session.request(0x20, b"hello")
+
+        self.assertEqual(result, b"HELLO")
+        self.assertEqual(stream.chunks[0], b"M")
+        self.assertTrue(stream.chunks[1].startswith(b"X"))
+        self.assertEqual(len(stream.chunks), 2)
+        self.assertEqual(
+            FrameParser().feed(b"".join(stream.chunks)), stream.requests)
+        sleep.assert_called_once_with(0.002)
+
+    def test_frame_wake_delay_repeats_identical_split_wire_on_retry(self):
+        stream = PacedFakeStream(respond_on_attempt=2)
+        session = V3Session(
+            stream, timeout=0.5, retries=1, frame_wake_delay=0.002)
+
+        with mock.patch("msx_v3.time.sleep") as sleep:
+            result = session.request(0x20, b"retry")
+
+        self.assertEqual(result, b"RETRY")
+        self.assertEqual(len(stream.chunks), 4)
+        first_wire = b"".join(stream.chunks[:2])
+        second_wire = b"".join(stream.chunks[2:])
+        self.assertEqual(first_wire, second_wire)
+        self.assertEqual(
+            [request.sequence for request in stream.requests], [0, 0])
+        self.assertEqual(sleep.call_args_list, [mock.call(0.002)] * 2)
+
+    def test_frame_wake_delay_must_be_finite_and_non_negative(self):
+        stream = PacedFakeStream()
+        for value in (-0.001, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    V3Session(stream, frame_wake_delay=value)
+        with self.assertRaises(TypeError):
+            V3Session(stream, frame_wake_delay=True)
+
+    def test_frame_wake_delay_never_sends_remainder_past_deadline(self):
+        stream = PacedFakeStream()
+        session = V3Session(
+            stream, timeout=0.001, retries=0, frame_wake_delay=0.002)
+
+        with (mock.patch("msx_v3.time.sleep") as sleep,
+              self.assertRaises(V3TimeoutError)):
+            session.request(0x20, b"deadline")
+
+        self.assertEqual(stream.chunks, [b"M"])
+        sleep.assert_not_called()
+
+    def test_frame_wake_ack_consumes_ack_before_sending_remainder(self):
+        stream = WakeAckFakeStream(ack=b"A")
+        session = V3Session(
+            stream, timeout=0.5, frame_wake_ack=b"A")
+
+        result = session.request(0x20, b"hello")
+
+        self.assertEqual(result, b"HELLO")
+        self.assertEqual(stream.chunks[0], b"M")
+        self.assertTrue(stream.chunks[1].startswith(b"X"))
+        self.assertEqual(len(stream.chunks), 2)
+        self.assertEqual(session.pop_protocol_errors(), [])
+
+    def test_frame_wake_ack_timeout_retries_magic_without_remainder(self):
+        stream = WakeAckFakeStream(ack=b"A", ack_on_attempt=2)
+        session = V3Session(
+            stream, timeout=0.5, retries=1, frame_wake_ack=b"A")
+
+        result = session.request(0x20, b"retry")
+
+        self.assertEqual(result, b"RETRY")
+        self.assertEqual(stream.chunks[0:2], [b"M", b"M"])
+        self.assertTrue(stream.chunks[2].startswith(b"X"))
+        self.assertEqual(len(stream.requests), 1)
+        self.assertEqual(stream.requests[0].sequence, 0)
+
+    def test_frame_wake_ack_repeats_identical_frame_after_response_timeout(self):
+        stream = WakeAckFakeStream(ack=b"A", respond_on_attempt=2)
+        session = V3Session(
+            stream, timeout=0.5, retries=1, frame_wake_ack=b"A")
+
+        result = session.request(0x20, b"retry")
+
+        self.assertEqual(result, b"RETRY")
+        self.assertEqual(stream.chunks[0], b"M")
+        self.assertEqual(stream.chunks[2], b"M")
+        self.assertEqual(stream.chunks[1], stream.chunks[3])
+        self.assertEqual(
+            [request.sequence for request in stream.requests], [0, 0])
+
+    def test_frame_wake_ack_must_be_exactly_one_byte(self):
+        stream = WakeAckFakeStream()
+        for value in (b"", b"AB"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    V3Session(stream, frame_wake_ack=value)
+        for value in (True, 0x06, "A"):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    V3Session(stream, frame_wake_ack=value)
+
+    def test_frame_wake_ack_rejects_wrong_ack_without_sending_remainder(self):
+        stream = WakeAckFakeStream(ack=b"N")
+        session = V3Session(
+            stream, timeout=0.5, retries=0, frame_wake_ack=b"A",
+            frame_wake_ack_optional=True)
+
+        with self.assertRaises(V3TimeoutError):
+            session.request(0x20, b"blocked")
+
+        self.assertEqual(stream.chunks, [b"M"])
+
+    def test_optional_frame_wake_ack_falls_back_for_old_agent(self):
+        stream = WakeAckFakeStream(ack_on_attempt=999)
+        session = V3Session(
+            stream, timeout=0.5, retries=0, frame_wake_ack=b"A",
+            frame_wake_ack_optional=True, frame_wake_ack_timeout=0.01)
+
+        result = session.request(0x20, b"legacy")
+
+        self.assertEqual(result, b"LEGACY")
+        self.assertEqual(stream.chunks[0], b"M")
+        self.assertTrue(stream.chunks[1].startswith(b"X"))
+        self.assertEqual(len(stream.requests), 1)
+
+    def test_optional_frame_wake_ack_reserves_half_short_deadline(self):
+        clock = [0.0]
+        stream = ClockedWakeAckFakeStream(clock)
+        with mock.patch("msx_v3.time.monotonic", side_effect=lambda: clock[0]):
+            session = V3Session(
+                stream, timeout=0.05, retries=0, frame_wake_ack=b"A",
+                frame_wake_ack_optional=True, frame_wake_ack_timeout=0.1)
+            result = session.request(0x20, b"short")
+
+        self.assertEqual(result, b"SHORT")
+        self.assertAlmostEqual(clock[0], 0.025)
+        self.assertTrue(any(abs(value - 0.025) < 1e-9
+                            for value in stream.timeouts))
+
+    def test_optional_frame_wake_ack_never_falls_back_past_deadline(self):
+        clock = [0.0]
+        stream = ClockedWakeAckFakeStream(clock, timeout_scale=2)
+        with (mock.patch("msx_v3.time.monotonic",
+                         side_effect=lambda: clock[0]),
+              self.assertRaises(V3TimeoutError)):
+            session = V3Session(
+                stream, timeout=0.05, retries=0, frame_wake_ack=b"A",
+                frame_wake_ack_optional=True, frame_wake_ack_timeout=0.1)
+            session.request(0x20, b"expired")
+
+        self.assertEqual(stream.chunks, [b"M"])
+
+    def test_frame_wake_ack_optional_and_timeout_validation(self):
+        stream = WakeAckFakeStream()
+        with self.assertRaises(TypeError):
+            V3Session(stream, frame_wake_ack_optional=1)
+        for value in (0, -0.1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    V3Session(stream, frame_wake_ack_timeout=value)
+        with self.assertRaises(TypeError):
+            V3Session(stream, frame_wake_ack_timeout=True)
+
     def test_generic_stream_roundtrip_sequence_and_lock(self):
         stream = ResponsiveFakeStream(delay=0.02)
         session = V3Session(stream, sequence_start=0xFFFE, timeout=0.5)

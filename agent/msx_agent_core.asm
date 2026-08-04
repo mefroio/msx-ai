@@ -27,6 +27,8 @@
 ;   m page segment            -> 'K', select mapper segment (monitor only)
 ;   F                         -> 'K',3,max-lo,max-hi; switch to framed v3
 ;   z                         -> 'K', uninstall (monitor state only)
+; Framed v3 adds a resident-only bounded snapshot pause:
+;   S lease                   -> OK, pause; 'g' resumes before lease expiry
 ;
 ; This cooperative monitor requires maskable interrupts and the BIOS H.KEYI
 ; chain to remain active.  Arbitrary games that replace the BIOS ISR or keep DI
@@ -67,6 +69,10 @@ CAPABILITIES:   equ 0FFh       ; core + framed v3 + hardware/mapping
 CAPABILITY_RUN: equ 008h
 CAPABILITY_MAPPING: equ 080h
 FEATURE_KEYBUF_INPUT: equ 001h ; optional v3 HELLO feature byte, bit 0
+FEATURE_DEBUG_PEER:  equ 002h ; foreground DEBUG peer label, bit 1
+FEATURE_SNAPSHOT_LEASE: equ 004h ; bounded resident snapshot pause, bit 2
+FEATURE_FRAME_WAKE_ACK: equ 008h ; parser-ready ACK after framed magic byte
+DEBUG_PEER_MAX:      equ 63
 ; The hook stack has no recursion, no local frame buffers and never calls user
 ; code. A static high-water audit stays below 64 bytes; 224 bytes leaves more
 ; than three times that headroom while keeping the universal build below BDOS.
@@ -95,6 +101,7 @@ FRAME_UNSUPPORTED: equ 7
 ; random serial noise must not silently downgrade an active v3 session.
 RECONNECT_BYTE:   equ 01Bh
 RECONNECT_LENGTH: equ 8
+FRAME_WAKE_ACK:   equ 006h      ; ACK: parser consumed the first frame byte
 
 if MSXAI_TSR_BUILD
     org TSR_BUILD_BASE
@@ -353,7 +360,10 @@ memman_incompatible_message:
 inconsistent_message:
     db "Inconsistent resident agent state",13,10,"$"
 usage_message:
-    db 13,10,"Usage:",13,10
+    db 13,10,"MSX-AI MCP Agent",13,10
+    db "Provides remote MCP control of MSX hardware over TCP/IP.",13,10
+    db "Author: Rodrigo Galhardi M. Garcia - Version 2.0",13,10,13,10
+    db "Usage:",13,10
     db "  MSXAI /DRIVER:8251",13,10
     db "  MSXAI /DRIVER:16C550",13,10
     db "  MSXAI /DRIVER:8251 /MONITOR [DEBUG ON]",13,10
@@ -699,6 +709,14 @@ in_hook:
     db 0
 resume_requested:
     db 0
+snapshot_lease:
+    ; Zero is the persistent manual pause. Non-zero values count transport
+    ; timeout periods before a snapshot pause automatically resumes.
+    db 0
+snapshot_lease_reload:
+    ; A successfully serviced frame reloads the current countdown from here,
+    ; so isolated slow-8251 timeouts do not accumulate across a long capture.
+    db 0
 vram_bank:
     db 0
 saved_r14:
@@ -780,6 +798,8 @@ resident_initialize:
     xor a
     ld (in_hook),a
     ld (resume_requested),a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     ld (post_action_pending),a
     ld (debug_column),a
     ld a,(runtime_mode)
@@ -796,6 +816,8 @@ monitor_reset:
     ld (run_state),a
     ld (in_hook),a
     ld (resume_requested),a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     ld (post_action_pending),a
 main_loop:
     call receive_dispatch
@@ -845,14 +867,44 @@ receive_dispatch:
 if MSXAI_TSR_BUILD
 resident_keyi_hook:
     push af
+    ld a,(in_hook)
+    or a
+    jr nz,memman_nested_keyi_return
+    ld a,1
+    ld (in_hook),a             ; close the guard before saving more context
     xor a
     ld (hook_kind),a
     jr resident_hook_saved_af
 
 resident_timi_hook:
     push af
+    ld a,(in_hook)
+    or a
+    jr nz,memman_nested_timi_return
     ld a,1
+    ld (in_hook),a             ; nested hooks now take the minimal return path
     ld (hook_kind),a
+    jr resident_hook_saved_af
+
+; A nested MemMan hook must return before saving another context or replacing
+; hook_dispatch_sp. MemMan receives QuitHook in A' bit 0: an exclusive H.KEYI
+; is suppressed, while H.TIMI and a future non-exclusive H.KEYI keep chaining.
+memman_nested_keyi_return:
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_KEYI_EXCLUSIVE
+    jr z,memman_nested_hook_continue
+    pop af
+    ex af,af'
+    ld a,1                     ; QuitHook=1: suppress exclusive H.KEYI
+    ex af,af'
+    ret
+memman_nested_timi_return:
+memman_nested_hook_continue:
+    pop af
+    ex af,af'
+    xor a                      ; QuitHook=0: continue the hook chain
+    ex af,af'
+    ret
 
 resident_hook_saved_af:
     push bc
@@ -872,8 +924,6 @@ resident_hook_saved_af:
     ; MemMan entered through a BIOS hook with its dispatcher and stack in
     ; stable page-3 RAM. Keep that stack: switching page 1 cannot invalidate it.
     ld (hook_dispatch_sp),sp
-    ld a,1
-    ld (in_hook),a
     ; An exclusive H.KEYI transport must suppress the previous RS-232 handler
     ; even when RxRDY is not set at this exact instruction. Otherwise a byte
     ; arriving between our poll and the old handler's poll can be stolen from
@@ -1135,9 +1185,11 @@ endif
 
 ; --------------------------------------------------------------- protocol ----
 dispatch:                       ; A = command
-    call debug_trace_command
+    ; The raw bootstrap has a deliberately short host timeout. Reply to its
+    ; probe immediately; tracing starts with the negotiated MCP operations.
     cp '?'
-    jp z,cmd_hello
+    jr z,cmd_hello
+    call debug_trace_command
     cp 'q'
     jp z,cmd_status
     cp 'r'
@@ -1198,13 +1250,24 @@ current_capabilities:
     ret
 
 current_features:
+    ld b,0
+    ld a,(active_transport_id)
+    cp UART8251_ID
+    jr nz,current_features_transport_ready
+    ld b,FEATURE_FRAME_WAKE_ACK
+current_features_transport_ready:
     ld a,(runtime_mode)
     cp RUNTIME_RESIDENT
-    jr nz,current_features_none
-    ld a,FEATURE_KEYBUF_INPUT
+    jr z,current_features_resident
+    ld a,(debug_enabled)
+    or a
+    ld a,b
+    ret z
+    or FEATURE_DEBUG_PEER
     ret
-current_features_none:
-    xor a
+current_features_resident:
+    ld a,b
+    or FEATURE_KEYBUF_INPUT | FEATURE_SNAPSHOT_LEASE
     ret
 
 cmd_status:
@@ -1413,6 +1476,8 @@ cmd_pause:
     ld (run_state),a
     xor a
     ld (resume_requested),a
+    ld (snapshot_lease),a      ; raw/manual pause remains persistent
+    ld (snapshot_lease_reload),a
 pause_service_loop:
     call receive_dispatch
     ld a,(resume_requested)
@@ -1425,6 +1490,9 @@ pause_service_loop:
 cmd_resume:
     ld a,1
     ld (resume_requested),a
+    xor a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     ld a,'K'
     jp ser_put
 
@@ -1434,6 +1502,9 @@ cmd_stop:
     jp nz,error_busy
     ld a,'K'
     call ser_put
+    xor a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     ld a,(in_hook)
     or a
     ret z
@@ -1687,6 +1758,16 @@ frame_seek_magic:
     cp 'M'
     jr nz,frame_seek_magic
 frame_have_magic_m:
+    ; The 8251 has no receive FIFO. Confirm that the hook is already inside the
+    ; framed parser before the host releases the rest of a 19,200-baud frame.
+    ; The 16C550 does not need this round trip because its FIFO is protected by
+    ; RTS/CTS, so only the 8251 advertises and emits the ready byte.
+    ld a,(active_transport_id)
+    cp UART8251_ID
+    jr nz,frame_wait_second_magic
+    ld a,FRAME_WAKE_ACK
+    call ser_put
+frame_wait_second_magic:
     call ser_get
     cp 'X'
     jr z,frame_magic_found
@@ -1889,6 +1970,8 @@ frame_dispatch:
     jp z,frame_cmd_status
     cp 't'
     jp z,frame_cmd_keybuf_input
+    cp 'I'
+    jp z,frame_cmd_debug_peer
     cp 'r'
     jp z,frame_cmd_ram_read
     cp 'p'
@@ -1901,6 +1984,8 @@ frame_dispatch:
     jp z,frame_cmd_call
     cp 'j'
     jp z,frame_cmd_run
+    cp 'S'
+    jp z,frame_cmd_snapshot_pause
     cp 's'
     jp z,frame_cmd_pause
     cp 'g'
@@ -2179,6 +2264,68 @@ frame_cmd_status:
     xor a
     ld (frame_response_status),a
     jp frame_cache_and_send
+
+; Optional host-provided peer label. The UART agent cannot discover TCP/IP
+; metadata itself, so a v3 host sends the accepted peer address after HELLO.
+; Only printable ASCII is accepted, preventing terminal-control injection.
+frame_cmd_debug_peer:
+    ld a,(runtime_mode)
+    cp RUNTIME_MONITOR
+    jp nz,frame_reply_bad_state
+    ld a,(debug_enabled)
+    or a
+    jp z,frame_reply_unsupported
+    ld a,(in_hook)
+    or a
+    jp nz,frame_reply_bad_state
+    ld hl,(frame_length)
+    ld a,h
+    or a
+    jp nz,frame_reply_range
+    ld a,l
+    or a
+    jp z,frame_reply_bad_arg
+    cp DEBUG_PEER_MAX + 1
+    jp nc,frame_reply_range
+    ld b,a
+    ld hl,frame_request_buffer
+frame_debug_peer_validate:
+    ld a,(hl)
+    cp 020h
+    jp c,frame_reply_bad_arg
+    cp 07Fh
+    jp nc,frame_reply_bad_arg
+    inc hl
+    djnz frame_debug_peer_validate
+
+    ld a,13
+    call debug_putchar
+    ld a,10
+    call debug_putchar
+    ld hl,debug_peer_prefix
+frame_debug_peer_prefix_loop:
+    ld a,(hl)
+    or a
+    jr z,frame_debug_peer_payload
+    call debug_putchar
+    inc hl
+    jr frame_debug_peer_prefix_loop
+frame_debug_peer_payload:
+    ld hl,frame_request_buffer
+    ld a,(frame_length)
+    ld c,a
+frame_debug_peer_payload_loop:
+    ld a,c
+    or a
+    jp z,frame_reply_ok
+    ld a,(hl)
+    call debug_putchar
+    inc hl
+    dec c
+    jr frame_debug_peer_payload_loop
+
+debug_peer_prefix:
+    db "MCP client: ",0
 
 ; Request payload: zero to query the queue, otherwise 1..39 keyboard bytes.
 ; Response payload: accepted byte count, then bytes pending in the BIOS ring.
@@ -2662,6 +2809,38 @@ frame_reply_ok_prepare:
     ld (frame_response_length),hl
     ret
 
+; A snapshot pause is deliberately bounded for slow transports such as the
+; 19,200-baud 8251. The host normally sends RESUME immediately after acquiring
+; the required bytes; transport silence instead consumes the lease and safely
+; restores the interrupted application when the lease reaches zero.
+frame_cmd_snapshot_pause:
+    ld de,1
+    call frame_require_length
+    jp nz,frame_reply_bad_arg
+    ld a,(in_hook)
+    or a
+    jp z,frame_reply_bad_state
+    ld a,(run_state)
+    cp 1
+    jp nz,frame_reply_bad_state
+    ld a,(frame_request_buffer)
+    or a
+    jp z,frame_reply_bad_arg
+    ld a,1
+    ld (post_action_pending),a
+    call frame_reply_ok_prepare
+    call frame_cache_and_send
+    xor a
+    ld (post_action_pending),a
+    ld a,2
+    ld (run_state),a
+    xor a
+    ld (resume_requested),a
+    ld a,(frame_request_buffer)
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
+    jr frame_pause_service_loop
+
 frame_cmd_pause:
     ld de,0
     call frame_require_length
@@ -2682,16 +2861,23 @@ frame_cmd_pause:
     ld (run_state),a
     xor a
     ld (resume_requested),a
+    ld (snapshot_lease),a      ; lowercase 's' is a persistent manual pause
+    ld (snapshot_lease_reload),a
 frame_pause_service_loop:
     call receive_dispatch
     ld a,(resume_requested)
     or a
-    jr z,frame_pause_service_loop
+    jr nz,frame_pause_complete
+    ld a,(snapshot_lease_reload)
+    ld (snapshot_lease),a      ; successful traffic renews a bounded pause
+    jr frame_pause_service_loop
 frame_pause_complete:
     ld a,1
     ld (run_state),a
     xor a
     ld (resume_requested),a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     ; A pause may span any number of protocol frames and transport timeouts.
     ; Discard the nested parser stack and unwind through the one saved hook
     ; context instead of depending on the original PAUSE call chain.
@@ -2707,6 +2893,9 @@ frame_cmd_resume:
     jp nz,frame_reply_bad_state
     ld a,1
     ld (resume_requested),a
+    xor a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     jp frame_reply_ok
 
 frame_cmd_stop:
@@ -2722,6 +2911,8 @@ frame_cmd_stop:
     call frame_cache_and_send
     xor a
     ld (post_action_pending),a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     ld a,(in_hook)
     or a
     ret z
@@ -2990,17 +3181,25 @@ hook_timeout_no_pending_action:
     ld a,(run_state)
     cp 2
     jr nz,hook_timeout_state_done
-    ; An explicit pause is persistent. A quiet or temporarily disconnected
-    ; transport must not silently resume the application. Restart the framed
-    ; scanner on the saved hook stack; a later RESUME (or its retry) performs
-    ; the single controlled unwind in frame_pause_complete.
+    ; RESUME wins immediately, including when its acknowledgement was lost.
     ld a,(resume_requested)
     or a
     jp nz,frame_pause_complete
+    ; A zero lease identifies the persistent lowercase-'s' manual pause. A
+    ; snapshot lease loses one unit per complete transport timeout so a vanished
+    ; or stalled 8251 peer cannot leave the game frozen indefinitely.
+    ld a,(snapshot_lease)
+    or a
+    jp z,frame_pause_service_loop
+    dec a
+    ld (snapshot_lease),a
+    jp z,frame_pause_complete
     jp frame_pause_service_loop
 hook_timeout_state_done:
     xor a
     ld (resume_requested),a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
     jp hook_done
 
 ; Request and response deliberately share the negotiated work area. This keeps

@@ -87,6 +87,9 @@ uart16c550_restore:
 
 uart16c550_rx_ready:
     in a,(UART16C550_LSR)
+    inc a                       ; FFh means an absent/floating UART, not data
+    ret z
+    dec a
     and 01h                     ; data ready
     ret
 

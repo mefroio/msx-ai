@@ -73,6 +73,7 @@ class _FakeMachine:
         self.advances = []
         self.typed = []
         self.imported_agent = None
+        self.disk_files = {"MSXAI.COM": b"stale-agent"}
         self.closed = False
 
     def start(self, *, headless):
@@ -89,9 +90,16 @@ class _FakeMachine:
         if command.startswith("debug read memory"):
             raise AssertionError("bench must not inspect a fixed resident address")
         self.commands.append(command)
+        if command == "diskmanipulator dir hda1":
+            return "\n".join(
+                f"{name.lower():<12} -----  {len(data)}"
+                for name, data in self.disk_files.items())
+        if command.startswith("diskmanipulator delete hda1"):
+            self.disk_files.pop(command.rsplit(" ", 1)[-1].upper(), None)
         if command.startswith("diskmanipulator import hda1"):
             path = re.search(r"\{(.+)\}", command).group(1)
             self.imported_agent = Path(path).read_bytes()
+            self.disk_files[Path(path).name.upper()] = self.imported_agent
         return ""
 
     def type_line(self, command):
@@ -151,25 +159,39 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                           msx_mcp_server.shutil, "copytree",
                           side_effect=copy_home),
                       mock.patch.object(
-                          msx_mcp_server, "OpenMSX", return_value=machine),
+                          msx_mcp_server, "OpenMSX",
+                          return_value=machine) as openmsx,
                       mock.patch.object(
                           msx_mcp_server, "RealMSX", return_value=real)):
-                    peer = session.start_tcp_bench(timeout=12)
+                    peer = session.start_tcp_bench(timeout=12, window=True)
 
                 self.assertEqual(peer, ("127.0.0.1", 65000))
                 build.assert_called_once_with()
                 self.assertEqual(
+                    openmsx.call_args.kwargs["extensions"],
+                    [msx_mcp_server.MCP_SLOT_EXPANDER,
+                     msx_mcp_server.DOS_EXTENSION, "rs232_proto"])
+                self.assertEqual(
                     machine.imported_agent, b"canonical-universal-agent")
-                self.assertEqual(machine.typed, ["MSXAITST /DRIVER:8251"])
+                self.assertEqual(machine.typed, ["MSXAI /DRIVER:8251"])
+                delete_index = machine.commands.index(
+                    "diskmanipulator delete hda1 MSXAI.COM")
+                import_index = next(
+                    index for index, command in enumerate(machine.commands)
+                    if command.startswith("diskmanipulator import hda1"))
+                self.assertLess(delete_index, import_index)
                 self.assertLess(
                     machine.commands.index("set power off"),
-                    next(index for index, command in enumerate(machine.commands)
-                         if command.startswith("diskmanipulator import hda1")))
+                    import_index)
                 self.assertIn(
                     msx_mcp_server.RESIDENT_INSTALL_SECONDS,
                     machine.advances)
                 self.assertEqual(real.accepted_timeout, 12.0)
                 self.assertEqual(real.simulation, "openmsx-rs232-net")
+                self.assertFalse(machine.headless)
+                self.assertLess(
+                    machine.commands.index("plug msx-rs232 rs232-net"),
+                    machine.commands.index("set renderer SDLGL-PP"))
                 self.assertFalse(any(
                     command.startswith("debug read memory")
                     for command in machine.commands))

@@ -157,6 +157,11 @@ class _ConnectedStream:
     def __init__(self, stream, peer=("198.51.100.7", 6603)):
         self.stream = stream
         self.peer = peer
+        self.family = socket.AF_INET
+        self.socket_options = []
+
+    def setsockopt(self, level, option, value):
+        self.socket_options.append((level, option, value))
 
     def recv(self, size):
         return self.stream.recv(size)
@@ -260,16 +265,16 @@ class RealMSXTransportTest(unittest.TestCase):
         with self.assertRaises(RealMSXError):
             self.msx.resume()
 
-    def test_mcp_atomic_write_restores_running_state(self):
+    def test_mcp_atomic_write_refuses_legacy_running_agent(self):
         self.msx.run(0x8000)
         previous = (msx_mcp_server.SESSION.msx,
                     msx_mcp_server.SESSION.profile)
         msx_mcp_server.SESSION.msx = self.msx
         msx_mcp_server.SESSION.profile = "real"
         try:
-            result = msx_mcp_server.t_memory_write(
-                "ram", 0x4000, "4d4350", verify=True)
-            self.assertIn("verified", result)
+            with self.assertRaisesRegex(RealMSXError, "snapshot-lease"):
+                msx_mcp_server.t_memory_write(
+                    "ram", 0x4000, "4d4350", verify=True)
             self.assertEqual(self.msx.status()["state"], "running")
         finally:
             (msx_mcp_server.SESSION.msx,
@@ -375,7 +380,8 @@ class RealMSXTransportTest(unittest.TestCase):
 
 class RealMSXTCPConnectionModesTest(unittest.TestCase):
     def test_tcp_listener_accepts_adapter_client(self):
-        accepted, resident = socket.socketpair()
+        accepted_socket, resident = socket.socketpair()
+        accepted = _ConnectedStream(accepted_socket)
         listener = _FakeTCPListener(accepted)
         agent = FakeResidentAgent(resident)
         msx = RealMSX(host="0.0.0.0", port=0, socket_timeout=1)
@@ -389,6 +395,9 @@ class RealMSXTCPConnectionModesTest(unittest.TestCase):
             self.assertEqual(listener.bound, ("0.0.0.0", 0))
             self.assertEqual(msx.network_transport, "tcp")
             self.assertEqual(msx.network_role, "listen")
+            self.assertIn(
+                (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                accepted.socket_options)
             self.assertEqual(msx.info()["network_transport"], "tcp")
             self.assertEqual(msx.status()["state"], "monitor")
         finally:
@@ -402,20 +411,31 @@ class RealMSXTCPConnectionModesTest(unittest.TestCase):
         msx = RealMSX(socket_timeout=1)
         try:
             with mock.patch.object(
+                    msx_real.socket, "gethostbyname",
+                    return_value="198.51.100.7") as gethostbyname, \
+                 mock.patch.object(
                     msx_real.socket, "create_connection",
                     return_value=stream) as create_connection:
                 peer = msx.connect("adapter.example", 6603, timeout=1)
 
+            gethostbyname.assert_called_once_with("adapter.example")
             create_connection.assert_called_once_with(
-                ("adapter.example", 6603), timeout=1.0)
+                ("198.51.100.7", 6603), timeout=1.0)
             self.assertEqual(peer, ("198.51.100.7", 6603))
             self.assertEqual(msx.network_transport, "tcp")
             self.assertEqual(msx.network_role, "connect")
+            self.assertIn(
+                (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                stream.socket_options)
             self.assertEqual(msx.info()["network_role"], "connect")
             self.assertEqual(msx.status()["state"], "monitor")
         finally:
             msx.close()
             agent.close()
+
+    def test_tcp_connector_rejects_ipv6_target(self):
+        with self.assertRaisesRegex(RealMSXError, "IPv6 is not supported"):
+            RealMSX(socket_timeout=1).connect("::1", 6603, timeout=1)
 
     def test_stream_contract_is_explicit(self):
         with self.assertRaisesRegex(TypeError, "recv"):

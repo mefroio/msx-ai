@@ -17,14 +17,15 @@ UART8251_TIMER_TX:      equ 085h
 UART8251_TIMER_CONTROL: equ 087h
 UART8251_TIMER_RX_MODE: equ 036h    ; counter 0, LSB/MSB, mode 3, binary
 UART8251_TIMER_TX_MODE: equ 076h    ; counter 1, LSB/MSB, mode 3, binary
-UART8251_TIMER_DIVISOR: equ 24      ; 1.8432 MHz / 24 / 16 = 4,800 baud
+UART8251_TIMER_DIVISOR: equ 6       ; 1.8432 MHz / 6 / 16 = 19,200 baud
 
 uart8251_init:
     ; The standard MSX RS-232 interface clocks the 8251 from counters 0 and 1
     ; of an 8253/8254 at ports 84h..87h. Leaving those counters at firmware or
     ; power-on values makes receive delivery intermittent. Program both sides
-    ; explicitly for a rate whose 2.08-ms character interval tolerates the
-    ; MemMan/BIOS interrupt path without overflowing the one-byte receiver.
+    ; explicitly for 19,200 baud, the 8251A asynchronous maximum in x16 mode.
+    ; Going faster is unsafe on this one-byte receiver without a FIFO or flow
+    ; control; higher rates belong to the separate 16C550 transport.
     ld a,UART8251_TIMER_RX_MODE
     out (UART8251_TIMER_CONTROL),a
     ld a,UART8251_TIMER_DIVISOR
@@ -65,6 +66,16 @@ uart8251_restore:
 
 uart8251_rx_ready:
     in a,(UART8251_STATUS)
+    inc a                       ; FFh means an absent/floating UART, not RxRDY
+    ret z
+    dec a
+    push af
+    and 038h                    ; PE|OE|FE are sticky until command ER is set
+    jr z,uart8251_rx_status_clean
+    ld a,037h                   ; preserve Tx/Rx/DTR/RTS and reset errors
+    out (UART8251_STATUS),a
+uart8251_rx_status_clean:
+    pop af
     and 02h                     ; 8251 RxRDY
     ret
 

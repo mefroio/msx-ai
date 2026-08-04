@@ -9,6 +9,7 @@ the same sequence number, and correlated with their response.
 from __future__ import annotations
 
 from collections import deque
+import math
 import socket
 import threading
 import time
@@ -48,6 +49,7 @@ DEFAULT_TIMEOUT = 1.0
 DEFAULT_RETRIES = 2
 DEFAULT_MAX_PAYLOAD = 4096
 DEFAULT_RECV_SIZE = 4096
+DEFAULT_FRAME_WAKE_ACK_TIMEOUT = 0.1
 
 
 class V3SessionError(Exception):
@@ -154,6 +156,10 @@ class _AttemptTimedOut(Exception):
     """Private control-flow exception for one request attempt."""
 
 
+class _FrameWakeAckTimedOut(Exception):
+    """Private signal that an optional wake ACK did not arrive in time."""
+
+
 def _payload_limit(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer")
@@ -172,6 +178,29 @@ def _positive_float(value: float, name: str) -> float:
         raise TypeError(f"{name} must be a number") from exc
     if result <= 0:
         raise ValueError(f"{name} must be greater than zero")
+    return result
+
+
+def _non_negative_float(value: float, name: str) -> float:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a number") from exc
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return result
+
+
+def _optional_single_byte(value, name: str) -> bytes | None:
+    if value is None:
+        return None
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError(f"{name} must be a bytes-like object or None")
+    result = bytes(value)
+    if len(result) != 1:
+        raise ValueError(f"{name} must contain exactly one byte")
     return result
 
 
@@ -200,7 +229,11 @@ class V3Session:
                  max_payload: int = DEFAULT_MAX_PAYLOAD,
                  peer_max_payload: int | None = None,
                  recv_size: int = DEFAULT_RECV_SIZE,
-                 sequence_start: int = 0,
+                 sequence_start: int = 0, frame_wake_delay: float = 0,
+                 frame_wake_ack: bytes | None = None,
+                 frame_wake_ack_optional: bool = False,
+                 frame_wake_ack_timeout: float =
+                 DEFAULT_FRAME_WAKE_ACK_TIMEOUT,
                  queue_limit: int = 256):
         if not callable(getattr(stream, "recv", None)):
             raise TypeError("stream must provide recv(size)")
@@ -212,6 +245,8 @@ class V3Session:
         if (isinstance(queue_limit, bool) or not isinstance(queue_limit, int)
                 or queue_limit <= 0):
             raise ValueError("queue_limit must be a positive integer")
+        if not isinstance(frame_wake_ack_optional, bool):
+            raise TypeError("frame_wake_ack_optional must be a boolean")
 
         self.stream = stream
         self.timeout = _positive_float(timeout, "timeout")
@@ -223,6 +258,16 @@ class V3Session:
         self.max_payload = min(
             self.local_max_payload, self.peer_max_payload)
         self.recv_size = recv_size
+        self.frame_wake_delay = _non_negative_float(
+            frame_wake_delay, "frame_wake_delay")
+        self.frame_wake_ack = _optional_single_byte(
+            frame_wake_ack, "frame_wake_ack")
+        self.frame_wake_ack_optional = frame_wake_ack_optional
+        self.frame_wake_ack_timeout = _positive_float(
+            frame_wake_ack_timeout, "frame_wake_ack_timeout")
+        if not math.isfinite(self.frame_wake_ack_timeout):
+            raise ValueError(
+                "frame_wake_ack_timeout must be a finite positive number")
 
         self._sequences = SequenceCounter(sequence_start)
         self._parser = FrameParser(max_payload=self.max_payload)
@@ -362,6 +407,32 @@ class V3Session:
         return remaining
 
     def _send_wire(self, wire: bytes, deadline: float) -> None:
+        if self.frame_wake_ack is not None:
+            self._send_wire_chunk(wire[:1], deadline)
+            ack_deadline = deadline
+            if self.frame_wake_ack_optional:
+                remaining = self._remaining(deadline)
+                ack_wait = min(
+                    self.frame_wake_ack_timeout, remaining / 2)
+                ack_deadline = min(
+                    deadline, time.monotonic() + ack_wait)
+            try:
+                self._wait_for_frame_wake_ack(ack_deadline)
+            except _FrameWakeAckTimedOut:
+                if not self.frame_wake_ack_optional:
+                    raise _AttemptTimedOut from None
+            self._send_wire_chunk(wire[1:], deadline)
+            return
+        if self.frame_wake_delay > 0:
+            self._send_wire_chunk(wire[:1], deadline)
+            if self.frame_wake_delay >= self._remaining(deadline):
+                raise _AttemptTimedOut
+            time.sleep(self.frame_wake_delay)
+            self._send_wire_chunk(wire[1:], deadline)
+            return
+        self._send_wire_chunk(wire, deadline)
+
+    def _send_wire_chunk(self, wire: bytes, deadline: float) -> None:
         self._set_stream_timeout(self._remaining(deadline))
         try:
             self.stream.sendall(wire)
@@ -369,6 +440,28 @@ class V3Session:
             raise _AttemptTimedOut from exc
         except OSError as exc:
             raise V3TransportError(f"v3 send failed: {exc}") from exc
+
+    def _wait_for_frame_wake_ack(self, deadline: float) -> None:
+        self._set_stream_timeout(self._remaining(deadline))
+        try:
+            chunk = self.stream.recv(1)
+        except (socket.timeout, TimeoutError) as exc:
+            raise _FrameWakeAckTimedOut from exc
+        except OSError as exc:
+            raise V3TransportError(
+                f"v3 frame-wake receive failed: {exc}") from exc
+        if not chunk:
+            raise V3DisconnectedError("v3 peer disconnected")
+        try:
+            data = bytes(chunk)
+        except (TypeError, ValueError) as exc:
+            raise V3TransportError(
+                "stream recv() returned a non-bytes value") from exc
+        if len(data) != 1:
+            raise V3TransportError(
+                "stream recv(1) returned more than one byte")
+        if data != self.frame_wake_ack:
+            raise _AttemptTimedOut
 
     def _wait_for_response(self, request: Frame, deadline: float) -> Frame:
         while True:
@@ -435,7 +528,8 @@ class V3Session:
 
 __all__ = [
     "DEFAULT_TIMEOUT", "DEFAULT_RETRIES", "DEFAULT_MAX_PAYLOAD",
-    "DEFAULT_RECV_SIZE", "V3Session", "V3SessionError",
+    "DEFAULT_RECV_SIZE", "DEFAULT_FRAME_WAKE_ACK_TIMEOUT", "V3Session",
+    "V3SessionError",
     "V3TransportError", "V3DisconnectedError", "V3TimeoutError",
     "UnexpectedFrameError", "RemoteStatusError",
     "RemoteInvalidOpcodeError", "RemoteInvalidArgumentError",

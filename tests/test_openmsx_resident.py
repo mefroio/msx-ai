@@ -149,6 +149,8 @@ mailbox: dw 0
         self.assertNotIn("mapping", status["capabilities"])
         self.assertEqual(status["agent_transport"], "uart-8251")
         self.assertEqual(status["agent_transport_id"], 0)
+        self.assertIn("snapshot-lease", status["features"])
+        self.assertIn("frame-wake-ack", status["features"])
 
         mapping = self.tool_result(
             "msx_slot_select", page=0, slot_id=0)
@@ -157,7 +159,10 @@ mailbox: dw 0
             "unavailable in resident mode", mapping["content"][0]["text"])
 
         machine.type_line("COUNT")
-        machine.advance(0.4)
+        # The command echo can appear before Nextor has finished loading the
+        # COM file from the emulated disk. Give that I/O a deterministic margin
+        # before asserting through the independent TCP/agent path.
+        machine.advance(1.0)
         self.assertEqual(
             self.read_memory("ram", 0x0100, 11),
             bytes.fromhex("fb762a0b0123220b0118f6"),
@@ -171,6 +176,16 @@ mailbox: dw 0
             print(self.machine_diagnostics(machine), file=sys.stderr)
             raise
         self.assertGreater(second, first)
+
+        # Exercise the bounded S lease while the fixture is actively running.
+        running_screenshot = self.call_tool("msx_screenshot", atomic=True)
+        self.assertTrue(base64.b64decode(
+            running_screenshot[1]["data"]).startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(self.status()["state"], "running")
+        machine.advance(0.4)
+        after_snapshot = int.from_bytes(
+            self.read_memory("ram", 0x010B, 2), "little")
+        self.assertGreater(after_snapshot, second)
 
         self.call_tool("msx_pause")
         paused = int.from_bytes(self.read_memory("ram", 0x010B, 2), "little")
@@ -189,6 +204,7 @@ mailbox: dw 0
         self.assertIn("ASM agent/TCP", screenshot[0]["text"])
         self.assertTrue(base64.b64decode(screenshot[1]["data"]).startswith(
             b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(self.status()["state"], "paused")
 
         self.call_tool("msx_resume")
         machine.advance(0.4)

@@ -145,6 +145,7 @@ Available profiles are:
 - `disk`: the same machine with the DDX 3.0 disk extension.
 - `dos`: the same machine with Sunrise IDE/Nextor and a local hard-disk image.
 - `msx2plus`: Sony HB-F1XDJ MSX2+ configuration.
+- `mcp`: the reusable, user-owned foreground TCP test instance described below.
 
 ### TCP agent test bench
 
@@ -152,6 +153,9 @@ Available profiles are:
 canonical `MSXAI.COM`, selects the 8251 driver, and connects it to the MCP
 server through RS232-Net/TCP. All physical-agent operations then use the TCP
 protocol; they do not use openMSX debugger memory APIs.
+
+The isolated bench also loads the generic four-way slot expander before its
+Sunrise/Nextor and RS-232 cartridges.
 
 For an interactive resident test, call it with:
 
@@ -168,6 +172,51 @@ For direct ASM upload and on-screen command tracing:
 
 ~~~~json
 {"window": true, "mode": "monitor", "debug": true}
+~~~~
+
+### Reusable user-launched TCP instance
+
+On macOS, double-click `open-msx-mcp.command`, or run:
+
+~~~~sh
+./open-msx-mcp.command
+~~~~
+
+The launcher builds the canonical `MSXAI.COM`, copies the local MSX-DOS disk
+to a disposable runtime image, and starts one visible openMSX instance with
+normal sound. It makes the agent available on the runtime disk but does not
+start it automatically, so the user can choose resident or foreground-monitor
+mode at the DOS prompt. It never modifies the base disk, rejects a second
+openMSX process, and accepts only an IPv4 target.
+
+The MCP profile inserts openMSX's generic four-way slot expander before the
+Sunrise/Nextor and RS-232 cartridges. Additional hardware can therefore be
+added through the same launcher, for example:
+
+~~~~sh
+./open-msx-mcp.command -ext MegaRAM_2MB -ext DDX_3.0
+~~~~
+
+`MSX_AI_MCP_SLOT_EXPANDER` can select another compatible slot-expander
+extension; its default is `slotexpander`. Extra openMSX arguments are appended
+after the MCP profile's required hardware while the four expanded secondary
+slots are available.
+
+The instance retries its transparent RS232-Net connection to
+`127.0.0.1:6603`. It can therefore be started before the MCP listener. Once the
+agent has been started at the DOS prompt, connect with `msx_agent_listen` using
+host `127.0.0.1` and port `6603`. Do not call `msx_tcp_bench_start`: the
+emulator is already user-owned and running.
+
+If the MCP client disconnects while openMSX remains open, press F11 once to
+rearm the TCP connection, then call `msx_agent_listen` again. Closing the
+window removes only its disposable runtime disk; the original MSX-DOS image
+remains unchanged.
+
+Optional IPv4 endpoint overrides are available for local testing:
+
+~~~~sh
+MSX_AI_MCP_IPV4=127.0.0.1 MSX_AI_MCP_PORT=6603 ./open-msx-mcp.command
 ~~~~
 
 Then use `msx_asm_load` with `execute="call"` or `execute="run"`.
@@ -218,7 +267,7 @@ link, so reconnect through the newly selected interface.
 
 | Driver | Current configuration | Notes |
 |---|---|---|
-| `8251` | Ports `80h/81h`, standard timer ports `84h/85h/87h`, 4800 baud, 8N1 | Reference path used by the openMSX RS232-Net integration tests |
+| `8251` | Ports `80h/81h`, standard timer ports `84h/85h/87h`, 19,200 baud, 8N1 | Reference path used by the openMSX RS232-Net integration tests |
 | `16C550` | Ports `80h-87h`, 115200 baud, 8N1, 16-byte FIFO, automatic RTS/CTS | Generic register-compatible path; hardware flow control is required |
 
 BaDCaT SMD is an intended 16C550-compatible device, not a dependency or a
@@ -272,18 +321,19 @@ Direct I/O is an expert escape hatch. Writing the active UART, VDP ports, mapper
 ports, or unrelated hardware can terminate the protocol session or damage live
 machine state.
 
-## TCP/IP transport
+## TCP/IPv4 transport
 
 The external contract is a transparent, ordered, full-duplex byte stream over
-TCP/IP. The MSX-side driver knows only UART bytes; the host protocol does not
-depend on how the adapter was configured.
+TCP/IPv4. IPv6 endpoints are intentionally unsupported. The MSX-side driver
+knows only UART bytes; the host protocol does not depend on how the adapter was
+configured.
 
 ~~~~text
 MCP/backend operations
         |
 protocol v3 frames
         |
-TCP/IP (host listens or connects)
+TCP/IPv4 (host listens or connects)
         |
 transparent network/UART adapter
         |
@@ -295,6 +345,16 @@ Use `msx_agent_listen` when the adapter is a TCP client. Use
 `msx_real_listen` name remains as a compatibility alias. `msx_status`
 reports `network_transport`, `network_role`, `agent_transport`, and
 `agent_transport_id` separately.
+
+Host-created IPv4 TCP streams enable `TCP_NODELAY`. A current 8251 agent
+advertises `frame-wake-ack`: for each framed request the host sends the first
+magic byte, waits until the agent returns `0x06` after actually entering the
+parser, and only then sends the rest continuously at 19,200 baud. This avoids
+the one-byte 8251 receiver overrun without throttling the payload. The first
+HELLO probes this ACK with a bounded compatibility fallback because its feature
+bit is not known yet; older agents retain conservative first-byte pacing. The
+16C550 path does not add this round trip. The eight-ESC recovery marker uses a
+conservative first-byte gap on an 8251 or before the transport is known.
 
 ## Protocol v3
 
@@ -321,12 +381,50 @@ The host waits for each line to be consumed before sending the next one, so a
 BASIC line editor cannot discard commands queued after Return. Cached v3
 responses also prevent a retried request from typing duplicate characters.
 
+When the foreground monitor runs with `DEBUG ON`, the optional
+`debug-peer-label` feature enables opcode `I`. Immediately after HELLO, a TCP
+host sends the accepted IPv4 source endpoint as printable ASCII and the MSX
+displays it as `MCP client: <ipv4>:<port>`. The UART-facing agent remains
+transport-neutral: it never attempts to discover network metadata itself.
+
+The optional `snapshot-lease` feature enables v3 opcode `S`. Its one-byte
+payload is a lease of 1-255 agent receive-timeout periods; these are transport
+timeouts, not wall-clock seconds. Valid protocol traffic refreshes the timeout,
+so a long active transfer remains paused. Silence after a lost connection
+consumes the lease and eventually resumes the interrupted program. The host
+still sends `g` immediately after the final requested byte and uses the lease
+only as failure recovery. If that resume acknowledgement is lost, the host
+tries `g` directly, resets a damaged framed session with eight ESC bytes, and
+verifies that the target is running. Manual `msx_pause` remains unbounded and
+is released only by `msx_resume`. Atomic MCP RAM/VRAM reads and writes use the
+same bounded lease instead of the manual pause command. While it owns a lease,
+the host caps each framed-request attempt at one second and verifies that the
+agent is still paused after acquisition. If the lease expired during a host
+suspension or stalled transfer, the potentially mixed capture is discarded.
+
+The `frame-wake-ack` feature (8251 only) makes the agent return raw byte `0x06`
+after consuming the leading `M` of each framed request. It is transport flow
+control rather than an MCP response; the real framed response remains unchanged.
+
 ## Screenshots from VRAM
 
 `msx_screenshot` captures VRAM and VDP/BIOS state, renders the image on the
 host, and returns a PNG MCP image content block. It does not require a visible
-openMSX renderer. On a running physical target, `atomic=true` pauses the
-application for a consistent capture and resumes it afterward.
+openMSX renderer. On a running physical target, `atomic=true` uses the bounded
+snapshot lease for a consistent capture. The target resumes immediately after
+the final RAM/VRAM byte is received, before host-side rendering, PNG
+compression, file reading, or Base64 encoding. An older agent without the
+`snapshot-lease` feature is rejected before any display-memory read; install
+the current `MSXAI.COM` or explicitly use `atomic=false` (after a manual pause
+if consistency is required).
+
+For a target that reports the 19,200-baud 8251 driver, the host reads only the
+small display metadata under the lease, then estimates payload, frame overhead,
+request count, and transfer time before bulk VRAM acquisition. Captures above
+the safety threshold are refused by default and the short lease is released
+immediately. Pass `allow_slow=true` to opt in to the long transfer. This guard
+also applies to `atomic=false`, because it protects the slow link as well as
+the paused application.
 
 Supported standard modes:
 

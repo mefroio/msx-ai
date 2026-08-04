@@ -16,6 +16,7 @@ vendor-specific Korean/Hangul mode rather than a baseline MSX V99x8 mode and
 is rejected explicitly.
 """
 
+from dataclasses import dataclass
 import struct
 import zlib
 
@@ -656,6 +657,44 @@ def _real_registers(m):
     return regs
 
 
+@dataclass(frozen=True)
+class RealMSXCapturePlan:
+    """Target state and byte ranges required for one real-MSX screenshot."""
+
+    mode: int
+    regs: tuple
+    text_width: object
+    height: int
+    sprites: bool
+    page: object
+    ranges: tuple
+
+    @property
+    def vram_bytes(self):
+        return sum(size for _base, size in self.ranges)
+
+    @property
+    def metadata_bytes(self):
+        # SCRMOD, three register-shadow reads, and LINLEN in SCREEN 0.
+        return 1 + 8 + 16 + 3 + (1 if self.mode == 0 else 0)
+
+    @property
+    def target_bytes(self):
+        return self.metadata_bytes + self.vram_bytes
+
+    @property
+    def metadata_reads(self):
+        return 4 + (1 if self.mode == 0 else 0)
+
+
+@dataclass(frozen=True)
+class RealMSXCapture:
+    """Acquired target bytes, intentionally independent from PNG rendering."""
+
+    plan: RealMSXCapturePlan
+    vram: object
+
+
 def _addresses_for_capture(mode, regs, height, sprites, page=None,
                            text_width=None):
     addresses = set()
@@ -751,13 +790,8 @@ def capture_openmsx(m, path, *, palette=None, sprites=True, page=None):
     return path, mode
 
 
-def capture_realmsx(m, path, *, palette=None, sprites=True, page=None):
-    """Capture SCREEN 0--8 or 10--12 using resident-agent RAM/VRAM reads.
-
-    For an exact custom palette, pass the agent's palette mirror as
-    ``palette``.  BIOS register save variables are necessarily a best effort
-    for software that writes VDP ports directly without updating them.
-    """
+def plan_realmsx_capture(m, *, sprites=True, page=None):
+    """Read display metadata and plan the target bytes for a screenshot."""
     mode = m.peek(0xFCAF, 1)[0]  # SCRMOD
     _validate_mode(mode)
     regs = _real_registers(m)
@@ -767,13 +801,42 @@ def capture_realmsx(m, path, *, palette=None, sprites=True, page=None):
     height = _active_height(regs, mode, None)
     addresses = _addresses_for_capture(mode, regs, height, sprites, page,
                                        text_width)
-    vram = _capture_vram(m.vpeek, addresses)
-    rgb, width, height = render_vram(vram, mode, regs,
-                                     palette or V9938_DEFAULT,
-                                     height=height, page=page, sprites=sprites,
-                                     text_width=text_width)
+    return RealMSXCapturePlan(
+        mode=mode, regs=tuple(regs), text_width=text_width, height=height,
+        sprites=bool(sprites), page=page,
+        ranges=tuple(_ranges(addresses)))
+
+
+def acquire_realmsx_capture(m, *, sprites=True, page=None, plan=None):
+    """Acquire only RAM/VRAM bytes; perform no rendering or file I/O."""
+    if plan is None:
+        plan = plan_realmsx_capture(m, sprites=sprites, page=page)
+    vram = bytearray(VRAM_SIZE)
+    for base, size in plan.ranges:
+        vram[base:base + size] = m.vpeek(base, size)
+    return RealMSXCapture(plan=plan, vram=vram)
+
+
+def render_realmsx_capture(capture, path, *, palette=None):
+    """Render previously acquired bytes and write their PNG on the host."""
+    plan = capture.plan
+    rgb, width, height = render_vram(
+        capture.vram, plan.mode, plan.regs, palette or V9938_DEFAULT,
+        height=plan.height, page=plan.page, sprites=plan.sprites,
+        text_width=plan.text_width)
     write_png(path, width, height, rgb)
-    return path, mode
+    return path, plan.mode
+
+
+def capture_realmsx(m, path, *, palette=None, sprites=True, page=None):
+    """Compatibility wrapper that acquires and renders a real-MSX screen.
+
+    MCP callers that pause a running target must call
+    :func:`acquire_realmsx_capture` inside the pause and
+    :func:`render_realmsx_capture` only after resuming it.
+    """
+    capture = acquire_realmsx_capture(m, sprites=sprites, page=page)
+    return render_realmsx_capture(capture, path, palette=palette)
 
 
 def _render_text(m):

@@ -18,7 +18,9 @@ from msx_protocol import (  # noqa: E402
     GarbageDataError,
 )
 from msx_real import (  # noqa: E402
+    FRAME_WAKE_ACK,
     RECONNECT_ESCAPE,
+    UART8251_FRAME_WAKE_DELAY,
     RealMSX,
     RealMSXError,
     RealMSXRangeError,
@@ -31,7 +33,9 @@ class FakeV3Resident:
     def __init__(self, sock, *, max_payload=64, corrupt_once=(), drop_once=(),
                  vram_size=0x20000, legacy_hello=False, start_framed=False,
                  runtime_mode=1, keybuf_feature=True,
-                 consume_keybuf=True):
+                 consume_keybuf=True, debug=False,
+                 debug_peer_feature=False, frame_wake_ack_feature=False,
+                 transport_id=1):
         self.sock = sock
         self.max_payload = max_payload
         self.corrupt_once = set(corrupt_once)
@@ -44,6 +48,10 @@ class FakeV3Resident:
         self.runtime_mode = runtime_mode
         self.keybuf_feature = bool(keybuf_feature)
         self.consume_keybuf = bool(consume_keybuf)
+        self.debug = bool(debug)
+        self.debug_peer_feature = bool(debug_peer_feature)
+        self.frame_wake_ack_feature = bool(frame_wake_ack_feature)
+        self.transport_id = int(transport_id)
         self.capabilities = 0xFF if runtime_mode != 0 else 0x77
         self.vdp_generation = 0 if vram_size == 0x4000 else 2
 
@@ -57,6 +65,7 @@ class FakeV3Resident:
         self.last_run = None
         self.keybuf = bytearray()
         self.typed = bytearray()
+        self.debug_peer_labels = []
 
         self.bootstrap_queries = 0
         self.upgrades = 0
@@ -126,6 +135,8 @@ class FakeV3Resident:
             data = self.sock.recv(4096)
             if not data:
                 return
+            if self.frame_wake_ack_feature and data == b"M":
+                self.sock.sendall(FRAME_WAKE_ACK)
             for request in parser.feed(data):
                 if request.frame_type is not FrameType.REQUEST:
                     raise AssertionError(f"unexpected host frame {request!r}")
@@ -170,18 +181,27 @@ class FakeV3Resident:
             # version, caps, resident page, transport, MTU, control, debug, VDP,
             # banks and directly addressable bytes.
             response_payload = (
-                bytes([3, self.capabilities, 0xC8, 1])
+                bytes([3, self.capabilities, 0xC8, self.transport_id])
                 + self.max_payload.to_bytes(2, "little")
-                + b"\x01\x00" + bytes([self.vdp_generation])
+                + bytes([1, int(self.debug), self.vdp_generation])
             )
             if not self.legacy_hello:
                 response_payload += bytes([self.vram_size // 0x4000])
                 response_payload += self.vram_size.to_bytes(3, "little")
                 response_payload += bytes([self.runtime_mode])
-                response_payload += bytes([
-                    1 if self.keybuf_feature and self.runtime_mode == 0 else 0])
+                features = (
+                    1 if self.keybuf_feature and self.runtime_mode == 0 else 0)
+                if (self.debug_peer_feature and self.runtime_mode == 1 and
+                        self.debug):
+                    features |= 2
+                if (self.frame_wake_ack_feature and
+                        self.transport_id == 0):
+                    features |= 8
+                response_payload += bytes([features])
         elif opcode == "q":
             response_payload = bytes([self.state, 3])
+        elif opcode == "I" and self.debug_peer_feature:
+            self.debug_peer_labels.append(payload)
         elif opcode == "t" and self.keybuf_feature:
             if self.runtime_mode != 0 or self.state != 1:
                 status = FrameStatus.INVALID_STATE
@@ -263,6 +283,7 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(self.info["transport"], "uart-16c550")
         self.assertEqual(self.info["agent_transport"], "uart-16c550")
         self.assertEqual(self.info["agent_transport_id"], 1)
+        self.assertEqual(self.msx._v3.frame_wake_delay, 0.0)
         self.assertEqual(self.info["network_transport"], "custom-stream")
         self.assertEqual(self.info["network_role"], "attached")
         self.assertEqual(self.info["resident_base"], 0xC800)
@@ -283,6 +304,69 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(again["protocol"], 3)
         self.assertEqual(self.agent.bootstrap_queries, 1)
         self.assertEqual(self.agent.upgrades, 1)
+
+    def test_8251_negotiation_retains_first_byte_wake_delay(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(resident, transport_id=0)
+
+        info = self.msx.info()
+
+        self.assertEqual(info["agent_transport"], "uart-8251")
+        self.assertEqual(
+            self.msx._v3.frame_wake_delay, UART8251_FRAME_WAKE_DELAY)
+        self.assertIsNone(self.msx._v3.frame_wake_ack)
+
+    def test_8251_negotiation_uses_explicit_frame_wake_ack(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, transport_id=0, frame_wake_ack_feature=True)
+
+        info = self.msx.info()
+
+        self.assertIn("frame-wake-ack", info["features"])
+        self.assertEqual(self.msx._v3.frame_wake_ack, FRAME_WAKE_ACK)
+        self.assertEqual(self.msx._v3.frame_wake_delay, 0.0)
+        self.assertEqual(self.msx.status()["state"], "monitor")
+
+    def test_debug_peer_ip_is_announced_once_after_v3_hello(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_stream(
+            client, peer=("203.0.113.7", 49152),
+            network_transport="tcp", network_role="listen")
+        self.agent = FakeV3Resident(
+            resident, debug=True, debug_peer_feature=True)
+
+        info = self.msx.info()
+        self.assertIn("debug-peer-label", info["features"])
+        self.assertEqual(
+            self.agent.debug_peer_labels, [b"203.0.113.7:49152"])
+        self.msx.info()
+        self.assertEqual(
+            self.agent.debug_peer_labels, [b"203.0.113.7:49152"])
+
+    def test_ipv6_peer_is_not_announced_to_debug(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_stream(
+            client, peer=("2001:db8::1", 49152),
+            network_transport="tcp", network_role="listen")
+        self.agent = FakeV3Resident(
+            resident, debug=True, debug_peer_feature=True)
+
+        info = self.msx.info()
+        self.assertIn("debug-peer-label", info["features"])
+        self.assertEqual(self.agent.debug_peer_labels, [])
+        self.msx.info()
+        self.assertEqual(self.agent.debug_peer_labels, [])
 
     def test_negotiated_ram_chunks_roundtrip(self):
         payload = bytes(range(200))

@@ -69,6 +69,18 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertNotIn("jp 00A2h", debug)
         self.assertIn("call debug_trace_hex_nibble", debug)
         self.assertIn("and 00Fh", debug)
+        raw_dispatch = self.source.split("dispatch:", 1)[1].split(
+            "cmd_hello:", 1)[0]
+        self.assertRegex(
+            raw_dispatch,
+            r"(?s)cp '\?'.*jr z,cmd_hello.*call debug_trace_command")
+        self.assertIn("FEATURE_DEBUG_PEER:", self.source)
+        self.assertIn("frame_cmd_debug_peer:", self.source)
+        self.assertIn('db "MCP client: ",0', self.source)
+        self.assertRegex(
+            self.source,
+            r"(?s)cp 'I'.*jp z,frame_cmd_debug_peer.*"
+            r"frame_cmd_debug_peer:.*cp 020h.*cp 07Fh.*call debug_putchar")
         hello = self.source.split("frame_cmd_hello:", 1)[1].split(
             "frame_cmd_status:", 1)[0]
         self.assertIn("ld a,(debug_enabled)", hello)
@@ -96,7 +108,7 @@ class ResidentAgentSourceTests(unittest.TestCase):
         features = self.source.split("current_features:", 1)[1].split(
             "cmd_status:", 1)[0]
         self.assertIn("cp RUNTIME_RESIDENT", features)
-        self.assertIn("ld a,FEATURE_KEYBUF_INPUT", features)
+        self.assertIn("FEATURE_KEYBUF_INPUT", features)
 
         keybuf = self.source.split("frame_cmd_keybuf_input:", 1)[1].split(
             "frame_cmd_ram_read:", 1)[0]
@@ -130,6 +142,43 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertLess(
             policy.index("and TRANSPORT_FLAG_KEYI_EXCLUSIVE"),
             policy.index("ld (chain_keyi),a"))
+
+    def test_memman_nested_hooks_return_through_quithook_without_resaving(self):
+        hooks = self.source.split(
+            "; ---------------------------------------------------------------- H.KEYI", 1
+        )[1].split("else", 1)[0]
+        keyi_entry = hooks.split("resident_keyi_hook:", 1)[1].split(
+            "resident_timi_hook:", 1)[0]
+        timi_entry = hooks.split("resident_timi_hook:", 1)[1].split(
+            "; A nested MemMan hook", 1)[0]
+        self.assertRegex(
+            keyi_entry,
+            r"(?s)push af.*ld a,\(in_hook\).*or a.*"
+            r"jr nz,memman_nested_keyi_return.*ld a,1.*"
+            r"ld \(in_hook\),a.*ld \(hook_kind\),a")
+        self.assertRegex(
+            timi_entry,
+            r"(?s)push af.*ld a,\(in_hook\).*or a.*"
+            r"jr nz,memman_nested_timi_return.*ld a,1.*"
+            r"ld \(in_hook\),a.*ld \(hook_kind\),a")
+
+        before_full_save = hooks.split("resident_hook_saved_af:", 1)[0]
+        self.assertNotIn("push bc", before_full_save)
+        nested_keyi = hooks.split("memman_nested_keyi_return:", 1)[1].split(
+            "memman_nested_timi_return:", 1)[0]
+        self.assertNotIn("ld (hook_kind),a", nested_keyi)
+        self.assertNotIn("ld (hook_dispatch_sp),sp", nested_keyi)
+        self.assertRegex(
+            nested_keyi,
+            r"(?s)and TRANSPORT_FLAG_KEYI_EXCLUSIVE.*"
+            r"pop af.*ex af,af'.*ld a,1.*ex af,af'.*ret")
+        nested_timi = hooks.split("memman_nested_timi_return:", 1)[1].split(
+            "resident_hook_saved_af:", 1)[0]
+        self.assertNotIn("ld (hook_kind),a", nested_timi)
+        self.assertNotIn("ld (hook_dispatch_sp),sp", nested_timi)
+        self.assertRegex(
+            nested_timi,
+            r"(?s)pop af.*ex af,af'.*xor a.*ex af,af'.*ret")
 
     def test_hook_stack_comment_matches_reserved_bytes(self):
         reserve = re.search(
@@ -249,6 +298,114 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r"ld a,\(resume_requested\).*"
             r"jp nz,frame_pause_complete.*jp frame_pause_service_loop")
 
+    def test_snapshot_pause_is_bounded_resident_v3_feature(self):
+        self.assertRegex(
+            self.source,
+            r"(?m)^FEATURE_SNAPSHOT_LEASE:\s+equ\s+004h\b")
+        features = self.source.split("current_features_resident:", 1)[1].split(
+            "cmd_status:", 1)[0]
+        self.assertIn("FEATURE_KEYBUF_INPUT", features)
+        self.assertIn("FEATURE_SNAPSHOT_LEASE", features)
+        dispatch = self.source.split("frame_dispatch:", 1)[1].split(
+            "frame_require_length:", 1)[0]
+        self.assertRegex(
+            dispatch,
+            r"(?s)cp 'S'.*jp z,frame_cmd_snapshot_pause.*"
+            r"cp 's'.*jp z,frame_cmd_pause")
+
+        snapshot = self.source.split(
+            "frame_cmd_snapshot_pause:", 1)[1].split(
+                "frame_cmd_pause:", 1)[0]
+        self.assertRegex(
+            snapshot,
+            r"(?s)ld de,1.*call frame_require_length.*"
+            r"ld a,\(in_hook\).*jp z,frame_reply_bad_state.*"
+            r"ld a,\(run_state\).*cp 1.*jp nz,frame_reply_bad_state.*"
+            r"ld a,\(frame_request_buffer\).*or a.*"
+            r"jp z,frame_reply_bad_arg")
+        self.assertRegex(
+            snapshot,
+            r"(?s)call frame_cache_and_send.*ld a,2.*"
+            r"ld \(run_state\),a.*ld \(resume_requested\),a.*"
+            r"ld a,\(frame_request_buffer\).*ld \(snapshot_lease\),a.*"
+            r"ld \(snapshot_lease_reload\),a.*"
+            r"jr frame_pause_service_loop")
+
+    def test_snapshot_lease_timeout_and_manual_pause_semantics(self):
+        raw_manual = self.source.split("cmd_pause:", 1)[1].split(
+            "pause_service_loop:", 1)[0]
+        self.assertRegex(
+            raw_manual,
+            r"(?s)ld a,2.*ld \(run_state\),a.*xor a.*"
+            r"ld \(resume_requested\),a.*ld \(snapshot_lease\),a.*"
+            r"ld \(snapshot_lease_reload\),a")
+
+        manual = self.source.split("frame_cmd_pause:", 1)[1].split(
+            "frame_pause_service_loop:", 1)[0]
+        self.assertRegex(
+            manual,
+            r"(?s)ld a,2.*ld \(run_state\),a.*xor a.*"
+            r"ld \(resume_requested\),a.*ld \(snapshot_lease\),a.*"
+            r"ld \(snapshot_lease_reload\),a")
+
+        service = self.source.split("frame_pause_service_loop:", 1)[1].split(
+            "frame_pause_complete:", 1)[0]
+        self.assertRegex(
+            service,
+            r"(?s)call receive_dispatch.*ld a,\(resume_requested\).*"
+            r"jr nz,frame_pause_complete.*"
+            r"ld a,\(snapshot_lease_reload\).*"
+            r"ld \(snapshot_lease\),a.*jr frame_pause_service_loop")
+
+        timeout = self.source.split("hook_transport_timeout:", 1)[1].split(
+            "frame_request_buffer:", 1)[0]
+        self.assertRegex(
+            timeout,
+            r"(?s)ld a,\(run_state\).*cp 2.*"
+            r"ld a,\(resume_requested\).*jp nz,frame_pause_complete.*"
+            r"ld a,\(snapshot_lease\).*or a.*"
+            r"jp z,frame_pause_service_loop.*dec a.*"
+            r"ld \(snapshot_lease\),a.*jp z,frame_pause_complete")
+        paused_timeout = timeout.split("hook_timeout_state_done:", 1)[0]
+        self.assertNotIn("ld (snapshot_lease_reload),a", paused_timeout)
+
+    def test_framed_parser_advertises_and_emits_wake_ack(self):
+        self.assertRegex(
+            self.source,
+            r"(?m)^FEATURE_FRAME_WAKE_ACK:\s+equ\s+008h\b")
+        self.assertRegex(
+            self.source,
+            r"(?m)^FRAME_WAKE_ACK:\s+equ\s+006h\b")
+        features = self.source.split("current_features:", 1)[1].split(
+            "cmd_status:", 1)[0]
+        self.assertIn("FEATURE_FRAME_WAKE_ACK", features)
+        magic = self.source.split("frame_have_magic_m:", 1)[1].split(
+            "frame_reconnect_byte:", 1)[0]
+        self.assertRegex(
+            magic,
+            r"(?s)ld a,FRAME_WAKE_ACK.*call ser_put.*call ser_get")
+
+    def test_snapshot_lease_is_cleared_by_lifecycle_and_exit_paths(self):
+        initialize = self.source.split("resident_initialize:", 1)[1].split(
+            "resident_main:", 1)[0]
+        reset = self.source.split("monitor_reset:", 1)[1].split(
+            "main_loop:", 1)[0]
+        raw_resume = self.source.split("cmd_resume:", 1)[1].split(
+            "cmd_stop:", 1)[0]
+        raw_stop = self.source.split("cmd_stop:", 1)[1].split(
+            "; ------------------------------------------------------ hardware control", 1)[0]
+        pause_complete = self.source.split("frame_pause_complete:", 1)[1].split(
+            "frame_cmd_resume:", 1)[0]
+        frame_resume = self.source.split("frame_cmd_resume:", 1)[1].split(
+            "frame_cmd_stop:", 1)[0]
+        frame_stop = self.source.split("frame_cmd_stop:", 1)[1].split(
+            "frame_cmd_io_read:", 1)[0]
+        for section in (
+                initialize, reset, raw_resume, raw_stop, pause_complete,
+                frame_resume, frame_stop):
+            self.assertIn("ld (snapshot_lease),a", section)
+            self.assertIn("ld (snapshot_lease_reload),a", section)
+
     def test_protocol_core_has_no_uart_specific_registers(self):
         for token in ("UART_DATA", "UART_STATUS", "UART_LSR", "COMMSK"):
             with self.subTest(token=token):
@@ -292,7 +449,7 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("UART8251_TIMER_RX:      equ 084h", source)
         self.assertIn("UART8251_TIMER_TX:      equ 085h", source)
         self.assertIn("UART8251_TIMER_CONTROL: equ 087h", source)
-        self.assertIn("UART8251_TIMER_DIVISOR: equ 24", source)
+        self.assertIn("UART8251_TIMER_DIVISOR: equ 6", source)
         init = source.split("uart8251_init:", 1)[1].split(
             "uart8251_restore:", 1)[0]
         self.assertIn("out (UART8251_TIMER_CONTROL),a", init)
@@ -300,6 +457,11 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("out (UART8251_TIMER_TX),a", init)
         self.assertIn("ld a,0FEh", init)
         self.assertNotIn("and 0FEh", init)
+        receive = source.split("uart8251_rx_ready:", 1)[1].split(
+            "uart8251_tx_ready:", 1)[0]
+        self.assertIn("and 038h", receive)
+        self.assertIn("ld a,037h", receive)
+        self.assertIn("out (UART8251_STATUS),a", receive)
 
     def test_16c550_driver_remains_product_neutral(self):
         source = UART16C550_TRANSPORT.read_text(encoding="utf-8")
