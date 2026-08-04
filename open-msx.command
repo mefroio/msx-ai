@@ -195,7 +195,7 @@ fi
 
 echo "Starting openMSX (profile: $PROFILE, machine: ${openmsx_args[1]})"
 if [[ "$PROFILE" == "mcp" ]]; then
-  echo "MSX-AI foreground monitor: DEBUG ON"
+  echo "MSXAI.COM is available for manual start at the DOS prompt"
   echo "Waiting for MCP TCP listener at $MSX_AI_MCP_IPV4:$MSX_AI_MCP_PORT"
   "$OPENMSX_EXECUTABLE" "${openmsx_args[@]}" "$@"
   exit $?

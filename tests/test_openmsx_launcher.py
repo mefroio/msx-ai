@@ -49,9 +49,8 @@ class OpenMSXMCPLauncherTest(unittest.TestCase):
         self.assertIn('-script "$MCP_SCRIPT"', self.launcher)
 
     def test_startup_keeps_agent_manual_and_retries_transport(self):
-        self.assertIn(
-            '//type "MSXAI /DRIVER:8251 /MONITOR DEBUG ON\\r"',
-            self.startup)
+        self.assertNotIn('//type "MSXAI ', self.startup)
+        self.assertIn("MSXAI.COM ready for manual start", self.startup)
         self.assertIn("diskmanipulator delete hda1 MSXAI.COM", self.startup)
         self.assertIn("diskmanipulator import hda1 $agent", self.startup)
         self.assertIn('set rs232-net-address "$ipv4:$port"', self.startup)
