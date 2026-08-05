@@ -4,7 +4,7 @@
 ; The default path installs a relocatable MemMan TSR in CPU page 1 and returns
 ; to MSX-DOS. The BIOS H.TIMI chain keeps the UART service reachable while
 ; ordinary DOS programs and cooperative games run. /MONITOR selects the older
-; foreground supervisor below BDOS for explicit upload/call/run workflows.
+; foreground supervisor below BDOS for explicit call/run workflows.
 ;
 ; The single wrapper includes every supported byte-stream driver. The loader
 ; selects one explicitly from the MSX-DOS command line and binds six resident
@@ -32,12 +32,8 @@
 ;   S lease                   -> OK, pause; 'g' resumes before lease expiry
 ; and negotiated batched keyboard input:
 ;   T [control data...]       -> accepted/pending/credits/input-state
-; and foreground file-receiver mailbox input:
-;   U offset-lo offset-hi data... -> accepted/received/credits/upload-state
-;
-; The transient universal COM also accepts `/PUT file hex-length crc16`. It
-; receives framed chunks through the resident and writes them through BDOS,
-; outside every resident hook and without pre-overwriting the DOS TPA.
+; Protocol X is the only file-transfer path. Its DOS-facing implementation is
+; isolated in the transient MSXAIXF.COM helper.
 ;
 ; This cooperative monitor requires maskable interrupts and the BIOS H.TIMI
 ; chain to remain active. UART receive IRQs stay masked: a game that replaces
@@ -83,7 +79,7 @@ FEATURE_SNAPSHOT_LEASE: equ 004h ; bounded resident snapshot pause, bit 2
 FEATURE_FRAME_WAKE_ACK: equ 008h ; parser-ready ACK after framed magic byte
 FEATURE_TIMI_POLL_SAFE: equ 010h ; resident is polled only from BIOS H.TIMI
 FEATURE_KEYBUF_SPOOL:   equ 020h ; 255-byte resident keyboard spool, bit 5
-FEATURE_FILE_UPLOAD:    equ 040h ; foreground DOS file receiver, bit 6
+FEATURE_FILE_TRANSFER:  equ 080h ; resumable 32-bit PUT/GET protocol, bit 7
 DEBUG_PEER_MAX:      equ 63
 KEYBUF_SPOOL_CAPACITY: equ 255
 KEYBUF_SPOOL_SETTLE_TICKS: equ 4 ; wait about 67 ms at the standard 60-Hz TIMI
@@ -92,19 +88,8 @@ KEYBUF_SPOOL_REQUEST_CANCEL: equ 2
 KEYBUF_SPOOL_FLAG_BARRIER: equ 1
 KEYBUF_SPOOL_FLAG_ACTIVE: equ 2
 KEYBUF_SPOOL_FLAG_AUTHORIZED: equ 4
-UPLOAD_CHUNK_CAPACITY: equ FRAMED_MAX - 2 ; two request bytes carry the offset
-UPLOAD_FLAG_ACTIVE: equ 1
-UPLOAD_FLAG_PENDING: equ 2
-UPLOAD_FLAG_COMPLETE: equ 4
-UPLOAD_FLAG_SUCCEEDED: equ 8
-UPLOAD_FLAG_FAILED: equ 16
-UPLOAD_RESULT_NONE: equ 0
-UPLOAD_RESULT_SUCCEEDED: equ 1
-UPLOAD_RESULT_FAILED: equ 2
 TSR_TALK_CONFIG: equ 0A5h
-TSR_TALK_UPLOAD_BEGIN: equ 0A6h
-TSR_TALK_UPLOAD_POLL: equ 0A7h
-TSR_TALK_UPLOAD_END: equ 0A8h
+include 'agent/msx_xfer_protocol.inc'
 ; The hook stack has no recursion, no local frame buffers and never calls user
 ; code. A static high-water audit stays below 64 bytes; 224 bytes leaves more
 ; than three times that headroom while keeping the universal build below BDOS.
@@ -114,7 +99,6 @@ RUNTIME_RESIDENT: equ 0
 RUNTIME_MONITOR:  equ 1
 LOADER_ACTION_INSTALL: equ 0
 LOADER_ACTION_UNINSTALL: equ 1
-LOADER_ACTION_PUT: equ 2
 TRANSPORT_FLAG_KEYI_EXCLUSIVE: equ 1
 TRANSPORT_FLAG_TIMI_ONLY:      equ 2
 TRANSPORT_FLAG_FRAME_WAKE_ACK: equ 4
@@ -152,10 +136,6 @@ installer:
     ld (loader_entry_sp),sp
     call loader_parse_command_line
     jp c,loader_usage_exit
-
-    ld a,(loader_action)
-    cp LOADER_ACTION_PUT
-    jp z,loader_put_file
 
     ld de,install_banner
     ld c,9
@@ -330,7 +310,8 @@ install_no_room:
 ; ------------------------------------------------------- resident lifecycle --
 ; The default mode is a genuine MemMan TSR.  If the ID already exists, use its
 ; standardized talk entry to select/reselect the transport without installing
-; a duplicate.  Otherwise the embedded loader takes over and does not return.
+; a duplicate. Otherwise the external-suite loader takes over and does not
+; return.
 loader_install_resident:
     call memman_find_agent
     jr c,loader_install_resident_new
@@ -390,7 +371,7 @@ monitor_mode_banner:
 uninstall_mode_banner:
     db "Action: uninstall resident agent",13,10,"$"
 debug_on_banner:
-    db "On-screen command trace: DEBUG ON",13,10,"$"
+    db "On-screen command trace: DEBUG",13,10,"$"
 no_room_message:
     db "Not enough upper TPA space for the resident agent",13,10,"$"
 already_message:
@@ -410,21 +391,16 @@ usage_message:
     db "Usage:",13,10
     db "  MSXAI /DRIVER:8251",13,10
     db "  MSXAI /DRIVER:16C550",13,10
-    db "  MSXAI /DRIVER:8251 /MONITOR [DEBUG ON]",13,10
-    db "  MSXAI /DRIVER:16C550 /MONITOR [DEBUG ON]",13,10
+    db "  MSXAI /DRIVER:8251 /MONITOR [DEBUG]",13,10
+    db "  MSXAI /DRIVER:16C550 /MONITOR [DEBUG]",13,10
     db "  MSXAI /UNINSTALL",13,10
-    db "  MSXAI /PUT <DOS-file> <hex-bytes> <crc16>",13,10
-    db "DEBUG ON is intentionally restricted to /MONITOR.",13,10,"$"
+    db "DEBUG is intentionally restricted to /MONITOR.",13,10,"$"
 driver_required_message:
     db "Select exactly one /DRIVER:8251 or /DRIVER:16C550",13,10,"$"
 debug_requires_monitor_message:
-    db "DEBUG ON requires /MONITOR",13,10,"$"
-debug_syntax_message:
-    db "DEBUG must be followed by ON",13,10,"$"
+    db "DEBUG requires /MONITOR",13,10,"$"
 uninstall_syntax_message:
     db "/UNINSTALL cannot be combined with driver, monitor, or debug options",13,10,"$"
-put_syntax_message:
-    db "/PUT requires a DOS filename, 0001h..4000h bytes, and CRC16",13,10,"$"
 unknown_option_message:
     db "Unknown command-line option",13,10,"$"
 loader_transport_id:
@@ -437,16 +413,6 @@ loader_action:
     db LOADER_ACTION_INSTALL
 loader_command_buffer:
     ds 128,0
-loader_put_filename:
-    ds 16,0
-loader_put_length:
-    dw 0
-loader_put_crc_expected:
-    dw 0
-; TsrCall temporarily maps the resident into page 1. Keep this foreground
-; transfer buffer in page 0 so it remains addressable throughout the copy.
-loader_put_buffer:
-    ds UPLOAD_CHUNK_CAPACITY,0
 
 loader_parse_command_line:
     ld a,0FFh
@@ -509,9 +475,6 @@ loader_parse_token_loop:
     ld de,option_uninstall
     call loader_token_equals
     jr z,loader_parse_uninstall
-    ld de,option_put
-    call loader_token_equals
-    jp z,loader_parse_put
     ld de,unknown_option_message
     jp loader_parse_error
 
@@ -537,11 +500,6 @@ loader_parse_monitor:
     call loader_skip_token
     jp loader_parse_token_loop
 loader_parse_debug:
-    call loader_skip_token
-    call loader_skip_spaces
-    ld de,option_on
-    call loader_token_equals
-    jp nz,loader_parse_debug_syntax_error
     ld a,1
     ld (loader_debug_enabled),a
     call loader_skip_token
@@ -554,43 +512,6 @@ loader_parse_uninstall:
     ld (loader_action),a
     call loader_skip_token
     jp loader_parse_token_loop
-
-loader_parse_put:
-    ; /PUT is a complete foreground action, not an install option. It receives
-    ; framed data through the installed resident and writes it through BDOS.
-    ld a,(loader_action)
-    or a
-    jr nz,loader_parse_put_error
-    ld a,(loader_transport_id)
-    cp 0FFh
-    jr nz,loader_parse_put_error
-    ld a,(loader_runtime_mode)
-    or a
-    jr nz,loader_parse_put_error
-    ld a,(loader_debug_enabled)
-    or a
-    jr nz,loader_parse_put_error
-    call loader_skip_token
-    call loader_skip_spaces
-    call loader_copy_put_filename
-    jr c,loader_parse_put_error
-    call loader_skip_spaces
-    call loader_parse_put_length
-    jr c,loader_parse_put_error
-    call loader_skip_spaces
-    call loader_parse_put_crc
-    jr c,loader_parse_put_error
-    call loader_skip_spaces
-    ld a,(hl)
-    or a
-    jr nz,loader_parse_put_error
-    ld a,LOADER_ACTION_PUT
-    ld (loader_action),a
-    or a
-    ret
-loader_parse_put_error:
-    ld de,put_syntax_message
-    jp loader_parse_error
 
 loader_parse_tokens_done:
     ld a,(loader_action)
@@ -627,9 +548,6 @@ loader_parse_driver_error:
     jr loader_parse_error
 loader_parse_debug_error:
     ld de,debug_requires_monitor_message
-    jr loader_parse_error
-loader_parse_debug_syntax_error:
-    ld de,debug_syntax_message
     jr loader_parse_error
 loader_parse_uninstall_error:
     ld de,uninstall_syntax_message
@@ -718,165 +636,10 @@ option_monitor:
     db "/MONITOR",0
 option_debug:
     db "DEBUG",0
-option_on:
-    db "ON",0
 option_uninstall:
     db "/UNINSTALL",0
-option_put:
-    db "/PUT",0
 loader_old_bdos:
     dw 0
-
-; Copy one whitespace-delimited DOS pathname. The direct DOS API receives the
-; ASCIIZ value, so this is not shell text; the limit prevents buffer overflow.
-loader_copy_put_filename:
-    ld de,loader_put_filename
-    ld b,15
-    ld c,0
-loader_copy_put_filename_loop:
-    ld a,(hl)
-    or a
-    jr z,loader_copy_put_filename_done
-    cp ' '
-    jr z,loader_copy_put_filename_done
-    cp 9
-    jr z,loader_copy_put_filename_done
-    ld a,b
-    or a
-    jr z,loader_copy_put_filename_error
-    ld a,(hl)
-    ld (de),a
-    inc hl
-    inc de
-    inc c
-    dec b
-    jr loader_copy_put_filename_loop
-loader_copy_put_filename_done:
-    ld a,c
-    or a
-    jr z,loader_copy_put_filename_error
-    xor a
-    ld (de),a
-    ret
-loader_copy_put_filename_error:
-    scf
-    ret
-
-; Parse a 1..4-digit hexadecimal byte count and constrain it to 16 KiB.
-; Input/output HL points into loader_command_buffer.
-loader_parse_put_length:
-    ld de,0
-    ld b,0
-loader_parse_put_length_loop:
-    ld a,(hl)
-    or a
-    jr z,loader_parse_put_length_done
-    cp ' '
-    jr z,loader_parse_put_length_done
-    cp 9
-    jr z,loader_parse_put_length_done
-    call loader_hex_nibble
-    jr c,loader_parse_put_length_error
-    ld c,a
-    ld a,d
-    and 0F0h
-    jr nz,loader_parse_put_length_error
-    sla e
-    rl d
-    sla e
-    rl d
-    sla e
-    rl d
-    sla e
-    rl d
-    ld a,e
-    or c
-    ld e,a
-    inc b
-    inc hl
-    jr loader_parse_put_length_loop
-loader_parse_put_length_done:
-    ld a,b
-    or a
-    jr z,loader_parse_put_length_error
-    ld a,d
-    or e
-    jr z,loader_parse_put_length_error
-    ld (loader_put_length),de
-    push hl
-    ld hl,04000h
-    or a
-    sbc hl,de
-    pop hl
-    ret nc
-loader_parse_put_length_error:
-    scf
-    ret
-
-; Parse exactly four hexadecimal CRC-16 digits. Input/output HL points into
-; loader_command_buffer, matching loader_parse_put_length's calling contract.
-loader_parse_put_crc:
-    ld de,0
-    ld b,0
-loader_parse_put_crc_loop:
-    ld a,(hl)
-    or a
-    jr z,loader_parse_put_crc_done
-    cp ' '
-    jr z,loader_parse_put_crc_done
-    cp 9
-    jr z,loader_parse_put_crc_done
-    ld a,b
-    cp 4
-    jr nc,loader_parse_put_crc_error
-    ld a,(hl)
-    call loader_hex_nibble
-    jr c,loader_parse_put_crc_error
-    ld c,a
-    sla e
-    rl d
-    sla e
-    rl d
-    sla e
-    rl d
-    sla e
-    rl d
-    ld a,e
-    or c
-    ld e,a
-    inc b
-    inc hl
-    jr loader_parse_put_crc_loop
-loader_parse_put_crc_done:
-    ld a,b
-    cp 4
-    jr nz,loader_parse_put_crc_error
-    ld (loader_put_crc_expected),de
-    or a
-    ret
-loader_parse_put_crc_error:
-    scf
-    ret
-
-loader_hex_nibble:
-    cp '0'
-    jr c,loader_hex_nibble_error
-    cp '9' + 1
-    jr c,loader_hex_nibble_digit
-    cp 'A'
-    jr c,loader_hex_nibble_error
-    cp 'F' + 1
-    jr nc,loader_hex_nibble_error
-    sub 'A' - 10
-    or a
-    ret
-loader_hex_nibble_digit:
-    sub '0'
-    or a
-    ret
-loader_hex_nibble_error:
-    scf
-    ret
 
 install_inconsistent:
     ld de,inconsistent_message
@@ -905,8 +668,8 @@ loader_timi_is_agent:
     sbc hl,de
     ret
 
-; Disk extraction, MemMan discovery, TsrLoad/TsrKill command chains, and the
-; embedded public-domain utilities are transient and never enter the TSR.
+; External-suite validation, MemMan discovery, and TsrLoad/TsrKill command
+; chains are transient and never enter the TSR.
 include 'agent/msx_memman_loader.asm'
 
 ; z80asm's ORG changes label addresses without padding the output.  Therefore
@@ -919,7 +682,7 @@ endif
 resident_start:
 if MSXAI_TSR_BUILD
 active_transport_id:
-    db 0FEh                     ; patched in the embedded TSR before extraction
+    db 0FEh                     ; build-time template; packaged TSRs patch 0/1
 resident_page:
     db 0
 else
@@ -1049,24 +812,51 @@ keybuf_spool_accepted:
 keybuf_spool_buffer:
     ds 256,0
 keybuf_spool_buffer_end:
-upload_active:
+
+; Protocol X/v1 keeps the staged descriptor resident while MSXAIXF.COM is
+; launched transiently to perform DOS calls. The wire-facing hook owns only
+; this bounded mailbox. PUT credit returns after an exact BDOS WRITE; durable
+; progress advances separately, only after a batched DOS ENSURE and explicit
+; commit. GET data remains pinned until the host acknowledges both its next
+; offset and rolling CRC-32.
+if MSXAI_TSR_BUILD
+xfer_descriptor:
+    ds XFER_DESC_SIZE,0
+xfer_state:
+    db XFER_STATE_IDLE
+xfer_error:
+    db XFER_ERROR_NONE
+xfer_result_flags:
     db 0
-upload_pending:
+xfer_pending:
     db 0
-upload_expected:
+xfer_close_requested:
+    db 0
+xfer_foreground_ready:
+    db 0
+xfer_get_ack_pending:
+    db 0
+xfer_buffer_length:
     dw 0
-upload_received:
+xfer_buffer_offset:
+    ds 4,0
+xfer_buffer_crc:
+    ds 4,0
+xfer_accepted:
+    ds 4,0
+xfer_durable:
+    ds 4,0
+xfer_prefix_crc:
+    ds 4,0
+xfer_request_count:
     dw 0
-upload_chunk_length:
+xfer_last_accepted:
     dw 0
-upload_request_length:
-    dw 0
-upload_accepted:
-    dw 0
-upload_result:
-    db UPLOAD_RESULT_NONE
-upload_buffer:
-    ds UPLOAD_CHUNK_CAPACITY,0
+xfer_math32:
+    ds 4,0
+xfer_buffer:
+    ds XFER_GET_CAPACITY,0
+endif
 
 resident_initialize:
     di
@@ -1090,7 +880,9 @@ resident_initialize:
     ld (post_action_pending),a
     ld (debug_column),a
     call keybuf_spool_reset
-    call upload_reset
+if MSXAI_TSR_BUILD
+    call xfer_reset
+endif
     ld a,(runtime_mode)
     cp RUNTIME_RESIDENT
     ret nz
@@ -1109,7 +901,9 @@ monitor_reset:
     ld (snapshot_lease_reload),a
     ld (post_action_pending),a
     call keybuf_spool_reset
-    call upload_reset
+if MSXAI_TSR_BUILD
+    call xfer_reset
+endif
 main_loop:
     call receive_dispatch
     jr main_loop
@@ -1409,7 +1203,7 @@ hook_return_direct:
     ret
 endif
 
-; DEBUG ON is deliberately a foreground-monitor feature. BIOS output from an
+; DEBUG is deliberately a foreground-monitor feature. BIOS output from an
 ; interrupt hook could be re-entrant and would corrupt the application image,
 ; so hook-side commands remain silent even when diagnostics are enabled.
 debug_trace_command:            ; A = raw/v3 opcode, all registers preserved
@@ -1466,7 +1260,7 @@ debug_trace_hex_emit:
 
 debug_putchar:                  ; A=character, foreground MSX-DOS only
 if MSXAI_TSR_BUILD
-    ; DEBUG ON cannot be selected for a MemMan TSR, so this path is
+    ; DEBUG cannot be selected for a MemMan TSR, so this path is
     ; unreachable and the transient loader's BDOS proxy is intentionally absent.
     ret
 else
@@ -1589,7 +1383,7 @@ current_features_transport_ready:
     ret
 current_features_resident:
     ld a,b
-    or FEATURE_KEYBUF_INPUT | FEATURE_SNAPSHOT_LEASE | FEATURE_KEYBUF_SPOOL | FEATURE_FILE_UPLOAD
+    or FEATURE_KEYBUF_INPUT | FEATURE_SNAPSHOT_LEASE | FEATURE_KEYBUF_SPOOL | FEATURE_FILE_TRANSFER
     ld b,a
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_TIMI_ONLY
@@ -2129,7 +1923,6 @@ frame_rebootstrap:
     ld (last_request_valid),a
     ld (frame_reconnect_count),a
     call keybuf_spool_reset
-    call upload_reset
     ld hl,0
     ld (next_sequence),hl
     jp cmd_hello
@@ -2309,8 +2102,10 @@ frame_dispatch:
     jp z,frame_cmd_keybuf_input
     cp 'T'
     jp z,frame_cmd_keybuf_spool
-    cp 'U'
-    jp z,frame_cmd_file_upload
+if MSXAI_TSR_BUILD
+    cp 'X'
+    jp z,frame_cmd_file_transfer
+endif
     cp 'I'
     jp z,frame_cmd_debug_peer
     cp 'r'
@@ -2849,22 +2644,30 @@ keybuf_spool_cancel:
     ld (PUTPNT),hl
     ret
 
-upload_reset:
+if MSXAI_TSR_BUILD
+xfer_reset:
     xor a
-    ld (upload_active),a
-    ld (upload_pending),a
-    ld (upload_expected),a
-    ld (upload_expected + 1),a
-    ld (upload_received),a
-    ld (upload_received + 1),a
-    ld (upload_chunk_length),a
-    ld (upload_chunk_length + 1),a
-    ld (upload_request_length),a
-    ld (upload_request_length + 1),a
-    ld (upload_accepted),a
-    ld (upload_accepted + 1),a
-    ld (upload_result),a
+    ld (xfer_state),a
+    ld (xfer_error),a
+    ld (xfer_result_flags),a
+    ld (xfer_pending),a
+    ld (xfer_close_requested),a
+    ld (xfer_foreground_ready),a
+    ld (xfer_get_ack_pending),a
+    ld (xfer_buffer_length),a
+    ld (xfer_buffer_length + 1),a
+    ld hl,xfer_descriptor
+    ld de,xfer_descriptor + 1
+    ld bc,XFER_DESC_SIZE - 1
+    ld (hl),a
+    ldir
+    ld hl,xfer_buffer_offset
+    ld de,xfer_buffer_offset + 1
+    ld bc,4 + 4 + 4 + 4 + 4 - 1
+    ld (hl),a
+    ldir
     ret
+endif
 
 ; Called only from H.TIMI after the interrupted context is fully saved. It
 ; touches the BIOS work area directly and never calls BIOS, BDOS or BASIC.
@@ -3135,13 +2938,16 @@ frame_keybuf_spool_flags_ready:
     ld (frame_response_status),a
     jp frame_cache_and_send
 
-; Foreground /PUT owns the DOS handle while the resident keeps all UART work
-; inside its normal framed H.TIMI path. Request: offset:u16 plus up to 318 data
-; bytes; offset alone is a credit query. Response: accepted:u16, received:u16,
-; credits:u16, flags:u8. Flags distinguish bytes accepted from the terminal
-; foreground success/failure result. The one-chunk mailbox prevents the hook
-; from calling BDOS and gives the foreground writer deterministic backpressure.
-frame_cmd_file_upload:
+; -------------------------------------------------------------------------
+; Resumable file transfer, opcode X / subprotocol version 1.
+;
+; No handler below calls DOS. OPEN stages an immutable descriptor in resident
+; memory; the host then starts MSXAIXF.COM with `/PUT <id>` or `/GET <id>`.
+; That foreground process claims the descriptor through TsrCall and is the only
+; component allowed to OPEN/READ/WRITE/SEEK/ENSURE/CLOSE/RENAME files.
+
+if MSXAI_TSR_BUILD
+frame_cmd_file_transfer:
     ld a,(runtime_mode)
     cp RUNTIME_RESIDENT
     jp nz,frame_reply_bad_state
@@ -3152,140 +2958,741 @@ frame_cmd_file_upload:
     cp 1
     jp nz,frame_reply_bad_state
     ld hl,(frame_length)
-    ld de,2
+    ld a,h
+    or l
+    jp z,frame_reply_bad_arg
+    ld a,(frame_request_buffer)
+    cp XFER_CMD_CAPS
+    jp z,frame_xfer_caps
+    cp XFER_CMD_OPEN
+    jp z,frame_xfer_open
+    cp XFER_CMD_STATUS
+    jp z,frame_xfer_status
+    cp XFER_CMD_PUT_DATA
+    jp z,frame_xfer_put_data
+    cp XFER_CMD_GET_READ
+    jp z,frame_xfer_get_read
+    cp XFER_CMD_GET_ACK
+    jp z,frame_xfer_get_ack
+    cp XFER_CMD_CLOSE
+    jp z,frame_xfer_close
+    cp XFER_CMD_CANCEL
+    jp z,frame_xfer_cancel
+    jp frame_reply_bad_arg
+
+; CAPS response: version:u8, caps:u32le, max_put:u16, max_get:u16,
+; max_path:u16. Compression bits are intentionally absent in version 1.
+frame_xfer_caps:
+    ld de,1
+    call frame_require_length
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_response_buffer
+    ld (hl),XFER_VERSION
+    inc hl
+    ld (hl),XFER_CAPABILITIES
+    inc hl
+    xor a
+    ld (hl),a
+    inc hl
+    ld (hl),a
+    inc hl
+    ld (hl),a
+    inc hl
+    ld de,XFER_PUT_CAPACITY
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld de,XFER_GET_CAPACITY
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld (hl),XFER_PATH_MAX
+    inc hl
+    ld (hl),0
+    ld hl,11
+    jp frame_xfer_reply_length_ok
+
+; OPEN request (47-byte fixed prefix followed by path):
+; sub, version, direction, encoding, flags, id[16], wire size/CRC,
+; final size/CRC, resume offset/prefix CRC, path length:u16, ASCII path.
+frame_xfer_open:
+    ld hl,(frame_length)
+    ld de,47
     or a
     sbc hl,de
     jp c,frame_reply_bad_arg
-    ld (upload_request_length),hl
-    xor a
-    ld (upload_accepted),a
-    ld (upload_accepted + 1),a
-
-    ld a,(upload_active)
+    ld (xfer_request_count),hl
+    ld a,(frame_request_buffer + 46)
     or a
-    jr z,frame_file_upload_reply
-    ld hl,(frame_request_buffer)
-    ld de,(upload_received)
+    jp nz,frame_reply_range
+    ld a,(frame_request_buffer + 45)
+    or a
+    jp z,frame_reply_bad_arg
+    cp XFER_PATH_MAX + 1
+    jp nc,frame_reply_range
+    ld e,a
+    ld d,0
+    ld hl,(xfer_request_count)
     or a
     sbc hl,de
     jp nz,frame_reply_bad_arg
-    ld hl,(upload_request_length)
-    ld a,h
-    or l
-    jr z,frame_file_upload_reply
-    ld a,(upload_pending)
+    ld a,(frame_request_buffer + 1)
+    cp XFER_VERSION
+    jp nz,frame_reply_unsupported
+    ld a,(frame_request_buffer + 2)
+    cp XFER_DIRECTION_GET + 1
+    jp nc,frame_reply_bad_arg
+    ld a,(frame_request_buffer + 3)
+    cp XFER_ENCODING_RAW
+    jr z,frame_xfer_open_encoding_ok
+    cp XFER_ENCODING_PACKBITS
+    jp nz,frame_reply_unsupported
+    ld a,(frame_request_buffer + 2)
+    cp XFER_DIRECTION_PUT
+    jp nz,frame_reply_unsupported ; GET is intentionally always byte-exact RAW
+frame_xfer_open_encoding_ok:
+    ld a,(frame_request_buffer + 4)
+    and 0FFh - XFER_FLAGS_SUPPORTED
+    jp nz,frame_reply_bad_arg
+    ld a,(frame_request_buffer + 4)
+    and XFER_FLAG_RESUME
+    jr nz,frame_xfer_open_resume_flag_ok
+    ld hl,frame_request_buffer + 37
+    ld b,8
+    ld c,0
+frame_xfer_open_no_resume_check:
+    ld a,(hl)
+    or c
+    ld c,a
+    inc hl
+    djnz frame_xfer_open_no_resume_check
+    ld a,c
     or a
-    jr nz,frame_file_upload_reply
+    jp nz,frame_reply_bad_arg
+frame_xfer_open_resume_flag_ok:
+    ; Receiptless replay is narrower than ordinary resume: only a PUT at its
+    ; exact complete CRC boundary may ask the foreground helper to validate a
+    ; target after successful publication removed the durable sidecar.
+    ld a,(frame_request_buffer + 4)
+    and XFER_FLAG_RECEIPTLESS_REPLAY
+    jr z,frame_xfer_open_receiptless_ok
+    ld a,(frame_request_buffer + 2)
+    cp XFER_DIRECTION_PUT
+    jp nz,frame_reply_bad_arg
+    ld a,(frame_request_buffer + 4)
+    and XFER_FLAG_RESUME
+    jp z,frame_reply_bad_arg
+    ld hl,frame_request_buffer + 37
+    ld de,frame_request_buffer + 21
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_request_buffer + 41
+    ld de,frame_request_buffer + 25
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+frame_xfer_open_receiptless_ok:
 
-    ; Refuse a chunk that crosses the length negotiated by foreground /PUT.
-    ld hl,(upload_expected)
-    ld de,(upload_received)
+    ; A running transfer owns the resident descriptor. Terminal descriptors may
+    ; be replaced, but never let a second host steal staged/foreground state.
+    ld a,(xfer_state)
+    cp XFER_STATE_IDLE
+    jr z,frame_xfer_open_state_ok
+    cp XFER_STATE_COMPLETE
+    jr z,frame_xfer_open_state_ok
+    cp XFER_STATE_FAILED
+    jr z,frame_xfer_open_state_ok
+    cp XFER_STATE_CANCELLED
+    jp nz,frame_reply_bad_state
+frame_xfer_open_state_ok:
+    ld hl,frame_request_buffer + 5
+    ld b,16
+    ld c,0
+frame_xfer_open_id_check:
+    ld a,(hl)
+    or c
+    ld c,a
+    inc hl
+    djnz frame_xfer_open_id_check
+    ld a,c
+    or a
+    jp z,frame_reply_bad_arg
+
+    ; Validate printable, non-NUL path bytes before publishing any state.
+    ld hl,frame_request_buffer + 47
+    ld a,(frame_request_buffer + 45)
+    ld b,a
+frame_xfer_open_path_check:
+    ld a,(hl)
+    cp 020h
+    jp c,frame_reply_bad_arg
+    cp 07Fh
+    jp nc,frame_reply_bad_arg
+    cp '*'
+    jp z,frame_reply_bad_arg
+    cp '?'
+    jp z,frame_reply_bad_arg
+frame_xfer_open_path_character_ok:
+    inc hl
+    djnz frame_xfer_open_path_check
+    dec hl
+    ld a,(hl)
+    cp ':'
+    jp z,frame_reply_bad_arg
+    cp 05Ch
+    jp z,frame_reply_bad_arg
+    cp '/'
+    jp z,frame_reply_bad_arg
+
+    ; RAW PUT must have identical wire/final integrity metadata. PackBits has a
+    ; distinct compressed wire representation. GET discovery deliberately
+    ; permits zero metadata; foreground fills it after scanning.
+    ld a,(frame_request_buffer + 2)
+    cp XFER_DIRECTION_GET
+    jr z,frame_xfer_open_copy
+    ld a,(frame_request_buffer + 3)
+    cp XFER_ENCODING_RAW
+    jr nz,frame_xfer_open_put_size_ok
+    ld hl,frame_request_buffer + 21
+    ld de,frame_request_buffer + 29
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_request_buffer + 25
+    ld de,frame_request_buffer + 33
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+frame_xfer_open_put_size_ok:
+    ; requested resume offset <= complete wire length, including zero length.
+    ld hl,(frame_request_buffer + 21)
+    ld de,(frame_request_buffer + 37)
     or a
     sbc hl,de
-    ld de,(upload_request_length)
-    or a
+    ld hl,(frame_request_buffer + 23)
+    ld de,(frame_request_buffer + 39)
     sbc hl,de
     jp c,frame_reply_range
 
-    ld bc,(upload_request_length)
-    ld hl,frame_request_buffer + 2
-    ld de,upload_buffer
+frame_xfer_open_copy:
+    call xfer_reset
+    ld hl,frame_request_buffer + 5
+    ld de,xfer_descriptor + XFER_DESC_ID
+    ld bc,16
     ldir
-    ld hl,(upload_request_length)
-    ld (upload_chunk_length),hl
-    ld (upload_accepted),hl
-    ld de,(upload_received)
-    add hl,de
-    ld (upload_received),hl
-    ld a,1                     ; publish the mailbox only after the copy
-    ld (upload_pending),a
-
-frame_file_upload_reply:
-    ld hl,frame_response_buffer
-    ld de,(upload_accepted)
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl
-    ld de,(upload_received)
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl
-
-    ; A free mailbox grants one frame-sized credit, capped by bytes remaining.
-    ld de,0
-    ld a,(upload_active)
-    or a
-    jr z,frame_file_upload_credit_ready
-    ld a,(upload_pending)
-    or a
-    jr nz,frame_file_upload_credit_ready
-    push hl
-    ld hl,(upload_expected)
-    ld bc,(upload_received)
-    or a
-    sbc hl,bc
-    ld bc,UPLOAD_CHUNK_CAPACITY
-    push hl
-    or a
-    sbc hl,bc
-    pop hl
-    jr c,frame_file_upload_credit_remaining
-    jr z,frame_file_upload_credit_remaining
-    ld hl,UPLOAD_CHUNK_CAPACITY
-frame_file_upload_credit_remaining:
-    ex de,hl
-    pop hl
-frame_file_upload_credit_ready:
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl
-
-    ld c,0
-    ld a,(upload_active)
-    or a
-    jr z,frame_file_upload_flags_result
-    ld c,UPLOAD_FLAG_ACTIVE
-    ld a,(upload_pending)
-    or a
-    jr z,frame_file_upload_flags_complete
-    ld a,c
-    or UPLOAD_FLAG_PENDING
+    ld hl,frame_request_buffer + 2
+    ld de,xfer_descriptor + XFER_DESC_DIRECTION
+    ld bc,3
+    ldir
+    xor a
+    ld (xfer_descriptor + XFER_DESC_RESERVED),a
+    ld hl,frame_request_buffer + 21
+    ld de,xfer_descriptor + XFER_DESC_WIRE_SIZE
+    ld bc,24
+    ldir
+    ld a,(frame_request_buffer + 45)
+    ld (xfer_descriptor + XFER_DESC_PATH_LENGTH),a
     ld c,a
-frame_file_upload_flags_complete:
-    ld de,(upload_expected)
-    ld hl,(upload_received)
+    ld b,0
+    ld hl,frame_request_buffer + 47
+    ld de,xfer_descriptor + XFER_DESC_PATH
+    ldir
+    xor a
+    ld (de),a
+    ld hl,xfer_descriptor + XFER_DESC_RESUME_OFFSET
+    ld de,xfer_accepted
+    ld bc,4
+    ldir
+    ld hl,xfer_descriptor + XFER_DESC_RESUME_OFFSET
+    ld de,xfer_durable
+    ld bc,4
+    ldir
+    ld hl,xfer_descriptor + XFER_DESC_PREFIX_CRC
+    ld de,xfer_prefix_crc
+    ld bc,4
+    ldir
+    ld a,XFER_STATE_STAGED
+    ld (xfer_state),a
+    ld a,XFER_STATUS_ACTIVE | XFER_STATUS_RESUMABLE
+    ld (xfer_result_flags),a
+    jp frame_xfer_reply_state
+
+; STATUS request is sub + transfer ID. The 51-byte response is read-only and
+; may be recomputed if its framed reply is lost.
+frame_xfer_status:
+    call xfer_require_id_request
+    jp c,frame_reply_bad_arg
+    call xfer_credit
+    ld (xfer_request_count),hl
+    ld hl,frame_response_buffer
+    ld a,(xfer_state)
+    ld (hl),a
+    inc hl
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    ld (hl),a
+    inc hl
+    ld a,(xfer_descriptor + XFER_DESC_ENCODING)
+    ld (hl),a
+    inc hl
+    ld a,(xfer_error)
+    ld (hl),a
+    inc hl
+    ld a,(xfer_result_flags)
+    ld (hl),a
+    inc hl
+    ex de,hl
+    ld hl,xfer_descriptor + XFER_DESC_ID
+    ld bc,16
+    ldir
+    ld hl,xfer_descriptor + XFER_DESC_WIRE_SIZE
+    ld bc,16
+    ldir
+    ld hl,xfer_durable
+    ld bc,4
+    ldir
+    ld hl,xfer_accepted
+    ld bc,4
+    ldir
+    ld hl,xfer_prefix_crc
+    ld bc,4
+    ldir
+    push de
+    ld de,(xfer_request_count)
+    pop hl
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    ld hl,51
+    jp frame_xfer_reply_length_ok
+
+; PUT_DATA request: sub, id[16], offset:u32, data[0..298]. Response:
+; accepted:u16, accepted_end:u32, durable_end:u32, credit:u16, state, error.
+frame_xfer_put_data:
+    ld hl,(frame_length)
+    ld de,21
     or a
     sbc hl,de
-    jr nz,frame_file_upload_flags_result
-    ld a,c
-    or UPLOAD_FLAG_COMPLETE
+    jp c,frame_reply_bad_arg
+    ld de,XFER_PUT_CAPACITY
+    push hl
+    or a
+    sbc hl,de
+    pop hl
+    jp nc,frame_xfer_put_length_equal_or_over
+    jr frame_xfer_put_length_ok
+frame_xfer_put_length_equal_or_over:
+    jr z,frame_xfer_put_length_ok
+    jp frame_reply_range
+frame_xfer_put_length_ok:
+    ld (xfer_request_count),hl
+    xor a
+    ld (xfer_last_accepted),a
+    ld (xfer_last_accepted + 1),a
+    ; ID and state are operational checks, not parser errors.
+    ld hl,frame_request_buffer + 1
+    call xfer_id_matches
+    jp nz,frame_reply_bad_arg
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_PUT
+    jp nz,frame_reply_bad_state
+    ld hl,frame_request_buffer + 17
+    ld de,xfer_accepted
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+    ld a,(xfer_state)
+    cp XFER_STATE_READY
+    jr z,frame_xfer_put_state_ok
+    cp XFER_STATE_TRANSFERRING
+    jr z,frame_xfer_put_state_ok
+    jp frame_xfer_put_reply
+frame_xfer_put_state_ok:
+    ld hl,(xfer_request_count)
+    ld a,h
+    or l
+    jr z,frame_xfer_put_reply
+    ld a,(xfer_pending)
+    or a
+    jr nz,frame_xfer_put_reply
+    ld a,(xfer_foreground_ready)
+    or a
+    jr z,frame_xfer_put_reply
+
+    ; remaining = wire_size - accepted, rejecting both underflow and crossing.
+    call xfer_remaining
+    jp c,frame_reply_range
+    ld a,(xfer_math32 + 2)
     ld c,a
-frame_file_upload_flags_result:
-    ld a,(upload_result)
-    cp UPLOAD_RESULT_SUCCEEDED
-    jr nz,frame_file_upload_flags_failed
-    ld a,c
-    or UPLOAD_FLAG_SUCCEEDED
-    ld c,a
-    jr frame_file_upload_flags_ready
-frame_file_upload_flags_failed:
-    cp UPLOAD_RESULT_FAILED
-    jr nz,frame_file_upload_flags_ready
-    ld a,c
-    or UPLOAD_FLAG_FAILED
-    ld c,a
-frame_file_upload_flags_ready:
-    ld hl,frame_response_buffer + 6
-    ld a,c
+    ld a,(xfer_math32 + 3)
+    or c
+    jr nz,frame_xfer_put_fits
+    ld hl,(xfer_math32)
+    ld de,(xfer_request_count)
+    or a
+    sbc hl,de
+    jp c,frame_reply_range
+frame_xfer_put_fits:
+    ld bc,(xfer_request_count)
+    ld hl,frame_request_buffer + 21
+    ld de,xfer_buffer
+    ldir
+    ld hl,(xfer_request_count)
+    ld (xfer_buffer_length),hl
+    ld (xfer_last_accepted),hl
+    ld hl,xfer_accepted
+    ld de,xfer_buffer_offset
+    ld bc,4
+    ldir
+    ld hl,(xfer_request_count)
+    call xfer_add_accepted
+    ld a,1
+    ld (xfer_pending),a
+    ld a,XFER_STATE_TRANSFERRING
+    ld (xfer_state),a
+frame_xfer_put_reply:
+    ld hl,frame_response_buffer
+    ld de,(xfer_last_accepted)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ex de,hl
+    ld hl,xfer_accepted
+    ld bc,4
+    ldir
+    ld hl,xfer_durable
+    ld bc,4
+    ldir
+    ex de,hl
+    push hl
+    call xfer_credit
+    ex de,hl
+    pop hl
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld a,(xfer_state)
     ld (hl),a
-    ld hl,7
+    inc hl
+    ld a,(xfer_error)
+    ld (hl),a
+    ld hl,14
+    jp frame_xfer_reply_length_ok
+
+; GET_READ request: sub, id, offset:u32, max:u16. A published block is pinned
+; until GET_ACK; a zero-length reply means foreground has not published yet.
+frame_xfer_get_read:
+    ld de,23
+    call frame_require_length
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_request_buffer + 1
+    call xfer_id_matches
+    jp nz,frame_reply_bad_arg
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_GET
+    jp nz,frame_reply_bad_state
+    ld hl,(frame_request_buffer + 21)
+    ld a,h
+    or l
+    jp z,frame_reply_bad_arg
+    ld de,XFER_GET_CAPACITY
+    push hl
+    or a
+    sbc hl,de
+    pop hl
+    jp c,frame_xfer_get_max_ok
+    jp nz,frame_reply_range
+frame_xfer_get_max_ok:
+    ld (xfer_request_count),hl
+    ld a,(xfer_pending)
+    or a
+    jr z,frame_xfer_get_empty
+    ld hl,frame_request_buffer + 17
+    ld de,xfer_buffer_offset
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+    ld hl,(xfer_request_count)
+    ld de,(xfer_buffer_length)
+    or a
+    sbc hl,de
+    jp c,frame_reply_range
+    ld hl,xfer_buffer_offset
+    jr frame_xfer_get_header
+frame_xfer_get_empty:
+    ld hl,frame_request_buffer + 17
+    ld de,xfer_durable
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+    ld hl,xfer_durable
+frame_xfer_get_header:
+    ld de,frame_response_buffer
+    ld bc,4
+    ldir
+    ld hl,(xfer_buffer_length)
+    ld a,(xfer_pending)
+    or a
+    jr nz,frame_xfer_get_length_ready
+    ld hl,0
+frame_xfer_get_length_ready:
+    ld (frame_response_buffer + 4),hl
+    ld a,(xfer_state)
+    ld (frame_response_buffer + 6),a
+    ld a,(xfer_error)
+    ld (frame_response_buffer + 7),a
+    ld bc,(frame_response_buffer + 4)
+    ld a,b
+    or c
+    jr z,frame_xfer_get_copy_done
+    ld hl,xfer_buffer
+    ld de,frame_response_buffer + 8
+    ldir
+frame_xfer_get_copy_done:
+    ld hl,(frame_response_buffer + 4)
+    ld de,8
+    add hl,de
+    jp frame_xfer_reply_length_ok
+
+; GET_ACK request: sub, id, next_offset:u32, prefix_crc32:u32. The CRC binds
+; the ACK to the exact pinned bytes, so a stale/lost acknowledgement cannot
+; release a different block.
+frame_xfer_get_ack:
+    ld de,25
+    call frame_require_length
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_request_buffer + 1
+    call xfer_id_matches
+    jp nz,frame_reply_bad_arg
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_GET
+    jp nz,frame_reply_bad_state
+    ld a,(xfer_pending)
+    or a
+    jp z,frame_reply_bad_state
+    ld hl,xfer_buffer_offset
+    ld de,xfer_math32
+    ld bc,4
+    ldir
+    ld hl,(xfer_buffer_length)
+    call xfer_add_math32
+    ld hl,frame_request_buffer + 17
+    ld de,xfer_math32
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_request_buffer + 21
+    ld de,xfer_buffer_crc
+    call xfer_compare_four
+    jp nz,frame_reply_bad_arg
+    ld hl,xfer_math32
+    ld de,xfer_durable
+    ld bc,4
+    ldir
+    ld hl,xfer_math32
+    ld de,xfer_accepted
+    ld bc,4
+    ldir
+    ld hl,xfer_buffer_crc
+    ld de,xfer_prefix_crc
+    ld bc,4
+    ldir
+    xor a
+    ld (xfer_pending),a
+    ld a,1
+    ld (xfer_get_ack_pending),a
+    xor a
+    ld (xfer_buffer_length),a
+    ld (xfer_buffer_length + 1),a
+    ld a,XFER_STATE_TRANSFERRING
+    ld (xfer_state),a
+    ld hl,xfer_durable
+    ld de,frame_response_buffer
+    ld bc,4
+    ldir
+    ld a,(xfer_state)
+    ld (de),a
+    inc de
+    ld a,(xfer_error)
+    ld (de),a
+    ld hl,6
+    jp frame_xfer_reply_length_ok
+
+frame_xfer_close:
+    call xfer_require_id_request
+    jp c,frame_reply_bad_arg
+    ld a,(xfer_state)
+    cp XFER_STATE_COMPLETE
+    jr z,frame_xfer_reply_state
+    ld a,(xfer_close_requested)
+    or a
+    jr nz,frame_xfer_reply_state
+    ld a,(xfer_state)
+    cp XFER_STATE_READY
+    jr z,frame_xfer_close_state_ok
+    cp XFER_STATE_TRANSFERRING
+    jp nz,frame_reply_bad_state
+frame_xfer_close_state_ok:
+    ld a,(xfer_pending)
+    or a
+    jp nz,frame_reply_bad_state
+    ld hl,xfer_durable
+    ld de,xfer_descriptor + XFER_DESC_WIRE_SIZE
+    call xfer_compare_four
+    jp nz,frame_reply_bad_state
+    ld hl,xfer_accepted
+    ld de,xfer_descriptor + XFER_DESC_WIRE_SIZE
+    call xfer_compare_four
+    jp nz,frame_reply_bad_state
+    ld a,1
+    ld (xfer_close_requested),a
+    ld a,XFER_STATE_VERIFYING
+    ld (xfer_state),a
+    jr frame_xfer_reply_state
+
+frame_xfer_cancel:
+    call xfer_require_id_request
+    jp c,frame_reply_bad_arg
+    ld a,(xfer_state)
+    cp XFER_STATE_COMPLETE
+    jr z,frame_xfer_reply_state
+    cp XFER_STATE_POSTPROCESS
+    jp z,frame_reply_bad_state  ; final publication is now transaction-locked
+    ld a,XFER_STATE_CANCELLED
+    ld (xfer_state),a
+    ld a,XFER_ERROR_NONE
+    ld (xfer_error),a
+    xor a
+    ld (xfer_pending),a
+    ld (xfer_close_requested),a
+    ld a,XFER_STATUS_RESUMABLE
+    ld (xfer_result_flags),a
+    jr frame_xfer_reply_state
+
+frame_xfer_reply_state:
+    ld a,(xfer_state)
+    ld (frame_response_buffer),a
+    ld a,(xfer_error)
+    ld (frame_response_buffer + 1),a
+    ld hl,2
+frame_xfer_reply_length_ok:
     ld (frame_response_length),hl
     xor a
     ld (frame_response_status),a
     jp frame_cache_and_send
+
+; Require a 17-byte sub+ID request and compare its ID with the staged token.
+; Carry reports failure so callers can share their compact error branch.
+xfer_require_id_request:
+    ld hl,(frame_length)
+    ld de,17
+    or a
+    sbc hl,de
+    jr nz,xfer_require_id_error
+    ld hl,frame_request_buffer + 1
+    call xfer_id_matches
+    jr nz,xfer_require_id_error
+    or a
+    ret
+xfer_require_id_error:
+    scf
+    ret
+
+; Compare 16 transfer-ID bytes at HL with the resident descriptor. Z means
+; exact. Both pointers are consumed; callers do not rely on their final value.
+xfer_id_matches:
+    ld de,xfer_descriptor + XFER_DESC_ID
+    ld b,16
+xfer_id_match_loop:
+    ld a,(de)
+    cp (hl)
+    ret nz
+    inc de
+    inc hl
+    djnz xfer_id_match_loop
+    xor a
+    ret
+
+; Compare four little-endian bytes at HL and DE. Z means exact.
+xfer_compare_four:
+    ld b,4
+xfer_compare_four_loop:
+    ld a,(de)
+    cp (hl)
+    ret nz
+    inc de
+    inc hl
+    djnz xfer_compare_four_loop
+    xor a
+    ret
+
+; xfer_math32 = wire_size - accepted. Carry indicates corrupt underflow.
+xfer_remaining:
+    ld hl,(xfer_descriptor + XFER_DESC_WIRE_SIZE)
+    ld de,(xfer_accepted)
+    or a
+    sbc hl,de
+    ld (xfer_math32),hl
+    ld hl,(xfer_descriptor + XFER_DESC_WIRE_SIZE + 2)
+    ld de,(xfer_accepted + 2)
+    sbc hl,de
+    ld (xfer_math32 + 2),hl
+    ret
+
+; Return HL=PUT credit. Credit exists only after foreground readiness, while
+; its one-block mailbox is free, and never exceeds remaining wire bytes.
+xfer_credit:
+    ld hl,0
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_PUT
+    ret nz
+    ld a,(xfer_foreground_ready)
+    or a
+    ret z
+    ld a,(xfer_pending)
+    or a
+    ret nz
+    ld a,(xfer_state)
+    cp XFER_STATE_READY
+    jr z,xfer_credit_state_ok
+    cp XFER_STATE_TRANSFERRING
+    ret nz
+xfer_credit_state_ok:
+    call xfer_remaining
+    ret c
+    ld a,(xfer_math32 + 2)
+    ld c,a
+    ld a,(xfer_math32 + 3)
+    or c
+    ld hl,XFER_PUT_CAPACITY
+    ret nz
+    ld de,(xfer_math32)
+    push hl
+    or a
+    sbc hl,de
+    pop hl
+    ret c
+    ret z
+    ex de,hl
+    ret
+
+; Add the 16-bit HL value to accepted or xfer_math32 respectively.
+xfer_add_accepted:
+    ld de,(xfer_accepted)
+    add hl,de
+    ld (xfer_accepted),hl
+    ld hl,(xfer_accepted + 2)
+    ld de,0
+    adc hl,de
+    ld (xfer_accepted + 2),hl
+    ret
+
+xfer_add_math32:
+    ld de,(xfer_math32)
+    add hl,de
+    ld (xfer_math32),hl
+    ld hl,(xfer_math32 + 2)
+    ld de,0
+    adc hl,de
+    ld (xfer_math32 + 2),hl
+    ret
+endif
 
 frame_cmd_ram_read:
     ld de,4
@@ -4041,17 +4448,29 @@ tsr_kill:
     call transport_restore
     ret
 
-; Foreground MSXAI.COM invocations use TsrCall both to configure the selected
-; driver and to bridge one file-upload mailbox into a DOS-owned page-0 buffer.
+; Foreground suite programs use TsrCall to configure the selected driver and
+; bridge protocol-X mailboxes into DOS-owned page-0 buffers.
 tsr_talk:
     cp TSR_TALK_CONFIG
-    jr z,tsr_talk_config
-    cp TSR_TALK_UPLOAD_BEGIN
-    jr z,tsr_talk_upload_begin
-    cp TSR_TALK_UPLOAD_POLL
-    jr z,tsr_talk_upload_poll
-    cp TSR_TALK_UPLOAD_END
-    jp z,tsr_talk_upload_end
+    jp z,tsr_talk_config
+    cp TSR_TALK_XFER_CLAIM
+    jp z,tsr_talk_xfer_claim
+    cp TSR_TALK_XFER_READY
+    jp z,tsr_talk_xfer_ready
+    cp TSR_TALK_XFER_PUT_POLL
+    jp z,tsr_talk_xfer_put_poll
+    cp TSR_TALK_XFER_PUT_COMMIT
+    jp z,tsr_talk_xfer_put_commit
+    cp TSR_TALK_XFER_GET_PUBLISH
+    jp z,tsr_talk_xfer_get_publish
+    cp TSR_TALK_XFER_GET_POLL
+    jp z,tsr_talk_xfer_get_poll
+    cp TSR_TALK_XFER_FINISH
+    jp z,tsr_talk_xfer_finish
+    cp TSR_TALK_XFER_POSTPROCESS
+    jp z,tsr_talk_xfer_postprocess
+    cp TSR_TALK_XFER_PUT_RELEASE
+    jp z,tsr_talk_xfer_put_release
     jp tsr_talk_unsupported
 
 tsr_talk_config:
@@ -4071,7 +4490,7 @@ tsr_talk_config:
     call transport_bind
     call transport_init
     call keybuf_spool_reset     ; never carry synthetic input to a new driver
-    call upload_reset           ; foreground receiver must fail closed
+    call xfer_reset             ; staged descriptors are transport-bound
     xor a
     ld (framed_mode),a
     ld (last_response_valid),a
@@ -4083,106 +4502,425 @@ tsr_talk_done:
     ld a,(active_transport_id)
     ret
 
-; Begin input: HL=total bytes (1..4000h). Return A=0 on success.
-tsr_talk_upload_begin:
-    ld a,h
-    or l
-    jp z,tsr_talk_unsupported
-    push hl
-    ld de,04000h
-    or a
-    sbc hl,de
-    pop hl
-    jr c,tsr_talk_upload_begin_ready
-    jp nz,tsr_talk_unsupported
-tsr_talk_upload_begin_ready:
-    call upload_reset
-    ld (upload_expected),hl
-    ld a,1
-    ld (upload_active),a         ; publish only after every field is initialized
-    xor a
-    ret
-
-; Poll input: HL=caller destination in page 0. Return A=0 while waiting,
-; A=1 with HL=chunk length after a copy, or FFh when no upload is active.
-tsr_talk_upload_poll:
-    ld a,(upload_active)
-    or a
-    jr z,tsr_talk_unsupported
-    ld a,(upload_pending)
-    or a
-    jr z,tsr_talk_upload_waiting
-    ; TsrCall maps the resident into page 1. Keep the complete destination
-    ; range in caller-owned page 0 so a malformed caller cannot overwrite the
-    ; resident or an unrelated page while the mailbox is copied.
+; Validate that an entire caller range beginning at HL remains in page zero.
+; Input BC=count. Carry means that TsrCall's page-1 mapping would hide part of
+; the destination/source range.
+tsr_talk_page0_range:
     ld a,h
     cp 040h
-    jr nc,tsr_talk_unsupported
+    jr nc,tsr_talk_page0_bad
     push hl
-    ld bc,(upload_chunk_length)
     add hl,bc
     ld a,h
     cp 040h
-    jr c,tsr_talk_upload_destination_ready
-    jr nz,tsr_talk_upload_destination_invalid
+    jr c,tsr_talk_page0_ok
+    jr nz,tsr_talk_page0_bad_pop
     ld a,l
     or a
-    jr z,tsr_talk_upload_destination_ready
-tsr_talk_upload_destination_invalid:
+    jr nz,tsr_talk_page0_bad_pop
+tsr_talk_page0_ok:
     pop hl
-    jr tsr_talk_unsupported
-tsr_talk_upload_destination_ready:
+    or a
+    ret
+tsr_talk_page0_bad_pop:
+    pop hl
+tsr_talk_page0_bad:
+    scf
+    ret
+
+; CLAIM input HL points to a page-zero descriptor whose first 16 bytes contain
+; the command-line transfer ID. On success the complete staged descriptor is
+; copied there and its state changes STAGED -> OPENING.
+tsr_talk_xfer_claim:
+    ld bc,XFER_DESC_SIZE
+    call tsr_talk_page0_range
+    jp c,tsr_talk_unsupported
+    ld a,(xfer_state)
+    cp XFER_STATE_STAGED
+    jp nz,tsr_talk_unsupported
+    push hl
+    call xfer_id_matches
+    pop de
+    jp nz,tsr_talk_unsupported
+    ld hl,xfer_descriptor
+    ld bc,XFER_DESC_SIZE
+    ldir
+    ld a,XFER_STATE_OPENING
+    ld (xfer_state),a
+    xor a
+    ld (xfer_error),a
+    ld (xfer_foreground_ready),a
+    ret
+
+; READY input is the claimed descriptor after foreground disk validation.
+; PUT may advance resume offset/prefix to the actual verified partial length;
+; GET additionally fills the four size/CRC fields discovered from its source.
+tsr_talk_xfer_ready:
+    ld bc,XFER_DESC_SIZE
+    call tsr_talk_page0_range
+    jp c,tsr_talk_unsupported
+    ld a,(xfer_state)
+    cp XFER_STATE_OPENING
+    jp nz,tsr_talk_unsupported
+    push hl
+    call xfer_id_matches
+    pop hl
+    jp nz,tsr_talk_unsupported
+    push hl
+    ld de,XFER_DESC_DIRECTION
+    add hl,de
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp (hl)
+    jr nz,tsr_talk_xfer_ready_bad_pop
+    inc hl
+    ld a,(xfer_descriptor + XFER_DESC_ENCODING)
+    cp (hl)
+    jr nz,tsr_talk_xfer_ready_bad_pop
+    pop hl
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_GET
+    jr nz,tsr_talk_xfer_ready_metadata_done
+    push hl
+    ld de,XFER_DESC_WIRE_SIZE
+    add hl,de
+    ld de,xfer_descriptor + XFER_DESC_WIRE_SIZE
+    ld bc,16
+    ldir
+    pop hl
+tsr_talk_xfer_ready_metadata_done:
+    push hl
+    ld de,XFER_DESC_RESUME_OFFSET
+    add hl,de
+    ld de,xfer_descriptor + XFER_DESC_RESUME_OFFSET
+    ld bc,8
+    ldir
+    pop hl
+    ld de,XFER_DESC_RESUME_OFFSET
+    add hl,de
+    push hl
+    ld de,xfer_durable
+    ld bc,4
+    ldir
     pop hl
     push hl
-    ld bc,(upload_chunk_length)
-    ld hl,upload_buffer
-    pop de
+    ld de,xfer_accepted
+    ld bc,4
     ldir
-    ld hl,(upload_chunk_length)
+    pop hl
+    ld de,4
+    add hl,de
+    ld de,xfer_prefix_crc
+    ld bc,4
+    ldir
+    ; Foreground must never advertise an offset beyond the now-known size.
+    ld hl,(xfer_descriptor + XFER_DESC_WIRE_SIZE)
+    ld de,(xfer_durable)
+    or a
+    sbc hl,de
+    ld hl,(xfer_descriptor + XFER_DESC_WIRE_SIZE + 2)
+    ld de,(xfer_durable + 2)
+    sbc hl,de
+    jr c,tsr_talk_xfer_ready_bad
+    ld a,1
+    ld (xfer_foreground_ready),a
+    ld a,XFER_STATE_READY
+    ld (xfer_state),a
     xor a
-    ld (upload_pending),a        ; release credit only after the complete copy
-    inc a
     ret
-tsr_talk_upload_waiting:
+tsr_talk_xfer_ready_bad_pop:
+    pop hl
+tsr_talk_xfer_ready_bad:
+    ld a,XFER_ERROR_METADATA
+    ld (xfer_error),a
+    ld a,XFER_STATE_FAILED
+    ld (xfer_state),a
+    ld a,XFER_STATUS_RESUMABLE
+    ld (xfer_result_flags),a
+    jp tsr_talk_unsupported
+
+; PUT_POLL input HL=page-zero destination. It returns A=1/HL=length when a
+; block is available but deliberately retains pending ownership until COMMIT;
+; A=2 means CLOSE was requested, A=0 means wait, FFh means terminal failure.
+tsr_talk_xfer_put_poll:
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_PUT
+    jp nz,tsr_talk_unsupported
+    ld a,(xfer_state)
+    cp XFER_STATE_FAILED
+    jp z,tsr_talk_unsupported
+    cp XFER_STATE_CANCELLED
+    jp z,tsr_talk_unsupported
+    ld a,(xfer_close_requested)
+    or a
+    jr z,tsr_talk_xfer_put_poll_data
+    ld hl,0
+    ld a,2
+    ret
+tsr_talk_xfer_put_poll_data:
+    ld a,(xfer_pending)
+    or a
+    jr z,tsr_talk_xfer_wait
+    ld bc,(xfer_buffer_length)
+    push hl
+    call tsr_talk_page0_range
+    pop de
+    jp c,tsr_talk_unsupported
+    ld hl,xfer_buffer
+    ldir
+    ld hl,(xfer_buffer_length)
+    ld a,1
+    ret
+tsr_talk_xfer_wait:
     ld hl,0
     xor a
     ret
 
-tsr_talk_upload_end:
-    ld a,(upload_active)
+; PUT_RELEASE input HL is the exact current block length. It releases mailbox
+; credit after WRITE without claiming that DOS has made those bytes durable.
+; A later PUT_COMMIT covers every released write since the previous ENSURE.
+tsr_talk_xfer_put_release:
+    ld a,(xfer_pending)
     or a
-    jr z,tsr_talk_unsupported
-    ld a,h
-    or l
-    jr z,tsr_talk_upload_abort
-
-    ; Foreground validates the whole-file CRC and DOS write/close before
-    ; acknowledging success. Also require the resident mailbox to be empty and
-    ; every negotiated byte to have been accepted.
-    ld a,(upload_pending)
-    or a
-    jr nz,tsr_talk_upload_invalid_success
-    ld hl,(upload_received)
-    ld de,(upload_expected)
+    jp z,tsr_talk_unsupported
+    ld de,(xfer_buffer_length)
     or a
     sbc hl,de
-    jr nz,tsr_talk_upload_invalid_success
-    ld a,UPLOAD_RESULT_SUCCEEDED
-    jr tsr_talk_upload_finish
-tsr_talk_upload_invalid_success:
-    ld a,UPLOAD_RESULT_FAILED
-    call tsr_talk_upload_finish
-    ld a,0FFh
-    ret
-tsr_talk_upload_abort:
-    ld a,UPLOAD_RESULT_FAILED
-tsr_talk_upload_finish:
-    ld (upload_result),a
+    jp nz,tsr_talk_unsupported
     xor a
-    ld (upload_active),a
-    ld (upload_pending),a
-    ld (upload_chunk_length),a
-    ld (upload_chunk_length + 1),a
+    ld (xfer_pending),a
+    ld (xfer_buffer_length),a
+    ld (xfer_buffer_length + 1),a
+    ret
+
+; PUT_COMMIT input HL points to cumulative length:u16 + rolling prefix_crc32.
+; The length must equal accepted-durable exactly. Only a foreground caller
+; that has completed DOS ENSURE may advance the durable boundary this way.
+tsr_talk_xfer_put_commit:
+    ld bc,6
+    call tsr_talk_page0_range
+    jp c,tsr_talk_unsupported
+    ld a,(xfer_pending)
+    or a
+    jp z,tsr_talk_unsupported
+    push hl
+    ld hl,(xfer_accepted)
+    ld de,(xfer_durable)
+    or a
+    sbc hl,de
+    ld (xfer_math32),hl
+    ld hl,(xfer_accepted + 2)
+    ld de,(xfer_durable + 2)
+    sbc hl,de
+    ld (xfer_math32 + 2),hl
+    pop hl
+    ld a,(xfer_math32 + 2)
+    ld d,a
+    ld a,(xfer_math32 + 3)
+    or d
+    jp nz,tsr_talk_unsupported
+    ld de,(xfer_math32)
+    ld a,(hl)
+    cp e
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp d
+    jp nz,tsr_talk_unsupported
+    inc hl
+    push hl
+    ld hl,xfer_accepted
+    ld de,xfer_durable
+    ld bc,4
+    ldir
+    pop hl
+    ld de,xfer_prefix_crc
+    ld bc,4
+    ldir
+    xor a
+    ld (xfer_pending),a
+    ld (xfer_buffer_length),a
+    ld (xfer_buffer_length + 1),a
+    ret
+
+; GET_PUBLISH input: length:u16, prefix CRC after block:u32, data. The resident
+; copies and pins the complete block before returning to foreground DOS code.
+tsr_talk_xfer_get_publish:
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_GET
+    jp nz,tsr_talk_unsupported
+    ld a,(xfer_pending)
+    or a
+    jp nz,tsr_talk_unsupported
+    push hl
+    ld c,(hl)
+    inc hl
+    ld b,(hl)
+    pop hl
+    ld a,b
+    or c
+    jp z,tsr_talk_unsupported
+    push hl
+    ld hl,XFER_GET_CAPACITY
+    or a
+    sbc hl,bc
+    pop hl
+    jp c,tsr_talk_unsupported
+    push bc
+    inc bc
+    inc bc
+    inc bc
+    inc bc
+    inc bc
+    inc bc
+    call tsr_talk_page0_range
+    pop bc
+    jp c,tsr_talk_unsupported
+    push hl
+    ld hl,xfer_durable
+    ld de,xfer_buffer_offset
+    ld bc,4
+    ldir
+    pop hl
+    ld c,(hl)
+    inc hl
+    ld b,(hl)
+    inc hl
+    ld (xfer_buffer_length),bc
+    push bc
+    ld de,xfer_buffer_crc
+    ld bc,4
+    ldir
+    pop bc
+    ld de,xfer_buffer
+    ldir
+    ld hl,xfer_durable
+    ld de,xfer_accepted
+    ld bc,4
+    ldir
+    ld hl,(xfer_buffer_length)
+    call xfer_add_accepted
+    ; xfer_add_accepted used xfer_accepted as intended after the durable copy.
+    ld hl,(xfer_descriptor + XFER_DESC_WIRE_SIZE)
+    ld de,(xfer_accepted)
+    or a
+    sbc hl,de
+    ld hl,(xfer_descriptor + XFER_DESC_WIRE_SIZE + 2)
+    ld de,(xfer_accepted + 2)
+    sbc hl,de
+    jp c,tsr_talk_xfer_ready_bad
+    ld a,1
+    ld (xfer_pending),a
+    ld a,XFER_STATE_TRANSFERRING
+    ld (xfer_state),a
+    xor a
+    ret
+
+; Foreground waits here after publishing GET data. A=1 acknowledges that the
+; host released the block; A=2 signals CLOSE at EOF; FFh is cancel/failure.
+tsr_talk_xfer_get_poll:
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_GET
+    jp nz,tsr_talk_unsupported
+    ld a,(xfer_state)
+    cp XFER_STATE_FAILED
+    jp z,tsr_talk_unsupported
+    cp XFER_STATE_CANCELLED
+    jp z,tsr_talk_unsupported
+    ld a,(xfer_get_ack_pending)
+    or a
+    jr z,tsr_talk_xfer_get_poll_close
+    xor a
+    ld (xfer_get_ack_pending),a
+    inc a
+    ret
+tsr_talk_xfer_get_poll_close:
+    ld a,(xfer_close_requested)
+    or a
+    jr z,tsr_talk_xfer_get_poll_ack
+    ld a,2
+    ret
+tsr_talk_xfer_get_poll_ack:
+    ld a,(xfer_pending)
+    or a
+    jp nz,tsr_talk_xfer_wait
+    ld a,1
+    ret
+
+; The foreground enters POSTPROCESS after the complete wire representation is
+; durable and verified. The final representation may still be decoded and
+; checked here, so FINAL_VERIFIED and PUBLISHED remain reserved for a
+; successful FINISH. This state locks out host cancellation across that work
+; and the target-check/rename window.
+tsr_talk_xfer_postprocess:
+    ld a,(xfer_state)
+    cp XFER_STATE_VERIFYING
+    jp nz,tsr_talk_unsupported
+    ld a,(xfer_close_requested)
+    or a
+    jp z,tsr_talk_unsupported
+    ld a,(xfer_pending)
+    or a
+    jp nz,tsr_talk_unsupported
+    ld hl,xfer_durable
+    ld de,xfer_descriptor + XFER_DESC_WIRE_SIZE
+    call xfer_compare_four
+    jp nz,tsr_talk_unsupported
+    ld a,XFER_STATE_POSTPROCESS
+    ld (xfer_state),a
+    ld a,XFER_STATUS_ACTIVE | XFER_STATUS_RESUMABLE | XFER_STATUS_WIRE_VERIFIED
+    ld (xfer_result_flags),a
+    xor a
+    ret
+
+; FINISH input L=1 for verified success, L=0 for failure and H=protocol error.
+; Success is accepted only after CLOSE and the complete durable byte count.
+tsr_talk_xfer_finish:
+    ld a,(xfer_state)
+    cp XFER_STATE_CANCELLED
+    jr z,tsr_talk_xfer_finish_cancelled
+    ld a,l
+    or a
+    jr z,tsr_talk_xfer_finish_failed
+    ld a,(xfer_state)
+    cp XFER_STATE_POSTPROCESS
+    jp nz,tsr_talk_xfer_ready_bad
+    ld a,(xfer_close_requested)
+    or a
+    jp z,tsr_talk_xfer_ready_bad
+    ld a,(xfer_pending)
+    or a
+    jp nz,tsr_talk_xfer_ready_bad
+    ld hl,xfer_durable
+    ld de,xfer_descriptor + XFER_DESC_WIRE_SIZE
+    call xfer_compare_four
+    jp nz,tsr_talk_xfer_ready_bad
+    ld a,XFER_STATE_COMPLETE
+    ld (xfer_state),a
+    xor a
+    ld (xfer_error),a
+    ld (xfer_foreground_ready),a
+    ld a,XFER_STATUS_RESUMABLE | XFER_STATUS_WIRE_VERIFIED | XFER_STATUS_FINAL_VERIFIED | XFER_STATUS_PUBLISHED
+    ld (xfer_result_flags),a
+    xor a
+    ret
+tsr_talk_xfer_finish_cancelled:
+    xor a
+    ret
+tsr_talk_xfer_finish_failed:
+    ld a,h
+    or a
+    jr nz,tsr_talk_xfer_finish_error_ready
+    ld a,XFER_ERROR_IO
+tsr_talk_xfer_finish_error_ready:
+    ld (xfer_error),a
+    ld a,XFER_STATE_FAILED
+    ld (xfer_state),a
+    xor a
+    ld (xfer_pending),a
+    ld (xfer_foreground_ready),a
+    ld a,XFER_STATUS_RESUMABLE
+    ld (xfer_result_flags),a
+    xor a
     ret
 tsr_talk_unsupported:
     ld a,0FFh
@@ -4204,4 +4942,5 @@ tsr_init_end:
 else
 hook_stack_top: equ resident_end + STACK_RESERVE
 resident_size: equ resident_end - resident_start
+
 endif

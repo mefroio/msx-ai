@@ -14,24 +14,31 @@ from msx_client import OpenMSXError  # noqa: E402
 
 
 class CanonicalAgentBuildTest(unittest.TestCase):
-    def test_build_uses_make_target_and_returns_final_artifact(self):
+    def test_build_uses_make_target_and_returns_agent_package(self):
         with tempfile.TemporaryDirectory() as directory:
-            artifact = Path(directory) / "work" / "agent" / "MSXAI.COM"
+            root = Path(directory) / "work" / "agent"
+            paths = tuple(root / name for name in msx_mcp_server.AGENT_PACKAGE_NAMES)
 
             def make_agent(*args, **kwargs):
-                artifact.parent.mkdir(parents=True)
-                artifact.write_bytes(b"universal-agent")
+                root.mkdir(parents=True)
+                for path in paths:
+                    path.write_bytes(("artifact:" + path.name).encode())
                 return subprocess.CompletedProcess(args[0], 0, "built", "")
 
-            with (mock.patch.object(msx_mcp_server, "AGENT_COM", artifact),
+            constants = (
+                "AGENT_COM", "AGENT_XFER_COM", "AGENT_TSR_8251",
+                "AGENT_TSR_16C550", "AGENT_MEMMAN_COM", "AGENT_TL_COM",
+                "AGENT_TK_COM")
+            replacements = dict(zip(constants, paths, strict=True))
+            with (mock.patch.multiple(msx_mcp_server, **replacements),
                   mock.patch.object(msx_mcp_server, "MAKE", "test-make"),
                   mock.patch.object(
                       msx_mcp_server.subprocess, "run",
                       side_effect=make_agent) as run):
-                result = msx_mcp_server._build_agent_artifact()
+                result = msx_mcp_server._build_agent_artifacts()
 
-            self.assertEqual(result, artifact)
-            self.assertEqual(result.read_bytes(), b"universal-agent")
+            self.assertEqual(result, paths)
+            self.assertTrue(all(path.stat().st_size for path in paths))
             args, kwargs = run.call_args
             self.assertEqual(args[0], ["test-make", "agent"])
             self.assertEqual(kwargs["cwd"], msx_mcp_server.PROJ)
@@ -39,15 +46,21 @@ class CanonicalAgentBuildTest(unittest.TestCase):
 
     def test_success_without_final_artifact_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            artifact = Path(directory) / "work" / "agent" / "MSXAI.COM"
+            root = Path(directory) / "work" / "agent"
+            paths = tuple(root / name for name in msx_mcp_server.AGENT_PACKAGE_NAMES)
             completed = subprocess.CompletedProcess(
                 ["test-make", "agent"], 0, "", "")
-            with (mock.patch.object(msx_mcp_server, "AGENT_COM", artifact),
+            constants = (
+                "AGENT_COM", "AGENT_XFER_COM", "AGENT_TSR_8251",
+                "AGENT_TSR_16C550", "AGENT_MEMMAN_COM", "AGENT_TL_COM",
+                "AGENT_TK_COM")
+            replacements = dict(zip(constants, paths, strict=True))
+            with (mock.patch.multiple(msx_mcp_server, **replacements),
                   mock.patch.object(
                       msx_mcp_server.subprocess, "run",
                       return_value=completed)):
                 with self.assertRaisesRegex(OpenMSXError, "did not produce"):
-                    msx_mcp_server._build_agent_artifact()
+                    msx_mcp_server._build_agent_artifacts()
 
     def test_dos_prompt_must_be_last_visible_row(self):
         self.assertTrue(msx_mcp_server._dos_prompt_visible(
@@ -73,6 +86,7 @@ class _FakeMachine:
         self.advances = []
         self.typed = []
         self.imported_agent = None
+        self.imported_files = {}
         self.disk_files = {"MSXAI.COM": b"stale-agent"}
         self.closed = False
 
@@ -100,6 +114,7 @@ class _FakeMachine:
             path = re.search(r"\{(.+)\}", command).group(1)
             self.imported_agent = Path(path).read_bytes()
             self.disk_files[Path(path).name.upper()] = self.imported_agent
+            self.imported_files[Path(path).name.upper()] = self.imported_agent
         return ""
 
     def type_line(self, command):
@@ -140,9 +155,16 @@ class TCPBenchHostFlowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             disk = root / "msxdos.dsk"
-            artifact = root / "MSXAI.COM"
+            artifacts = tuple(
+                root / ("source-" + name)
+                for name in msx_mcp_server.AGENT_PACKAGE_NAMES)
             disk.write_bytes(b"disk")
-            artifact.write_bytes(b"canonical-universal-agent")
+            expected_files = {}
+            for name, artifact in zip(
+                    msx_mcp_server.AGENT_PACKAGE_NAMES, artifacts, strict=True):
+                data = ("canonical:" + name).encode()
+                artifact.write_bytes(data)
+                expected_files[name] = data
             machine = _FakeMachine()
             real = _FakeRealAgent("127.0.0.1", 0)
 
@@ -153,8 +175,8 @@ class TCPBenchHostFlowTest(unittest.TestCase):
             try:
                 with (mock.patch.object(msx_mcp_server, "DOS_HDD", disk),
                       mock.patch.object(
-                          msx_mcp_server, "_build_agent_artifact",
-                          return_value=artifact) as build,
+                          msx_mcp_server, "_build_agent_artifacts",
+                          return_value=artifacts) as build,
                       mock.patch.object(
                           msx_mcp_server.shutil, "copytree",
                           side_effect=copy_home),
@@ -171,14 +193,14 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                     openmsx.call_args.kwargs["extensions"],
                     [msx_mcp_server.MCP_SLOT_EXPANDER,
                      msx_mcp_server.DOS_EXTENSION, "rs232_proto"])
-                self.assertEqual(
-                    machine.imported_agent, b"canonical-universal-agent")
+                self.assertEqual(machine.imported_files, expected_files)
                 self.assertEqual(machine.typed, ["MSXAI /DRIVER:8251"])
                 delete_index = machine.commands.index(
                     "diskmanipulator delete hda1 MSXAI.COM")
                 import_index = next(
                     index for index, command in enumerate(machine.commands)
-                    if command.startswith("diskmanipulator import hda1"))
+                    if command.startswith("diskmanipulator import hda1") and
+                    "MSXAI.COM" in command)
                 self.assertLess(delete_index, import_index)
                 self.assertLess(
                     machine.commands.index("set power off"),

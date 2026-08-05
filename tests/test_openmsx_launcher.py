@@ -35,10 +35,13 @@ class OpenMSXMCPLauncherTest(unittest.TestCase):
         self.assertIn(
             'cp "$PROJECT_DIR/tools/openmsx_mcp_test.tcl" "$MCP_SCRIPT"',
             self.launcher)
+        self.assertIn("MCP_PACKAGE_NAMES=(MSXAI.COM MSXAIXF.COM", self.launcher)
+        self.assertIn("MCP8251.TSR MCP16550.TSR", self.launcher)
+        self.assertIn("MEMMAN.COM TL.COM TK.COM", self.launcher)
         self.assertIn(
-            'cp "$MCP_AGENT_COM" "$MCP_RUNTIME_AGENT"', self.launcher)
+            'cp "$suite_source" "$suite_destination"', self.launcher)
         self.assertIn(
-            'MSX_AI_MCP_AGENT_COM="$MCP_RUNTIME_AGENT"', self.launcher)
+            'MSX_AI_MCP_SUITE_DIR="$MCP_RUNTIME_DIR"', self.launcher)
         slot_expander = self.launcher.index('-ext "$MCP_SLOT_EXPANDER"')
         dos_extension = self.launcher.index(
             '-ext "$DOS_EXTENSION"', slot_expander)
@@ -50,9 +53,13 @@ class OpenMSXMCPLauncherTest(unittest.TestCase):
 
     def test_startup_keeps_agent_manual_and_retries_transport(self):
         self.assertNotIn('//type "MSXAI ', self.startup)
-        self.assertIn("MSXAI.COM ready for manual start", self.startup)
-        self.assertIn("diskmanipulator delete hda1 MSXAI.COM", self.startup)
-        self.assertIn("diskmanipulator import hda1 $agent", self.startup)
+        self.assertIn("agent package ready", self.startup)
+        self.assertIn("MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR",
+                      self.startup)
+        self.assertIn("MEMMAN.COM TL.COM TK.COM", self.startup)
+        self.assertIn("diskmanipulator delete hda1 $suite_name", self.startup)
+        self.assertIn("diskmanipulator import hda1", self.startup)
+        self.assertIn("MSX_AI_MCP_SUITE_DIR", self.startup)
         self.assertIn('set rs232-net-address "$ipv4:$port"', self.startup)
         self.assertIn("set rs232-net-ip232 off", self.startup)
         self.assertIn("after realtime $retry_seconds", self.startup)

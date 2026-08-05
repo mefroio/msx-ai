@@ -14,6 +14,8 @@ from tools.build_agent_tsr import (  # noqa: E402
     BUILD_ORIGINS,
     H_KEYI,
     H_TIMI,
+    TRANSPORT_16C550,
+    TRANSPORT_8251,
     TSR_NAME,
     AgentTsrBuildError,
     LinkedImage,
@@ -72,6 +74,8 @@ class AgentTsrBuilderTest(unittest.TestCase):
             first = build_agent_tsr(ROOT, output, metadata)
             first_data = output.read_bytes()
             first_metadata = metadata.read_bytes()
+            driver_8251 = first.driver_8251_path.read_bytes()
+            driver_16c550 = first.driver_16c550_path.read_bytes()
 
             self.assertEqual(first.size, len(first_data))
             self.assertEqual(len(first_data) % 128, 0)
@@ -98,6 +102,17 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 self.assertGreaterEqual(hook_handler, fields[4])
                 self.assertLess(hook_handler, fields[4] + fields[8])
             self.assertEqual(first_data[first.transport_file_offset], 0xFE)
+            self.assertEqual(len(driver_8251), len(first_data))
+            self.assertEqual(len(driver_16c550), len(first_data))
+            self.assertEqual(
+                driver_8251[first.transport_file_offset], TRANSPORT_8251)
+            self.assertEqual(
+                driver_16c550[first.transport_file_offset], TRANSPORT_16C550)
+            self.assertEqual(
+                [index for index, pair in enumerate(
+                 zip(driver_8251, driver_16c550, strict=True))
+                 if pair[0] != pair[1]],
+                [first.transport_file_offset])
 
             metadata_text = first_metadata.decode("ascii")
             self.assertRegex(
@@ -116,6 +131,9 @@ class AgentTsrBuilderTest(unittest.TestCase):
             self.assertEqual(second, first)
             self.assertEqual(output.read_bytes(), first_data)
             self.assertEqual(metadata.read_bytes(), first_metadata)
+            self.assertEqual(first.driver_8251_path.read_bytes(), driver_8251)
+            self.assertEqual(
+                first.driver_16c550_path.read_bytes(), driver_16c550)
 
 
 if __name__ == "__main__":

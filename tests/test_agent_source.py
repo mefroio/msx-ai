@@ -56,7 +56,17 @@ class ResidentAgentSourceTests(unittest.TestCase):
     def test_debug_is_runtime_opt_in_and_foreground_only(self):
         self.assertIn("debug_enabled:", self.source)
         self.assertIn('db "DEBUG",0', self.source)
-        self.assertIn('db "ON",0', self.source)
+        self.assertNotIn('db "ON",0', self.source)
+        self.assertNotIn("option_on:", self.source)
+        parser = self.source.split("loader_parse_debug:", 1)[1].split(
+            "loader_parse_uninstall:", 1)[0]
+        self.assertIn("ld (loader_debug_enabled),a", parser)
+        self.assertIn("call loader_skip_token", parser)
+        self.assertNotIn("loader_token_equals", parser)
+        usage = self.source.split("usage_message:", 1)[1].split(
+            "driver_required_message:", 1)[0]
+        self.assertIn("/MONITOR [DEBUG]", usage)
+        self.assertNotIn("DEBUG ON", usage)
         self.assertIn("debug_trace_command:", self.source)
         debug = self.source.split("debug_trace_command:", 1)[1].split(
             "; --------------------------------------------------------------- protocol", 1)[0]
@@ -201,38 +211,40 @@ class ResidentAgentSourceTests(unittest.TestCase):
         for forbidden in ("call bdos_proxy", "call CHGET", "call CHPUT"):
             self.assertNotIn(forbidden, spool)
 
-    def test_file_upload_uses_a_credited_resident_mailbox_without_bdos(self):
-        self.assertRegex(
-            self.source, r"(?m)^FEATURE_FILE_UPLOAD:\s+equ\s+040h\b")
+    def test_protocol_x_is_the_only_resident_file_transfer_path(self):
+        self.assertNotIn("FEATURE_FILE_UPLOAD", self.source)
         features = self.source.split(
             "current_features_resident:", 1)[1].split("cmd_status:", 1)[0]
-        self.assertIn("FEATURE_FILE_UPLOAD", features)
+        self.assertIn("FEATURE_FILE_TRANSFER", features)
         dispatch = self.source.split("frame_dispatch:", 1)[1].split(
             "frame_require_length:", 1)[0]
-        self.assertRegex(dispatch, r"(?s)cp 'U'.*frame_cmd_file_upload")
-        upload = self.source.split("frame_cmd_file_upload:", 1)[1].split(
-            "frame_cmd_ram_read:", 1)[0]
-        self.assertIn("UPLOAD_CHUNK_CAPACITY", upload)
-        self.assertIn("ld de,upload_buffer", upload)
-        self.assertIn("ld (upload_pending),a", upload)
-        self.assertIn("ld hl,7", upload)
-        self.assertIn("UPLOAD_FLAG_SUCCEEDED", upload)
-        self.assertIn("UPLOAD_FLAG_FAILED", upload)
-        for forbidden in ("00005h", "bdos_proxy", "DOS_WRITE"):
-            self.assertNotIn(forbidden, upload)
+        self.assertRegex(dispatch, r"(?s)cp 'X'.*frame_cmd_file_transfer")
+        self.assertNotRegex(dispatch, r"cp 'U'")
+        for obsolete in (
+                "frame_cmd_file_upload:", "UPLOAD_CHUNK_CAPACITY",
+                "UPLOAD_FLAG_ACTIVE", "UPLOAD_RESULT_SUCCEEDED",
+                "upload_active:", "upload_buffer:", "upload_reset:"):
+            self.assertNotIn(obsolete, self.source)
+
+        storage = self.source.split("xfer_descriptor:", 1)[1].split(
+            "resident_initialize:", 1)[0]
+        self.assertRegex(
+            storage, r"(?m)^xfer_buffer:\s*\n\s*ds XFER_GET_CAPACITY,0$")
+        self.assertNotIn("equ upload_buffer", storage)
+
         talk = self.source.split("tsr_talk:", 1)[1].split(
             "tsr_talk_unsupported:", 1)[0]
-        for action in ("TSR_TALK_UPLOAD_BEGIN", "TSR_TALK_UPLOAD_POLL",
-                       "TSR_TALK_UPLOAD_END"):
+        for action in (
+                "TSR_TALK_XFER_CLAIM", "TSR_TALK_XFER_READY",
+                "TSR_TALK_XFER_PUT_POLL", "TSR_TALK_XFER_GET_PUBLISH",
+                "TSR_TALK_XFER_FINISH"):
             self.assertIn(action, talk)
-        poll = self.source.split("tsr_talk_upload_poll:", 1)[1].split(
-            "tsr_talk_upload_waiting:", 1)[0]
-        self.assertIn("cp 040h", poll)
-        self.assertIn("add hl,bc", poll)
-        end = self.source.split("tsr_talk_upload_end:", 1)[1].split(
-            "tsr_talk_unsupported:", 1)[0]
-        self.assertIn("UPLOAD_RESULT_SUCCEEDED", end)
-        self.assertIn("UPLOAD_RESULT_FAILED", end)
+        for obsolete in (
+                "TSR_TALK_UPLOAD_BEGIN", "TSR_TALK_UPLOAD_POLL",
+                "TSR_TALK_UPLOAD_END", "tsr_talk_upload_begin:",
+                "tsr_talk_upload_poll:", "tsr_talk_upload_end:"):
+            self.assertNotIn(obsolete, self.source)
+        self.assertIn("tsr_talk_page0_range:", self.source)
 
     def test_memman_registers_keyi_guard_and_timi_dispatch(self):
         hook_spec = self.tsr_builder_source.split("hooks=(", 1)[1].split(

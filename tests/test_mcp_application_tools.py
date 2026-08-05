@@ -19,8 +19,9 @@ class FakeRealMSX:
         self.stops = 0
         self.hardware = []
         self.typed = []
-        self.files = []
-        self.feature_bits = msx_mcp_server.FEATURE_FILE_UPLOAD
+        self.put_payloads = []
+        self.transfers = []
+        self.feature_bits = msx_mcp_server.FEATURE_FILE_TRANSFER
         self.screen = "MSX-DOS 2\nA:\\>"
 
     def stop(self):
@@ -62,18 +63,34 @@ class FakeRealMSX:
 
     def type(self, text):
         self.typed.append(("type", text))
+        return len(text.encode("ascii"))
 
     def type_line(self, text):
         self.typed.append(("line", text))
         if text == "BASIC":
             self.screen = "Microsoft MSX BASIC\nOk"
+        return len(text.encode("ascii")) + 1
 
     def type_lines(self, lines):
-        self.typed.append(("lines", tuple(lines)))
+        lines = tuple(lines)
+        self.typed.append(("lines", lines))
+        return sum(len(line.encode("ascii")) + 1 for line in lines)
 
-    def put_dos_file(self, name, data):
-        self.files.append((name, bytes(data)))
+    def put_file(self, source, target, **options):
+        source = Path(source)
+        self.transfers.append(("put", source, target, options))
+        # BASIC uploads use a short-lived host file. Capture its bytes here so
+        # assertions remain valid after the temporary directory is removed.
+        self.put_payloads.append((target, source.read_bytes(), dict(options)))
         self.screen = "MSXAI PUT OK\nA:\\>"
+        return {"direction": "put", "wire_bytes": source.stat().st_size,
+                "target": target, "encoding": "raw"}
+
+    def get_file(self, source, target, **options):
+        self.transfers.append(("get", source, Path(target), options))
+        self.screen = "MSXAI GET OK\nA:\\>"
+        return {"direction": "get", "wire_bytes": 123,
+                "target": str(target), "encoding": "raw"}
 
     def press(self, key):
         self.typed.append(("key", key))
@@ -146,13 +163,21 @@ class MCPApplicationToolsTest(unittest.TestCase):
                 call()
 
     def test_real_type_tools_dispatch_through_backend_keyboard_api(self):
-        with mock.patch.object(msx_mcp_server.time, "sleep"):
-            self.assertEqual(msx_mcp_server.t_type("PRINT 1"), self.backend.screen)
-            self.assertEqual(msx_mcp_server.t_type_line("RUN"), self.backend.screen)
-            self.assertEqual(
-                msx_mcp_server.t_type_lines(["10 PRINT 1", "RUN"]),
-                self.backend.screen)
+        with (mock.patch.object(msx_mcp_server.time, "sleep"),
+              mock.patch.object(
+                  self.backend, "screen_text",
+                  side_effect=AssertionError("unexpected VRAM read"))):
+            typed = json.loads(msx_mcp_server.t_type("PRINT 1"))
+            line = json.loads(msx_mcp_server.t_type_line("RUN"))
+            lines = json.loads(msx_mcp_server.t_type_lines(
+                ["10 PRINT 1", "RUN"]))
 
+        self.assertEqual(typed["bytes_consumed"], 7)
+        self.assertEqual(line["bytes_consumed"], 4)
+        self.assertEqual(lines["lines"], 2)
+        self.assertFalse(typed["screen_capture_performed"])
+        self.assertFalse(line["screen_capture_performed"])
+        self.assertFalse(lines["screen_capture_performed"])
         self.assertEqual(self.backend.typed, [
             ("type", "PRINT 1"),
             ("line", "RUN"),
@@ -160,65 +185,31 @@ class MCPApplicationToolsTest(unittest.TestCase):
         ])
 
     def test_real_key_tool_dispatches_special_keys_through_agent_backend(self):
-        with mock.patch.object(msx_mcp_server.time, "sleep") as sleep:
-            self.assertEqual(
-                msx_mcp_server.t_key("CTRL+STOP"), self.backend.screen)
+        with (mock.patch.object(msx_mcp_server.time, "sleep") as sleep,
+              mock.patch.object(
+                  self.backend, "screen_text",
+                  side_effect=AssertionError("unexpected VRAM read"))):
+            result = json.loads(msx_mcp_server.t_key("CTRL+STOP"))
 
+        self.assertFalse(result["screen_capture_performed"])
         self.assertEqual(self.backend.typed, [("key", "CTRL+STOP")])
         sleep.assert_called_once_with(0.1)
 
     def test_real_run_basic_enters_from_dos_and_sends_one_batch(self):
         program = "10 PRINT \"MCP\"   \n\n20 END\n"
-        with mock.patch.object(msx_mcp_server.time, "sleep"):
-            result = msx_mcp_server.t_run_basic(program, clear=True)
+        with mock.patch.object(
+                self.backend, "screen_text",
+                side_effect=AssertionError("unexpected VRAM read")):
+            result = json.loads(msx_mcp_server.t_run_basic(
+                program, clear=True, dos_prompt_confirmed=True))
 
-        self.assertEqual(result, self.backend.screen)
+        self.assertTrue(result["run_submitted"])
+        self.assertFalse(result["screen_capture_performed"])
         self.assertEqual(self.backend.typed, [
             ("line", "BASIC"),
             ("line", "NEW"),
             ("lines", ("10 PRINT \"MCP\"", "20 END", "RUN")),
         ])
-
-    def test_real_run_basic_waits_for_delayed_basic_prompt(self):
-        screens = iter([
-            "MSX-DOS 2\nA:\\>",
-            "MSX-DOS 2\nA:\\>BASIC",
-            "Microsoft MSX BASIC\nOk",
-            "Microsoft MSX BASIC\nOk",
-            "MCP\nOk",
-        ])
-        with (mock.patch.object(
-                  self.backend, "screen_text", side_effect=screens) as capture,
-              mock.patch.object(msx_mcp_server.time, "sleep") as sleep):
-            result = msx_mcp_server.t_run_basic(
-                '10 PRINT "MCP"', clear=True)
-
-        self.assertEqual(result, "MCP\nOk")
-        sleep.assert_called()
-        bounded = [call.kwargs["timeout"] for call in capture.call_args_list
-                   if "timeout" in call.kwargs]
-        self.assertTrue(bounded)
-        self.assertEqual(
-            bounded,
-            [msx_mcp_server.REAL_BASIC_SCREEN_CAPTURE_TIMEOUT_SECONDS] *
-            len(bounded))
-
-    def test_real_screen_wait_never_shrinks_capture_timeout(self):
-        screens = iter(["booting", "still booting", "Ok"])
-        clock = iter([0.0, 29.95, 29.96, 29.97, 29.98, 29.99])
-        with (mock.patch.object(
-                  self.backend, "screen_text", side_effect=screens) as capture,
-              mock.patch.object(msx_mcp_server.time, "monotonic",
-                                side_effect=clock),
-              mock.patch.object(msx_mcp_server.time, "sleep")):
-            result = msx_mcp_server._wait_for_real_screen(
-                self.backend, lambda screen: screen.endswith("Ok"),
-                timeout=30.0)
-
-        self.assertEqual(result, "Ok")
-        self.assertEqual(
-            [call.kwargs["timeout"] for call in capture.call_args_list],
-            [msx_mcp_server.REAL_BASIC_SCREEN_CAPTURE_TIMEOUT_SECONDS] * 3)
 
     def test_real_run_basic_clear_false_does_not_enter_basic_again(self):
         self.backend.screen = "Microsoft MSX BASIC\nOk"
@@ -234,31 +225,46 @@ class MCPApplicationToolsTest(unittest.TestCase):
         program = "\n".join(
             f"{10 + index * 10} REM " + ("X" * 40)
             for index in range(12))
-        with (mock.patch.object(msx_mcp_server.time, "sleep"),
-              mock.patch.object(msx_mcp_server, "_temporary_basic_filename",
-                                return_value="A:MX123456.BAS")):
-            result = msx_mcp_server.t_run_basic(program)
+        with (mock.patch.object(msx_mcp_server, "_temporary_basic_filename",
+                                return_value="A:MX123456.BAS"),
+              mock.patch.object(
+                  self.backend, "screen_text",
+                  side_effect=AssertionError("unexpected VRAM read"))):
+            result = json.loads(msx_mcp_server.t_run_basic(
+                program, dos_prompt_confirmed=True))
 
-        self.assertEqual(result, self.backend.screen)
-        self.assertEqual(len(self.backend.files), 1)
-        name, data = self.backend.files[0]
+        self.assertEqual(result["delivery"], "file-transfer-v2")
+        self.assertFalse(result["screen_capture_performed"])
+        self.assertEqual(len(self.backend.put_payloads), 1)
+        name, data, options = self.backend.put_payloads[0]
         self.assertEqual(name, "A:MX123456.BAS")
         self.assertTrue(data.startswith(b"10 REM "))
         self.assertTrue(data.endswith(b"\r\n\x1a"))
+        self.assertEqual(options["compression"], "raw")
+        self.assertFalse(options["resume"])
         self.assertEqual(self.backend.typed, [
             ("line", "BASIC"),
             ("line", 'LOAD"A:MX123456.BAS"'),
             ("line", 'KILL"A:MX123456.BAS":RUN'),
         ])
 
-    def test_type_lines_captures_the_screen_only_once(self):
+    def test_forced_basic_file_transfer_requires_protocol_x(self):
+        self.backend.feature_bits = 0
+        with self.assertRaisesRegex(Exception, "file-transfer-v2"):
+            msx_mcp_server.t_run_basic(
+                "10 PRINT 1", transfer="file", clear=True,
+                dos_prompt_confirmed=True)
+        self.assertEqual(self.backend.put_payloads, [])
+
+    def test_type_lines_never_captures_real_screen_implicitly(self):
         with mock.patch.object(
                 self.backend, "screen_text",
-                wraps=self.backend.screen_text) as capture:
-            result = msx_mcp_server.t_type_lines(["10 PRINT 1", "RUN"])
+                side_effect=AssertionError("unexpected VRAM read")) as capture:
+            result = json.loads(msx_mcp_server.t_type_lines(
+                ["10 PRINT 1", "RUN"]))
 
-        self.assertEqual(result, self.backend.screen)
-        capture.assert_called_once_with()
+        self.assertFalse(result["screen_capture_performed"])
+        capture.assert_not_called()
         self.assertEqual(
             self.backend.typed, [("lines", ("10 PRINT 1", "RUN"))])
 
@@ -271,9 +277,58 @@ class MCPApplicationToolsTest(unittest.TestCase):
                   mock.patch.object(msx_mcp_server, "_temporary_basic_filename",
                                     return_value="A:MXABCDEF.BAS")):
                 msx_mcp_server.t_run_basic_file(
-                    str(path), format="tokenized")
+                    str(path), dos_prompt_confirmed=True,
+                    format="tokenized", drive="A")
 
-        self.assertEqual(self.backend.files, [("A:MXABCDEF.BAS", payload)])
+        self.assertEqual(len(self.backend.put_payloads), 1)
+        name, transferred, options = self.backend.put_payloads[0]
+        self.assertEqual((name, transferred), ("A:MXABCDEF.BAS", payload))
+        self.assertEqual(options["compression"], "raw")
+        self.assertFalse(options["resume"])
+
+    def test_basic_file_normalizer_preserves_msx_graphical_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "GAME.BAS"
+            path.write_bytes(b"10 PRINT \x80\n20 END\n")
+
+            payload, selected, source = msx_mcp_server._read_basic_file(
+                str(path), format="ascii")
+
+        self.assertEqual(selected, "ascii")
+        self.assertEqual(source, path)
+        self.assertEqual(payload, b"10 PRINT \x80\r\n20 END\r\n\x1a")
+        self.assertEqual(
+            msx_mcp_server.normalize_msx_basic_text(payload), payload)
+
+    def test_generic_put_leaves_basic_policy_to_shared_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "GAME.BAS"
+            source.write_bytes(b"10 PRINT \x80\n20 END\n")
+
+            json.loads(msx_mcp_server.t_file_put(
+                str(source), "A:\\GAME.BAS",
+                dos_prompt_confirmed=True))
+
+        name, payload, options = self.backend.put_payloads[0]
+        self.assertEqual(name, "A:\\GAME.BAS")
+        self.assertEqual(payload, b"10 PRINT \x80\n20 END\n")
+        self.assertNotIn("caller_binding", options)
+
+    def test_generic_put_accepts_canonical_and_tokenized_bas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            canonical = Path(directory) / "TEXT.BAS"
+            canonical.write_bytes(b"10 END\r\n\x1a")
+            tokenized = Path(directory) / "TOKEN.BAS"
+            tokenized.write_bytes(b"\xff\x00\x80\x00\x00")
+
+            msx_mcp_server.t_file_put(
+                str(canonical), "A:\\TEXT.BAS",
+                dos_prompt_confirmed=True)
+            msx_mcp_server.t_file_put(
+                str(tokenized), "A:\\TOKEN.BAS",
+                dos_prompt_confirmed=True)
+
+        self.assertEqual(len(self.backend.transfers), 2)
 
     def test_real_run_basic_existing_prompt_requires_explicit_opt_in(self):
         self.backend.screen = "Microsoft MSX BASIC\nOk"
@@ -289,8 +344,17 @@ class MCPApplicationToolsTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             msx_mcp_server.t_run_basic(
                 "10 END", allow_existing_basic="yes")
+        with self.assertRaises(TypeError):
+            msx_mcp_server.t_run_basic(
+                "10 END", dos_prompt_confirmed="yes")
         with self.assertRaisesRegex(ValueError, "transfer"):
             msx_mcp_server.t_run_basic("10 END", transfer="fastest")
+        with self.assertRaisesRegex(ValueError, "drive"):
+            msx_mcp_server.t_run_basic("10 END", dos_drive="AA")
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            msx_mcp_server.t_run_basic(
+                "10 END", dos_prompt_confirmed=True,
+                allow_existing_basic=True)
         with self.assertRaises(TypeError):
             msx_mcp_server.t_type_lines("10 END")
         with self.assertRaises(TypeError):
@@ -298,27 +362,90 @@ class MCPApplicationToolsTest(unittest.TestCase):
 
     def test_real_run_basic_refuses_arbitrary_application_screen(self):
         self.backend.screen = "GAME OVER\nPRESS FIRE"
-        with self.assertRaisesRegex(Exception, "refusing to type"):
+        with (mock.patch.object(
+                  self.backend, "screen_text",
+                  side_effect=AssertionError("unexpected VRAM read")) as capture,
+              self.assertRaisesRegex(Exception, "confirm the target state")):
             msx_mcp_server.t_run_basic("10 END")
+        capture.assert_not_called()
         self.assertEqual(self.backend.typed, [])
 
     def test_tools_are_published_with_required_fields_and_ranges(self):
         for name in ("msx_app_load", "msx_io_read", "msx_io_write",
                      "msx_slot_select", "msx_mapper_select",
                      "msx_agent_listen", "msx_agent_connect",
-                     "msx_type_lines", "msx_run_basic_file"):
+                     "msx_type_lines", "msx_run_basic_file",
+                     "msx_file_put", "msx_file_get"):
             self.assertIn(name, msx_mcp_server.TOOLS)
         app_schema = msx_mcp_server.TOOLS["msx_app_load"][2]
         self.assertEqual(app_schema["required"], ["path"])
         self.assertEqual(
             msx_mcp_server.TOOLS["msx_slot_select"][2]["properties"]["page"]["maximum"],
             1)
+        for name in ("msx_file_put", "msx_file_get"):
+            schema = msx_mcp_server.TOOLS[name][2]
+            self.assertIn("dos_prompt_confirmed", schema["required"])
+            self.assertEqual(
+                schema["properties"]["dos_prompt_confirmed"]["type"],
+                "boolean")
 
-    def test_basic_file_uses_the_drive_from_the_dos_prompt(self):
-        self.assertEqual(
-            msx_mcp_server._dos_prompt_drive("MSX-DOS 2\nB:\\TOOLS>"), "B")
-        self.assertIsNone(
-            msx_mcp_server._dos_prompt_drive("Microsoft MSX BASIC\nOk"))
+    def test_generic_file_tools_delegate_without_loading_binary_payloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "archive.zip"
+            source.write_bytes(b"PK\x03\x04binary")
+            with mock.patch.object(
+                    self.backend, "screen_text",
+                    side_effect=AssertionError("unexpected VRAM read")) as capture:
+                put = json.loads(msx_mcp_server.t_file_put(
+                    str(source), "B:\\ARCHIVE.ZIP",
+                    dos_prompt_confirmed=True, compression="auto",
+                    resume=True, timeout=45))
+                destination = Path(directory) / "download.bin"
+                get = json.loads(msx_mcp_server.t_file_get(
+                    "B:\\REMOTE.BIN", str(destination),
+                    dos_prompt_confirmed=True, resume=False, timeout=90))
+
+        capture.assert_not_called()
+        self.assertEqual(put["direction"], "put")
+        self.assertEqual(get["direction"], "get")
+        self.assertEqual(put["completion"], "protocol-x-terminal-verified")
+        self.assertEqual(get["prompt_check"], "not-performed")
+        self.assertFalse(put["screen_capture_performed"])
+        self.assertFalse(get["screen_capture_performed"])
+        self.assertEqual(self.backend.transfers[0], (
+            "put", source.resolve(), "B:\\ARCHIVE.ZIP",
+            {"compression": "auto", "resume": True,
+             "existing_only": False, "timeout": 45}))
+        self.assertEqual(self.backend.transfers[1], (
+            "get", "B:\\REMOTE.BIN", destination.resolve(strict=False),
+            {"resume": False, "existing_only": False, "timeout": 90}))
+
+    def test_generic_file_tools_require_explicit_dos_confirmation_to_launch(self):
+        self.backend.screen = "GAME OVER\nPRESS FIRE"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "data.bin"
+            source.write_bytes(b"data")
+            with self.assertRaisesRegex(Exception, "dos_prompt_confirmed=true"):
+                msx_mcp_server.t_file_put(
+                    str(source), "A:\\DATA.BIN",
+                    dos_prompt_confirmed=False, resume=False)
+        self.assertEqual(self.backend.transfers, [])
+
+    def test_generic_file_tool_can_attach_active_resume_without_dos_prompt(self):
+        self.backend.screen = "MSXAI PUT READY"
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "data.bin"
+            source.write_bytes(b"data")
+            msx_mcp_server.t_file_put(
+                str(source), "A:\\DATA.BIN",
+                dos_prompt_confirmed=False, resume=True)
+
+        self.assertTrue(self.backend.transfers[0][3]["existing_only"])
+
+    def test_basic_file_uses_an_explicit_normalized_drive(self):
+        self.assertEqual(msx_mcp_server._normalize_dos_drive("b"), "B")
+        with self.assertRaisesRegex(ValueError, "drive"):
+            msx_mcp_server._normalize_dos_drive("BB")
 
     def test_mcp_call_returns_structured_loader_summary_as_text(self):
         with tempfile.TemporaryDirectory() as directory:

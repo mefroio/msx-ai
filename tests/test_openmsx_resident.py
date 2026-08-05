@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -40,7 +41,11 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
     def call_tool(self, name, **arguments):
         result = self.tool_result(name, **arguments)
         if result.get("isError"):
-            self.fail(result["content"][0]["text"])
+            detail = result["content"][0]["text"]
+            machine = msx_mcp_server.SESSION.bench_machine
+            if machine is not None:
+                detail += self.machine_diagnostics(machine)
+            self.fail(detail)
         return result["content"]
 
     def status(self):
@@ -52,11 +57,11 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
                 print(self.machine_diagnostics(machine), file=sys.stderr)
             raise
 
-    def read_memory(self, space, address, length):
+    def read_memory(self, space, address, length, *, atomic=True):
         try:
             content = self.call_tool(
                 "msx_memory_read", space=space, address=address,
-                length=length)
+                length=length, atomic=atomic)
         except Exception:
             machine = msx_mcp_server.SESSION.bench_machine
             if machine is not None:
@@ -271,8 +276,8 @@ mailbox: dw 0
         self.assertTrue(
             msx_mcp_server._dos_prompt_visible(reconfigured), reconfigured)
 
-        # The first call overlays the embedded TsrKill utility directly. A second,
-        # ordinary foreground invocation is an idempotency probe: its
+        # The first call overlays the validated external TsrKill utility. A
+        # second ordinary foreground invocation is an idempotency probe: its
         # "not installed" result comes from GetTsrID and therefore confirms
         # that the named TSR was removed rather than merely disconnected.
         machine.type_line("CLS")
@@ -298,11 +303,88 @@ mailbox: dw 0
         self.assertEqual(status["runtime_mode"], "resident")
         self.assertIn("keybuf-input", status["features"])
         self.assertIn("keybuf-spool", status["features"])
-        self.assertIn("file-upload", status["features"])
+        self.assertNotIn("file-upload", status["features"])
+        self.assertIn("file-transfer-v2", status["features"])
 
-        # A listing above the automatic threshold is streamed through the
-        # resident mailbox and persisted by foreground MSXAI /PUT. No openMSX
-        # disk import, TPA staging write or keyboard API carries the file data.
+        clear_result = json.loads(self.call_tool(
+            "msx_type_line", text="CLS")[0]["text"])
+        self.assertFalse(clear_result["screen_capture_performed"], clear_result)
+        machine.advance(0.3)
+
+        # Exercise the complete public MCP/TCP path before entering BASIC:
+        # opcode X, foreground DOS workers, target filesystem I/O, CRC-32,
+        # explicit CLOSE, publication, and a byte-exact GET back to the host.
+        # Reuse this same openMSX process so the suite never multiplies the
+        # emulator's memory footprint.
+        transfer_fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(transfer_fixture.cleanup)
+        transfer_root = pathlib.Path(transfer_fixture.name)
+
+        archive_payload = b"PK\x03\x04" + bytes(range(251)) * 2
+        archive_source = transfer_root / "preserved.zip"
+        archive_source.write_bytes(archive_payload)
+        raw_put = json.loads(self.call_tool(
+            "msx_file_put", local_path=str(archive_source),
+            msx_path="A:\\MCPRAW.ZIP", dos_prompt_confirmed=True,
+            compression="auto", timeout=60
+        )[0]["text"])
+        self.assertEqual(raw_put["encoding"], "raw", raw_put)
+        self.assertEqual(raw_put["wire_bytes"], len(archive_payload), raw_put)
+        self.assertEqual(
+            raw_put["completion"], "protocol-x-terminal-verified", raw_put)
+        self.assertFalse(raw_put["screen_capture_performed"], raw_put)
+
+        archive_copy = transfer_root / "preserved-roundtrip.zip"
+        raw_get = json.loads(self.call_tool(
+            "msx_file_get", msx_path="A:\\MCPRAW.ZIP",
+            local_path=str(archive_copy), dos_prompt_confirmed=True, timeout=60
+        )[0]["text"])
+        self.assertEqual(archive_copy.read_bytes(), archive_payload)
+        self.assertEqual(raw_get["prompt_check"], "not-performed", raw_get)
+
+        # Read this regression snapshot through openMSX's local debugger, not
+        # through the resident. Hidden agent VRAM reads used to leave binary
+        # glyph rows here. A 32-hex ID wrapping at column 40 is expected.
+        transfer_screen = machine.screen_text()
+        transfer_rows = [
+            row.strip() for row in transfer_screen.splitlines() if row.strip()
+        ]
+        allowed_transfer_row = re.compile(
+            r"^(?:(?:A:\\>)(?:MSXAIXF /(?:PUT|GET) [0-9A-F]*)?|"
+            r"[0-9A-F]{1,32}|MSXAI (?:PUT|GET) (?:READY|OK))$")
+        for row in transfer_rows:
+            self.assertRegex(row, allowed_transfer_row, transfer_screen)
+
+        # PackBits compresses byte runs, not repeated multi-byte phrases. Use
+        # long binary runs so auto mode crosses its 256-byte savings floor and
+        # this E2E genuinely exercises target-side decoding.
+        compressible_payload = b"A" * 640 + b"B" * 640 + b"\x00" * 640
+        compressible_source = transfer_root / "compressible.bin"
+        compressible_source.write_bytes(compressible_payload)
+        packbits_put = json.loads(self.call_tool(
+            "msx_file_put", local_path=str(compressible_source),
+            msx_path="A:\\MCPPACK.BIN", dos_prompt_confirmed=True,
+            compression="auto", timeout=60
+        )[0]["text"])
+        self.assertEqual(packbits_put["encoding"], "packbits", packbits_put)
+        self.assertLess(packbits_put["wire_bytes"], packbits_put["final_bytes"])
+        self.assertFalse(
+            packbits_put["screen_capture_performed"], packbits_put)
+
+        compressible_copy = transfer_root / "compressible-roundtrip.bin"
+        packbits_get = json.loads(self.call_tool(
+            "msx_file_get", msx_path="A:\\MCPPACK.BIN",
+            local_path=str(compressible_copy), dos_prompt_confirmed=True,
+            timeout=60
+        )[0]["text"])
+        self.assertEqual(compressible_copy.read_bytes(), compressible_payload)
+        self.assertEqual(
+            packbits_get["completion"], "protocol-x-terminal-verified",
+            packbits_get)
+
+        # A listing above the automatic threshold uses the same protocol-X
+        # worker as arbitrary files. No legacy opcode U, openMSX disk import,
+        # TPA staging write or keyboard API carries the file data.
         file_lines = [
             f"{10 + index * 10} REM " + ("X" * 36)
             for index in range(14)
@@ -310,8 +392,12 @@ mailbox: dw 0
         file_lines.append('200 PRINT "MCP FILE OK"')
         file_screen = self.call_tool(
             "msx_run_basic", program="\n".join(file_lines),
-            clear=True)[0]["text"]
-        self.assertIn("MCP FILE OK", file_screen, file_screen)
+            clear=True, dos_prompt_confirmed=True)[0]["text"]
+        file_result = json.loads(file_screen)
+        self.assertTrue(file_result["run_submitted"], file_result)
+        self.assertFalse(file_result["screen_capture_performed"], file_result)
+        machine.advance(2.5)
+        self.assertIn("MCP FILE OK", machine.screen_text())
 
         # The first source line exceeds the BIOS ring's 39-byte capacity.  The
         # host must split it without letting BASIC discard a following line at
@@ -320,22 +406,29 @@ mailbox: dw 0
         program = (
             '10 A$="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"\n'
             '20 PRINT "MCP TYPE OK ";LEN(A$)')
-        screen = self.call_tool(
+        result = json.loads(self.call_tool(
             "msx_run_basic", program=program, clear=True,
-            allow_existing_basic=True, transfer="type")[0]["text"]
+            allow_existing_basic=True, transfer="type")[0]["text"])
+        self.assertFalse(result["screen_capture_performed"], result)
+        machine.advance(2.5)
+        screen = machine.screen_text()
         self.assertIn("MCP TYPE OK", screen, screen)
         self.assertIn("36", screen, screen)
 
-        screen = self.call_tool(
+        result = json.loads(self.call_tool(
             "msx_type_lines",
-            lines=['PRINT "BATCH ONE"', 'PRINT "BATCH TWO"'])[0]["text"]
+            lines=['PRINT "BATCH ONE"', 'PRINT "BATCH TWO"'])[0]["text"])
+        self.assertFalse(result["screen_capture_performed"], result)
+        screen = machine.screen_text()
         self.assertIn("BATCH TWO", screen, screen)
 
         # Exercise raw msx_type followed by msx_type_line on the same resident
         # connection; no openMSX input API participates in either operation.
         self.call_tool("msx_type", text="PRINT ")
-        screen = self.call_tool(
-            "msx_type_line", text='"RESIDENT TYPE OK"')[0]["text"]
+        result = json.loads(self.call_tool(
+            "msx_type_line", text='"RESIDENT TYPE OK"')[0]["text"])
+        self.assertFalse(result["screen_capture_performed"], result)
+        screen = machine.screen_text()
         self.assertIn("RESIDENT TYPE OK", screen, screen)
         self.assertEqual(self.status()["state"], "running")
 
@@ -361,10 +454,12 @@ counter: dw 0
                        execute="run")
         machine.advance(0.3)
         self.assertEqual(self.status()["state"], "running")
-        first = int.from_bytes(self.read_memory("ram", 0x800B, 2), "little")
+        first = int.from_bytes(
+            self.read_memory("ram", 0x800B, 2, atomic=False), "little")
         machine.advance(0.3)
         self.assertGreater(
-            int.from_bytes(self.read_memory("ram", 0x800B, 2), "little"),
+            int.from_bytes(
+                self.read_memory("ram", 0x800B, 2, atomic=False), "little"),
             first)
 
         self.call_tool("msx_pause")
@@ -386,7 +481,8 @@ counter: dw 0
         self.call_tool("msx_resume")
         machine.advance(0.3)
         self.assertGreater(
-            int.from_bytes(self.read_memory("ram", 0x800B, 2), "little"),
+            int.from_bytes(
+                self.read_memory("ram", 0x800B, 2, atomic=False), "little"),
             paused)
         self.call_tool("msx_stop")
         self.assertEqual(self.status()["state"], "monitor")

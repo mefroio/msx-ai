@@ -98,11 +98,14 @@ MCP_RUNTIME_DIR=""
 MCP_SETTINGS=""
 MCP_DISK=""
 MCP_SCRIPT=""
-MCP_RUNTIME_AGENT=""
+MCP_RUNTIME_FILES=()
+MCP_PACKAGE_NAMES=(MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR \
+                   MEMMAN.COM TL.COM TK.COM)
 
 cleanup_mcp_runtime() {
   if [[ -n "$MCP_RUNTIME_DIR" ]]; then
-    rm -f "$MCP_DISK" "$MCP_SETTINGS" "$MCP_SCRIPT" "$MCP_RUNTIME_AGENT"
+    rm -f "$MCP_DISK" "$MCP_SETTINGS" "$MCP_SCRIPT" \
+      "${MCP_RUNTIME_FILES[@]}"
     rmdir "$MCP_RUNTIME_DIR" 2>/dev/null || true
   fi
 }
@@ -151,23 +154,25 @@ case "$PROFILE" in
     fi
 
     make -C "$PROJECT_DIR" agent >/dev/null
-    MCP_AGENT_COM="$PROJECT_DIR/work/agent/MSXAI.COM"
-    if [[ ! -s "$MCP_AGENT_COM" ]]; then
-      echo "Agent build did not produce: $MCP_AGENT_COM" >&2
-      exit 1
-    fi
-
     MCP_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/msx-ai-mcp.XXXXXX")"
     MCP_DISK="$MCP_RUNTIME_DIR/msxdos.dsk"
     MCP_SETTINGS="$MCP_RUNTIME_DIR/settings.xml"
     MCP_SCRIPT="$MCP_RUNTIME_DIR/startup.tcl"
-    MCP_RUNTIME_AGENT="$MCP_RUNTIME_DIR/MSXAI.COM"
     trap cleanup_mcp_runtime EXIT INT TERM
     cp "$DOS_DISK" "$MCP_DISK"
     cp "$PROJECT_DIR/tools/openmsx_mcp_test.tcl" "$MCP_SCRIPT"
-    cp "$MCP_AGENT_COM" "$MCP_RUNTIME_AGENT"
+    for suite_name in "${MCP_PACKAGE_NAMES[@]}"; do
+      suite_source="$PROJECT_DIR/work/agent/$suite_name"
+      suite_destination="$MCP_RUNTIME_DIR/$suite_name"
+      if [[ ! -s "$suite_source" ]]; then
+        echo "Agent build did not produce $suite_name" >&2
+        exit 1
+      fi
+      cp "$suite_source" "$suite_destination"
+      MCP_RUNTIME_FILES+=("$suite_destination")
+    done
 
-    export MSX_AI_MCP_AGENT_COM="$MCP_RUNTIME_AGENT"
+    export MSX_AI_MCP_SUITE_DIR="$MCP_RUNTIME_DIR"
     export MSX_AI_MCP_IPV4="$MCP_IPV4"
     export MSX_AI_MCP_PORT="$MCP_PORT_VALUE"
     # Insert the expander first so four secondary slots are available before
@@ -195,7 +200,7 @@ fi
 
 echo "Starting openMSX (profile: $PROFILE, machine: ${openmsx_args[1]})"
 if [[ "$PROFILE" == "mcp" ]]; then
-  echo "MSXAI.COM is available for manual start at the DOS prompt"
+  echo "The complete seven-file MSX-AI suite is available on the DOS disk"
   echo "Waiting for MCP TCP listener at $MSX_AI_MCP_IPV4:$MSX_AI_MCP_PORT"
   "$OPENMSX_EXECUTABLE" "${openmsx_args[@]}" "$@"
   exit $?

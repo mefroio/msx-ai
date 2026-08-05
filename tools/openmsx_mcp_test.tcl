@@ -1,6 +1,6 @@
 # User-owned openMSX instance for MSX-AI MCP TCP development.
 # The launcher supplies a disposable DOS disk and these validated variables:
-# MSX_AI_MCP_AGENT_COM, MSX_AI_MCP_IPV4, and MSX_AI_MCP_PORT.
+# MSX_AI_MCP_SUITE_DIR, MSX_AI_MCP_IPV4, and MSX_AI_MCP_PORT.
 
 namespace eval msx_ai_mcp {
     variable retry_seconds 1.0
@@ -33,20 +33,25 @@ namespace eval msx_ai_mcp {
         set mute off
         set renderer SDLGL-PP
         after realtime 0 [namespace code retry_connection]
-        puts "MSX-AI: MSXAI.COM ready for manual start; press F11 to reconnect"
+        puts "MSX-AI: agent package ready; press F11 to reconnect"
     }
 
     proc start {} {
-        set agent [required_environment MSX_AI_MCP_AGENT_COM]
+        set suite_dir [required_environment MSX_AI_MCP_SUITE_DIR]
         set ipv4 [required_environment MSX_AI_MCP_IPV4]
         set port [required_environment MSX_AI_MCP_PORT]
 
         set power off
-        set listing [diskmanipulator dir hda1]
-        if {[string match -nocase "*msxai.com*" $listing]} {
-            diskmanipulator delete hda1 MSXAI.COM
+        foreach suite_name {
+            MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR
+            MEMMAN.COM TL.COM TK.COM
+        } {
+            set listing [diskmanipulator dir hda1]
+            if {[string match -nocase "*$suite_name*" $listing]} {
+                diskmanipulator delete hda1 $suite_name
+            }
+            diskmanipulator import hda1 [file join $suite_dir $suite_name]
         }
-        diskmanipulator import hda1 $agent
 
         set rs232-net-address "$ipv4:$port"
         set rs232-net-ip232 off

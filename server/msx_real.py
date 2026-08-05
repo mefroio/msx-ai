@@ -27,7 +27,41 @@ import threading
 import time
 
 from msx_v3 import V3Session, V3SessionError
-from msx_protocol import crc16_ccitt
+from msx_transfer import (
+    FEATURE_FILE_TRANSFER_V2,
+    TRANSFER_OPCODE,
+    TransferBindingError,
+    TransferCapability,
+    TransferDescriptor,
+    TransferDirection,
+    TransferEncoding,
+    TransferError,
+    TransferJournal,
+    TransferRemoteError,
+    TransferReplyFlag,
+    TransferState,
+    crc32_file_prefix,
+    crc32_update,
+    encode_cancel,
+    encode_capabilities_request,
+    encode_close,
+    encode_get_ack,
+    encode_get_read,
+    encode_open,
+    encode_put_data,
+    encode_status,
+    new_transfer_id,
+    parse_cancel_reply,
+    parse_capabilities_reply,
+    parse_close_reply,
+    parse_get_ack_reply,
+    parse_get_read_reply,
+    parse_open_reply,
+    parse_put_data_reply,
+    parse_status_reply,
+    prepare_msx_basic_source,
+    prepare_put_payload,
+)
 
 PROJ = pathlib.Path(__file__).resolve().parent.parent
 Z80ASM = (os.environ.get("Z80ASM") or shutil.which("z80asm") or
@@ -73,7 +107,7 @@ FEATURE_SNAPSHOT_LEASE = 0x04
 FEATURE_FRAME_WAKE_ACK = 0x08
 FEATURE_TIMI_POLL_SAFE = 0x10
 FEATURE_KEYBUF_SPOOL = 0x20
-FEATURE_FILE_UPLOAD = 0x40
+FEATURE_FILE_TRANSFER = FEATURE_FILE_TRANSFER_V2
 DEBUG_PEER_MAX = 63
 SNAPSHOT_LEASE_TIMEOUTS = 8
 SNAPSHOT_PAUSE_ATTEMPTS = 2
@@ -85,7 +119,7 @@ AGENT_FEATURE_NAMES = {
     FEATURE_FRAME_WAKE_ACK: "frame-wake-ack",
     FEATURE_TIMI_POLL_SAFE: "timi-poll-safe",
     FEATURE_KEYBUF_SPOOL: "keybuf-spool",
-    FEATURE_FILE_UPLOAD: "file-upload",
+    FEATURE_FILE_TRANSFER: "file-transfer-v2",
 }
 AGENT_TRANSPORT_NAMES = {
     0: "uart-8251",
@@ -111,14 +145,11 @@ KEYBUF_SPOOL_FLAG_AUTHORIZED = 0x04
 KEYBUF_SPOOL_REQUEST_PUMP = 0x01
 KEYBUF_SPOOL_REQUEST_CANCEL = 0x02
 KEYBUF_SPOOL_REFILL_TARGET = 128
-DOS_FILE_MAX_SIZE = 0x4000
-FILE_UPLOAD_CHUNK_CAPACITY = 318
-FILE_UPLOAD_FINALIZE_TIMEOUT = 30.0
-FILE_UPLOAD_FLAG_ACTIVE = 0x01
-FILE_UPLOAD_FLAG_PENDING = 0x02
-FILE_UPLOAD_FLAG_COMPLETE = 0x04
-FILE_UPLOAD_FLAG_SUCCEEDED = 0x08
-FILE_UPLOAD_FLAG_FAILED = 0x10
+FILE_TRANSFER_STATE_DIR = PROJ / "work" / "transfers"
+FILE_TRANSFER_POLL_INTERVAL = 0.05
+FILE_TRANSFER_PROGRESS_TIMEOUT = 600.0
+FILE_TRANSFER_JOURNAL_INTERVAL = 64 * 1024
+FILE_TRANSFER_MAX_UNCOMMITTED = 16 * 1024
 SPECIAL_KEY_BYTES = {
     "ESC": 0x1B,
     "RET": 0x0D,
@@ -190,6 +221,7 @@ class RealMSX:
         self.bootstrap_protocol_version = None
         self.bootstrap_feature_bits = 0
         self.bootstrap_features_known = False
+        self.transfer_capabilities = None
         self._debug_peer_sent = False
         self._snapshot_pause_owned = False
         self._v3 = None
@@ -330,6 +362,7 @@ class RealMSX:
         self.bootstrap_protocol_version = None
         self.bootstrap_feature_bits = 0
         self.bootstrap_features_known = False
+        self.transfer_capabilities = None
         self._debug_peer_sent = False
         self._snapshot_pause_owned = False
         self._v3 = None
@@ -1585,152 +1618,769 @@ class RealMSX:
             return 0
         return self.type("\r".join(lines) + "\r", timeout=timeout)
 
-    def file_upload_write(self, data, timeout=KEYBUF_INPUT_TIMEOUT):
-        """Stream bytes to an active foreground ``MSXAI /PUT`` receiver."""
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise TypeError("file data must be bytes-like")
-        data = bytes(data)
-        timeout = float(timeout)
-        if timeout <= 0:
-            raise RealMSXTimeoutError("file upload timeout must be positive")
-        if self._v3 is None or not self.feature_bits & FEATURE_FILE_UPLOAD:
-            raise RealMSXError("resident file upload was not negotiated")
-        max_batch = min(
-            FILE_UPLOAD_CHUNK_CAPACITY, self._v3.max_payload - 2)
-        if max_batch <= 0:
-            raise RealMSXProtocolError(
-                "negotiated frame payload cannot carry file data")
-
-        offset = 0
-        credits = 0
-        started = False
-        previous = None
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining_time = deadline - time.monotonic()
-            if remaining_time <= 0:
-                raise RealMSXTimeoutError(
-                    "timeout waiting for foreground MSX-DOS file receiver")
-            if started and offset < len(data) and credits:
-                chunk = data[offset:offset + min(credits, max_batch)]
-            else:
-                chunk = b""
-            request_timeout = max(
-                0.001, remaining_time / (self._v3.retries + 1))
-            with self._lock:
-                reply = self._request_v3(
-                    "U", self._le16(offset) + chunk,
-                    timeout=request_timeout)
-            if len(reply) != 7:
-                raise RealMSXProtocolError(
-                    f"invalid file-upload response: {reply!r}")
-            accepted = int.from_bytes(reply[0:2], "little")
-            received = int.from_bytes(reply[2:4], "little")
-            new_credits = int.from_bytes(reply[4:6], "little")
-            flags = reply[6]
-            active = bool(flags & FILE_UPLOAD_FLAG_ACTIVE)
-            pending = bool(flags & FILE_UPLOAD_FLAG_PENDING)
-            complete = bool(flags & FILE_UPLOAD_FLAG_COMPLETE)
-            succeeded = bool(flags & FILE_UPLOAD_FLAG_SUCCEEDED)
-            failed = bool(flags & FILE_UPLOAD_FLAG_FAILED)
-            if (accepted > len(chunk) or
-                    (active or started) and received > len(data) or
-                    new_credits > FILE_UPLOAD_CHUNK_CAPACITY or
-                    flags & ~(FILE_UPLOAD_FLAG_ACTIVE |
-                              FILE_UPLOAD_FLAG_PENDING |
-                              FILE_UPLOAD_FLAG_COMPLETE |
-                              FILE_UPLOAD_FLAG_SUCCEEDED |
-                              FILE_UPLOAD_FLAG_FAILED) or
-                    (succeeded and failed) or
-                    (active and (succeeded or failed))):
-                raise RealMSXProtocolError(
-                    "invalid file-upload state "
-                    f"accepted={accepted}, received={received}, "
-                    f"credits={new_credits}, flags=0x{flags:02X}")
-            if active and received != offset + accepted:
-                raise RealMSXProtocolError(
-                    "file-upload offset diverged: "
-                    f"host={offset + accepted}, agent={received}")
-            offset += accepted
-            state = (active, pending, complete, new_credits, received)
-            progressed = bool(accepted)
-            if active and not started:
-                started = True
-                progressed = True
-            if previous is not None:
-                progressed = (progressed or
-                              previous[1] and not pending or
-                              not previous[2] and complete or
-                              new_credits > previous[3])
-            if progressed:
-                # Once every byte is accepted, foreground still has to copy
-                # the last mailbox, update CRC, write, close, and publish the
-                # terminal result. On an interrupt-driven 8251 that can take
-                # longer than the normal no-progress budget even though every
-                # poll is answered. Keep a separate bounded finalize window.
-                progress_timeout = (
-                    max(timeout, FILE_UPLOAD_FINALIZE_TIMEOUT)
-                    if offset == len(data) else timeout)
-                deadline = time.monotonic() + progress_timeout
-            previous = state
-            credits = new_credits
-
-            if not active:
-                if not started:
-                    time.sleep(KEYBUF_POLL_INTERVAL)
-                    continue
-                if failed:
-                    raise RealMSXError(
-                        "foreground MSX-DOS file receiver reported a "
-                        "CRC, write or close failure")
-                if not succeeded:
-                    raise RealMSXProtocolError(
-                        "foreground file receiver ended without a terminal "
-                        "success status")
-                if offset != len(data):
-                    raise RealMSXError(
-                        "foreground file receiver aborted before all bytes "
-                        f"were accepted ({offset}/{len(data)})")
-                return offset
-            if complete and offset != len(data):
-                raise RealMSXProtocolError(
-                    "agent reported file completion at the wrong offset")
-            if not accepted:
-                time.sleep(KEYBUF_POLL_INTERVAL)
-
-    def put_dos_file(self, name, data, timeout=KEYBUF_INPUT_TIMEOUT):
-        """Launch the foreground ``/PUT`` sink and stream one DOS file.
-
-        The resident performs framed UART I/O into a one-chunk mailbox. The
-        same universal MSXAI.COM copies each credited chunk in foreground and
-        performs BDOS writes, so no DOS call occurs from H.TIMI.
-        """
-        if not isinstance(name, str) or not name or len(name) > 15:
-            raise ValueError("DOS filename must contain 1..15 characters")
-        try:
-            encoded_name = name.encode("ascii")
-        except UnicodeEncodeError as exc:
-            raise ValueError("DOS filename must be ASCII") from exc
-        if (any(byte <= 0x20 or byte == 0x7F for byte in encoded_name) or
-                "\x00" in name):
-            raise ValueError("DOS filename cannot contain whitespace or controls")
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise TypeError("file data must be bytes-like")
-        data = bytes(data)
-        if not 1 <= len(data) <= DOS_FILE_MAX_SIZE:
-            raise RealMSXRangeError(
-                f"DOS file must contain 1..{DOS_FILE_MAX_SIZE} bytes")
+    # ---- resumable DOS file transfer ---------------------------------
+    def _require_file_transfer_v2(self):
         if self.runtime_mode != "resident":
             raise RealMSXError(
                 "DOS file transfer requires the resident agent")
-        if self._v3 is None or not self.feature_bits & FEATURE_FILE_UPLOAD:
+        if self._v3 is None or not self.feature_bits & FEATURE_FILE_TRANSFER:
             raise RealMSXError(
-                "the resident does not support foreground DOS file transfer")
-        checksum = crc16_ccitt(data)
-        self.type_line(
-            f"MSXAI /PUT {name} {len(data):04X} {checksum:04X}",
-            timeout=timeout)
-        return self.file_upload_write(data, timeout=timeout)
+                "the resident does not advertise file-transfer-v2")
+
+    @staticmethod
+    def _parse_transfer_reply(parser, payload, *args, **kwargs):
+        try:
+            return parser(payload, *args, **kwargs)
+        except TransferError as exc:
+            raise RealMSXProtocolError(
+                f"invalid file-transfer-v2 response: {exc}") from exc
+
+    def file_transfer_capabilities(self, *, refresh=False):
+        """Return the separately negotiated opcode-X transfer limits."""
+        self._require_file_transfer_v2()
+        if self.transfer_capabilities is not None and not refresh:
+            return self.transfer_capabilities
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE, encode_capabilities_request())
+        capabilities = self._parse_transfer_reply(
+            parse_capabilities_reply, payload)
+        self.transfer_capabilities = capabilities
+        return capabilities
+
+    def file_transfer_open(self, descriptor):
+        """Stage an immutable descriptor before launching MSXAIXF.COM."""
+        if not isinstance(descriptor, TransferDescriptor):
+            raise TypeError("descriptor must be a TransferDescriptor")
+        capabilities = self.file_transfer_capabilities()
+        required = (TransferCapability.RAW | TransferCapability.CRC32 |
+                    (TransferCapability.PUT
+                     if descriptor.direction is TransferDirection.PUT
+                     else TransferCapability.GET))
+        if capabilities.capabilities & required != required:
+            raise RealMSXError(
+                "the resident lacks required raw/CRC32 file-transfer "
+                "capabilities")
+        if (descriptor.resume and not
+                capabilities.capabilities & TransferCapability.RESUME):
+            raise RealMSXError("the resident does not support transfer resume")
+        if (descriptor.encoding is TransferEncoding.PACKBITS and not
+                capabilities.capabilities & TransferCapability.PACKBITS_DECODE):
+            raise RealMSXError(
+                "the resident does not advertise PackBits decompression")
+        path_length = len(descriptor.path.encode("ascii"))
+        if path_length > capabilities.max_path:
+            raise RealMSXRangeError(
+                f"MSX path is {path_length} bytes; target maximum is "
+                f"{capabilities.max_path}")
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE, encode_open(descriptor))
+        return self._parse_transfer_reply(parse_open_reply, payload)
+
+    def file_transfer_status(self, transfer_id):
+        self._require_file_transfer_v2()
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE, encode_status(transfer_id))
+        return self._parse_transfer_reply(
+            parse_status_reply, payload,
+            expected_transfer_id=bytes(transfer_id))
+
+    def file_transfer_put_data(self, transfer_id, offset, data):
+        self._require_file_transfer_v2()
+        capabilities = self.file_transfer_capabilities()
+        if len(data) > capabilities.max_put_chunk:
+            raise RealMSXRangeError(
+                f"PUT block is {len(data)} bytes; target maximum is "
+                f"{capabilities.max_put_chunk}")
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE, encode_put_data(transfer_id, offset, data))
+        return self._parse_transfer_reply(parse_put_data_reply, payload)
+
+    def file_transfer_get_read(self, transfer_id, offset, maximum):
+        self._require_file_transfer_v2()
+        capabilities = self.file_transfer_capabilities()
+        maximum = min(int(maximum), capabilities.max_get_chunk)
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE,
+                encode_get_read(transfer_id, offset, maximum))
+        return self._parse_transfer_reply(parse_get_read_reply, payload)
+
+    def file_transfer_get_ack(self, transfer_id, next_offset, prefix_crc32):
+        self._require_file_transfer_v2()
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE,
+                encode_get_ack(transfer_id, next_offset, prefix_crc32))
+        return self._parse_transfer_reply(parse_get_ack_reply, payload)
+
+    def file_transfer_close(self, transfer_id):
+        self._require_file_transfer_v2()
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE, encode_close(transfer_id))
+        return self._parse_transfer_reply(parse_close_reply, payload)
+
+    def file_transfer_cancel(self, transfer_id):
+        self._require_file_transfer_v2()
+        with self._lock:
+            payload = self._request_v3(
+                TRANSFER_OPCODE, encode_cancel(transfer_id))
+        return self._parse_transfer_reply(parse_cancel_reply, payload)
+
+    @staticmethod
+    def _raise_transfer_remote(reply, operation):
+        error = getattr(reply, "error", TransferRemoteError.NONE)
+        state = getattr(reply, "state", None)
+        if error is not TransferRemoteError.NONE:
+            raise RealMSXError(
+                f"MSX {operation} failed: {error.name.lower()} "
+                f"(state {state.name.lower() if state is not None else 'unknown'})")
+        if state in (TransferState.FAILED, TransferState.CANCELLED):
+            raise RealMSXError(
+                f"MSX {operation} entered terminal state {state.name.lower()}")
+
+    @staticmethod
+    def _validate_progress_timeout(timeout):
+        if isinstance(timeout, bool):
+            raise TypeError("transfer timeout must be a number")
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("transfer timeout must be a number") from exc
+        if timeout <= 0:
+            raise ValueError("transfer timeout must be positive")
+        return timeout
+
+    def _wait_file_transfer(self, transfer_id, states, *, timeout,
+                            previous=None):
+        """Poll STATUS until one of ``states`` with a no-progress deadline."""
+        states = frozenset(states)
+        deadline = time.monotonic() + timeout
+        marker = previous
+        while True:
+            status = self.file_transfer_status(transfer_id)
+            self._raise_transfer_remote(status, "file transfer")
+            current = (
+                status.state, status.durable_offset, status.accepted_offset,
+                status.prefix_crc32, status.credit, status.flags)
+            if current != marker:
+                marker = current
+                deadline = time.monotonic() + timeout
+            if status.state in states:
+                return status
+            if status.state is TransferState.SUSPENDED:
+                raise RealMSXTimeoutError(
+                    "MSX file transfer was suspended; invoke it again with "
+                    "resume enabled")
+            if time.monotonic() >= deadline:
+                raise RealMSXTimeoutError(
+                    "timeout waiting for MSX file-transfer progress")
+            time.sleep(FILE_TRANSFER_POLL_INTERVAL)
+
+    @staticmethod
+    def _validate_transfer_binding(status, descriptor):
+        if status.transfer_id != descriptor.transfer_id:
+            raise RealMSXProtocolError("MSX transfer ID changed after OPEN")
+        if (status.direction is not descriptor.direction or
+                status.encoding is not descriptor.encoding):
+            raise RealMSXProtocolError(
+                "MSX transfer direction or encoding changed after OPEN")
+        unknown_get = (
+            descriptor.direction is TransferDirection.GET and
+            descriptor.wire_size == descriptor.wire_crc32 ==
+            descriptor.final_size == descriptor.final_crc32 == 0)
+        if not unknown_get and (
+                status.wire_size != descriptor.wire_size or
+                status.wire_crc32 != descriptor.wire_crc32 or
+                status.final_size != descriptor.final_size or
+                status.final_crc32 != descriptor.final_crc32):
+            raise RealMSXProtocolError(
+                "MSX transfer metadata differs from the staged descriptor")
+
+    def _recover_active_transfer(self, descriptor):
+        """Return a still-active journalled transfer, or ``None`` if absent.
+
+        A restarted IDE may reconnect while the DOS foreground worker is still
+        alive.  Reissuing OPEN in that state is intentionally rejected by the
+        agent, so probe the unguessable journalled ID first and attach only
+        after the complete wire binding has been validated.
+        """
+        try:
+            status = self.file_transfer_status(descriptor.transfer_id)
+        except RealMSXProtocolError:
+            if self.write_quarantined:
+                raise
+            return None
+        if status.state in (
+                TransferState.IDLE, TransferState.FAILED,
+                TransferState.CANCELLED):
+            return None
+        self._raise_transfer_remote(status, "recovered file transfer")
+        self._validate_transfer_binding(status, descriptor)
+        return status
+
+    @staticmethod
+    def _exact_local_write(stream, data):
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            count = stream.write(view[written:])
+            if count is None:
+                count = len(view) - written
+            if not isinstance(count, int) or count <= 0:
+                raise OSError("short local file write during MSX GET")
+            written += count
+
+    def put_file(self, source, target, *, compression="auto", resume=True,
+                 existing_only=False,
+                 state_directory=FILE_TRANSFER_STATE_DIR,
+                 timeout=FILE_TRANSFER_PROGRESS_TIMEOUT):
+        """Stream a local file to MSX-DOS with CRC-32 and durable resume.
+
+        Compression is negotiated independently. ``auto`` falls back to raw
+        when the connected target has no PackBits decoder; explicit ``packbits``
+        fails instead of silently changing the requested representation.
+        Existing archive/media formats selected by the planner remain raw.
+        """
+        timeout = self._validate_progress_timeout(timeout)
+        if not isinstance(resume, bool):
+            raise TypeError("resume must be a boolean")
+        if not isinstance(existing_only, bool):
+            raise TypeError("existing_only must be a boolean")
+        source_path = pathlib.Path(source).expanduser().resolve(strict=True)
+        if not source_path.is_file():
+            raise ValueError(f"local PUT source is not a regular file: {source_path}")
+        state_directory = pathlib.Path(state_directory).expanduser()
+        capabilities = self.file_transfer_capabilities()
+        target_path = str(target)
+        packbits_decode = bool(
+            capabilities.capabilities & TransferCapability.PACKBITS_DECODE)
+        if compression == "packbits":
+            if not packbits_decode:
+                raise RealMSXError(
+                    "PackBits was requested but the MSX has no negotiated decoder")
+        # Do not spend host CPU and temporary disk space producing a PackBits
+        # stream that the target cannot consume. Explicit PackBits fails above;
+        # automatic mode simply keeps the original byte stream as RAW.
+        raw_fallback_reason = None
+        if compression == "auto" and not packbits_decode:
+            raw_fallback_reason = "target has no PackBits decoder"
+        planning_mode = (
+            "raw" if raw_fallback_reason is not None
+            else compression)
+        basic_source = prepare_msx_basic_source(
+            source_path, target_path, state_directory=state_directory)
+        prepared = None
+        try:
+            prepared = prepare_put_payload(
+                basic_source.transfer_path,
+                state_directory=state_directory, mode=planning_mode)
+            caller_binding = str(source_path)
+            candidate = TransferDescriptor(
+                direction=TransferDirection.PUT,
+                encoding=prepared.encoding,
+                transfer_id=new_transfer_id(),
+                wire_size=prepared.wire_digest.size,
+                wire_crc32=prepared.wire_digest.crc32,
+                final_size=prepared.final_digest.size,
+                final_crc32=prepared.final_digest.crc32,
+                path=target_path,
+            )
+            journal = TransferJournal(state_directory)
+            record = (journal.find_matching(
+                candidate, caller_binding=caller_binding) if resume else None)
+            if existing_only and record is None:
+                raise RealMSXError(
+                    "no matching PUT journal exists for active-only recovery")
+            if record is None:
+                descriptor = candidate
+                confirmed_offset = 0
+                confirmed_crc = 0
+                close_intent = False
+            else:
+                descriptor = record.resumed_descriptor()
+                confirmed_offset = record.confirmed_offset
+                confirmed_crc = record.prefix_crc32
+                close_intent = record.close_intent
+
+            local_prefix = crc32_file_prefix(
+                prepared.wire_path, confirmed_offset).crc32
+            if local_prefix != confirmed_crc:
+                raise TransferBindingError(
+                    "local PUT prefix no longer matches its resume journal")
+            journal.save(
+                descriptor, confirmed_offset=confirmed_offset,
+                prefix_crc32=confirmed_crc,
+                caller_binding=caller_binding,
+                close_intent=close_intent)
+
+            status = (self._recover_active_transfer(descriptor)
+                      if record is not None else None)
+            if existing_only and status is None:
+                raise RealMSXError(
+                    "the journalled PUT is no longer active on the MSX")
+            if status is None:
+                opened = self.file_transfer_open(descriptor)
+                self._raise_transfer_remote(opened, "PUT open")
+                if opened.state not in (TransferState.STAGED,
+                                        TransferState.OPENING,
+                                        TransferState.READY):
+                    raise RealMSXProtocolError(
+                        f"unexpected PUT OPEN state {opened.state.name.lower()}")
+                status_state = opened.state
+            else:
+                status_state = status.state
+
+            if status_state is TransferState.STAGED:
+                if existing_only:
+                    raise RealMSXError(
+                        "the recovered PUT is staged but no DOS prompt is "
+                        "visible to launch it safely")
+                self.type_line(
+                    f"MSXAIXF /PUT {descriptor.transfer_id.hex().upper()}",
+                    timeout=timeout)
+                status = None
+            if status is None or status.state is TransferState.OPENING:
+                status = self._wait_file_transfer(
+                    descriptor.transfer_id,
+                    (TransferState.READY, TransferState.TRANSFERRING,
+                     TransferState.VERIFYING, TransferState.POSTPROCESS,
+                     TransferState.COMPLETE), timeout=timeout)
+            self._validate_transfer_binding(status, descriptor)
+
+            with prepared.wire_path.open("rb") as stream:
+                durable_offset = status.durable_offset
+                durable_crc = crc32_file_prefix(
+                    prepared.wire_path, durable_offset).crc32
+                if durable_crc != status.prefix_crc32:
+                    raise TransferBindingError(
+                        "MSX PUT partial prefix differs from the local source")
+                accepted_offset = status.accepted_offset
+                if not durable_offset <= accepted_offset <= descriptor.wire_size:
+                    raise RealMSXProtocolError(
+                        "MSX PUT reported invalid durable/accepted progress")
+                if (accepted_offset - durable_offset >
+                        FILE_TRANSFER_MAX_UNCOMMITTED):
+                    raise RealMSXProtocolError(
+                        "MSX PUT exceeded the bounded uncommitted window")
+                # The target releases mailbox credit after exact writes and
+                # advances durable progress only after a batched DOS ENSURE.
+                # Reconstruct that bounded gap once after reconnect; subsequent
+                # CRC progress remains incremental.
+                stream.seek(durable_offset)
+                inflight = bytearray(
+                    stream.read(accepted_offset - durable_offset))
+                if len(inflight) != accepted_offset - durable_offset:
+                    raise RealMSXProtocolError(
+                        "local PUT source ended inside accepted progress")
+                journal.save(
+                    descriptor, confirmed_offset=durable_offset,
+                    prefix_crc32=durable_crc,
+                    caller_binding=caller_binding,
+                    close_intent=close_intent)
+                journal_checkpoint = durable_offset
+
+                def reconcile_durable(remote_offset, remote_crc=None):
+                    nonlocal durable_offset, durable_crc, journal_checkpoint
+                    if not durable_offset <= remote_offset <= accepted_offset:
+                        raise RealMSXProtocolError(
+                            "MSX PUT durable offset diverged from host progress")
+                    advance = remote_offset - durable_offset
+                    if advance > len(inflight):
+                        raise RealMSXProtocolError(
+                            "MSX PUT committed bytes outside its accepted block")
+                    if advance:
+                        durable_crc = crc32_update(
+                            memoryview(inflight)[:advance], durable_crc)
+                        del inflight[:advance]
+                        durable_offset = remote_offset
+                        if (durable_offset == descriptor.wire_size or
+                                durable_offset - journal_checkpoint >=
+                                FILE_TRANSFER_JOURNAL_INTERVAL):
+                            journal.save(
+                                descriptor, confirmed_offset=durable_offset,
+                                prefix_crc32=durable_crc,
+                                caller_binding=caller_binding,
+                                close_intent=close_intent)
+                            journal_checkpoint = durable_offset
+                    if remote_crc is not None and remote_crc != durable_crc:
+                        raise TransferBindingError(
+                            "MSX PUT rolling CRC differs from local source")
+
+                def persist_close_intent():
+                    """Authorize only a proven full-boundary terminal replay."""
+
+                    nonlocal close_intent
+                    if close_intent:
+                        return
+                    if (durable_offset != descriptor.wire_size or
+                            accepted_offset != descriptor.wire_size or
+                            durable_crc != descriptor.wire_crc32):
+                        raise RealMSXProtocolError(
+                            "cannot close PUT before its durable CRC boundary")
+                    # This fsync-backed bit distinguishes a helper that reached
+                    # READY and the complete durable boundary from a journal
+                    # written before OPEN.  A later OPEN may use it to recover
+                    # a successful publication whose sidecar and terminal
+                    # response are both already gone.
+                    journal.save(
+                        descriptor, confirmed_offset=durable_offset,
+                        prefix_crc32=durable_crc,
+                        caller_binding=caller_binding,
+                        close_intent=True)
+                    close_intent = True
+
+                if (durable_offset == descriptor.wire_size and
+                        accepted_offset == descriptor.wire_size):
+                    persist_close_intent()
+
+                close_sent = False
+                progress_marker = (
+                    status.state, status.durable_offset,
+                    status.accepted_offset, status.credit)
+                progress_deadline = time.monotonic() + timeout
+                while status.state is not TransferState.COMPLETE:
+                    if (durable_offset == descriptor.wire_size and
+                            accepted_offset == descriptor.wire_size):
+                        # CLOSE is the explicit end-of-stream signal.  The
+                        # foreground DOS worker cannot verify, decompress, or
+                        # publish the file until it sees this flag.
+                        if not close_sent:
+                            persist_close_intent()
+                            closing = self.file_transfer_close(
+                                descriptor.transfer_id)
+                            self._raise_transfer_remote(
+                                closing, "PUT end-of-stream")
+                            close_sent = True
+                            progress_deadline = time.monotonic() + timeout
+                        else:
+                            time.sleep(FILE_TRANSFER_POLL_INTERVAL)
+                    elif (accepted_offset < descriptor.wire_size and
+                            status.credit and
+                            status.accepted_offset == accepted_offset and
+                            accepted_offset - durable_offset <
+                            FILE_TRANSFER_MAX_UNCOMMITTED):
+                        stream.seek(accepted_offset)
+                        block = stream.read(min(
+                            status.credit, capabilities.max_put_chunk,
+                            FILE_TRANSFER_MAX_UNCOMMITTED -
+                            (accepted_offset - durable_offset),
+                            descriptor.wire_size - accepted_offset))
+                        if not block:
+                            raise RealMSXProtocolError(
+                                "local PUT source ended before its declared size")
+                        progress = self.file_transfer_put_data(
+                            descriptor.transfer_id, accepted_offset, block)
+                        self._raise_transfer_remote(progress, "PUT data")
+                        if (progress.accepted > len(block) or
+                                progress.accepted_end !=
+                                accepted_offset + progress.accepted or
+                                progress.durable_end > progress.accepted_end or
+                                progress.credit > capabilities.max_put_chunk):
+                            raise RealMSXProtocolError(
+                                "MSX returned inconsistent PUT progress")
+                        inflight.extend(block[:progress.accepted])
+                        accepted_offset = progress.accepted_end
+                        reconcile_durable(progress.durable_end)
+                    else:
+                        time.sleep(FILE_TRANSFER_POLL_INTERVAL)
+
+                    status = self.file_transfer_status(
+                        descriptor.transfer_id)
+                    self._raise_transfer_remote(status, "PUT")
+                    self._validate_transfer_binding(status, descriptor)
+                    current_marker = (
+                        status.state, status.durable_offset,
+                        status.accepted_offset, status.credit)
+                    if current_marker != progress_marker:
+                        progress_marker = current_marker
+                        progress_deadline = time.monotonic() + timeout
+                    elif time.monotonic() >= progress_deadline:
+                        raise RealMSXTimeoutError(
+                            "timeout waiting for durable MSX PUT progress")
+                    if status.state is TransferState.SUSPENDED:
+                        raise RealMSXTimeoutError(
+                            "MSX PUT was suspended; retry with resume enabled")
+                    if status.accepted_offset != accepted_offset:
+                        raise RealMSXProtocolError(
+                            "MSX PUT accepted offset diverged from the host")
+                    reconcile_durable(
+                        status.durable_offset, status.prefix_crc32)
+
+            if not close_sent:
+                closing = self.file_transfer_close(descriptor.transfer_id)
+                self._raise_transfer_remote(closing, "PUT end-of-stream")
+            required_flags = (
+                TransferReplyFlag.WIRE_VERIFIED |
+                TransferReplyFlag.FINAL_VERIFIED |
+                TransferReplyFlag.PUBLISHED)
+            if (durable_offset != descriptor.wire_size or
+                    durable_crc != descriptor.wire_crc32 or
+                    status.durable_offset != durable_offset or
+                    status.prefix_crc32 != durable_crc or
+                    status.flags & required_flags != required_flags):
+                raise RealMSXProtocolError(
+                    "MSX PUT completed without durable CRC-verified publication")
+            journal.remove(descriptor, caller_binding=caller_binding)
+            result = {
+                "direction": "put",
+                "transfer_id": descriptor.transfer_id.hex(),
+                "source": str(source_path),
+                "target": descriptor.path,
+                "encoding": descriptor.encoding.name.lower(),
+                "compression_reason": raw_fallback_reason or prepared.reason,
+                "wire_bytes": descriptor.wire_size,
+                "final_bytes": descriptor.final_size,
+                "wire_crc32": f"{descriptor.wire_crc32:08x}",
+                "final_crc32": f"{descriptor.final_crc32:08x}",
+                "resumed_from": confirmed_offset,
+            }
+            if basic_source.basic_format is not None:
+                result["source_bytes"] = basic_source.source_size
+                result["basic_format"] = basic_source.basic_format
+                result["basic_normalization"] = basic_source.normalization
+            return result
+        finally:
+            if prepared is not None:
+                prepared.cleanup()
+            basic_source.cleanup()
+
+    def get_file(self, source, target, *, resume=True,
+                 existing_only=False,
+                 state_directory=FILE_TRANSFER_STATE_DIR,
+                 timeout=FILE_TRANSFER_PROGRESS_TIMEOUT):
+        """Stream one MSX-DOS file to a collision-safe local destination."""
+        timeout = self._validate_progress_timeout(timeout)
+        if not isinstance(resume, bool):
+            raise TypeError("resume must be a boolean")
+        if not isinstance(existing_only, bool):
+            raise TypeError("existing_only must be a boolean")
+        destination = pathlib.Path(target).expanduser().resolve(strict=False)
+        if destination.exists():
+            raise FileExistsError(f"local GET destination exists: {destination}")
+        if not destination.parent.is_dir():
+            raise FileNotFoundError(
+                f"local GET destination directory does not exist: "
+                f"{destination.parent}")
+        state_directory = pathlib.Path(state_directory).expanduser()
+        capabilities = self.file_transfer_capabilities()
+        caller_binding = str(destination)
+        candidate = TransferDescriptor(
+            TransferDirection.GET, TransferEncoding.RAW, new_transfer_id(),
+            0, 0, 0, 0, str(source))
+        journal = TransferJournal(state_directory)
+        record = (journal.find_matching(
+            candidate, caller_binding=caller_binding) if resume else None)
+        if existing_only and record is None:
+            raise RealMSXError(
+                "no matching GET journal exists for active-only recovery")
+        if record is None:
+            descriptor = candidate
+            confirmed_offset = 0
+            confirmed_crc = 0
+        else:
+            descriptor = record.resumed_descriptor()
+            confirmed_offset = record.confirmed_offset
+            confirmed_crc = record.prefix_crc32
+        part = destination.parent / (
+            f".{destination.name}.{descriptor.transfer_id.hex()}.msxpart")
+        if record is None:
+            try:
+                stream = part.open("xb")
+            except FileExistsError as exc:
+                raise RealMSXError(
+                    f"unbound local GET partial already exists: {part}") from exc
+            part_size = 0
+        else:
+            if not part.is_file():
+                raise TransferBindingError(
+                    "local GET partial from the resume journal is missing")
+            part_size = part.stat().st_size
+            if part_size < confirmed_offset:
+                raise TransferBindingError(
+                    "local GET partial is shorter than its resume journal")
+            actual = crc32_file_prefix(part, confirmed_offset).crc32
+            if actual != confirmed_crc:
+                raise TransferBindingError(
+                    "local GET partial CRC differs from its resume journal")
+            stream = part.open("r+b")
+
+        try:
+            # Persist the random ID even before OPEN/foreground discovery, so
+            # an IDE restart in that narrow window can still find the staged
+            # GET and its collision-safe local partial.
+            journal.save(
+                descriptor, confirmed_offset=confirmed_offset,
+                prefix_crc32=confirmed_crc,
+                caller_binding=caller_binding)
+            status = (self._recover_active_transfer(descriptor)
+                      if record is not None else None)
+            if existing_only and status is None:
+                raise RealMSXError(
+                    "the journalled GET is no longer active on the MSX")
+            if status is None:
+                if part_size > confirmed_offset:
+                    # The file write may have reached disk before its ACK or
+                    # journal update. With no active worker, return to the last
+                    # mutually committed boundary and request that block again.
+                    stream.truncate(confirmed_offset)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    part_size = confirmed_offset
+                opened = self.file_transfer_open(descriptor)
+                self._raise_transfer_remote(opened, "GET open")
+                status_state = opened.state
+            else:
+                status_state = status.state
+
+            if status_state is TransferState.STAGED:
+                if existing_only:
+                    raise RealMSXError(
+                        "the recovered GET is staged but no DOS prompt is "
+                        "visible to launch it safely")
+                self.type_line(
+                    f"MSXAIXF /GET {descriptor.transfer_id.hex().upper()}",
+                    timeout=timeout)
+                status = None
+            if status is None or status.state is TransferState.OPENING:
+                status = self._wait_file_transfer(
+                    descriptor.transfer_id,
+                    (TransferState.READY, TransferState.TRANSFERRING,
+                     TransferState.COMPLETE), timeout=timeout)
+            self._validate_transfer_binding(status, descriptor)
+            if descriptor.wire_size == 0 and descriptor.final_size == 0:
+                descriptor = TransferDescriptor(
+                    TransferDirection.GET, TransferEncoding.RAW,
+                    descriptor.transfer_id,
+                    status.wire_size, status.wire_crc32,
+                    status.final_size, status.final_crc32,
+                    descriptor.path,
+                    resume_offset=confirmed_offset,
+                    resume_prefix_crc32=confirmed_crc,
+                    resume=bool(record))
+            self._validate_transfer_binding(status, descriptor)
+            if status.durable_offset < confirmed_offset:
+                raise TransferBindingError(
+                    "active MSX GET is behind its committed local journal")
+            if status.durable_offset > part_size:
+                raise TransferBindingError(
+                    "active MSX GET is ahead of its durable local partial")
+            if part_size > status.durable_offset:
+                # A crash can leave exactly the offered-but-unacknowledged
+                # block on disk. Discard it and request the resident's pinned
+                # block again from the last ACKed boundary.
+                stream.truncate(status.durable_offset)
+                stream.flush()
+                os.fsync(stream.fileno())
+                part_size = status.durable_offset
+            # The journal prefix was already hashed before recovery. Reuse it
+            # at the same boundary; hash again only if the active MSX worker
+            # committed additional bytes that are already durable locally.
+            actual = (
+                confirmed_crc
+                if status.durable_offset == confirmed_offset
+                else crc32_file_prefix(part, status.durable_offset).crc32)
+            if actual != status.prefix_crc32:
+                raise TransferBindingError(
+                    "MSX GET prefix CRC differs from the local partial")
+            confirmed_offset = status.durable_offset
+            confirmed_crc = status.prefix_crc32
+            journal.save(
+                descriptor, confirmed_offset=confirmed_offset,
+                prefix_crc32=confirmed_crc,
+                caller_binding=caller_binding)
+
+            offset = confirmed_offset
+            checksum = confirmed_crc
+            journal_checkpoint = confirmed_offset
+            progress_deadline = time.monotonic() + timeout
+            stream.seek(offset)
+            while offset < descriptor.wire_size:
+                block = self.file_transfer_get_read(
+                    descriptor.transfer_id, offset,
+                    min(capabilities.max_get_chunk,
+                        descriptor.wire_size - offset))
+                self._raise_transfer_remote(block, "GET data")
+                if block.offset != offset:
+                    raise RealMSXProtocolError(
+                        "MSX GET returned a block at the wrong offset")
+                if not block.data:
+                    if time.monotonic() >= progress_deadline:
+                        raise RealMSXTimeoutError(
+                            "timeout waiting for the next MSX GET block")
+                    time.sleep(FILE_TRANSFER_POLL_INTERVAL)
+                    continue
+                if offset + len(block.data) > descriptor.wire_size:
+                    raise RealMSXProtocolError(
+                        "MSX GET block crosses the declared file size")
+                self._exact_local_write(stream, block.data)
+                stream.flush()
+                os.fsync(stream.fileno())
+                checksum = crc32_update(block.data, checksum)
+                offset += len(block.data)
+                acknowledged = self.file_transfer_get_ack(
+                    descriptor.transfer_id, offset, checksum)
+                self._raise_transfer_remote(acknowledged, "GET acknowledge")
+                if acknowledged.durable_offset != offset:
+                    raise RealMSXProtocolError(
+                        "MSX GET acknowledge did not commit the local offset")
+                if (offset == descriptor.wire_size or
+                        offset - journal_checkpoint >=
+                        FILE_TRANSFER_JOURNAL_INTERVAL):
+                    journal.save(
+                        descriptor, confirmed_offset=offset,
+                        prefix_crc32=checksum,
+                        caller_binding=caller_binding)
+                    journal_checkpoint = offset
+                progress_deadline = time.monotonic() + timeout
+
+            closing = self.file_transfer_close(descriptor.transfer_id)
+            self._raise_transfer_remote(closing, "GET end-of-stream")
+            status = self._wait_file_transfer(
+                descriptor.transfer_id, (TransferState.COMPLETE,),
+                timeout=timeout)
+            self._validate_transfer_binding(status, descriptor)
+            required_flags = (
+                TransferReplyFlag.WIRE_VERIFIED |
+                TransferReplyFlag.FINAL_VERIFIED)
+            if (offset != descriptor.wire_size or
+                    checksum != descriptor.wire_crc32 or
+                    status.durable_offset != descriptor.wire_size or
+                    status.prefix_crc32 != descriptor.wire_crc32 or
+                    status.flags & required_flags != required_flags):
+                raise RealMSXProtocolError(
+                    "GET completed without matching size and CRC-32")
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            stream = None
+            try:
+                os.link(part, destination)
+            except FileExistsError:
+                raise FileExistsError(
+                    f"local GET destination appeared during transfer: "
+                    f"{destination}")
+            part.unlink()
+            journal.remove(descriptor, caller_binding=caller_binding)
+            return {
+                "direction": "get",
+                "transfer_id": descriptor.transfer_id.hex(),
+                "source": descriptor.path,
+                "target": str(destination),
+                "encoding": "raw",
+                "wire_bytes": descriptor.wire_size,
+                "final_bytes": descriptor.final_size,
+                "wire_crc32": f"{descriptor.wire_crc32:08x}",
+                "final_crc32": f"{descriptor.final_crc32:08x}",
+                "resumed_from": confirmed_offset,
+            }
+        finally:
+            if stream is not None:
+                stream.close()
 
     def type_line(self, text, timeout=KEYBUF_INPUT_TIMEOUT):
         """Type one text line followed by the MSX Return key."""

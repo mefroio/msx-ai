@@ -29,10 +29,15 @@ from tools.build_memman_tsr import (  # noqa: E402
 
 
 TSR_NAME = "MSXAI MCP1"
-BUILD_ORIGINS = (0x4024, 0x5135, 0x6246)
+# Keep all synthetic link origins low enough that the largest supported TSR
+# still fits in page 1.  They only need to be distinct to cross-check inferred
+# relocations; high origins unnecessarily reduced the builder's size ceiling.
+BUILD_ORIGINS = (0x4024, 0x49B5, 0x5346)
 H_KEYI = 0xFD9A
 H_TIMI = 0xFD9F
 TRANSPORT_TEMPLATE = 0xFE
+TRANSPORT_8251 = 0
+TRANSPORT_16C550 = 1
 LABEL_LINE = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*):\s*equ\s+\$([0-9A-Fa-f]+)\s*$")
 REQUIRED_LABELS = (
@@ -63,6 +68,8 @@ class LinkedImage:
 class AgentTsrOutputs:
     tsr_path: pathlib.Path
     metadata_path: pathlib.Path
+    driver_8251_path: pathlib.Path
+    driver_16c550_path: pathlib.Path
     size: int
     transport_file_offset: int
     relocation_offsets: tuple[int, ...]
@@ -236,9 +243,11 @@ def _atomic_write(path: pathlib.Path, data: bytes) -> None:
 
 def build_agent_tsr(
         repository: pathlib.Path, output: pathlib.Path,
-        metadata_output: pathlib.Path, assembler: str = "z80asm"
+        metadata_output: pathlib.Path, assembler: str = "z80asm",
+        driver_8251_output: pathlib.Path | None = None,
+        driver_16c550_output: pathlib.Path | None = None,
 ) -> AgentTsrOutputs:
-    """Build the TSR at three origins, cross-check it, and emit artifacts."""
+    """Build, cross-check, and emit the template plus fixed-driver TSRs."""
 
     repository = repository.resolve()
     with tempfile.TemporaryDirectory(prefix="msxai-tsr-") as directory:
@@ -293,12 +302,35 @@ def build_agent_tsr(
         raise AgentTsrBuildError(
             "computed transport patch offset does not address its template")
 
+    if driver_8251_output is None:
+        driver_8251_output = output.with_name("MCP8251.TSR")
+    if driver_16c550_output is None:
+        driver_16c550_output = output.with_name("MCP16550.TSR")
+    if len({output.resolve(), driver_8251_output.resolve(),
+            driver_16c550_output.resolve()}) != 3:
+        raise AgentTsrBuildError(
+            "template and fixed-driver TSR outputs must be distinct")
+
+    driver_8251 = bytearray(result.data)
+    driver_8251[transport_file_offset] = TRANSPORT_8251
+    driver_16c550 = bytearray(result.data)
+    driver_16c550[transport_file_offset] = TRANSPORT_16C550
+    differing = tuple(
+        index for index, (left, right) in enumerate(
+            zip(driver_8251, driver_16c550, strict=True))
+        if left != right)
+    if differing != (transport_file_offset,):
+        raise AgentTsrBuildError(
+            "fixed-driver TSRs must differ only at the transport byte")
+
     metadata = _metadata(len(result.data), transport_file_offset)
     _atomic_write(output, result.data)
     _atomic_write(metadata_output, metadata)
+    _atomic_write(driver_8251_output, bytes(driver_8251))
+    _atomic_write(driver_16c550_output, bytes(driver_16c550))
     return AgentTsrOutputs(
-        output, metadata_output, len(result.data), transport_file_offset,
-        result.relocation_offsets)
+        output, metadata_output, driver_8251_output, driver_16c550_output,
+        len(result.data), transport_file_offset, result.relocation_offsets)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -309,10 +341,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository", type=pathlib.Path, default=REPOSITORY)
     parser.add_argument(
         "--output", "-o", type=pathlib.Path,
-        default=REPOSITORY / "work" / "agent" / "MSXAI.TSR")
+        default=REPOSITORY / "work" / "agent" / "build" / "MSXAI.TSR")
     parser.add_argument(
         "--metadata-output", type=pathlib.Path,
-        default=REPOSITORY / "work" / "agent" / "MSXAI_TSR.INC")
+        default=(REPOSITORY / "work" / "agent" / "build" /
+                 "MSXAI_TSR.INC"))
+    parser.add_argument(
+        "--8251-output", dest="driver_8251_output", type=pathlib.Path,
+        default=REPOSITORY / "work" / "agent" / "MCP8251.TSR")
+    parser.add_argument(
+        "--16c550-output", dest="driver_16c550_output", type=pathlib.Path,
+        default=REPOSITORY / "work" / "agent" / "MCP16550.TSR")
     parser.add_argument(
         "--assembler", default=os.environ.get("Z80ASM", "z80asm"))
     return parser
@@ -323,7 +362,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         outputs = build_agent_tsr(
             args.repository, args.output, args.metadata_output,
-            args.assembler)
+            args.assembler, args.driver_8251_output,
+            args.driver_16c550_output)
     except (AgentTsrBuildError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -332,6 +372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{len(outputs.relocation_offsets)} relocation(s); transport patch "
         f"offset 0x{outputs.transport_file_offset:04X}")
     print(f"wrote {outputs.metadata_path}")
+    print(f"wrote {outputs.driver_8251_path}: transport 8251")
+    print(f"wrote {outputs.driver_16c550_path}: transport 16C550")
     return 0
 
 

@@ -4,19 +4,37 @@ AGENT_SRC := agent/msx_agent.asm
 AGENT_TSR_SRC := agent/msx_agent_tsr.asm
 AGENT_CORE := agent/msx_agent_core.asm
 AGENT_LOADER := agent/msx_memman_loader.asm
+AGENT_XFER_SRC := agent/msx_xfer.asm
+AGENT_XFER_PROTOCOL := agent/msx_xfer_protocol.inc
 AGENT_TRANSPORTS := agent/transports/msx_transport_8251.inc \
 	agent/transports/msx_transport_16c550.inc
 AGENT_COM := work/agent/MSXAI.COM
-AGENT_TSR := work/agent/MSXAI.TSR
-AGENT_TSR_METADATA := work/agent/MSXAI_TSR.INC
-MEMMAN_VENDOR_DIR := work/agent/vendor
+AGENT_XFER_COM := work/agent/MSXAIXF.COM
+AGENT_BUILD_DIR := work/agent/build
+AGENT_TSR := $(AGENT_BUILD_DIR)/MSXAI.TSR
+AGENT_TSR_METADATA := $(AGENT_BUILD_DIR)/MSXAI_TSR.INC
+AGENT_TSR_8251 := work/agent/MCP8251.TSR
+AGENT_TSR_16C550 := work/agent/MCP16550.TSR
+MEMMAN_VENDOR_DIR := work/agent
 MEMMAN_VENDOR := $(MEMMAN_VENDOR_DIR)/MEMMAN.COM \
 	$(MEMMAN_VENDOR_DIR)/TL.COM \
 	$(MEMMAN_VENDOR_DIR)/TK.COM
+AGENT_SUITE := $(AGENT_COM) $(AGENT_XFER_COM) \
+	$(AGENT_TSR_8251) $(AGENT_TSR_16C550) $(MEMMAN_VENDOR)
+# Bench MSX-DOS exposes a TPA from 0100h through 9898h (38,808 bytes).
+# Keep 2 KiB free above each transient COM for its stack and DOS call headroom.
+MSX_DOS_BENCH_COM_MAX := 36760
 
 .PHONY: agent agent-prerequisites agent-tsr memman-assets test test-integration
 
-agent: $(AGENT_COM)
+agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM)
+	@test -s $(AGENT_COM)
+	@test -s $(AGENT_XFER_COM)
+	@test -s $(AGENT_TSR_8251)
+	@test -s $(AGENT_TSR_16C550)
+	@test -s $(MEMMAN_VENDOR_DIR)/MEMMAN.COM
+	@test -s $(MEMMAN_VENDOR_DIR)/TL.COM
+	@test -s $(MEMMAN_VENDOR_DIR)/TK.COM
 
 agent-prerequisites: memman-assets agent-tsr
 
@@ -25,15 +43,23 @@ memman-assets:
 
 agent-tsr:
 	$(PYTHON) tools/build_agent_tsr.py --assembler "$(Z80ASM)" \
-		--output $(AGENT_TSR) --metadata-output $(AGENT_TSR_METADATA)
+		--output $(AGENT_TSR) --metadata-output $(AGENT_TSR_METADATA) \
+		--8251-output $(AGENT_TSR_8251) \
+		--16c550-output $(AGENT_TSR_16C550)
 
-# Prerequisites are intentionally normal (not order-only): the generated TSR
-# and verified vendor bytes are embedded in the COM, so every regeneration must
-# force the final assembly as well.
+# Prerequisites are intentionally normal (not order-only): generated metadata
+# is assembled into the loader's external-suite validation, while the verified
+# utilities and fixed-driver TSRs are deployable files in the same package.
 $(AGENT_COM): agent-prerequisites
-$(AGENT_COM): $(AGENT_SRC) $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_TRANSPORTS)
+$(AGENT_COM): $(AGENT_SRC) $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) $(AGENT_TRANSPORTS)
 	mkdir -p $(dir $@)
 	$(Z80ASM) $< -o $@
+	$(PYTHON) tools/check_msx_com_size.py $@ $(MSX_DOS_BENCH_COM_MAX)
+
+$(AGENT_XFER_COM): $(AGENT_XFER_SRC) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL)
+	mkdir -p $(dir $@)
+	$(Z80ASM) $< -o $@
+	$(PYTHON) tools/check_msx_com_size.py $@ $(MSX_DOS_BENCH_COM_MAX)
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v

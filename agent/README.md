@@ -1,9 +1,17 @@
 # MSX-AI physical-target agent
 
-`MSXAI.COM` is the MSX-DOS side of the physical-target backend. The same
-executable contains the protocol core, the MemMan resident lifecycle, the
-foreground monitor, and every supported UART driver. Runtime command-line
-options select the driver and operating mode.
+The MSX-DOS side of the physical-target backend is a compact seven-file suite:
+
+- `MSXAI.COM` is the command-line lifecycle front end and foreground monitor;
+- `MSXAIXF.COM` is the transient protocol-X PUT/GET worker and bounded
+  PackBits decoder;
+- `MCP8251.TSR` and `MCP16550.TSR` are fixed-driver resident images selected
+  by `/DRIVER` on first installation; and
+- `MEMMAN.COM`, `TL.COM`, and `TK.COM` provide the external MemMan lifecycle.
+
+Runtime command-line options select the driver and operating mode. Splitting
+the suite keeps unrelated transient utilities out of the main executable and
+does not make their file sizes cumulative in MSX RAM.
 
 The external contract is a full-duplex byte stream. TCP roles, MCP tools,
 application parsing, and screenshot rendering live on the host and are not
@@ -17,22 +25,34 @@ From the repository root:
 make agent
 ~~~~
 
-The only production executable is:
+The canonical deployable suite is:
 
 ~~~~text
 work/agent/MSXAI.COM
+work/agent/MSXAIXF.COM
+work/agent/MCP8251.TSR
+work/agent/MCP16550.TSR
+work/agent/MEMMAN.COM
+work/agent/TL.COM
+work/agent/TK.COM
 ~~~~
 
 Internal build products include:
 
-- `work/agent/MSXAI.TSR`: the relocatable MemMan payload embedded in the COM;
-- `work/agent/MSXAI_TSR.INC`: generated relocation/patch metadata;
-- `work/agent/vendor/MEMMAN.COM`, `TL.COM`, and `TK.COM`: verified
-  public-domain MemMan 2.42 components embedded into the final executable.
+- `work/agent/build/MSXAI.TSR`: the relocatable template used to generate the
+  two fixed-driver TSRs; and
+- `work/agent/build/MSXAI_TSR.INC`: generated validation and relocation
+  metadata consumed by the loader build.
 
-These internal files are not alternative agents and should not be copied to a
-release disk. Their pinned Base64 sources, SHA-256 values, and redistribution
-notice are under `third_party/memman/`.
+These two internal files are not alternative agents and should not be copied to
+a release disk. `MEMMAN.COM`, `TL.COM`, and `TK.COM`, by contrast, are required
+deployable dependencies. Their pinned Base64 sources, SHA-256 values, and
+redistribution notice are under `third_party/memman/`.
+
+Keep all seven deployable files together and invoke `MSXAI` and `MSXAIXF` from
+that current MSX-DOS directory. The lifecycle resolves the external utilities
+and selected TSR by these canonical filenames; partial packages or files mixed
+from different builds are unsupported.
 
 Set a different assembler when necessary:
 
@@ -50,18 +70,20 @@ MSXAI /DRIVER:8251
 MSXAI /DRIVER:16C550
 MSXAI /DRIVER:8251 /MONITOR
 MSXAI /DRIVER:16C550 /MONITOR
-MSXAI /DRIVER:8251 /MONITOR DEBUG ON
-MSXAI /DRIVER:16C550 /MONITOR DEBUG ON
+MSXAI /DRIVER:8251 /MONITOR DEBUG
+MSXAI /DRIVER:16C550 /MONITOR DEBUG
 MSXAI /UNINSTALL
-MSXAI /PUT A:PROGRAM.BAS 1234 29B1
+MSXAIXF /PUT 00112233445566778899AABBCCDDEEFF
+MSXAIXF /GET 00112233445566778899AABBCCDDEEFF
 MSXAI /?
 MSXAI /HELP
 ~~~~
 
-`/UNINSTALL` must be used alone. `DEBUG ON` is accepted only with
-`/MONITOR`; it is rejected for the default resident lifecycle. `/PUT` is a
-separate host-driven transient action: its arguments include a hexadecimal byte
-count from `0001` through `4000` and a four-digit CRC-16/CCITT-FALSE value.
+`/UNINSTALL` must be used alone. `DEBUG` is accepted only with
+`/MONITOR`; it is rejected for the default resident lifecycle. The
+`MSXAIXF /PUT` and `/GET` forms take the 32-hex-digit transfer ID staged by the
+host. `MSXAI.COM` has no file-transfer command; all DOS-file PUT and GET work
+is owned by `MSXAIXF.COM` and protocol X.
 
 The startup banner reports the selected driver and runtime mode before control
 passes to MemMan or the foreground monitor.
@@ -75,10 +97,10 @@ passes to MemMan or the foreground monitor.
 | RAM/VRAM and direct I/O | Yes, with resident memory restrictions | Yes, outside protected monitor memory |
 | Pause/resume | Bounded snapshot lease; persistent manual pause disabled | Yes |
 | BIOS keyboard-buffer input | Yes | No |
-| Transient DOS file sink | Yes, by launching the same COM from DOS | Not applicable |
+| Transient DOS PUT/GET | Yes, by launching `MSXAIXF.COM` from DOS | Not applicable |
 | Direct call/run/stop | No | Yes |
 | Slot/mapper selection | No | Yes, pages 0 and 1 |
-| `DEBUG ON` | Rejected | Optional |
+| `DEBUG` | Rejected | Optional |
 
 ### Default MemMan resident
 
@@ -87,14 +109,18 @@ prompt. It requires MSX-DOS 2 or Nextor and the MemMan 2.4+ API.
 
 The first installation follows this lifecycle:
 
-1. Parse options and print the universal agent banner.
+1. Parse options and print the agent banner.
 2. Discover a compatible existing MemMan through `EXTBIO`.
-3. If MemMan is absent, overlay the verified embedded `MEMMAN.COM`.
-4. Create collision-safe temporary loader/TSR filenames without overwriting
-   existing files.
-5. Patch the selected driver ID into the emitted TSR and load it through
-   MemMan.
-6. Delete the temporary files and return to DOS.
+3. Validate external `MEMMAN.COM`, `TL.COM`, and the fixed-driver TSR selected
+   by `/DRIVER` before changing disk or resident state.
+4. Read `MEMMAN.COM` into guarded free space at the top of the TPA, close its
+   handle, and overlay it at `0100h` for the point-of-no-return handoff.
+5. Let the MemMan command chain invoke external `TL.COM` with
+   `MCP8251.TSR` or `MCP16550.TSR`, then return to DOS with only that selected
+   TSR resident.
+
+No executable or TSR is emitted, patched, renamed, deleted, or left behind by
+this lifecycle. Every component was already supplied as a final suite file.
 
 The resident ID is the fixed 12-byte MemMan name `MSXAI MCP1  `. Re-running
 `MSXAI` with a driver finds that ID and uses `TsrCall` to reconfigure the
@@ -105,47 +131,128 @@ initializes the new UART.
 Changing drivers can drop the active host connection. Reconnect through the
 newly selected interface.
 
-`MSXAI /UNINSTALL` discovers the named TSR and overlays the embedded MemMan
-`TK.COM` directly with that ID. MemMan detaches the registered `H.KEYI` guard
-and `H.TIMI` service hook before the agent's kill entry restores UART state. No
-uninstall helper is written to disk. Repeating the command is safe and reports
-that the agent is not installed.
+`MSXAI /UNINSTALL` discovers the named TSR, validates external `TK.COM`, stages
+it in free high TPA, and overlays it directly with that ID. MemMan detaches the
+registered `H.KEYI` guard and `H.TIMI` service hook before the agent's kill
+entry restores UART state. No uninstall helper is written or deleted.
+Repeating the command is safe and reports that the agent is not installed.
 
-Replacing the COM file does not patch a TSR already loaded in MSX memory. After
-copying a rebuilt `MSXAI.COM`, run `MSXAI /UNINSTALL` and install it again with
-the selected `/DRIVER`. This uninstall/reinstall step is required to activate
-the `timi-poll-safe` resident correction.
+Replacing suite files does not patch a TSR already loaded in MSX memory. After
+copying a rebuilt suite, run `MSXAI /UNINSTALL` and install it again with the
+selected `/DRIVER`. This uninstall/reinstall step is required to activate a
+resident change.
 
-MemMan versions older than 2.4 are rejected. A loader failure removes only
-temporary files proven to have been created by the current invocation and
-reports incomplete cleanup rather than overwriting or deleting an existing
-file.
+MemMan versions older than 2.4 are rejected. Before the external overlay
+handoff, a loader failure closes any open suite file and returns an error
+without creating, overwriting, or deleting a disk file.
 
-### Transient DOS file sink
+### Resumable DOS file transfer
 
-The host can transfer a 1..16 KiB file without simulating every character. It
-types `MSXAI /PUT <name> <hex-length> <crc16>` at the DOS prompt, waits for the
-foreground receiver, and sends credited `U` frames containing up to 318 data
-bytes. The resident places one validated frame in a mailbox. The foreground
-process copies that mailbox through MemMan `TsrCall`, writes it with MSX-DOS 2,
-and releases the next credit. No host write is made into the command processor's
-TPA before the transient process owns it. `CREATE_NEW` prevents overwriting an
-existing pathname; exact-write checks and a whole-file CRC protect completion.
-A terminal success state is exposed to the host only after the CRC, exact-write,
-and close checks pass. A ten-second NTSC/twelve-second PAL no-progress timeout
-deletes a partial file.
+Framed opcode `X` stages an immutable, transfer-ID-bound descriptor containing
+direction, encoding, DOS path, 32-bit wire/final sizes, CRC-32 values, and an
+optional resume boundary. The host then types only
+`MSXAIXF /PUT <32-hex-id>` or `MSXAIXF /GET <32-hex-id>`. The transient process
+claims the descriptor through MemMan `TsrCall`; a different ID cannot claim or
+replace an active transfer.
 
-The resident hook itself never calls DOS. `/PUT` runs as an ordinary transient
-foreground process, which is why the file operation is safe and independent of
-the selected 8251 or 16C550 transport. The host uses random 8.3 names on the
-drive shown by the current DOS prompt and deletes the temporary file after
-BASIC loads it.
-The host uses a separate bounded 30-second finalization window after all bytes
-have been accepted, allowing the foreground process to verify the CRC, close
-the file, and publish its terminal result even over a slow 8251 connection.
-If the host disappears, BASIC cannot start, or LOAD fails between successful
-file creation and BASIC cleanup, the random `MXxxxxxx.BAS` pathname can remain
-on that drive and may be deleted normally.
+All DOS work remains in that foreground process. The resident hook performs
+UART framing and bounded mailbox copies but never calls BDOS. This separation
+is independent of the selected 8251 or 16C550 byte-stream transport and keeps
+interrupted DOS, games, and BIOS hooks out of the filesystem path.
+
+The host BASIC file mode uses this same path: it materializes the ASCII or
+tokenized `.BAS` bytes temporarily, stages a raw protocol-X PUT, launches
+`MSXAIXF.COM`, and requires the final CRC-32 and publication checks before
+entering BASIC. There is no separate BASIC upload opcode or compatibility
+file-transfer command in `MSXAI.COM`.
+
+The caller explicitly confirms the initial DOS prompt; the physical-target
+host does not read VRAM to infer it. On every successful PUT/GET path,
+`MSXAIXF.COM` completes file cleanup and prints its final status before sending
+`TSR_TALK_XFER_FINISH`. Terminal `COMPLETE` therefore leaves only the immediate
+DOS termination instruction in the transient process. Host PUT/GET and BASIC
+file workflows use that protocol witness instead of hidden pre/post screen
+captures. A 32-hex transfer ID naturally wraps on a 40-column DOS screen.
+
+PUT uses a one-block mailbox with separate accepted and durable boundaries. The
+hook may accept at most 298 bytes at once. After an exact MSX-DOS 2 `WRITE`, the
+foreground worker releases that mailbox without claiming durability, allowing
+the next block to arrive. It runs `ENSURE` at an 8 KiB batch boundary and for
+the final block; only then does a cumulative commit advance the host-visible
+durable offset and CRC-32. The host bounds the accepted-minus-durable window to
+16 KiB, so a stalled or nonconforming target cannot grow host memory without
+limit.
+
+A same-directory partial named `xxxxxxxx.PRT` is created from 32 ID bits with
+`CREATE_NEW`. Its `xxxxxxxx.MTD` sidecar contains an immutable full 128-bit
+binding plus a small complemented transaction phase. The phase is itself
+`ENSURE`d before ownership of a PackBits `.OUT` or the final rename boundary is
+claimed. Publication first refuses an existing target, then uses DOS2 `RENAME`
+in the same directory. It never truncates or replaces a user file.
+
+GET opens the requested source read-only, discovers its 32-bit length and
+CRC-32 in the foreground, and publishes blocks of at most 312 bytes. Each block
+is pinned in resident memory until the host acknowledges its exact next offset
+and rolling prefix CRC. A lost acknowledgement therefore cannot release or
+silently skip a different block.
+
+Both directions support zero-byte files and lengths above 64 KiB; actual media,
+filesystem, and MSX-DOS limits still apply. CLOSE is the explicit end-of-stream
+signal and is replay-safe while verification is running and after completion.
+A one-minute NTSC/72-second PAL no-progress deadline closes foreground handles
+without deleting a valid PUT partial. On resume, the sidecar binding and phase
+are revalidated, the actual partial length and CRC are scanned, and the host
+must confirm the returned prefix before sending more bytes. This recovers both
+a disk `WRITE` that survived before its next batched `ENSURE` and an `ENSURE`
+whose resident commit reply was lost. The implementation does not write a
+per-block disk journal: actual partial bytes, CRC reconciliation, and the few
+publication phases are the recovery authority.
+
+The foreground worker renders `[##################] 100% 11520 B/s` as one
+fixed-width, 35-column, carriage-returned status line. This fits Brazilian
+machines whose DOS console exposes 37 columns without touching the auto-wrap
+column. PUT updates after every exact
+`DOS_WRITE` is released or committed, and GET updates after each host ACK.
+Percentage uses the complete 32-bit wire position and size, including a resumed
+starting offset. Rate uses confirmed bytes per BIOS-jiffy interval and follows
+the saved VDP PAL/NTSC setting. The display code is compiled only into
+`MSXAIXF.COM`; it adds no resident TSR memory and disappears when DOS terminates
+the helper.
+
+Protocol version 1 advertises RAW plus PUT-side `PACKBITS_DECODE`; GET remains
+RAW. The host uses deterministic standard PackBits only after capability
+negotiation and only when the requested compression policy selects it. A
+`.ZIP`, `.GZ`, or other recognized already-compressed input remains byte-exact
+in automatic mode. Uncompressed ROM and disk-image data may use transparent
+PackBits when it clears the normal savings threshold; the published file is
+still restored byte-for-byte.
+
+Before protocol-X planning, the shared host backend recognizes an
+unambiguously textual `.BAS` destination and streams it into the canonical
+MSX-DOS representation: numbered 8-bit source lines, CRLF endings, and one
+final `0x1A` marker. Compression, sizes, CRC-32, and resume binding are all
+calculated from that canonical image. Tokenized BASIC beginning with `0xFF`
+and non-BASIC files remain byte-exact. This policy belongs to the shared real
+MSX backend, not to any MCP-specific interface.
+
+For a PackBits PUT, the verified `.PRT` is never published directly.
+`MSXAIXF.COM` reserves a distinct same-directory `.OUT` with `CREATE_NEW`, then
+decodes the complete wire stream incrementally with its fixed 318-byte buffer.
+It rejects reserved control `80h`, the non-canonical two-byte run `FFh`,
+truncated packets, trailing input, and output beyond the declared final size.
+It independently verifies exact 32-bit final length and CRC-32 before renaming
+`.OUT` to the requested basename. A reset during decoding discards only an
+`.OUT` whose ownership phase was durably recorded, then restarts decoding from
+the verified `.PRT`. A reset around `RENAME` validates whichever source or
+target survived before completing the phase idempotently. Ordinary failure
+preserves `.PRT` and `.MTD` for retry. After success, the sidecar is removed;
+if its terminal reply was lost, a host journal at the complete wire boundary
+may replay success only after the existing final target passes exact size and
+CRC-32 validation. The host first fsyncs a monotonic close-intent bit at that
+complete durable boundary. Only a resumed OPEN carrying this proof may enter
+the no-sidecar validation path; an initial zero-byte journal therefore cannot
+adopt an unrelated empty file. This requires MSX-DOS 2 and enough free disk
+space for the wire and final files, but never loads the complete file into RAM.
 
 ### Foreground monitor
 
@@ -167,17 +274,17 @@ fixed address is not used by the default MemMan lifecycle.
 
 ## Debug tracing
 
-Debug is disabled by default. `DEBUG ON` prints each foreground protocol
+Debug is disabled by default. `DEBUG` prints each foreground protocol
 opcode as `[XX]`, where `XX` is the uppercase hexadecimal byte. A v3 TCP host
 also sends its accepted IPv4 source endpoint once after HELLO when the agent
 advertises the `debug-peer-label` feature; the screen prints
 `MCP client: <ipv4>:<port>`.
 
 For repeatable openMSX testing, the repository-level
-`open-msx-mcp.command` launcher builds and installs this canonical executable,
-makes it available on a disposable runtime disk, and waits for an IPv4 MCP
-listener at `127.0.0.1:6603`. It leaves the agent at the DOS prompt for the
-user to start explicitly in resident mode or with `/MONITOR DEBUG ON`.
+`open-msx-mcp.command` launcher builds and stages the complete canonical suite
+on a disposable runtime disk, then waits for an IPv4 MCP listener at
+`127.0.0.1:6603`. It leaves the agent at the DOS prompt for the user to start
+explicitly in resident mode or with `/MONITOR DEBUG`.
 
 Tracing is deliberately limited:
 
@@ -251,6 +358,23 @@ interrupts MSX-BASIC and other cooperative BIOS software without claiming to
 emulate a physical key matrix.
 
 ## Memory model
+
+The seven deployable files are not simultaneously resident. DOS initially
+loads `MSXAI.COM` as a normal transient program. For a first resident install,
+the loader validates the external utilities and selected fixed-driver TSR,
+stages `MEMMAN.COM` at the guarded high end of free TPA, and overlays it at
+`0100h`; the old `MSXAI.COM` image is disposable after that handoff. MemMan then
+runs `TL.COM`, which loads only the selected TSR into mapper-managed resident
+memory. The unselected TSR, `TK.COM`, and `MSXAIXF.COM` remain disk files.
+
+`MSXAIXF.COM` is loaded later as an ordinary foreground transient only for a
+protocol-X PUT or GET. Its fixed buffer also performs PackBits decoding, and
+DOS reclaims its TPA when it exits. Uninstall similarly stages and overlays
+external `TK.COM` for one action. During a lifecycle handoff the front end and
+one staged external overlay briefly share the TPA; the other suite components
+do not. The requirement is therefore that active pair plus guarded stack and
+overlay headroom, never the sum of all seven file sizes. Only MemMan and the
+selected agent TSR remain allocated after installation.
 
 MemMan relocates the TSR within a managed segment. When a hook or talk entry is
 running, that segment is mapped into CPU page 1. The agent must execute there,
@@ -342,8 +466,9 @@ The v3 HELLO appends an optional feature byte after the runtime-mode byte. Bit
 `debug-peer-label`; bit 2 advertises the resident-only `snapshot-lease`; bit 3
 advertises the transport-independent `frame-wake-ack`; and bit 4 advertises
 resident-only `timi-poll-safe`; bit 5 advertises the resident-only
-`keybuf-spool`; and bit 6 advertises resident-assisted foreground
-`file-upload`. The safe features are valid only together with `frame-wake-ack`.
+`keybuf-spool`; bit 6 (`0x40`) is reserved and must remain clear; and bit 7
+(`0x80`) advertises resident-assisted resumable `file-transfer-v2`. The safe
+features are valid only together with `frame-wake-ack`.
 Raw command `N` exposes the same bitmap before `F`, allowing
 the first framed request to use the negotiated wake and no-retry policy. Older
 9-byte and 14-byte framed HELLO responses remain valid.
@@ -361,13 +486,29 @@ response is `accepted:u16 | pending:u16 | credits:u16 | flags:u8`; flag bits
 0..2 report the post-Return barrier, an active line, and unused authorization.
 `pending` includes both the private spool and BIOS ring.
 
-Opcode `U` is available only while a foreground `/PUT` receiver has registered
-its mailbox. A request is `offset:u16 | data` with up to 318 data bytes; an
-offset-only request polls credit. The response is
-`accepted:u16 | received:u16 | credits:u16 | flags:u8`, where flag bits 0..4
-mean active, mailbox pending, all bytes accepted, foreground success, and
-foreground failure. Success is terminal and is published only after the
-foreground CRC, exact-write, and close checks. The hook never calls BDOS.
+Opcode `X` carries file-transfer subprotocol version 1. Its subcommands are
+`CAPS=0`, `OPEN=1`, `STATUS=2`, `PUT_DATA=3`, `GET_READ=4`, `GET_ACK=5`,
+`CLOSE=6`, and `CANCEL=7`. Every stateful request after OPEN includes the
+16-byte transfer ID. OPEN uses this fixed prefix before its ASCII path:
+
+~~~~text
+sub:u8, version:u8, direction:u8, encoding:u8, flags:u8, id[16],
+wire_size:u32, wire_crc32:u32, final_size:u32, final_crc32:u32,
+resume_offset:u32, resume_prefix_crc32:u32, path_length:u16, path[]
+~~~~
+
+All integers are little-endian. OPEN flag bit 0 requests resume. Bit 1
+authorizes receiptless terminal replay and is accepted only together with bit 0
+for a PUT whose requested offset and prefix CRC exactly equal its complete wire
+size and CRC. PUT data is `sub | id | offset:u32 | data`; its response separates
+the accepted block length and accepted end from the
+batched, `ENSURE`-backed durable end and next credit. GET_READ returns
+`offset:u32 | length:u16 | state:u8 | error:u8 | data`; GET_ACK binds the
+next offset to the rolling prefix CRC-32. STATUS returns state, direction,
+encoding, error, result flags, ID, all four integrity fields, durable and
+accepted offsets, prefix CRC, and PUT credit. Result flag bits mean active,
+resumable, wire verified, final verified, and published. Numeric state/error
+values and the complete host parser are defined in `server/msx_transfer.py`.
 
 Opcode `S` accepts exactly one non-zero lease byte while the resident is
 servicing a running program from a hook. After acknowledging it, the agent
@@ -435,9 +576,13 @@ analog artifacts, and exact interlaced-field timing are not reconstructed.
 
 ## Transport implementation
 
-The universal build includes both current drivers and binds six `JP` operands
-once during initialization. There is no driver-selection branch in the
-per-byte hot path.
+The common resident core includes both current drivers. The build emits
+`MCP8251.TSR` and `MCP16550.TSR` by fixing the initial transport-selection byte
+in otherwise equivalent TSR images; `/DRIVER` chooses the matching file for a
+first install. Re-running `MSXAI` against an existing resident uses its MemMan
+`TsrCall` reconfiguration entry, so it does not load a duplicate TSR. In either
+case initialization binds six `JP` operands once, with no driver-selection
+branch in the per-byte hot path.
 
 The core calls:
 
@@ -520,17 +665,20 @@ pending arrival of that hardware.
 
 ### Adding another transport
 
-Do not create another COM wrapper. Extend the universal binary:
+Do not create another command-front-end COM wrapper. Extend the common core and
+canonical suite:
 
 1. Add a namespaced include under `agent/transports/`.
 2. Define a stable transport ID, control level, flags, and private state size.
 3. Implement namespaced `init`, `restore`, `rx_ready`, `tx_ready`,
    `read`, and `write` routines.
 4. Add its six-entry vector table and binding branch to the core.
-5. Add its command-line option and banner.
-6. Increase `TRANSPORT_STATE_SIZE` in both universal build entry points if
-   the new private state is larger.
-7. Add deterministic source/build tests and a serialized integration path.
+5. Generate and validate a canonically named fixed-driver TSR for first
+   installation, and add that file to suite packaging.
+6. Add its command-line option and banner.
+7. Increase `TRANSPORT_STATE_SIZE` in both common build entry points if the new
+   private state is larger.
+8. Add deterministic source/build tests and a serialized integration path.
 
 Byte routines may change `AF` but must preserve `BC`, `DE`, `HL`, `IX`,
 and `IY`; timeout loops and protocol dispatch keep live state in those
@@ -557,12 +705,14 @@ make test-integration
 
 The integration suite owns at most one openMSX process at a time. It validates:
 
-- the single universal COM and runtime 8251 selection;
+- staging of the canonical seven-file suite and selection of `MCP8251.TSR`;
 - MemMan installation returning to DOS;
 - intervention in a DOS-launched program;
 - bounded snapshot pause, patch, resume, and repeated `H.TIMI` entry;
 - an agent-VRAM PNG capture;
-- foreground call/run/stop and visible `DEBUG ON`;
+- raw ZIP and PackBits protocol-X PUT/GET round trips through the resident TCP
+  path in `test_resident_types_and_runs_basic_only_through_agent_tcp`;
+- foreground call/run/stop and visible `DEBUG`;
 - reconfiguration without a duplicate TSR;
 - safe and idempotent uninstall.
 

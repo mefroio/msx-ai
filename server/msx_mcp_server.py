@@ -17,9 +17,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import base64
 from msx_client import OpenMSX, OpenMSXError, PROJ
 from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
-                      FEATURE_FILE_UPLOAD, UART8251_BAUD)
+                      FEATURE_FILE_TRANSFER, UART8251_BAUD)
 from msx_application import load_application
 import msx_screenshot
+from msx_transfer import TransferError, normalize_msx_basic_text
 
 Z80ASM = (os.environ.get("Z80ASM") or shutil.which("z80asm") or
           "/opt/homebrew/bin/z80asm")
@@ -28,6 +29,12 @@ WORK = PROJ / "work"
 DISKS = WORK / "disks"
 DISKS.mkdir(parents=True, exist_ok=True)
 AGENT_COM = WORK / "agent" / "MSXAI.COM"
+AGENT_XFER_COM = WORK / "agent" / "MSXAIXF.COM"
+AGENT_TSR_8251 = WORK / "agent" / "MCP8251.TSR"
+AGENT_TSR_16C550 = WORK / "agent" / "MCP16550.TSR"
+AGENT_MEMMAN_COM = WORK / "agent" / "MEMMAN.COM"
+AGENT_TL_COM = WORK / "agent" / "TL.COM"
+AGENT_TK_COM = WORK / "agent" / "TK.COM"
 # Local Nextor / MSX-DOS 2 hard-disk image (never distributed by this project).
 DOS_HDD = pathlib.Path(os.environ.get(
     "MSX_AI_DOS_HDD", WORK / "system-disks" / "msxdos.dsk")).expanduser()
@@ -41,12 +48,18 @@ MCP_SLOT_EXPANDER = os.environ.get(
 RESIDENT_INSTALL_SECONDS = 15
 RESIDENT_PROMPT_GRACE_SECONDS = 15
 BENCH_AGENT_NAME = "MSXAI.COM"
-REAL_BASIC_PROMPT_TIMEOUT_SECONDS = 30.0
-REAL_BASIC_SCREEN_CAPTURE_TIMEOUT_SECONDS = 10.0
-REAL_BASIC_PROMPT_POLL_SECONDS = 0.10
+BENCH_XFER_NAME = "MSXAIXF.COM"
+AGENT_PACKAGE_NAMES = (
+    BENCH_AGENT_NAME,
+    BENCH_XFER_NAME,
+    "MCP8251.TSR",
+    "MCP16550.TSR",
+    "MEMMAN.COM",
+    "TL.COM",
+    "TK.COM",
+)
 REAL_BASIC_FILE_THRESHOLD = 512
 REAL_BASIC_FILE_LIMIT = 0x4000
-REAL_BASIC_PUT_MARKER = "MSXAI PUT OK"
 UART_BITS_PER_BYTE = 10
 UART_SCREENSHOT_MARGIN = 1.15
 SLOW_SCREENSHOT_SECONDS = 10.0
@@ -55,8 +68,8 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_VERSION = "0.6.0"
 
 
-def _build_agent_artifact():
-    """Build and return the one canonical universal agent executable."""
+def _build_agent_artifacts():
+    """Build and return the agent executable package used by MSX-DOS."""
     environment = os.environ.copy()
     environment["Z80ASM"] = Z80ASM
     try:
@@ -67,12 +80,29 @@ def _build_agent_artifact():
         raise OpenMSXError(f"could not run the canonical agent build: {exc}") from exc
     if build.returncode != 0:
         raise OpenMSXError(
-            "could not build work/agent/MSXAI.COM with `make agent`:\n"
+            "could not build the MSX-DOS agent package with `make agent`:\n"
             + (build.stderr or build.stdout))
-    if not AGENT_COM.is_file() or AGENT_COM.stat().st_size == 0:
+    artifacts = (
+        AGENT_COM,
+        AGENT_XFER_COM,
+        AGENT_TSR_8251,
+        AGENT_TSR_16C550,
+        AGENT_MEMMAN_COM,
+        AGENT_TL_COM,
+        AGENT_TK_COM,
+    )
+    missing = [path for path in artifacts
+               if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        names = ", ".join(str(path) for path in missing)
         raise OpenMSXError(
-            "canonical agent build did not produce work/agent/MSXAI.COM")
-    return AGENT_COM
+            f"agent build did not produce required artifact(s): {names}")
+    return artifacts
+
+
+def _build_agent_artifact():
+    """Compatibility wrapper returning the primary control executable."""
+    return _build_agent_artifacts()[0]
 
 
 def _dos_prompt_visible(screen):
@@ -192,7 +222,7 @@ class Session:
         if not isinstance(debug, bool):
             raise TypeError("debug must be a boolean")
         if debug and mode != "monitor":
-            raise ValueError("DEBUG ON is available only with mode='monitor'")
+            raise ValueError("DEBUG is available only with mode='monitor'")
         if not DOS_HDD.is_file():
             raise OpenMSXError(f"MSX-DOS image not found: {DOS_HDD}")
 
@@ -200,14 +230,15 @@ class Session:
         root = pathlib.Path(runtime.name)
         disk = root / "msxdos.dsk"
         home = root / "openmsx-home"
-        # The disposable bench disk exposes exactly the same canonical name as
-        # a physical target. A stale copy is removed before import because
-        # diskmanipulator does not overwrite an existing same-name file.
-        agent_com = root / BENCH_AGENT_NAME
+        # The disposable bench disk receives the complete seven-file package.
+        # Stale copies are removed before import because diskmanipulator does
+        # not overwrite an existing same-name file.
         machine = None
         real = None
         try:
-            canonical_agent = _build_agent_artifact()
+            canonical_artifacts = _build_agent_artifacts()
+            if len(canonical_artifacts) != len(AGENT_PACKAGE_NAMES):
+                raise OpenMSXError("agent build returned an incomplete package")
             shutil.copyfile(DOS_HDD, disk)
             shutil.copytree(
                 PROJ / ".openmsx-home", home,
@@ -215,7 +246,12 @@ class Session:
                     ".DS_Store", "persistent", "savestates", "replays",
                     "screenshots", "recordings", "settings.local.xml",
                     ".filecache", "imgui.ini"))
-            shutil.copyfile(canonical_agent, agent_com)
+            runtime_artifacts = []
+            for dos_name, canonical in zip(
+                    AGENT_PACKAGE_NAMES, canonical_artifacts, strict=True):
+                artifact = root / dos_name
+                shutil.copyfile(canonical, artifact)
+                runtime_artifacts.append((dos_name, artifact))
 
             real = RealMSX(host=host, port=int(port)).listen()
             machine = OpenMSX(
@@ -227,24 +263,24 @@ class Session:
             # Import while the emulated machine is off. openMSX may otherwise
             # retain stale filesystem sectors for a disk mounted by MSX-DOS.
             machine.cmd("set power off")
-            listing = machine.cmd("diskmanipulator dir hda1")
-            entry = re.search(
-                rf"(?im)^\s*{re.escape(BENCH_AGENT_NAME)}\s+\S+\s+(\d+)\s*$",
-                listing)
-            if entry is not None:
-                machine.cmd(
-                    f"diskmanipulator delete hda1 {BENCH_AGENT_NAME}")
-            machine.cmd(f"diskmanipulator import hda1 {{{agent_com}}}")
-            listing = machine.cmd("diskmanipulator dir hda1")
-            entry = re.search(
-                rf"(?im)^\s*{re.escape(BENCH_AGENT_NAME)}\s+\S+\s+(\d+)\s*$",
-                listing)
-            expected_size = agent_com.stat().st_size
-            if entry is None or int(entry.group(1)) != expected_size:
-                observed = "missing" if entry is None else entry.group(1)
-                raise OpenMSXError(
-                    f"bench disk {BENCH_AGENT_NAME} verification failed: "
-                    f"expected {expected_size} bytes, found {observed}")
+            for dos_name, artifact in runtime_artifacts:
+                listing = machine.cmd("diskmanipulator dir hda1")
+                entry = re.search(
+                    rf"(?im)^\s*{re.escape(dos_name)}\s+\S+\s+(\d+)\s*$",
+                    listing)
+                if entry is not None:
+                    machine.cmd(f"diskmanipulator delete hda1 {dos_name}")
+                machine.cmd(f"diskmanipulator import hda1 {{{artifact}}}")
+                listing = machine.cmd("diskmanipulator dir hda1")
+                entry = re.search(
+                    rf"(?im)^\s*{re.escape(dos_name)}\s+\S+\s+(\d+)\s*$",
+                    listing)
+                expected_size = artifact.stat().st_size
+                if entry is None or int(entry.group(1)) != expected_size:
+                    observed = "missing" if entry is None else entry.group(1)
+                    raise OpenMSXError(
+                        f"bench disk {dos_name} verification failed: "
+                        f"expected {expected_size} bytes, found {observed}")
             for preload in preload_files:
                 preload = pathlib.Path(preload).resolve()
                 if not preload.is_file():
@@ -257,7 +293,7 @@ class Session:
             if mode == "monitor":
                 command += " /MONITOR"
             if debug:
-                command += " DEBUG ON"
+                command += " DEBUG"
             machine.type_line(command)
             machine.advance(
                 RESIDENT_INSTALL_SECONDS if mode == "resident" else 1)
@@ -363,31 +399,6 @@ SESSION = Session()
 # --------------------------------------------------------------------------
 def _screen():
     return SESSION.require().screen_text()
-
-
-def _wait_for_real_screen(m, predicate,
-                          timeout=REAL_BASIC_PROMPT_TIMEOUT_SECONDS):
-    """Poll agent-captured screens without starving the final capture.
-
-    The overall deadline is checked between captures.  Each capture keeps a
-    complete, fixed transfer budget because a shrinking remainder is divided
-    among all of the RAM/VRAM requests by the real backend.  Starting a slow
-    8251 capture with only milliseconds left would otherwise quarantine an
-    otherwise healthy session.
-    """
-    deadline = time.monotonic() + float(timeout)
-    screen = ""
-    while True:
-        if screen and time.monotonic() >= deadline:
-            return screen
-        screen = m.screen_text(
-            timeout=REAL_BASIC_SCREEN_CAPTURE_TIMEOUT_SECONDS)
-        if predicate(screen):
-            return screen
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return screen
-        time.sleep(min(REAL_BASIC_PROMPT_POLL_SECONDS, remaining))
 
 
 def t_boot(profile="basic", window=False):
@@ -778,9 +789,15 @@ def t_screenshot(atomic=True, page=None, sprites=True, palette=None,
 
 def t_type_line(text):
     m = SESSION.require()
-    m.type_line(text)
-    if SESSION.profile != "real":
-        m.advance(0.6)
+    consumed = m.type_line(text)
+    if SESSION.profile == "real":
+        return json.dumps({
+            "backend": "real",
+            "bytes_consumed": consumed,
+            "input": "line",
+            "screen_capture_performed": False,
+        }, sort_keys=True)
+    m.advance(0.6)
     return _screen()
 
 
@@ -790,16 +807,29 @@ def t_type_lines(lines):
     if any(not isinstance(line, str) for line in lines):
         raise TypeError("each line must be a string")
     m = SESSION.require()
-    m.type_lines(lines)
-    # Each backend owns the per-Return pacing. Only this final screen is read.
+    consumed = m.type_lines(lines)
+    if SESSION.profile == "real":
+        return json.dumps({
+            "backend": "real",
+            "bytes_consumed": consumed,
+            "input": "lines",
+            "lines": len(lines),
+            "screen_capture_performed": False,
+        }, sort_keys=True)
     return _screen()
 
 
 def t_type(text):
     m = SESSION.require()
-    m.type(text)
-    if SESSION.profile != "real":
-        m.advance(0.4)
+    consumed = m.type(text)
+    if SESSION.profile == "real":
+        return json.dumps({
+            "backend": "real",
+            "bytes_consumed": consumed,
+            "input": "text",
+            "screen_capture_performed": False,
+        }, sort_keys=True)
+    m.advance(0.4)
     return _screen()
 
 
@@ -808,6 +838,12 @@ def t_key(key):
     if SESSION.profile == "real":
         m.press(key)
         time.sleep(0.1)
+        return json.dumps({
+            "backend": "real",
+            "input": "key",
+            "key": key,
+            "screen_capture_performed": False,
+        }, sort_keys=True)
     else:
         m.press(key.upper())
         m.advance(0.6)
@@ -829,10 +865,15 @@ def _encode_basic_ascii(program):
     return listing + b"\x1a"
 
 
-def _temporary_basic_filename(drive):
+def _normalize_dos_drive(drive):
     if not isinstance(drive, str) or not re.fullmatch(r"[A-Za-z]", drive):
         raise ValueError("drive must be one DOS drive letter")
-    return drive.upper() + ":MX" + secrets.token_hex(3).upper() + ".BAS"
+    return drive.upper()
+
+
+def _temporary_basic_filename(drive):
+    drive = _normalize_dos_drive(drive)
+    return drive + ":MX" + secrets.token_hex(3).upper() + ".BAS"
 
 
 def _run_real_basic_file(m, data, drive):
@@ -841,31 +882,33 @@ def _run_real_basic_file(m, data, drive):
         raise ValueError(
             f"BASIC file must contain 1..{REAL_BASIC_FILE_LIMIT} bytes")
     filename = _temporary_basic_filename(drive)
-    m.put_dos_file(filename, data)
-    screen = _wait_for_real_screen(m, _dos_prompt_visible)
-    if not _dos_prompt_visible(screen) or REAL_BASIC_PUT_MARKER not in screen:
-        raise OpenMSXError(
-            "MSXAI /PUT did not confirm the transferred BASIC file. "
-            "The current MSXAI.COM must be reachable from the DOS prompt. "
-            "Last captured screen:\n" + screen)
-
+    # BASIC payloads are small, short-lived staging files. Protocol X still
+    # provides framed retries and end-to-end CRC-32, while a private journal
+    # directory avoids leaving resume state bound to a deleted temporary file.
+    with tempfile.TemporaryDirectory(prefix="msx-ai-basic-xfer-") as staging:
+        source = pathlib.Path(staging) / "PROGRAM.BAS"
+        source.write_bytes(data)
+        transfer = m.put_file(
+            source, filename, compression="raw", resume=False,
+            state_directory=staging)
+    # Protocol-X COMPLETE is emitted only after the transient worker has
+    # finished its DOS cleanup and final console message. The BASIC command can
+    # therefore be queued immediately; COMMAND2 consumes it after the helper's
+    # final termination instruction. No implicit VRAM read is needed here.
     m.type_line("BASIC")
-    screen = _wait_for_real_screen(m, _basic_prompt_visible)
-    if not _basic_prompt_visible(screen):
-        raise OpenMSXError(
-            "BASIC did not reach its Ok prompt after the file transfer. "
-            "Last captured screen:\n" + screen)
     m.type_line(f'LOAD"{filename}"')
-    screen = _wait_for_real_screen(m, _basic_prompt_visible)
-    if not _basic_prompt_visible(screen):
-        raise OpenMSXError(
-            "BASIC could not load the transferred file. "
-            "Last captured screen:\n" + screen)
     # KILL and RUN share one direct statement: the temporary file is removed
     # before execution without risking a second line being lost as type-ahead.
     m.type_line(f'KILL"{filename}":RUN')
-    time.sleep(2.5)
-    return _screen()
+    return {
+        "backend": "real",
+        "bytes_transferred": len(data),
+        "delivery": "file-transfer-v2",
+        "operation": "run-basic",
+        "run_submitted": True,
+        "screen_capture_performed": False,
+        "transfer_id": transfer.get("transfer_id"),
+    }
 
 
 def _read_basic_file(path, format="auto"):
@@ -889,116 +932,185 @@ def _read_basic_file(path, format="auto"):
             raise ValueError("tokenized MSX BASIC files must start with 0xFF")
         payload = data
     else:
+        # MSX BASIC source is an 8-bit DOS text format, not UTF-8 or strict
+        # 7-bit ASCII.  Listings commonly embed bytes above 0x7F for graphical
+        # characters.  Preserve those bytes while canonicalizing host line
+        # endings and the DOS text EOF marker.
         try:
-            text = data.rstrip(b"\x1a").decode("ascii")
-        except UnicodeDecodeError as exc:
-            raise ValueError("ASCII BASIC file contains non-ASCII bytes") from exc
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        payload = (normalized.rstrip("\n").replace("\n", "\r\n")
-                   .encode("ascii") + b"\r\n\x1a")
+            payload = normalize_msx_basic_text(data)
+        except TransferError as exc:
+            raise ValueError(f"invalid ASCII MSX BASIC file: {exc}") from exc
     if not 1 <= len(payload) <= REAL_BASIC_FILE_LIMIT:
         raise ValueError(
             f"BASIC file must contain 1..{REAL_BASIC_FILE_LIMIT} bytes")
     return payload, selected, source
 
 
-def t_run_basic_file(path, format="auto"):
+def t_run_basic_file(path, dos_prompt_confirmed, format="auto", drive="A"):
+    if not isinstance(dos_prompt_confirmed, bool):
+        raise TypeError("dos_prompt_confirmed must be a boolean")
+    if not dos_prompt_confirmed:
+        raise OpenMSXError(
+            "msx_run_basic_file requires dos_prompt_confirmed=true; confirm "
+            "the MSX-DOS prompt externally before starting the worker")
     if SESSION.profile != "real":
         raise OpenMSXError(
             "direct BASIC-file transfer currently requires a real-agent "
             "session at an MSX-DOS prompt")
     data, _selected, _source = _read_basic_file(path, format=format)
     m = SESSION.require()
-    if not m.feature_bits & FEATURE_FILE_UPLOAD:
+    if not m.feature_bits & FEATURE_FILE_TRANSFER:
         raise OpenMSXError(
-            "the connected resident does not advertise foreground file upload; "
-            "reinstall the current MSXAI.COM")
-    screen = m.screen_text()
-    if not _dos_prompt_visible(screen):
+            "the connected resident does not advertise file-transfer-v2; "
+            "reinstall the current agent suite")
+    return json.dumps(
+        _run_real_basic_file(m, data, drive), sort_keys=True)
+
+
+def _resolve_host_transfer_path(path, *, must_exist):
+    if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        raise ValueError("path must be a non-empty filesystem path")
+    resolved = pathlib.Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = PROJ / resolved
+    resolved = resolved.resolve(strict=must_exist)
+    if must_exist and not resolved.is_file():
+        raise ValueError(f"local transfer source is not a regular file: {resolved}")
+    return resolved
+
+
+def _require_file_transfer_backend(operation):
+    m = SESSION.require()
+    method = getattr(m, operation, None)
+    if not callable(method):
         raise OpenMSXError(
-            "msx_run_basic_file requires a visible MSX-DOS prompt; refusing "
-            "to overwrite a running program")
-    return _run_real_basic_file(m, data, _dos_prompt_drive(screen))
+            "the active backend does not implement resumable DOS file transfer")
+    if (SESSION.profile == "real" and
+            not m.feature_bits & FEATURE_FILE_TRANSFER):
+        raise OpenMSXError(
+            "the connected resident does not advertise file-transfer-v2; "
+            "install the current MSXAI.COM")
+    return m, method
+
+
+def _finish_file_transfer_tool(result):
+    """Describe protocol completion without an implicit resident VRAM read."""
+    result = dict(result)
+    result["completion"] = "protocol-x-terminal-verified"
+    result["prompt_check"] = "not-performed"
+    result["screen_capture_performed"] = False
+    return result
+
+
+def t_file_put(local_path, msx_path, dos_prompt_confirmed,
+               compression="auto", resume=True, timeout=600.0):
+    """Upload one arbitrary binary file through the active backend."""
+    if compression not in ("auto", "raw", "packbits"):
+        raise ValueError("compression must be 'auto', 'raw', or 'packbits'")
+    if not isinstance(resume, bool):
+        raise TypeError("resume must be a boolean")
+    if not isinstance(dos_prompt_confirmed, bool):
+        raise TypeError("dos_prompt_confirmed must be a boolean")
+    if not dos_prompt_confirmed and not resume:
+        raise OpenMSXError(
+            "starting a PUT requires dos_prompt_confirmed=true; false is "
+            "valid only for active resume recovery")
+    source = _resolve_host_transfer_path(local_path, must_exist=True)
+    _m, method = _require_file_transfer_backend("put_file")
+    result = method(
+        source, msx_path, compression=compression, resume=resume,
+        existing_only=not dos_prompt_confirmed, timeout=timeout)
+    return json.dumps(_finish_file_transfer_tool(result), indent=2)
+
+
+def t_file_get(msx_path, local_path, dos_prompt_confirmed,
+               resume=True, timeout=600.0):
+    """Download one arbitrary binary file through the active backend."""
+    if not isinstance(resume, bool):
+        raise TypeError("resume must be a boolean")
+    if not isinstance(dos_prompt_confirmed, bool):
+        raise TypeError("dos_prompt_confirmed must be a boolean")
+    if not dos_prompt_confirmed and not resume:
+        raise OpenMSXError(
+            "starting a GET requires dos_prompt_confirmed=true; false is "
+            "valid only for active resume recovery")
+    destination = _resolve_host_transfer_path(local_path, must_exist=False)
+    _m, method = _require_file_transfer_backend("get_file")
+    result = method(
+        msx_path, destination, resume=resume,
+        existing_only=not dos_prompt_confirmed, timeout=timeout)
+    return json.dumps(_finish_file_transfer_tool(result), indent=2)
 
 
 def t_run_basic(program, clear=True, allow_existing_basic=False,
-                transfer="auto"):
+                transfer="auto", dos_prompt_confirmed=False, dos_drive="A"):
     if not isinstance(program, str):
         raise TypeError("program must be a string")
     if not isinstance(clear, bool):
         raise TypeError("clear must be a boolean")
     if not isinstance(allow_existing_basic, bool):
         raise TypeError("allow_existing_basic must be a boolean")
+    if not isinstance(dos_prompt_confirmed, bool):
+        raise TypeError("dos_prompt_confirmed must be a boolean")
     if not isinstance(transfer, str) or transfer not in ("auto", "type", "file"):
         raise ValueError("transfer must be 'auto', 'type' or 'file'")
+    dos_drive = _normalize_dos_drive(dos_drive)
     m = SESSION.require()
     real = SESSION.profile == "real"
-    # A resident is normally installed from DOS.  Enter BASIC automatically
-    # only when the last visible row is an unambiguous DOS prompt; never type
-    # BASIC over an arbitrary application or game.
     if real:
-        screen = m.screen_text()
+        if dos_prompt_confirmed and allow_existing_basic:
+            raise ValueError(
+                "dos_prompt_confirmed and allow_existing_basic are mutually "
+                "exclusive target-state confirmations")
+        if not dos_prompt_confirmed and not allow_existing_basic:
+            raise OpenMSXError(
+                "confirm the target state explicitly: set "
+                "dos_prompt_confirmed=true at MSX-DOS, or set "
+                "allow_existing_basic=true at an MSX BASIC Ok prompt")
         file_data = _encode_basic_ascii(program)
-        file_supported = bool(m.feature_bits & FEATURE_FILE_UPLOAD)
+        file_supported = bool(m.feature_bits & FEATURE_FILE_TRANSFER)
         if transfer == "file" and not file_supported:
             raise OpenMSXError(
                 "transfer='file' requires a resident that advertises "
-                "foreground file upload; reinstall the current MSXAI.COM")
+                "file-transfer-v2; reinstall the current agent suite")
         use_file = (transfer == "file" or
                     transfer == "auto" and clear and
                     file_supported and
                     REAL_BASIC_FILE_THRESHOLD <= len(file_data) <=
                     REAL_BASIC_FILE_LIMIT and
-                    _dos_prompt_visible(screen))
+                    dos_prompt_confirmed)
         if use_file:
             if not clear:
                 raise ValueError(
                     "file transfer replaces the BASIC program and requires "
                     "clear=true")
-            if not _dos_prompt_visible(screen):
+            if not dos_prompt_confirmed:
                 raise OpenMSXError(
-                    "BASIC file transfer requires a visible MSX-DOS prompt")
-            return _run_real_basic_file(
-                m, file_data, _dos_prompt_drive(screen))
-        if _dos_prompt_visible(screen):
+                    "BASIC file transfer requires dos_prompt_confirmed=true")
+            return json.dumps(
+                _run_real_basic_file(m, file_data, dos_drive), sort_keys=True)
+        if dos_prompt_confirmed:
             m.type_line("BASIC")
-            screen = _wait_for_real_screen(m, _basic_prompt_visible)
-            if not _basic_prompt_visible(screen):
-                raise OpenMSXError(
-                    "BASIC did not reach its Ok prompt after leaving MSX-DOS. "
-                    "Last captured screen:\n" + screen)
-        elif not allow_existing_basic:
-            raise OpenMSXError(
-                "msx_run_basic requires a visible MSX-DOS prompt by default; "
-                "refusing to type over an unverified target. "
-                "Set allow_existing_basic=true only after confirming that the "
-                "target is waiting at an MSX BASIC Ok prompt")
-        elif not _basic_prompt_visible(screen):
-            raise OpenMSXError(
-                "allow_existing_basic was requested, but the visible screen "
-                "does not end at an MSX BASIC Ok prompt; refusing to type over "
-                "a running application or game")
     elif transfer == "file":
         raise OpenMSXError(
             "file transfer requires a real-agent session at an MSX-DOS prompt")
     if clear:
         m.type_line("NEW")
-        if real:
-            screen = _wait_for_real_screen(m, _basic_prompt_visible)
-            if not _basic_prompt_visible(screen):
-                raise OpenMSXError(
-                    "BASIC did not return to Ok after NEW. "
-                    "Last captured screen:\n" + screen)
-        else:
+        if not real:
             m.advance(0.4)
     lines = _basic_source_lines(program)
-    # One backend operation, one final screen capture. The resident spool keeps
-    # a hard Return barrier, and older agents retain the 39-byte-ring fallback.
-    m.type_lines(lines + ["RUN"])
+    consumed = m.type_lines(lines + ["RUN"])
     if real:
-        time.sleep(2.5)
-    else:
-        m.advance(2.5)
+        return json.dumps({
+            "backend": "real",
+            "bytes_consumed": consumed,
+            "delivery": "keyboard-spool",
+            "lines": len(lines),
+            "operation": "run-basic",
+            "run_submitted": True,
+            "screen_capture_performed": False,
+        }, sort_keys=True)
+    m.advance(2.5)
     return _screen()
 
 
@@ -1285,52 +1397,102 @@ TOOLS = {
     "msx_type_line": (t_type_line,
         "Type one line and press RETURN. A real resident agent injects the "
         "ASCII bytes atomically through the BIOS keyboard ring; software that "
-        "reads the hardware key matrix directly will not observe them. Returns "
-        "the text screen.",
+        "reads the hardware key matrix directly will not observe them. A real "
+        "target returns a delivery acknowledgement without implicitly reading "
+        "VRAM; call msx_screen explicitly when a capture is wanted.",
         _s({"text": {"type": "string"}}, ["text"])),
     "msx_type_lines": (t_type_lines,
         "Type multiple logical lines in one operation, adding RETURN after "
-        "each line and reading the text screen only once at the end. A new "
-        "real resident uses its negotiated credit-controlled keyboard spool; "
-        "older agents fall back to safe BIOS-ring pacing.",
+        "each line. A new real resident uses its negotiated credit-controlled "
+        "keyboard spool; older agents fall back to safe BIOS-ring pacing. The "
+        "real path returns an acknowledgement and performs no implicit VRAM "
+        "capture.",
         _s({"lines": {"type": "array",
                        "items": {"type": "string"}}}, ["lines"])),
     "msx_type": (t_type,
         "Type raw text without adding RETURN. A real resident agent uses the "
-        "BIOS keyboard ring and waits for each batch to be consumed.",
+        "BIOS keyboard ring and waits for each batch to be consumed, then "
+        "returns an acknowledgement without implicitly reading VRAM.",
         _s({"text": {"type": "string"}}, ["text"])),
     "msx_key": (t_key,
         "Press ESC, RET, STOP, SPACE, SELECT or TAB. A real resident agent "
         "also accepts CTRL+STOP and the CTRL+C break alias, sending the event "
         "through the BIOS keyboard ring or INTFLG over MCP/TCP; software that "
-        "reads the physical key matrix directly will not observe it.",
+        "reads the physical key matrix directly will not observe it. The real "
+        "path does not capture the screen automatically.",
         _s({"key": {"type": "string"}}, ["key"])),
     "msx_run_basic": (t_run_basic,
-        "Enter and RUN a BASIC program, returning one final text screen. Short "
-        "listings use one credit-controlled batched input operation. On a real "
+        "Enter and RUN a BASIC program. Short listings use one "
+        "credit-controlled batched input operation. On a real "
         "resident at DOS, larger listings automatically use a temporary ASCII "
         ".BAS file instead of simulated typing. Set transfer='type' or 'file' "
-        "to override that choice. The real target enters BASIC automatically "
-        "when the current screen ends at a DOS prompt. An already-visible BASIC "
-        "prompt requires explicit allow_existing_basic=true so an arbitrary "
-        "application displaying 'Ok' is not modified. Does NEW first unless "
-        "clear=false.",
+        "to override that choice. For a real target, explicitly confirm exactly "
+        "one state: dos_prompt_confirmed=true at MSX-DOS, or "
+        "allow_existing_basic=true at a BASIC Ok prompt. No screen is read to "
+        "infer that state, and the real path returns a delivery acknowledgement "
+        "without an implicit VRAM capture. Does NEW first unless clear=false.",
         _s({"program": {"type": "string"},
             "clear": {"type": "boolean", "default": True},
             "transfer": {"type": "string",
                          "enum": ["auto", "type", "file"],
                          "default": "auto"},
+            "dos_prompt_confirmed": {
+                "type": "boolean", "default": False},
+            "dos_drive": {"type": "string", "pattern": "^[A-Za-z]$",
+                          "default": "A"},
             "allow_existing_basic": {
                 "type": "boolean", "default": False}}, ["program"])),
     "msx_run_basic_file": (t_run_basic_file,
         "Transfer an ASCII or tokenized .BAS file over the active MCP/TCP "
         "agent, load it from MSX-DOS, remove the temporary target file, and "
         "RUN it. The same transport-neutral MSXAI.COM performs the DOS write "
-        "outside its resident hook. The target must be at a DOS prompt.",
+        "outside its resident hook. Set dos_prompt_confirmed=true only after "
+        "externally confirming the DOS prompt; the tool deliberately does not "
+        "read VRAM to infer it.",
         _s({"path": {"type": "string", "minLength": 1},
+            "dos_prompt_confirmed": {"type": "boolean"},
+            "drive": {"type": "string", "pattern": "^[A-Za-z]$",
+                      "default": "A"},
             "format": {"type": "string",
                        "enum": ["auto", "ascii", "tokenized"],
-                       "default": "auto"}}, ["path"])),
+                       "default": "auto"}},
+           ["path", "dos_prompt_confirmed"])),
+    "msx_file_put": (t_file_put,
+        "Upload an arbitrary binary file to MSX-DOS using the negotiated "
+        "streaming file-transfer-v2 protocol. Uses 32-bit sizes and offsets, "
+        "end-to-end CRC-32, collision-safe publication, and durable resume. "
+        "An unambiguously textual .BAS target is normalized to MSX-DOS "
+        "CRLF plus 0x1A before hashing; tokenized BASIC remains byte-exact. "
+        "compression='auto' keeps ZIP and other already-compressed files "
+        "unchanged and uses PackBits only when it saves space and the target "
+        "advertises a decoder. Set dos_prompt_confirmed=true only after "
+        "externally confirming the DOS prompt. False permits active resume "
+        "recovery only. The tool performs no automatic VRAM read.",
+        _s({"local_path": {"type": "string", "minLength": 1},
+            "msx_path": {"type": "string", "minLength": 1},
+            "dos_prompt_confirmed": {"type": "boolean"},
+            "compression": {"type": "string",
+                            "enum": ["auto", "raw", "packbits"],
+                            "default": "auto"},
+            "resume": {"type": "boolean", "default": True},
+            "timeout": {"type": "number", "exclusiveMinimum": 0,
+                        "default": 600.0}},
+           ["local_path", "msx_path", "dos_prompt_confirmed"])),
+    "msx_file_get": (t_file_get,
+        "Download an arbitrary MSX-DOS file using file-transfer-v2. Streams "
+        "raw bytes with 32-bit offsets, CRC-32, explicit block ACKs, durable "
+        "resume, and atomic no-overwrite publication on the host. GET remains "
+        "raw until an independently negotiated MSX encoder is available. The "
+        "MSX must be externally confirmed at a DOS prompt with "
+        "dos_prompt_confirmed=true; false permits active resume recovery only. "
+        "The tool performs no automatic VRAM read.",
+        _s({"msx_path": {"type": "string", "minLength": 1},
+            "local_path": {"type": "string", "minLength": 1},
+            "dos_prompt_confirmed": {"type": "boolean"},
+            "resume": {"type": "boolean", "default": True},
+            "timeout": {"type": "number", "exclusiveMinimum": 0,
+                        "default": 600.0}},
+           ["msx_path", "local_path", "dos_prompt_confirmed"])),
     "msx_reset": (t_reset,
         "OpenMSX only: reset the MSX and return the boot screen.", _s({})),
     "msx_app_load": (t_app_load,

@@ -25,13 +25,22 @@ server/msx_mcp_server.py
                            |
                            `-- transparent bridge --> MSX UART
                                                         |
-                                                        `-- MSXAI.COM
+                                                        `-- MSX-AI DOS suite
+                                                            + MSXAI.COM
+                                                            + MSXAIXF.COM
+                                                            + MCP8251.TSR
+                                                            + MCP16550.TSR
+                                                            + MEMMAN.COM
+                                                            + TL.COM
+                                                            `-- TK.COM
 ~~~~
 
 ## Current capabilities
 
 - Isolated openMSX sessions in headless or visible shared-window mode.
-- One canonical `MSXAI.COM` containing both supported UART drivers.
+- A compact seven-file MSX-DOS suite. `MSXAI.COM` provides setup and the
+  foreground monitor, one driver-selected `.TSR` becomes resident, and
+  `MSXAIXF.COM` provides the transient large-file PUT/GET workspace.
 - A true MemMan TSR by default: it returns to MSX-DOS and polls from the BIOS
   `H.TIMI` hook while cooperative DOS programs or games run.
 - An optional foreground monitor for direct upload, call, run, stop, slot, and
@@ -46,6 +55,9 @@ server/msx_mcp_server.py
 - Credit-controlled BIOS keyboard input through the resident agent, including
   255-byte batching for `msx_type_lines` and credited, whole-file-CRC-checked
   ASCII or tokenized `.BAS` transfer for larger programs.
+- Streaming, resumable binary `PUT` and `GET` between the host and MSX-DOS,
+  with 32-bit sizes and offsets, end-to-end CRC-32, restart recovery, and
+  collision-safe publication.
 - Rendering for standard SCREEN 0-8 and SCREEN 10-12 modes, including display
   pages, scroll, palettes, and sprites.
 - A backend-neutral loader for `msx-ai-app-v1` manifests, MSX-DOS COM files,
@@ -78,9 +90,12 @@ itself.
 - Legally obtained MSX system ROMs for machine configurations that require
   proprietary firmware.
 - For the default physical resident mode: MSX-DOS 2 or Nextor, a compatible
-  memory mapper, and the MemMan 2.4+ API. A verified public-domain MemMan 2.42
-  runtime is embedded in `MSXAI.COM` and is installed automatically when it
-  is not already present.
+  memory mapper, and the MemMan 2.4+ API. The suite supplies verified
+  public-domain MemMan 2.42 utilities as separate files and installs MemMan
+  automatically when it is not already present.
+- Transparent PackBits expansion after a compressed `PUT` uses bounded memory
+  inside `MSXAIXF.COM`; raw `PUT` and `GET` use the same transfer state machine
+  without codec post-processing.
 - A supported MSX UART connected to a transparent TCP/IP bridge for a physical
   target.
 
@@ -154,8 +169,8 @@ Available profiles are:
 
 ### TCP agent test bench
 
-`msx_tcp_bench_start` starts one isolated openMSX process, imports the
-canonical `MSXAI.COM`, selects the 8251 driver, and connects it to the MCP
+`msx_tcp_bench_start` starts one isolated openMSX process, imports the complete
+canonical seven-file suite, selects the 8251 driver, and connects it to the MCP
 server through RS232-Net/TCP. All physical-agent operations then use the TCP
 protocol; they do not use openMSX debugger memory APIs.
 
@@ -189,12 +204,12 @@ On macOS, double-click `open-msx-mcp.command`, or run:
 ./open-msx-mcp.command
 ~~~~
 
-The launcher builds the canonical `MSXAI.COM`, copies the local MSX-DOS disk
-to a disposable runtime image, and starts one visible openMSX instance with
-normal sound. It makes the agent available on the runtime disk but does not
-start it automatically, so the user can choose resident or foreground-monitor
-mode at the DOS prompt. It never modifies the base disk, rejects a second
-openMSX process, and accepts only an IPv4 target.
+The launcher builds and stages the canonical seven-file suite, copies the local
+MSX-DOS disk to a disposable runtime image, and starts one visible openMSX
+instance with normal sound. It makes the suite available on the runtime disk
+but does not start the agent automatically, so the user can choose resident or
+foreground-monitor mode at the DOS prompt. It never modifies the base disk,
+rejects a second openMSX process, and accepts only an IPv4 target.
 
 The MCP profile inserts openMSX's generic four-way slot expander before the
 Sunrise/Nextor and RS-232 cartridges. Additional hardware can therefore be
@@ -235,24 +250,45 @@ openMSX process at a time.
 
 ## Building the physical agent
 
-Build the single production executable:
+Build the production agent package:
 
 ~~~~sh
 make agent
 ~~~~
 
-The canonical output is:
+The canonical deployable suite is:
 
 ~~~~text
 work/agent/MSXAI.COM
+work/agent/MSXAIXF.COM
+work/agent/MCP8251.TSR
+work/agent/MCP16550.TSR
+work/agent/MEMMAN.COM
+work/agent/TL.COM
+work/agent/TK.COM
 ~~~~
 
-The build also creates an internal relocatable `MSXAI.TSR` and materializes
-verified MemMan utilities under the ignored `work/agent/` tree. Those are
-build inputs, not alternative agent executables.
+The build also creates `work/agent/build/MSXAI.TSR` and
+`work/agent/build/MSXAI_TSR.INC` as internal template and relocation-metadata
+inputs. They are
+not deployable alternatives to the two fixed-driver TSRs listed above.
 
-Copy only `MSXAI.COM` to the MSX-DOS system. Driver selection is explicit and
-case-insensitive:
+Copy all seven files to the same MSX-DOS directory and run the commands from
+that current directory. The lifecycle intentionally resolves its external
+MemMan utilities and fixed-driver TSR there; mixing files from different builds
+is unsupported.
+
+Seven files on disk do not mean seven images occupying RAM at once.
+`MSXAI.COM`, the MemMan utilities, and `MSXAIXF.COM` are transient and hand off
+execution sequentially. Installation selects only `MCP8251.TSR` or
+`MCP16550.TSR` for resident allocation. The external `MEMMAN.COM` or `TK.COM`
+image is staged in free high TPA alongside the small lifecycle front end, then
+overlaid for its one action; installation subsequently lets external `TL.COM`
+load the selected TSR. No temporary loader or TSR file is created, and there is
+no installation-time `DEL` cleanup. The PackBits worker is loaded only while a
+protocol-X transfer is active and returns its TPA to DOS when it exits.
+
+Driver selection is explicit and case-insensitive:
 
 | Command | Result |
 |---|---|
@@ -260,31 +296,31 @@ case-insensitive:
 | `MSXAI /DRIVER:16C550` | Install/reconfigure the default resident TSR for a generic 16C550 interface |
 | `MSXAI /DRIVER:8251 /MONITOR` | Start the non-resident foreground monitor with the 8251 driver |
 | `MSXAI /DRIVER:16C550 /MONITOR` | Start the non-resident foreground monitor with the 16C550 driver |
-| `MSXAI /DRIVER:8251 /MONITOR DEBUG ON` | Start the foreground monitor with visible command tracing |
+| `MSXAI /DRIVER:8251 /MONITOR DEBUG` | Start the foreground monitor with visible command tracing |
 | `MSXAI /UNINSTALL` | Remove the named resident TSR safely through MemMan |
-| `MSXAI /PUT <DOS-file> <hex-length> <crc16>` | Receive and write a 1..16 KiB file; used by the host BASIC-file flow |
+| `MSXAIXF /PUT <32-hex-transfer-id>` | Run the foreground worker for a staged file-transfer-v2 upload |
+| `MSXAIXF /GET <32-hex-transfer-id>` | Run the foreground worker for a staged file-transfer-v2 download |
 | `MSXAI /?` or `MSXAI /HELP` | Display command-line help |
 
 Exactly one `/DRIVER` is required for install or monitor mode.
 `/UNINSTALL` must be used alone. Running the resident command again finds the
 existing named TSR and changes its selected driver through MemMan instead of
 installing a duplicate. Changing the live driver can disconnect the current
-link, so reconnect through the newly selected interface.
+link, so reconnect through the newly selected interface. On a first install,
+`/DRIVER:8251` selects `MCP8251.TSR`, while `/DRIVER:16C550` selects
+`MCP16550.TSR`; an already resident agent is reconfigured through its existing
+MemMan `TsrCall` entry.
 
-`/PUT` is a transient file sink in the same universal executable. It does not
-install another agent. The host first starts it at the DOS prompt, then sends
-credited 318-byte `U` frames. The resident performs only framed UART and mailbox
-work from `H.TIMI`; the foreground process copies each complete chunk through
-MemMan `TsrCall` and performs the MSX-DOS 2 write. No remote staging write is
-made into the command processor's TPA. `CREATE_NEW` prevents overwriting an
-existing file, a whole-file CRC checks the completed stream, and a no-progress
-timeout deletes a partial file. This path is transport-neutral and works over
-either UART.
+The transfer-ID forms of `/PUT` and `/GET` belong to the small transient
+`MSXAIXF.COM` helper; they do not install another agent. The host first stages
+an immutable descriptor through framed opcode `X`, then starts the matching
+helper at the DOS prompt. The resident performs only bounded framing and
+mailbox work from `H.TIMI`; the transient process owns every MSX-DOS file call.
 
-Rebuilding or replacing `MSXAI.COM` does not modify a TSR that is already
-resident in MSX memory. To deploy this safety correction, copy the rebuilt
-`MSXAI.COM`, run `MSXAI /UNINSTALL`, and then install it again with the selected
-`/DRIVER`. A new host connection must negotiate with the reinstalled resident.
+Replacing files on disk does not modify a TSR that is already resident in MSX
+memory. To deploy a rebuilt resident, copy the complete matching suite, run
+`MSXAI /UNINSTALL`, and then install it again with the selected `/DRIVER`. A new
+host connection must negotiate with the reinstalled resident.
 
 ### Supported UART drivers
 
@@ -318,7 +354,7 @@ framed protocols, transport ABI, and driver implementation details.
 | Agent-side `call` and `run` | No | Yes |
 | Agent-side `stop` | No | Yes |
 | Slot and mapper selection | No | Yes, pages 0 and 1 |
-| On-screen `DEBUG ON` trace | No | Optional |
+| On-screen `DEBUG` trace | No | Optional |
 
 The resident reports execution state `running` while DOS or an application is
 active. The safe profile disables persistent manual `msx_pause`; atomic memory
@@ -429,6 +465,10 @@ The negotiated payload limit of the current agent is 320 bytes. Eight
 consecutive credited `ESC` bytes reset a current framed protocol session after
 a lost peer; a single noise byte cannot downgrade it.
 
+In the negotiated feature bitmap, bit `0x40` is reserved and remains clear.
+Bit `0x80` advertises `file-transfer-v2`, the only DOS-file transfer path in
+the current suite.
+
 The optional `keybuf-input` HELLO feature enables compatibility opcode `t`. It
 atomically enqueues up to 39 bytes in the BIOS keyboard ring and returns
 accepted/pending counts. The host uses those counts as credits instead of
@@ -447,20 +487,22 @@ the host attempts the cancel control; reconnect also drops private queued
 input. Hosts automatically fall back to opcode `t` with older
 agents, and cached v3 responses prevent duplicate characters after retries.
 
-The `file-upload` feature enables opcode `U`. Its request is
-`offset:u16 | data` with at most 318 data bytes; an offset-only request polls
-credits. Its seven-byte response reports accepted bytes, total received bytes,
-credits, and active/pending/complete/succeeded/failed flags. The terminal
-success flag is published only after foreground CRC, exact-write, and close
-checks pass. The foreground `/PUT` process owns all BDOS calls and exchanges
-one mailbox block at a time with the TSR.
+The `file-transfer-v2` feature enables opcode `X`. Subprotocol version 1 has
+`CAPS`, `OPEN`, `STATUS`, `PUT_DATA`, `GET_READ`, `GET_ACK`, `CLOSE`, and
+`CANCEL` operations. An immutable OPEN descriptor binds a 16-byte transfer ID,
+direction, encoding, DOS path, 32-bit wire and final sizes, independent CRC-32
+values, and any resume boundary. Stateful requests carry that 128-bit ID;
+offsets and progress counters are 32-bit. `CLOSE` is an explicit, replay-safe
+end-of-stream operation, not an inference from a short block or disconnect.
+The detailed state and payload layouts are in
+[`agent/README.md`](agent/README.md) and `server/msx_transfer.py`.
 
 `msx_key` uses that operation for ESC, Return, Tab, Select, and Space. STOP and
 Ctrl+STOP use an idempotent one-byte RAM write to the documented BIOS `INTFLG`
 work-area variable (`FC9Bh`, values `04h` and `03h` respectively). On the real
 backend, Ctrl+C is a convenience alias for the Ctrl+STOP break event.
 
-When the foreground monitor runs with `DEBUG ON`, the optional
+When the foreground monitor runs with `DEBUG`, the optional
 `debug-peer-label` feature enables opcode `I`. Immediately after HELLO, a TCP
 host sends the accepted IPv4 source endpoint as printable ASCII and the MSX
 displays it as `MCP client: <ipv4>:<port>`. The UART-facing agent remains
@@ -542,7 +584,7 @@ The V9938/V9958 palette interface is write-only. Games that change it directly
 without maintaining the BIOS palette mirror may require an explicit 16-entry
 RGB `palette` argument for exact colors. The same limitation applies to
 software that changes VDP registers without updating the readable BIOS
-shadows. `DEBUG ON` changes the foreground display and therefore appears in a
+shadows. `DEBUG` changes the foreground display and therefore appears in a
 capture. Raster effects, borders/overscan, analog artifacts, and exact
 interlaced-field timing are not reconstructed.
 
@@ -575,39 +617,44 @@ Execution constraints depend on the runtime:
 ## Batched BASIC input and file transfer
 
 `msx_type_lines` accepts an array of logical lines, appends Return to each one,
-and captures the text screen only once after the batch. On a current physical
-resident, the host fills the negotiated keyboard spool in large packets and
-uses its returned credits. On older residents it streams into available BIOS
-ring slots while retaining the same Return barrier.
+and waits for the target to consume the batch. On a current physical resident,
+the host fills the negotiated keyboard spool in large packets and uses its
+returned credits. On older residents it streams into available BIOS ring slots
+while retaining the same Return barrier. Real-agent input tools return a
+structured delivery acknowledgement and do not read VRAM automatically; use
+`msx_screen` explicitly when a text capture is actually required.
 
 `msx_run_basic` uses one batched input operation for short listings. When a
-real target is visibly waiting at an MSX-DOS prompt and the normalized ASCII
-listing is at least 512 bytes, `transfer="auto"` instead:
+real target is confirmed at an MSX-DOS prompt with
+`dos_prompt_confirmed=true` and the normalized ASCII listing is at least 512
+bytes, `transfer="auto"` instead:
 
-1. starts the transient `MSXAI /PUT` file sink;
-2. streams a CRLF/EOF `.BAS` image in credited, CRC-protected frames;
+1. stages a temporary host-side `.BAS` image and opens a protocol-X PUT;
+2. starts `MSXAIXF /PUT <transfer-id>` and streams the image with 32-bit
+   offsets, rolling CRC-32, and explicit close/publication checks;
 3. enters BASIC and loads the temporary file;
 4. deletes the temporary file and runs the loaded program.
 
 Use `transfer="type"` to force keyboard entry or `transfer="file"` to require
-the file path. The latter requires `clear=true`, a DOS prompt, and a resident
-that advertises `file-upload`; `auto` falls back to typing otherwise. One file
-is limited to 16 KiB. `msx_run_basic_file` performs the same flow for a
-host-side `.BAS` file; `format="auto"` preserves tokenized files beginning with
-`0xFF` and normalizes other files as ASCII. No BASIC memory layout or
-host-generated token stream is injected. The temporary file uses the drive
-shown in the current DOS prompt. A disconnect during `/PUT` times out and
-deletes the partial file. A disconnect, BASIC-entry failure, or LOAD failure
-after successful transfer but before BASIC cleanup can leave the collision-safe
-`MXxxxxxx.BAS` file there; it may be deleted normally from DOS.
+the file path. The latter requires `clear=true`, explicit DOS confirmation, and
+a resident that advertises `file-transfer-v2`; `auto` falls back to typing
+otherwise. Reusing a BASIC prompt requires the mutually exclusive
+`allow_existing_basic=true` confirmation. The host never infers either state
+from an automatic screen read. `dos_drive` (or `drive` for
+`msx_run_basic_file`) selects the temporary target drive and defaults to `A`.
+The BASIC tool retains a conservative 16 KiB input policy, but protocol X itself
+uses 32-bit sizes and is not limited to 16 KiB. `format="auto"` preserves
+tokenized files beginning with `0xFF` and normalizes other files as ASCII. No
+BASIC memory layout or host-generated token stream is injected.
 
-After the last upload block, the host allows a separate bounded 30-second
-window for the foreground receiver to verify the CRC, close the file, and
-publish terminal success. Subsequent DOS/BASIC prompt polling gives every
-screen capture its full 10-second transfer budget and checks the overall
-30-second prompt deadline only between captures. This prevents a slow 8251
-screen read from being started with an unusably small remainder and
-quarantining an otherwise healthy MCP/TCP session.
+The host waits for complete protocol-X size, CRC-32, close, and publication
+verification. The foreground worker performs cleanup and prints its final
+status before publishing terminal `COMPLETE`, then immediately terminates. The
+next BASIC command may therefore wait safely in the BIOS keyboard spool until
+COMMAND2 consumes it. No DOS/BASIC prompt polling or hidden VRAM capture occurs.
+A BASIC-entry or LOAD failure after successful publication but before BASIC
+cleanup can leave the random `MXxxxxxx.BAS` target there; it may be deleted
+normally from DOS.
 
 ## Main MCP tools
 
@@ -618,6 +665,7 @@ quarantining an otherwise healthy MCP/TCP session.
 | Memory/video | `msx_memory_read`, `msx_memory_write`, `msx_screen`, `msx_screenshot` |
 | Hardware | `msx_io_read`, `msx_io_write`, `msx_slot_select`, `msx_mapper_select` |
 | Input | `msx_type`, `msx_type_line`, `msx_type_lines`, `msx_run_basic`, `msx_run_basic_file`, and `msx_key` |
+| Files | `msx_file_put`, `msx_file_get` |
 | openMSX/DOS | `msx_dos_asm_run`, `msx_disk_put_text`, `msx_reset`, `msx_cmd` |
 
 Resident keyboard injection feeds the standard BIOS ring and therefore works
@@ -627,11 +675,11 @@ Ctrl+STOP are delivered through the BIOS `INTFLG`; the real backend maps
 Ctrl+C to the same break event for MCP client convenience. Physical reset, raw
 matrix emulation, and openMSX console commands remain openMSX-only. Physical
 operations use the agent byte stream rather than openMSX APIs. On a physical
-target, `msx_run_basic` enters BASIC automatically
-only from an unambiguous DOS prompt. Reusing an already-visible BASIC prompt
-requires `allow_existing_basic=true`, an explicit safety opt-in that prevents a
-screen merely ending in `Ok` from being treated as permission to overwrite a
-running application.
+target, `msx_run_basic` enters BASIC only after the caller sets
+`dos_prompt_confirmed=true`. Reusing an already-visible BASIC prompt requires
+the mutually exclusive `allow_existing_basic=true` opt-in. These confirmations
+prevent a tool from typing over a running application without first reading
+VRAM and disturbing the resident target's live VDP state.
 
 ## Validation
 
@@ -653,7 +701,10 @@ The integration suite uses one openMSX process at a time and validates:
 - intervention in a normally launched DOS COM program;
 - repeated pause/resume, RAM/VRAM access, and a PNG rendered from agent-captured
   VRAM;
-- foreground ASM upload/run/stop with visible `DEBUG ON` tracing;
+- raw ZIP and PackBits protocol-X PUT/GET round trips through the resident TCP
+  path in `test_resident_types_and_runs_basic_only_through_agent_tcp`, including
+  a local-debugger screen regression that rejects hidden-capture glyph damage;
+- foreground ASM upload/run/stop with visible `DEBUG` tracing;
 - reconfiguration without a duplicate TSR;
 - safe uninstall and an idempotent second uninstall.
 
@@ -665,17 +716,19 @@ changing emulated MSX sound behavior.
 
 ~~~~text
 agent/                    universal ASM agent, lifecycle, and UART drivers
+agent/msx_xfer.asm        transient protocol-X PUT/GET and PackBits helper
 agent/transports/         hardware-specific byte-stream implementations
 server/msx_client.py      openMSX control client
 server/msx_mcp_server.py  MCP JSON-RPC server and backend adapters
 server/msx_protocol.py    protocol-v3 codec and incremental parser
 server/msx_v3.py          framed stream session, retries, and correlation
 server/msx_real.py        physical-agent stream/TCP client
+server/msx_transfer.py    file-transfer-v2 wire contract and host helpers
 server/msx_screenshot.py  host-side VRAM renderer
 server/msx_application.py backend-neutral application parser/loader
 tests/                    deterministic and opt-in integration tests
 third_party/memman/       pinned public-domain MemMan assets and hashes
-tools/                    reproducible MemMan/TSR build helpers
+tools/                    reproducible agent and MemMan/TSR build helpers
 work/                     ignored binaries, disks, captures, and local data
 ~~~~
 
@@ -695,8 +748,117 @@ Review `git status` and `git ls-files` before release. Publish from Git or
 `git archive`, not by zipping the working directory, because ignored local
 media remains on disk. Do not force-add proprietary ROMs or disk images.
 
-The embedded MemMan assets have their own provenance and checksums in
-`third_party/memman/NOTICE`.
+The separately deployed MemMan assets have their own provenance and checksums
+in `third_party/memman/NOTICE`.
+
+## Resumable file transfer v2
+
+`msx_file_put` uploads an arbitrary binary host file to MSX-DOS, and
+`msx_file_get` downloads an MSX-DOS file to the host. Both stream blocks instead
+of buffering the complete file in MSX memory. The initial call requires
+`dos_prompt_confirmed=true`, set only after the caller has externally confirmed
+an MSX-DOS prompt, so the host can start `MSXAIXF /PUT <id>` or
+`MSXAIXF /GET <id>`. With `dos_prompt_confirmed=false`, the tool is fail-closed:
+it may only reattach to an already-active matching transfer when `resume=true`.
+That default resume mode survives a timeout, TCP disconnect, or IDE restart.
+
+Generic PUT remains byte-exact except for an unambiguously textual `.BAS`
+target. Numbered BASIC source is automatically converted to the MSX-DOS text
+image expected by the interpreter: 8-bit source bytes are preserved, LF/CR
+host endings become CRLF, and one final `0x1A` EOF marker is added before size,
+compression, and CRC-32 are calculated. The result reports the normalization
+and both the original and final sizes. Ambiguous or invalid `.BAS` input fails
+before transmission. Tokenized BASIC beginning with `0xFF` and every non-BASIC
+file are always transferred byte-exact.
+
+PUT/GET never capture VRAM before or after a transfer. Success is established
+by protocol-X terminal state, exact offsets and sizes, CRC-32, close, and the
+required verification/publication flags. Results report
+`completion="protocol-x-terminal-verified"`,
+`prompt_check="not-performed"`, and `screen_capture_performed=false`. This is
+intentional: the resident cannot portably inspect the VDP's internal write
+address without disturbing it. The 32-hex transfer ID may wrap onto two rows on
+a 40-column DOS screen; that wrapping is normal, while binary glyphs are not.
+
+While `MSXAIXF.COM` is active, the MSX displays one compact in-place progress
+line. Its 35-column layout also fits Brazilian machines that expose a 37-column
+DOS console without touching the auto-wrap column:
+
+```text
+[#########---------]  50%   480 B/s
+```
+
+PUT refreshes it after every exact DOS write has been released or durably
+committed; GET refreshes it after each acknowledged block. Percent thresholds
+use the protocol's full 32-bit wire size and start at the recovered offset on a
+resume. The displayed `B/s` is the latest confirmed-block rate measured from
+BIOS jiffies, using the VDP's PAL 50 Hz or NTSC 60 Hz setting. The fixed
+35-column line is rewritten with carriage return instead of scrolling. All
+state and formatting code belongs to the transient helper, so DOS reclaims it
+when the operation ends and the resident agent size is unchanged.
+
+Protocol `X` protects each operation with an opaque 128-bit transfer ID and
+immutable pathname, direction, size, and checksum bindings. It uses 32-bit
+sizes and offsets, rolling prefix CRC-32 for resume reconciliation, explicit
+GET acknowledgements, and an explicit `CLOSE` before final verification. The
+host persists restart journals, while the MSX rechecks the actual partial-file
+length and CRC before granting more PUT credit. A stale or mismatched session
+cannot append to another transfer.
+
+PUT mailbox writes and durable progress are deliberately distinct. Exact
+writes release the 298-byte mailbox immediately, while `DOS_ENSURE` and the
+durable offset advance in 8 KiB batches and at end of file. This avoids a disk
+flush for every UART frame. The host caps uncommitted progress at 16 KiB and
+journals only the target's `ENSURE`-backed boundary.
+
+Publication is fail-closed in both directions. PUT writes a same-directory
+partial and refuses an existing MSX destination; GET writes a host-side partial
+and refuses an existing local destination. The final pathname appears only
+after exact I/O, complete size, CRC-32, close, and publication checks succeed.
+The MSX sidecar combines immutable transfer binding with complemented decoding,
+publishing, and published phases. A restart can safely discard only owned
+PackBits scratch output and can recognize a completed rename only after exact
+final size/CRC validation. Successful PUT removes the sidecar; a lost terminal
+reply can still be replayed from a complete fsync-backed host journal, again
+only after validating the existing target byte-for-byte by size and CRC. A
+separate monotonic close-intent bit is fsync'd only after the foreground helper
+has reached the full durable boundary and before CLOSE. Receiptless replay is
+not authorized without that bit, so a zero-byte journal written before OPEN
+cannot mistake an unrelated empty destination for a completed transfer.
+Legacy version-1 journals load as ordinary resumes without terminal authority
+and therefore fail closed if their MSX sidecar is already gone.
+Zero-byte files, files larger than 64 KiB, and interrupted transfers use the
+same state machine. Each size field can represent up to 4,294,967,295 bytes,
+but the practical limit is the smallest limit imposed by the host staging
+space, MSX-DOS/filesystem, and available target media.
+
+Compression is asymmetric and capability-negotiated in protocol version 1:
+
+- `msx_file_put(compression="auto")` may create a deterministic standard
+  PackBits stream only when the target advertises `PACKBITS_DECODE` and
+  compression saves at least
+  the larger of 256 bytes or three percent of the source;
+- common archives and already-compressed media, including `.ZIP` and `.GZ`,
+  remain raw and arrive byte-for-byte unchanged in the default `auto` mode;
+- `compression="raw"` preserves the prepared representation without transport
+  encoding, while `compression="packbits"` is an explicit override and
+  requires the negotiated decoder; textual BASIC normalization, when selected
+  by the `.BAS` target, occurs before either compression policy;
+- `msx_file_get` always transfers raw bytes because the current MSX component
+  provides a PackBits decoder, not a PackBits encoder.
+
+For a PackBits PUT, the compressed wire stream has its own size and CRC-32. After
+explicit CLOSE, the MSX expands it and independently checks the declared final
+size and CRC-32 before publishing the requested destination. This is transparent
+transport compression: a source ZIP remains a ZIP, and a normally compressed
+source is restored under the requested filename rather than left encoded.
+`MSXAIXF.COM` decodes the stream incrementally with a fixed 318-byte buffer;
+there is no external codec installation or whole-file RAM requirement. The
+decoder rejects truncated, overlong, reserved, and non-canonical packets before
+publication. The file-transfer state machine is part of the common framed
+agent protocol and has no BaDCaT-specific commands or branches. MCP/TCP over
+8251, 16C550, or a future transparent byte-stream transport changes throughput
+and block pacing, not the transfer semantics.
 
 ## License
 
