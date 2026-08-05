@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Robust client for driving openMSX through its -control stdio protocol.
+"""Optional emulator adapter for openMSX's -control stdio protocol.
 
-This is the core the MCP server builds on. It spawns openMSX with an isolated
-OPENMSX_HOME (never touching the user's own setups), parses the XML reply
-stream reliably, and exposes high-level helpers (power, boot, type, screenshot,
-read the text screen).
+The physical-agent backend does not import an openMSX executable, open an
+openMSX socket, or use this adapter at runtime. Emulator tools instantiate it
+explicitly. It spawns openMSX with an isolated OPENMSX_HOME (never touching the
+user's own setups), parses the XML reply stream reliably, and exposes
+high-level emulator helpers.
 """
 import os, subprocess, threading, queue, time, re, html, pathlib, glob, socket, shutil
 import tempfile
 
 PROJ = pathlib.Path(__file__).resolve().parent.parent
-BIN = (os.environ.get("OPENMSX_BIN") or shutil.which("openmsx") or
-       "/Applications/openMSX.app/Contents/MacOS/openmsx")
 DEFAULT_HOME = pathlib.Path(os.environ.get(
     "MSX_AI_OPENMSX_HOME", PROJ / ".openmsx-home")).expanduser()
 
@@ -39,14 +38,20 @@ class OpenMSXError(RuntimeError):
     pass
 
 
+def _default_binary():
+    """Resolve openMSX only after an emulator operation is selected."""
+    return (os.environ.get("OPENMSX_BIN") or shutil.which("openmsx") or
+            "/Applications/openMSX.app/Contents/MacOS/openmsx")
+
+
 class OpenMSX:
     def __init__(self, machine="Gradiente_Expert20", extensions=("DDX_3.0",),
-                 harddisk=None, home=DEFAULT_HOME, bin=BIN):
+                 harddisk=None, home=DEFAULT_HOME, bin=None):
         self.machine = machine
         self.extensions = list(extensions)
         self.harddisk = harddisk        # path to an IDE/hda image (MSX-DOS/Nextor)
         self.home = str(home)
-        self.bin = bin
+        self.bin = _default_binary() if bin is None else bin
         self.proc = None
         self.sock = None            # set when attached to an existing instance
         self.attached = False

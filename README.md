@@ -1,15 +1,24 @@
 # MSX-AI
 
 MSX-AI is an MCP server for live MSX development. It can control openMSX
-directly or communicate with an ASM agent over a transport-neutral TCP/IP byte
-stream. The physical-target path can inspect and patch RAM/VRAM, pause and
-resume cooperative software, access hardware ports, and render screenshots
-from captured VRAM.
+directly, without TCP or an MSX-side agent, or communicate with an ASM agent
+through a separately selected host transport. The currently implemented agent
+transport is a transparent TCP/IPv4 byte stream. The physical-target path can
+inspect and patch RAM/VRAM, pause and resume cooperative software, access
+hardware ports, and render screenshots from captured VRAM.
 
 The project is intentionally independent from a particular AI interface or
 network adapter. MCP is the current public interface; the application loader,
 framed protocol, screenshot renderer, and MSX-side command core are separate
 layers.
+
+openMSX, TCP/IP, and BaDCaT are all optional at the project level. A
+physical-only installation does not need an openMSX executable, emulator ROMs,
+disk images, BaDCaT hardware, a BaDCaT SDK, or BaDCaT firmware. The MCP server
+does not probe or start an
+emulator implicitly: select `msx_agent_listen` or `msx_agent_connect` for a
+physical target, and select `msx_boot`, `msx_attach`, or `msx_tcp_bench_start`
+only when the optional emulator backend is wanted.
 
 ~~~~text
 AI client / MCP
@@ -34,6 +43,20 @@ server/msx_mcp_server.py
                                                             + TL.COM
                                                             `-- TK.COM
 ~~~~
+
+### Backend choices
+
+| Use case | openMSX | MSX agent | TCP/IPv4 |
+|---|---:|---:|---:|
+| Direct openMSX control | Required | Not used | Not used |
+| Physical MSX through the current agent backend | Not used | Required | Required by the current host adapter |
+| Agent-path simulation in openMSX | Required | Required | Required between RS232-Net and the host |
+| Both capabilities in one installation | Available | Available | Used only when the agent backend is selected |
+
+Backend selection is explicit. One MCP server session controls one active
+target at a time, but the same installation can switch between direct openMSX,
+an openMSX-hosted agent simulation, and a physical agent without changing the
+core server or installing a product-specific edition.
 
 ## Current capabilities
 
@@ -83,12 +106,22 @@ itself.
 
 ## Requirements
 
+### Core MCP server
+
 - Python 3.10 or newer.
-- [openMSX](https://openmsx.org/) for the emulator backend. Version 21.0 is the
-  currently tested version.
-- Bas Wijnen's `z80asm` for assembling uploaded source and the ASM agent.
-- Legally obtained MSX system ROMs for machine configurations that require
-  proprietary firmware.
+
+The server has no mandatory third-party Python packages. Starting it, listing
+its tools, and accepting or initiating a physical-agent TCP connection do not
+look for openMSX or any particular network-adapter product.
+
+TCP/IP is not required for direct openMSX control. It is currently required
+only when selecting the real-agent protocol path, whether that agent runs on a
+physical MSX or is simulated through openMSX RS232-Net. Additional host
+transport adapters can implement the same ordered byte-stream contract without
+changing the MCP tools or Z80 command core.
+
+### Physical MSX target through the current agent backend
+
 - For the default physical resident mode: MSX-DOS 2 or Nextor, a compatible
   memory mapper, and the MemMan 2.4+ API. The suite supplies verified
   public-domain MemMan 2.42 utilities as separate files and installs MemMan
@@ -99,9 +132,25 @@ itself.
 - A supported MSX UART connected to a transparent TCP/IP bridge for a physical
   target.
 
+The bridge may use any vendor or implementation as long as it exposes the
+selected 8251 or 16C550-compatible byte interface to the MSX and provides a
+transparent, ordered TCP/IPv4 stream. BaDCaT SMD is one intended validation
+device, not a dependency.
+
+### Optional emulator and development tools
+
+- [openMSX](https://openmsx.org/) is required only for the emulator backend and
+  emulator integration tests. Version 21.0 is the currently tested version.
+- Legally obtained MSX system ROMs are required only by openMSX machine
+  configurations that use proprietary firmware.
+- Bas Wijnen's `z80asm` is required to build the ASM agent suite or use tools
+  that assemble uploaded Z80 source. It is not required to start the MCP server
+  with an already-built agent suite.
+
 ROM images and bootable disk images are not distributed by this repository.
 
-The emulator defaults can be overridden with these environment variables:
+The optional emulator defaults can be overridden with these environment
+variables:
 
 | Variable | Purpose |
 |---|---|
@@ -141,7 +190,20 @@ The project-local `.mcp.json` uses a relative path:
 Clients with a global configuration should use the absolute path to
 `server/msx_mcp_server.py`.
 
-## openMSX workflows
+## Physical-only workflow
+
+Do not run `open-msx.command` or `open-msx-mcp.command`. Start the MCP server
+through the configuration above, then select exactly one physical TCP role:
+
+- call `msx_agent_listen` when the transparent adapter connects to the host;
+- call `msx_agent_connect` when the adapter listens as a TCP server.
+
+After the TCP handshake, backend-neutral tools operate through the resident
+agent. With no selected backend, they fail with an instruction to connect a
+physical target or explicitly boot the optional emulator; they never start
+openMSX automatically.
+
+## Optional openMSX workflows
 
 `msx_boot` starts an isolated headless emulator by default. Every headless
 process is muted at openMSX's host mixer for its complete lifetime. This does

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MSX-AI :: MCP bridge for openMSX and the resident real-MSX agent.
+"""MSX-AI :: transport-neutral MCP bridge for emulated or physical MSX targets.
 
 Zero external dependencies: speaks MCP (JSON-RPC 2.0) over newline-delimited
 stdio directly, so it runs anywhere Python 3 does. It can drive an isolated
@@ -7,8 +7,10 @@ openMSX through its control channel or a physical MSX through the resident Z80
 monitor and TCP/serial transport. Models can upload Z80 builds, inspect or
 patch RAM/VRAM, control execution and render screenshots from captured VRAM.
 
-Nothing here touches the user's own openMSX setups: OPENMSX_HOME points at the
-project-local .openmsx-home built for msx-ai.
+openMSX is an optional backend selected only by emulator-specific tools. A
+physical session uses RealMSX directly and requires neither an openMSX
+executable nor emulator ROMs. Emulator sessions use the project-local
+OPENMSX_HOME and never touch the user's normal setup.
 """
 import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re, time
 import secrets
@@ -136,8 +138,12 @@ def _basic_prompt_visible(screen):
     return bool(rows and rows[-1].lower() == "ok")
 
 # --------------------------------------------------------------------------
-# Emulator session (lazy, single instance kept alive across tool calls)
+# Explicitly selected backend (one emulator or physical session at a time)
 # --------------------------------------------------------------------------
+class BackendNotSelectedError(RuntimeError):
+    """Raised when a backend-neutral tool is called before target selection."""
+
+
 class Session:
     def __init__(self):
         self.msx = None
@@ -360,7 +366,10 @@ class Session:
 
     def require(self):
         if self.msx is None:
-            self.boot("basic")
+            raise BackendNotSelectedError(
+                "no active MSX backend; use msx_agent_listen or "
+                "msx_agent_connect for physical hardware, or msx_boot for the "
+                "optional openMSX emulator")
         return self.msx
 
     def shutdown(self):
@@ -1272,9 +1281,10 @@ TOOLS = {
             "timeout": {"type": "number", "default": 60}})),
     "msx_agent_listen": (t_agent_listen,
         "Listen for an MSX resident agent or transparent hardware adapter to "
-        "connect over TCP/IPv4. Use this after the user starts "
-        "open-msx-mcp.command, or when a hardware adapter is configured as a "
-        "TCP client. The MCP protocol is independent of its UART hardware.",
+        "connect over TCP/IPv4. Use this when a physical adapter is configured "
+        "as a TCP client; the optional openMSX test profile can use the same "
+        "endpoint. The MCP protocol is independent of emulator and adapter "
+        "brands.",
         _s({"host": {"type": "string", "default": "0.0.0.0"},
             "port": {"type": "integer", "default": 6603},
             "timeout": {"type": "number", "default": 60}})),
