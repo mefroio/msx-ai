@@ -63,6 +63,25 @@ The default MemMan resident returns to MSX-DOS and remains available while
 compatible software runs. Use the foreground monitor for direct call, run,
 stop, slot, mapper, and visible DEBUG workflows.
 
+The recommended MSX-DOS layout keeps the suite out of the disk root:
+
+```text
+A:\MSXAI\
+  MSXAI.COM    MSXAIXF.COM  MCP8251.TSR  MCP16550.TSR
+  MEMMAN.COM   TL.COM       TK.COM
+```
+
+Configure it once from `AUTOEXEC.BAT`:
+
+```bat
+SET MSXAI_HOME=A:\MSXAI
+PATH A:\MSXAI;%PATH%
+```
+
+`MSXAI` and `MSXAIXF` can then be called from any DOS directory. Keeping all
+seven files in the current directory remains a compatibility fallback when
+`MSXAI_HOME` is not set.
+
 ## Requirements
 
 - Python 3.10 or newer for the MCP server.

@@ -53,13 +53,18 @@ class OpenMSXMCPLauncherTest(unittest.TestCase):
 
     def test_startup_keeps_agent_manual_and_retries_transport(self):
         self.assertNotIn('//type "MSXAI ', self.startup)
-        self.assertIn("agent package ready", self.startup)
+        self.assertIn("A:\\\\MSXAI is on PATH", self.startup)
         self.assertIn("MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR",
                       self.startup)
         self.assertIn("MEMMAN.COM TL.COM TK.COM", self.startup)
+        self.assertIn("diskmanipulator mkdir hda1 MSXAI", self.startup)
+        self.assertIn("diskmanipulator chdir hda1 MSXAI", self.startup)
+        self.assertIn("diskmanipulator chdir hda1 /", self.startup)
         self.assertIn("diskmanipulator delete hda1 $suite_name", self.startup)
         self.assertIn("diskmanipulator import hda1", self.startup)
         self.assertIn("MSX_AI_MCP_SUITE_DIR", self.startup)
+        self.assertIn("SET MSXAI_HOME=A:\\\\MSXAI", self.startup)
+        self.assertIn("PATH A:\\\\MSXAI;%PATH%", self.startup)
         self.assertIn('set rs232-net-address "$ipv4:$port"', self.startup)
         self.assertIn("set rs232-net-ip232 off", self.startup)
         self.assertIn("after realtime $retry_seconds", self.startup)

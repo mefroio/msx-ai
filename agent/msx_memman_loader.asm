@@ -8,7 +8,8 @@
 ; Requirements:
 ;   - MSX-DOS 2 file-handle calls (BDOS functions 44h and above)
 ;   - loader_transport_id is set to one of the supported transport IDs
-;   - every suite file is available in the current DOS directory
+;   - every suite file is available under MSXAI_HOME, or in the current DOS
+;     directory when that optional environment item is unset
 ;
 ; Installation validates MEMMAN.COM, TL.COM, and the selected fixed-driver TSR,
 ; stages external MEMMAN.COM at the top of the TPA, and overlays address 0100h.
@@ -58,6 +59,9 @@ COM_ENTRY:               equ 00100h
 MEMMAN_ACTION_INSTALL:   equ 0
 MEMMAN_ACTION_UNINSTALL: equ 1
 MEMMAN_COMMAND_MAX:      equ 40
+SUITE_PATH_MAX:          equ 63
+SUITE_PATH_BUFFER_SIZE:  equ SUITE_PATH_MAX + 1
+DOS_PATH_SEPARATOR:      equ 05Ch
 
 ; Exact sizes of the pinned MemMan 2.42 public-domain utilities.  The build
 ; materializer verifies their SHA-256 values before these files are packaged.
@@ -2268,6 +2272,13 @@ loader_preflight:
     ld a,1
     ld (dos2_available),a
 
+    ; Resolve every external component before selecting an action.  An empty
+    ; or undefined MSXAI_HOME deliberately preserves the historical
+    ; current-directory behavior.
+    call suite_resolve_paths
+    or a
+    ret nz
+
     ld a,(memman_loader_action)
     cp MEMMAN_ACTION_UNINSTALL
     jp z,preflight_select_uninstall
@@ -2281,34 +2292,34 @@ loader_preflight:
     ret
 
 preflight_select_8251:
-    ld de,mcp8251_tsr_path
-    ld hl,install_8251_command
-    ld bc,install_8251_command_length
+    ld de,suite_mcp8251_tsr_path
     xor a
     jr preflight_install_selected
 
 preflight_select_16c550:
-    ld de,mcp16550_tsr_path
-    ld hl,install_16c550_command
-    ld bc,install_16c550_command_length
+    ld de,suite_mcp16550_tsr_path
     ld a,DRIVER_16C550
 
 preflight_install_selected:
     ld (suite_expected_transport),a
     ld (suite_selected_tsr_path),de
+    call suite_build_install_command
+    or a
+    ret nz
+    ld hl,install_command_buffer
     ld (suite_command_source),hl
     ld (suite_command_length),bc
-    ld de,memman_path
+    ld de,suite_memman_path
     ld (suite_overlay_path),de
     ld hl,MEMMAN_FILE_SIZE
     ld (suite_overlay_size),hl
 
-    ld de,memman_path
+    ld de,suite_memman_path
     ld hl,MEMMAN_FILE_SIZE
     call suite_validate_regular_file
     or a
     ret nz
-    ld de,tl_path
+    ld de,suite_tl_path
     ld hl,TL_FILE_SIZE
     call suite_validate_regular_file
     or a
@@ -2323,7 +2334,7 @@ preflight_select_uninstall:
     ld (suite_command_source),hl
     ld bc,uninstall_command_length
     ld (suite_command_length),bc
-    ld de,tk_path
+    ld de,suite_tk_path
     ld (suite_overlay_path),de
     ld hl,TK_FILE_SIZE
     ld (suite_overlay_size),hl
@@ -2397,6 +2408,150 @@ preflight_bad_version:
     ret
 preflight_no_memory:
     ld a,ERR_NO_MEMORY
+    ret
+
+; ---------------------------------------------------------------------------
+; Suite path resolution. MSX-DOS 2 function 6Bh returns a null string when an
+; environment item is absent. Every destination is a bounded ASCIIZ path, and
+; a trailing slash in MSXAI_HOME is accepted without duplication.
+
+suite_resolve_paths:
+    ld hl,suite_home_env_name
+    ld de,suite_home_buffer
+    ld b,SUITE_PATH_BUFFER_SIZE
+    ld c,DOS_GET_ENV
+    call 00005h
+    or a
+    ret nz
+
+    ld bc,memman_name
+    ld de,suite_memman_path
+    call suite_build_path
+    or a
+    ret nz
+    ld bc,tl_name
+    ld de,suite_tl_path
+    call suite_build_path
+    or a
+    ret nz
+    ld bc,tk_name
+    ld de,suite_tk_path
+    call suite_build_path
+    or a
+    ret nz
+    ld bc,mcp8251_tsr_name
+    ld de,suite_mcp8251_tsr_path
+    call suite_build_path
+    or a
+    ret nz
+    ld bc,mcp16550_tsr_name
+    ld de,suite_mcp16550_tsr_path
+    call suite_build_path
+    ret
+
+; Input BC=canonical filename and DE=destination buffer. Return A=0 on success.
+suite_build_path:
+    ld (suite_path_name_source),bc
+    ld hl,suite_home_buffer
+    ld b,SUITE_PATH_MAX
+    ld c,0                     ; last copied home character
+suite_build_path_home_loop:
+    ld a,(hl)
+    or a
+    jr z,suite_build_path_home_done
+    ld c,a
+    ld a,b
+    or a
+    jr z,suite_build_path_too_long
+    ld a,c
+    ld (de),a
+    inc de
+    inc hl
+    dec b
+    jr suite_build_path_home_loop
+suite_build_path_home_done:
+    ld a,(suite_home_buffer)
+    or a
+    jr z,suite_build_path_name
+    ld a,c
+    cp DOS_PATH_SEPARATOR
+    jr z,suite_build_path_name
+    cp '/'
+    jr z,suite_build_path_name
+    ld a,b
+    or a
+    jr z,suite_build_path_too_long
+    ld a,DOS_PATH_SEPARATOR
+    ld (de),a
+    inc de
+    dec b
+suite_build_path_name:
+    ld hl,(suite_path_name_source)
+suite_build_path_name_loop:
+    ld a,(hl)
+    or a
+    jr z,suite_build_path_complete
+    ld c,a
+    ld a,b
+    or a
+    jr z,suite_build_path_too_long
+    ld a,c
+    ld (de),a
+    inc de
+    inc hl
+    dec b
+    jr suite_build_path_name_loop
+suite_build_path_complete:
+    xor a
+    ld (de),a
+    ret
+suite_build_path_too_long:
+    ld a,ERR_INVALID_PARAMETER
+    ret
+
+; Build MemMan's post-warm-boot command. COMMAND2 finds TL through PATH; TL is
+; given the fully resolved TSR stem so it never depends on the current
+; directory. The canonical .TSR suffix is removed from the selected path.
+suite_build_install_command:
+    ld hl,install_command_prefix
+    ld de,install_command_buffer
+    ld bc,install_command_prefix_length
+    ldir
+    ld hl,(suite_selected_tsr_path)
+suite_build_install_command_copy:
+    ld a,(hl)
+    or a
+    jr z,suite_build_install_command_suffix
+    ld (de),a
+    inc de
+    inc hl
+    jr suite_build_install_command_copy
+suite_build_install_command_suffix:
+    dec de                       ; strip .TSR
+    dec de
+    dec de
+    dec de
+    ld a,'@'
+    ld (de),a
+    inc de
+    ld hl,install_command_buffer
+    ex de,hl                     ; HL=end, DE=start
+    or a
+    sbc hl,de
+    ld a,h
+    or a
+    jr nz,suite_build_install_command_too_long
+    ld a,l
+    or a
+    jr z,suite_build_install_command_too_long
+    cp MEMMAN_COMMAND_MAX + 1
+    jr nc,suite_build_install_command_too_long
+    ld c,l
+    ld b,0
+    xor a
+    ret
+suite_build_install_command_too_long:
+    ld a,ERR_INVALID_PARAMETER
     ret
 
 ; ---------------------------------------------------------------------------
@@ -2704,29 +2859,43 @@ memman_present:
 memman_compatible:
     db 0
 
-memman_path:
+suite_path_name_source:
+    dw 0
+suite_home_env_name:
+    db "MSXAI_HOME",0
+memman_name:
     db "MEMMAN.COM",0
-tl_path:
+tl_name:
     db "TL.COM",0
-tk_path:
+tk_name:
     db "TK.COM",0
-mcp8251_tsr_path:
+mcp8251_tsr_name:
     db "MCP8251.TSR",0
-mcp16550_tsr_path:
+mcp16550_tsr_name:
     db "MCP16550.TSR",0
+
+suite_home_buffer:
+    ds SUITE_PATH_BUFFER_SIZE,0
+suite_memman_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
+suite_tl_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
+suite_tk_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
+suite_mcp8251_tsr_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
+suite_mcp16550_tsr_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
 
 ; '@' is MemMan's documented representation of Return.  MemMan 2.42 consumes
 ; the first Return while warm-booting COMMAND2, so the second '@' is required
-; before the visible TL command. TL accepts a TSR basename without extension.
-install_8251_command:
-    db " _SYSTEM@@TL MCP8251@"
-install_8251_command_end:
-install_8251_command_length: equ install_8251_command_end - install_8251_command
-
-install_16c550_command:
-    db " _SYSTEM@@TL MCP16550@"
-install_16c550_command_end:
-install_16c550_command_length: equ install_16c550_command_end - install_16c550_command
+; before the visible TL command. TL accepts a TSR path without extension.
+install_command_prefix:
+    db " _SYSTEM@@TL "
+install_command_prefix_end:
+install_command_prefix_length: equ install_command_prefix_end - install_command_prefix
+install_command_buffer:
+    ds install_command_prefix_length + SUITE_PATH_MAX + 1,0
 
 uninstall_command:
     db " ",34,"MSXAI MCP1",34

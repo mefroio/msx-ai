@@ -236,9 +236,14 @@ Available profiles are:
 ### TCP agent test bench
 
 `msx_tcp_bench_start` starts one isolated openMSX process, imports the complete
-canonical seven-file suite, selects the 8251 driver, and connects it to the MCP
-server through RS232-Net/TCP. All physical-agent operations then use the TCP
-protocol; they do not use openMSX debugger memory APIs.
+canonical seven-file suite under `A:\MSXAI`, configures `MSXAI_HOME` and
+`PATH`, selects the 8251 driver, and connects it to the MCP server through
+RS232-Net/TCP. All physical-agent operations then use the TCP protocol; they do
+not use openMSX debugger memory APIs.
+
+Its file-transfer recovery journals live inside the same disposable bench
+directory. Integration runs therefore cannot pollute the persistent
+`work/transfers` state used for interrupted transfers with a physical MSX.
 
 The isolated bench also loads the generic four-way slot expander before its
 Sunrise/Nextor and RS-232 cartridges.
@@ -270,12 +275,13 @@ On macOS, double-click `open-msx-mcp.command`, or run:
 ./open-msx-mcp.command
 ~~~~
 
-The launcher builds and stages the canonical seven-file suite, copies the local
-MSX-DOS disk to a disposable runtime image, and starts one visible openMSX
-instance with normal sound. It makes the suite available on the runtime disk
-but does not start the agent automatically, so the user can choose resident or
-foreground-monitor mode at the DOS prompt. It never modifies the base disk,
-rejects a second openMSX process, and accepts only an IPv4 target.
+The launcher builds and stages the canonical seven-file suite under
+`A:\MSXAI`, copies the local MSX-DOS disk to a disposable runtime image, and
+starts one visible openMSX instance with normal sound. It configures
+`MSXAI_HOME` and `PATH` but does not start the agent automatically, so the user
+can call `MSXAI` from the root prompt and choose resident or foreground-monitor
+mode. It never modifies the base disk, rejects a second openMSX process, and
+accepts only an IPv4 target.
 
 The MCP profile inserts openMSX's generic four-way slot expander before the
 Sunrise/Nextor and RS-232 cartridges. Additional hardware can therefore be
@@ -339,10 +345,31 @@ The build also creates `work/agent/build/MSXAI.TSR` and
 inputs. They are
 not deployable alternatives to the two fixed-driver TSRs listed above.
 
-Copy all seven files to the same MSX-DOS directory and run the commands from
-that current directory. The lifecycle intentionally resolves its external
-MemMan utilities and fixed-driver TSR there; mixing files from different builds
-is unsupported.
+Copy all seven files to one short MSX-DOS directory. The recommended persistent
+layout and `AUTOEXEC.BAT` configuration are:
+
+~~~~text
+A:\MSXAI\MSXAI.COM
+A:\MSXAI\MSXAIXF.COM
+A:\MSXAI\MCP8251.TSR
+A:\MSXAI\MCP16550.TSR
+A:\MSXAI\MEMMAN.COM
+A:\MSXAI\TL.COM
+A:\MSXAI\TK.COM
+~~~~
+
+~~~~bat
+SET MSXAI_HOME=A:\MSXAI
+PATH A:\MSXAI;%PATH%
+~~~~
+
+`PATH` locates the two public commands and external `TL.COM` from any working
+directory. `MSXAI_HOME` supplies bounded, fully qualified paths for the
+MemMan utilities and selected TSR. If the environment item is missing or
+empty, the loader preserves the historical current-directory behavior. The
+fixed `A:\MSXAI` value also fits the MemMan 40-byte post-warm-boot command tail;
+unnecessarily deep paths can be rejected before any resident state changes.
+Mixing files from different builds is unsupported.
 
 Seven files on disk do not mean seven images occupying RAM at once.
 `MSXAI.COM`, the MemMan utilities, and `MSXAIXF.COM` are transient and hand off

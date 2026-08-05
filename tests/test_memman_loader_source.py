@@ -90,21 +90,44 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertNotIn("ld de,loader_transport_id", validate)
 
     def test_memman_install_tail_and_direct_tk_uninstall(self):
-        self.assertIn(
-            'db " _SYSTEM@@TL MCP8251@"', self.source)
-        self.assertIn(
-            'db " _SYSTEM@@TL MCP16550@"', self.source)
+        self.assertIn('db " _SYSTEM@@TL "', self.source)
+        command_builder = self.source.split(
+            "suite_build_install_command:", 1)[1].split(
+                "; ---------------------------------------------------------------------------\n"
+                "; External suite validation", 1)[0]
+        self.assertIn("ld hl,(suite_selected_tsr_path)", command_builder)
+        self.assertIn("strip .TSR", command_builder)
+        self.assertIn("ld a,'@'", command_builder)
+        self.assertIn("cp MEMMAN_COMMAND_MAX + 1", command_builder)
         uninstall = self.source.split("uninstall_command:", 1)[1].split(
             "uninstall_command_end:", 1)[0]
         self.assertIn('db " ",34,"MSXAI MCP1",34', uninstall)
         self.assertNotIn("_SYSTEM", uninstall)
         self.assertRegex(
             self.source, r"(?m)^MEMMAN_COMMAND_MAX:\s+equ\s+40$")
-        self.assertLessEqual(len(" _SYSTEM@@TL MCP8251@"), 40)
-        self.assertLessEqual(len(" _SYSTEM@@TL MCP16550@"), 40)
+        self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP8251@"), 40)
+        self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP16550@"), 40)
         self.assertLessEqual(len(' "MSXAI MCP1"'), 40)
         self.assertIn("ld de,COMMAND_TEXT", self.source)
         self.assertIn("ld (COMMAND_TAIL),a", self.source)
+
+    def test_suite_home_resolves_every_companion_with_safe_fallback(self):
+        resolver = self.source.split("suite_resolve_paths:", 1)[1].split(
+            "; ---------------------------------------------------------------------------\n"
+            "; External suite validation", 1)[0]
+        self.assertRegex(
+            self.source, r"(?m)^DOS_GET_ENV:\s+equ\s+06Bh$")
+        self.assertIn('db "MSXAI_HOME",0', self.source)
+        self.assertIn("ld c,DOS_GET_ENV", resolver)
+        for destination in (
+                "suite_memman_path", "suite_tl_path", "suite_tk_path",
+                "suite_mcp8251_tsr_path", "suite_mcp16550_tsr_path"):
+            self.assertIn(f"ld de,{destination}", resolver)
+        self.assertIn("ld a,(suite_home_buffer)", resolver)
+        self.assertIn("jr z,suite_build_path_name", resolver)
+        self.assertIn("cp DOS_PATH_SEPARATOR", resolver)
+        self.assertIn("cp '/'", resolver)
+        self.assertIn("ld a,ERR_INVALID_PARAMETER", resolver)
 
     def test_memman_discovery_uses_standard_id_and_tsr_call(self):
         discovery = self.source.split("memman_find_agent:", 1)[1].split(

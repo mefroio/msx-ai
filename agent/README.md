@@ -49,10 +49,22 @@ a release disk. `MEMMAN.COM`, `TL.COM`, and `TK.COM`, by contrast, are required
 deployable dependencies. Their pinned Base64 sources, SHA-256 values, and
 redistribution notice are under `third_party/memman/`.
 
-Keep all seven deployable files together and invoke `MSXAI` and `MSXAIXF` from
-that current MSX-DOS directory. The lifecycle resolves the external utilities
-and selected TSR by these canonical filenames; partial packages or files mixed
-from different builds are unsupported.
+Keep all seven deployable files together. The recommended installation is a
+short dedicated directory such as `A:\MSXAI`, configured from `AUTOEXEC.BAT`:
+
+~~~~bat
+SET MSXAI_HOME=A:\MSXAI
+PATH A:\MSXAI;%PATH%
+~~~~
+
+`PATH` makes `MSXAI` and `MSXAIXF` callable from any DOS directory.
+`MSXAI_HOME` lets the lifecycle resolve `MEMMAN.COM`, `TL.COM`, `TK.COM`, and
+the selected fixed-driver TSR without depending on the caller's current
+directory. A missing or empty `MSXAI_HOME` deliberately falls back to resolving
+all seven files in the current directory for compatibility with portable test
+disks. Partial packages or files mixed from different builds are unsupported.
+Keep the configured path short enough for the MSX-DOS/MemMan 40-byte command
+tail; `A:\MSXAI` is the canonical tested value.
 
 Set a different assembler when necessary:
 
@@ -112,12 +124,13 @@ The first installation follows this lifecycle:
 1. Parse options and print the agent banner.
 2. Discover a compatible existing MemMan through `EXTBIO`.
 3. Validate external `MEMMAN.COM`, `TL.COM`, and the fixed-driver TSR selected
-   by `/DRIVER` before changing disk or resident state.
+   by `/DRIVER` under `MSXAI_HOME`, or in the current directory when it is
+   unset, before changing disk or resident state.
 4. Read `MEMMAN.COM` into guarded free space at the top of the TPA, close its
    handle, and overlay it at `0100h` for the point-of-no-return handoff.
-5. Let the MemMan command chain invoke external `TL.COM` with
-   `MCP8251.TSR` or `MCP16550.TSR`, then return to DOS with only that selected
-   TSR resident.
+5. Let the MemMan command chain find external `TL.COM` through `PATH`, pass it
+   the fully resolved `MCP8251` or `MCP16550` TSR path, then return to DOS with
+   only that selected TSR resident.
 
 No executable or TSR is emitted, patched, renamed, deleted, or left behind by
 this lifecycle. Every component was already supplied as a final suite file.

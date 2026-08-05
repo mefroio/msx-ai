@@ -32,8 +32,9 @@ namespace eval msx_ai_mcp {
         set throttle on
         set mute off
         set renderer SDLGL-PP
+        type "SET MSXAI_HOME=A:\\MSXAI\rPATH A:\\MSXAI;%PATH%\rCLS\r"
         after realtime 0 [namespace code retry_connection]
-        puts "MSX-AI: agent package ready; press F11 to reconnect"
+        puts "MSX-AI: A:\\MSXAI is on PATH; press F11 to reconnect"
     }
 
     proc start {} {
@@ -42,6 +43,21 @@ namespace eval msx_ai_mcp {
         set port [required_environment MSX_AI_MCP_PORT]
 
         set power off
+        diskmanipulator chdir hda1 /
+        set root_listing [diskmanipulator dir hda1]
+        foreach suite_name {
+            MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR
+            MEMMAN.COM TL.COM TK.COM
+        } {
+            if {[string match -nocase "*$suite_name*" $root_listing]} {
+                diskmanipulator delete hda1 $suite_name
+                set root_listing [diskmanipulator dir hda1]
+            }
+        }
+        if {![string match -nocase "*MSXAI*<DIR>*" $root_listing]} {
+            diskmanipulator mkdir hda1 MSXAI
+        }
+        diskmanipulator chdir hda1 MSXAI
         foreach suite_name {
             MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR
             MEMMAN.COM TL.COM TK.COM
@@ -52,6 +68,7 @@ namespace eval msx_ai_mcp {
             }
             diskmanipulator import hda1 [file join $suite_dir $suite_name]
         }
+        diskmanipulator chdir hda1 /
 
         set rs232-net-address "$ipv4:$port"
         set rs232-net-ip232 off

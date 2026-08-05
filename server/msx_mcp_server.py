@@ -51,6 +51,8 @@ RESIDENT_INSTALL_SECONDS = 15
 RESIDENT_PROMPT_GRACE_SECONDS = 15
 BENCH_AGENT_NAME = "MSXAI.COM"
 BENCH_XFER_NAME = "MSXAIXF.COM"
+BENCH_SUITE_DIR = "MSXAI"
+BENCH_SUITE_HOME = f"A:\\{BENCH_SUITE_DIR}"
 AGENT_PACKAGE_NAMES = (
     BENCH_AGENT_NAME,
     BENCH_XFER_NAME,
@@ -236,9 +238,9 @@ class Session:
         root = pathlib.Path(runtime.name)
         disk = root / "msxdos.dsk"
         home = root / "openmsx-home"
-        # The disposable bench disk receives the complete seven-file package.
-        # Stale copies are removed before import because diskmanipulator does
-        # not overwrite an existing same-name file.
+        # The disposable bench disk receives the complete seven-file package
+        # under A:\MSXAI. Legacy root copies and stale directory copies are
+        # removed because diskmanipulator does not overwrite same-name files.
         machine = None
         real = None
         try:
@@ -259,7 +261,11 @@ class Session:
                 shutil.copyfile(canonical, artifact)
                 runtime_artifacts.append((dos_name, artifact))
 
-            real = RealMSX(host=host, port=int(port)).listen()
+            # Bench resume journals belong to this disposable simulation, not
+            # to the persistent physical-target recovery directory.
+            real = RealMSX(
+                host=host, port=int(port),
+                file_transfer_state_directory=root / "transfers").listen()
             machine = OpenMSX(
                 machine=BASIC_MACHINE,
                 extensions=[
@@ -269,6 +275,23 @@ class Session:
             # Import while the emulated machine is off. openMSX may otherwise
             # retain stale filesystem sectors for a disk mounted by MSX-DOS.
             machine.cmd("set power off")
+            machine.cmd("diskmanipulator chdir hda1 /")
+            root_listing = machine.cmd("diskmanipulator dir hda1")
+            for dos_name, _artifact in runtime_artifacts:
+                legacy = re.search(
+                    rf"(?im)^\s*{re.escape(dos_name)}\s+\S+\s+(\d+)\s*$",
+                    root_listing)
+                if legacy is not None:
+                    machine.cmd(
+                        f"diskmanipulator delete hda1 {dos_name}")
+                    root_listing = machine.cmd("diskmanipulator dir hda1")
+            if re.search(
+                    rf"(?im)^\s*{re.escape(BENCH_SUITE_DIR)}\b.*<DIR>",
+                    root_listing) is None:
+                machine.cmd(
+                    f"diskmanipulator mkdir hda1 {BENCH_SUITE_DIR}")
+            machine.cmd(
+                f"diskmanipulator chdir hda1 {BENCH_SUITE_DIR}")
             for dos_name, artifact in runtime_artifacts:
                 listing = machine.cmd("diskmanipulator dir hda1")
                 entry = re.search(
@@ -287,6 +310,7 @@ class Session:
                     raise OpenMSXError(
                         f"bench disk {dos_name} verification failed: "
                         f"expected {expected_size} bytes, found {observed}")
+            machine.cmd("diskmanipulator chdir hda1 /")
             for preload in preload_files:
                 preload = pathlib.Path(preload).resolve()
                 if not preload.is_file():
@@ -295,6 +319,11 @@ class Session:
                 machine.cmd(f"diskmanipulator import hda1 {{{preload}}}")
             machine.power_on()
             machine.advance(14)
+            for setup_command in (
+                    f"SET MSXAI_HOME={BENCH_SUITE_HOME}",
+                    f"PATH {BENCH_SUITE_HOME};%PATH%"):
+                machine.type_line(setup_command)
+                machine.advance(0.5)
             command = f"{pathlib.Path(BENCH_AGENT_NAME).stem} /DRIVER:8251"
             if mode == "monitor":
                 command += " /MONITOR"

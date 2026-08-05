@@ -200,7 +200,7 @@ fi
 
 echo "Starting openMSX (profile: $PROFILE, machine: ${openmsx_args[1]})"
 if [[ "$PROFILE" == "mcp" ]]; then
-  echo "The complete seven-file MSX-AI suite is available on the DOS disk"
+  echo "The complete MSX-AI suite is available through PATH at A:\\MSXAI"
   echo "Waiting for MCP TCP listener at $MSX_AI_MCP_IPV4:$MSX_AI_MCP_PORT"
   "$OPENMSX_EXECUTABLE" "${openmsx_args[@]}" "$@"
   exit $?

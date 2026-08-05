@@ -200,9 +200,12 @@ class RealMSX:
     in the MSX.
     """
 
-    def __init__(self, host="0.0.0.0", port=DEFAULT_PORT, socket_timeout=15):
+    def __init__(self, host="0.0.0.0", port=DEFAULT_PORT, socket_timeout=15,
+                 file_transfer_state_directory=FILE_TRANSFER_STATE_DIR):
         self.host, self.port = host, int(port)
         self.socket_timeout = float(socket_timeout)
+        self.file_transfer_state_directory = pathlib.Path(
+            file_transfer_state_directory).expanduser()
         self.srv = None
         self.conn = None
         self.peer = None
@@ -1868,7 +1871,7 @@ class RealMSX:
 
     def put_file(self, source, target, *, compression="auto", resume=True,
                  existing_only=False,
-                 state_directory=FILE_TRANSFER_STATE_DIR,
+                 state_directory=None,
                  timeout=FILE_TRANSFER_PROGRESS_TIMEOUT):
         """Stream a local file to MSX-DOS with CRC-32 and durable resume.
 
@@ -1885,7 +1888,9 @@ class RealMSX:
         source_path = pathlib.Path(source).expanduser().resolve(strict=True)
         if not source_path.is_file():
             raise ValueError(f"local PUT source is not a regular file: {source_path}")
-        state_directory = pathlib.Path(state_directory).expanduser()
+        state_directory = pathlib.Path(
+            self.file_transfer_state_directory
+            if state_directory is None else state_directory).expanduser()
         capabilities = self.file_transfer_capabilities()
         target_path = str(target)
         packbits_decode = bool(
@@ -2182,7 +2187,7 @@ class RealMSX:
 
     def get_file(self, source, target, *, resume=True,
                  existing_only=False,
-                 state_directory=FILE_TRANSFER_STATE_DIR,
+                 state_directory=None,
                  timeout=FILE_TRANSFER_PROGRESS_TIMEOUT):
         """Stream one MSX-DOS file to a collision-safe local destination."""
         timeout = self._validate_progress_timeout(timeout)
@@ -2197,7 +2202,9 @@ class RealMSX:
             raise FileNotFoundError(
                 f"local GET destination directory does not exist: "
                 f"{destination.parent}")
-        state_directory = pathlib.Path(state_directory).expanduser()
+        state_directory = pathlib.Path(
+            self.file_transfer_state_directory
+            if state_directory is None else state_directory).expanduser()
         capabilities = self.file_transfer_capabilities()
         caller_binding = str(destination)
         candidate = TransferDescriptor(

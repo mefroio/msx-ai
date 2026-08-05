@@ -87,7 +87,11 @@ class _FakeMachine:
         self.typed = []
         self.imported_agent = None
         self.imported_files = {}
-        self.disk_files = {"MSXAI.COM": b"stale-agent"}
+        self.imported_locations = {}
+        self.disk_cwd = ""
+        self.disk_dirs = {
+            "": {"MSXAI.COM": b"stale-agent"},
+        }
         self.closed = False
 
     def start(self, *, headless):
@@ -105,16 +109,35 @@ class _FakeMachine:
             raise AssertionError("bench must not inspect a fixed resident address")
         self.commands.append(command)
         if command == "diskmanipulator dir hda1":
-            return "\n".join(
+            entries = []
+            if self.disk_cwd == "":
+                entries.extend(
+                    f"{name:<12} <DIR>"
+                    for name in self.disk_dirs if name)
+            entries.extend(
                 f"{name.lower():<12} -----  {len(data)}"
-                for name, data in self.disk_files.items())
+                for name, data in self.disk_dirs[self.disk_cwd].items())
+            return "\n".join(entries)
+        if command == "diskmanipulator chdir hda1 /":
+            self.disk_cwd = ""
+        elif command.startswith("diskmanipulator chdir hda1 "):
+            target = command.rsplit(" ", 1)[-1].upper()
+            if target not in self.disk_dirs:
+                raise AssertionError(f"missing fake disk directory: {target}")
+            self.disk_cwd = target
+        elif command.startswith("diskmanipulator mkdir hda1 "):
+            target = command.rsplit(" ", 1)[-1].upper()
+            self.disk_dirs.setdefault(target, {})
         if command.startswith("diskmanipulator delete hda1"):
-            self.disk_files.pop(command.rsplit(" ", 1)[-1].upper(), None)
+            self.disk_dirs[self.disk_cwd].pop(
+                command.rsplit(" ", 1)[-1].upper(), None)
         if command.startswith("diskmanipulator import hda1"):
             path = re.search(r"\{(.+)\}", command).group(1)
             self.imported_agent = Path(path).read_bytes()
-            self.disk_files[Path(path).name.upper()] = self.imported_agent
-            self.imported_files[Path(path).name.upper()] = self.imported_agent
+            name = Path(path).name.upper()
+            self.disk_dirs[self.disk_cwd][name] = self.imported_agent
+            self.imported_files[name] = self.imported_agent
+            self.imported_locations[name] = self.disk_cwd
         return ""
 
     def type_line(self, command):
@@ -184,7 +207,8 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                           msx_mcp_server, "OpenMSX",
                           return_value=machine) as openmsx,
                       mock.patch.object(
-                          msx_mcp_server, "RealMSX", return_value=real)):
+                          msx_mcp_server, "RealMSX",
+                          return_value=real) as real_cls):
                     peer = session.start_tcp_bench(timeout=12, window=True)
 
                 self.assertEqual(peer, ("127.0.0.1", 65000))
@@ -194,14 +218,29 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                     [msx_mcp_server.MCP_SLOT_EXPANDER,
                      msx_mcp_server.DOS_EXTENSION, "rs232_proto"])
                 self.assertEqual(machine.imported_files, expected_files)
-                self.assertEqual(machine.typed, ["MSXAI /DRIVER:8251"])
+                self.assertEqual(
+                    machine.imported_locations,
+                    {name: msx_mcp_server.BENCH_SUITE_DIR
+                     for name in expected_files})
+                self.assertNotIn("MSXAI.COM", machine.disk_dirs[""])
+                self.assertEqual(machine.typed, [
+                    "SET MSXAI_HOME=A:\\MSXAI",
+                    "PATH A:\\MSXAI;%PATH%",
+                    "MSXAI /DRIVER:8251",
+                ])
                 delete_index = machine.commands.index(
                     "diskmanipulator delete hda1 MSXAI.COM")
+                mkdir_index = machine.commands.index(
+                    "diskmanipulator mkdir hda1 MSXAI")
+                chdir_index = machine.commands.index(
+                    "diskmanipulator chdir hda1 MSXAI")
                 import_index = next(
                     index for index, command in enumerate(machine.commands)
                     if command.startswith("diskmanipulator import hda1") and
                     "MSXAI.COM" in command)
                 self.assertLess(delete_index, import_index)
+                self.assertLess(mkdir_index, chdir_index)
+                self.assertLess(chdir_index, import_index)
                 self.assertLess(
                     machine.commands.index("set power off"),
                     import_index)
@@ -210,6 +249,12 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                     machine.advances)
                 self.assertEqual(real.accepted_timeout, 12.0)
                 self.assertEqual(real.simulation, "openmsx-rs232-net")
+                transfer_state = Path(
+                    real_cls.call_args.kwargs[
+                        "file_transfer_state_directory"])
+                self.assertEqual(transfer_state.name, "transfers")
+                self.assertTrue(
+                    transfer_state.parent.name.startswith("msx-ai-tcp-bench-"))
                 self.assertFalse(machine.headless)
                 self.assertLess(
                     machine.commands.index("plug msx-rs232 rs232-net"),
