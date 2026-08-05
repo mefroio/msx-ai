@@ -19,6 +19,7 @@ from msx_protocol import (  # noqa: E402
     GarbageDataError,
 )
 from msx_real import (  # noqa: E402
+    FEATURE_CPU_SNAPSHOT,
     FEATURE_KEYBUF_SPOOL,
     FEATURE_SNAPSHOT_LEASE,
     FEATURE_TIMI_POLL_SAFE,
@@ -28,8 +29,10 @@ from msx_real import (  # noqa: E402
     UART8251_FRAME_WAKE_DELAY,
     RealMSX,
     RealMSXError,
+    RealMSXProtocolError,
     RealMSXRangeError,
 )
+from msx_cpu import CPU_CONTEXT_SIZE, CPU_CONTEXT_VERSION  # noqa: E402
 
 
 class FakeV3Resident:
@@ -42,6 +45,7 @@ class FakeV3Resident:
                  consume_keybuf=True, debug=False,
                  debug_peer_feature=False, frame_wake_ack_feature=None,
                  timi_poll_safe_feature=None,
+                 cpu_snapshot_feature=False, cpu_context=None,
                  bootstrap_features_supported=True,
                  bootstrap_feature_bits=None,
                  transport_id=1):
@@ -60,6 +64,10 @@ class FakeV3Resident:
         self.consume_keybuf = bool(consume_keybuf)
         self.debug = bool(debug)
         self.debug_peer_feature = bool(debug_peer_feature)
+        self.cpu_snapshot_feature = bool(cpu_snapshot_feature)
+        self.cpu_context = (
+            self._default_cpu_context() if cpu_context is None
+            else bytes(cpu_context))
         self.frame_wake_ack_feature = (
             True if frame_wake_ack_feature is None
             else bool(frame_wake_ack_feature))
@@ -99,6 +107,24 @@ class FakeV3Resident:
         self._response_cache = {}
         self.thread = threading.Thread(target=self._run_checked, daemon=True)
         self.thread.start()
+
+    @staticmethod
+    def _default_cpu_context():
+        payload = bytearray(CPU_CONTEXT_SIZE)
+        payload[:8] = bytes([
+            CPU_CONTEXT_VERSION, 1, CPU_CONTEXT_SIZE, 0x3F,
+            1, 1, 0, 1,
+        ])
+        for offset, value in (
+                (8, 0x8888), (10, 0x7777), (12, 0x6666),
+                (14, 0x55A5), (16, 0x4444), (18, 0x3333),
+                (20, 0x2222), (22, 0x1111), (24, 0xABCD),
+                (26, 0x12A5), (28, 0xF234), (30, 0x4567)):
+            payload[offset:offset + 2] = value.to_bytes(2, "little")
+        payload[32:34] = bytes([0xD1, 0x42])
+        payload[34:36] = (0xBEEF).to_bytes(2, "little")
+        payload[36:40] = bytes([5, 2, 1, 0])
+        return bytes(payload)
 
     def _run_checked(self):
         try:
@@ -141,6 +167,8 @@ class FakeV3Resident:
             features |= 8
         if self.timi_poll_safe_feature:
             features |= FEATURE_TIMI_POLL_SAFE
+        if self.cpu_snapshot_feature:
+            features |= FEATURE_CPU_SNAPSHOT
         return features
 
     def _send_raw_hello(self):
@@ -274,6 +302,12 @@ class FakeV3Resident:
                 response_payload += bytes([self._feature_bits()])
         elif opcode == "q":
             response_payload = bytes([self.state, 3])
+        elif opcode == "D" and self.cpu_snapshot_feature:
+            if payload != bytes([CPU_CONTEXT_VERSION]):
+                status = FrameStatus.INVALID_ARGUMENT
+                flags = FrameFlag.ERROR
+            else:
+                response_payload = self.cpu_context
         elif opcode == "I" and self.debug_peer_feature:
             self.debug_peer_labels.append(payload)
         elif opcode == "t" and self.keybuf_feature:
@@ -443,6 +477,71 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(again["protocol"], 3)
         self.assertEqual(self.agent.bootstrap_queries, 1)
         self.assertEqual(self.agent.upgrades, 1)
+
+    def test_cpu_snapshot_is_feature_gated_versioned_and_parsed(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, cpu_snapshot_feature=True)
+
+        info = self.msx.info()
+        snapshot = self.msx.cpu_snapshot()
+
+        self.assertIn("cpu-snapshot-v1", info["features"])
+        self.assertEqual(snapshot["backend"], "real")
+        self.assertEqual(
+            snapshot["capture"]["source"], "bios-h-timi-hook-entry")
+        self.assertEqual(snapshot["registers"]["af"], "0x12A5")
+        self.assertEqual(snapshot["registers"]["bc"], "0xABCD")
+        self.assertIsNone(snapshot["registers"]["pc"])
+        self.assertEqual(snapshot["debug"]["jiffy"], 0xBEEF)
+        requests = [request for request in self.agent.requests
+                    if request.opcode == ord("D")]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            requests[0].payload, bytes([CPU_CONTEXT_VERSION]))
+
+    def test_cpu_snapshot_missing_feature_sends_no_request(self):
+        before = len(self.agent.requests)
+        with self.assertRaisesRegex(RealMSXError, "cpu-snapshot-v1"):
+            self.msx.cpu_snapshot()
+        self.assertFalse(any(
+            request.opcode == ord("D")
+            for request in self.agent.requests[before:]))
+
+    def test_cpu_snapshot_rejects_malformed_agent_record(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, cpu_snapshot_feature=True,
+            cpu_context=FakeV3Resident._default_cpu_context()[:-1])
+        self.msx.info()
+
+        with self.assertRaisesRegex(
+                RealMSXProtocolError, "invalid CPU snapshot response"):
+            self.msx.cpu_snapshot()
+
+    def test_cpu_snapshot_retry_reuses_the_identical_versioned_request(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, cpu_snapshot_feature=True, drop_once=(ord("D"),))
+        self.msx.info()
+        self.msx._v3.timeout = 0.03
+
+        snapshot = self.msx.cpu_snapshot()
+
+        self.assertEqual(snapshot["registers"]["af"], "0x12A5")
+        requests = [request for request in self.agent.requests
+                    if request.opcode == ord("D")]
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0], requests[1])
 
     def test_legacy_8251_negotiation_retains_first_byte_wake_delay(self):
         self.msx.close()

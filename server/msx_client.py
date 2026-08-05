@@ -10,6 +10,11 @@ high-level emulator helpers.
 import os, subprocess, threading, queue, time, re, html, pathlib, glob, socket, shutil
 import tempfile
 
+try:
+    from .msx_cpu import capture_openmsx_cpu
+except ImportError:  # pragma: no cover - exercised by repository-style imports
+    from msx_cpu import capture_openmsx_cpu
+
 PROJ = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_HOME = pathlib.Path(os.environ.get(
     "MSX_AI_OPENMSX_HOME", PROJ / ".openmsx-home")).expanduser()
@@ -57,7 +62,10 @@ class OpenMSX:
         self.attached = False
         self._buf = ""
         self._replies = queue.Queue()
-        self._lock = threading.Lock()
+        # High-level operations may hold the channel across several commands
+        # and then re-enter cmd(). This keeps debugger snapshots indivisible
+        # without deadlocking the command path.
+        self._lock = threading.RLock()
         self._runtime_settings_dir = None
 
     def _prepare_runtime_settings(self):
@@ -296,6 +304,11 @@ class OpenMSX:
 
     def screen_mode(self):
         return int(self.cmd("get_screen_mode_number"))
+
+    def cpu_snapshot(self):
+        """Return one exact debugger snapshot while preserving run/break state."""
+        with self._lock:
+            return capture_openmsx_cpu(self)
 
     def read_screen(self):
         """Decode the current text screen (SCREEN 0/1) from VRAM.

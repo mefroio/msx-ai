@@ -30,6 +30,8 @@
 ;   z                         -> 'K', uninstall (monitor state only)
 ; Framed v3 adds a resident-only bounded snapshot pause:
 ;   S lease                   -> OK, pause; 'g' resumes before lease expiry
+; and a versioned CPU callback-context snapshot:
+;   D version                 -> 40-byte H.TIMI hook-entry record
 ; and negotiated batched keyboard input:
 ;   T [control data...]       -> accepted/pending/credits/input-state
 ; Protocol X is the only file-transfer path. Its DOS-facing implementation is
@@ -62,6 +64,7 @@ MODE:           equ 0FAFCh      ; bits 2:1 encode installed VRAM capacity
 SCRMOD:         equ 0FCAFh
 REG1SAV:        equ 0F3E0h
 REG2SAV:        equ 0F3E1h
+CPU_JIFFY:      equ 0FC9Eh
 PUTPNT:         equ 0F3F8h      ; first free byte in the BIOS keyboard ring
 GETPNT:         equ 0F3FAh      ; next byte consumed by BIOS CHGET
 KEYBUF:         equ 0FBF0h
@@ -79,6 +82,7 @@ FEATURE_SNAPSHOT_LEASE: equ 004h ; bounded resident snapshot pause, bit 2
 FEATURE_FRAME_WAKE_ACK: equ 008h ; parser-ready ACK after framed magic byte
 FEATURE_TIMI_POLL_SAFE: equ 010h ; resident is polled only from BIOS H.TIMI
 FEATURE_KEYBUF_SPOOL:   equ 020h ; 255-byte resident keyboard spool, bit 5
+FEATURE_CPU_SNAPSHOT:   equ 040h ; versioned H.TIMI hook-entry context, bit 6
 FEATURE_FILE_TRANSFER:  equ 080h ; resumable 32-bit PUT/GET protocol, bit 7
 DEBUG_PEER_MAX:      equ 63
 KEYBUF_SPOOL_CAPACITY: equ 255
@@ -119,6 +123,20 @@ FRAME_RANGE:      equ 4
 FRAME_BAD_CRC:    equ 5
 FRAME_BUSY:       equ 6
 FRAME_UNSUPPORTED: equ 7
+
+CPU_CONTEXT_VERSION: equ 1
+CPU_CONTEXT_KIND_TIMI: equ 1
+CPU_CONTEXT_VALID_MAIN: equ 001h
+CPU_CONTEXT_VALID_ALT: equ 002h
+CPU_CONTEXT_VALID_INDEX: equ 004h
+CPU_CONTEXT_VALID_SERVICE_SP: equ 008h
+CPU_CONTEXT_VALID_CALLBACK_RETURN: equ 010h
+CPU_CONTEXT_VALID_SERVICE_META: equ 020h
+CPU_CONTEXT_FLAGS: equ CPU_CONTEXT_VALID_MAIN | CPU_CONTEXT_VALID_ALT | CPU_CONTEXT_VALID_INDEX | CPU_CONTEXT_VALID_SERVICE_SP | CPU_CONTEXT_VALID_CALLBACK_RETURN | CPU_CONTEXT_VALID_SERVICE_META
+CPU_CONTEXT_SIZE:    equ 40
+CPU_SERVICE_IFF2_VALID: equ 1
+CPU_SERVICE_IFF2_SET: equ 2
+FRAME_CACHE_MAX:     equ CPU_CONTEXT_SIZE
 
 ; Eight consecutive ESC bytes form the out-of-band reconnect marker while the
 ; framed parser is seeking magic.  A single byte is deliberately insufficient:
@@ -791,6 +809,10 @@ last_response_length:
     dw 0
 saved_context_sp:
     dw 0
+hook_context_sp:
+    ; Base of the fixed 20-byte register frame saved before protocol work.
+    ; This is a BIOS H.TIMI callback context, not an arbitrary application PC.
+    dw 0
 hook_dispatch_sp:
     dw 0
 keybuf_spool_get:
@@ -1009,6 +1031,7 @@ resident_hook_saved_af:
 
     ; MemMan entered through a BIOS hook with its dispatcher and stack in
     ; stable page-3 RAM. Keep that stack: switching page 1 cannot invalidate it.
+    ld (hook_context_sp),sp
     ld (hook_dispatch_sp),sp
     ; An exclusive H.KEYI transport must suppress the previous RS-232 handler
     ; even when RxRDY is not set at this exact instruction. Otherwise a byte
@@ -1126,6 +1149,7 @@ resident_hook_saved_af:
 
     ; Keep protocol parsing and pause service off the interrupted program's
     ; stack. Only the fixed-size saved context remains on the application stack.
+    ld (hook_context_sp),sp
     ld (saved_context_sp),sp
     ld sp,hook_stack_top
     ld (hook_dispatch_sp),sp
@@ -1366,11 +1390,11 @@ current_capabilities:
     ret
 
 current_features:
-    ld b,0
+    ld b,FEATURE_CPU_SNAPSHOT
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_FRAME_WAKE_ACK
     jr z,current_features_transport_ready
-    ld b,FEATURE_FRAME_WAKE_ACK
+    ld b,FEATURE_FRAME_WAKE_ACK | FEATURE_CPU_SNAPSHOT
 current_features_transport_ready:
     ld a,(runtime_mode)
     cp RUNTIME_RESIDENT
@@ -2048,7 +2072,7 @@ frame_crc_valid:
     or a
     jp nz,frame_dispatch       ; bulk RAM/VRAM reads are safe to recompute
     ld a,l
-    cp 17
+    cp FRAME_CACHE_MAX + 1
     jp nc,frame_dispatch
     or a
     jp z,frame_emit_response
@@ -2098,6 +2122,8 @@ frame_dispatch:
     jp z,frame_cmd_hello
     cp 'q'
     jp z,frame_cmd_status
+    cp 'D'
+    jp z,frame_cmd_cpu_context
     cp 't'
     jp z,frame_cmd_keybuf_input
     cp 'T'
@@ -2186,7 +2212,7 @@ frame_cache_and_send:
     or a
     jr nz,frame_cache_payload_done
     ld a,l
-    cp 17
+    cp FRAME_CACHE_MAX + 1
     jr nc,frame_cache_payload_done
     or a
     jr z,frame_cache_payload_done
@@ -2396,6 +2422,100 @@ frame_cmd_status:
     inc hl
     ld (hl),FRAMED_VERSION
     ld hl,2
+    ld (frame_response_length),hl
+    xor a
+    ld (frame_response_status),a
+    jp frame_cache_and_send
+
+; Return the fixed register frame captured before any resident protocol work.
+; This describes the BIOS H.TIMI callback boundary. BIOS and MemMan have
+; already entered their interrupt/dispatcher paths, so neither the service
+; stack nor its return address is presented by the host as application SP/PC.
+;
+; Request: context version 1. Response v1 (40 bytes):
+;   version, kind, size, validity flags, state, hook kind, runtime, transport
+;   HL',DE',BC',AF',IY,IX,HL,DE,BC,AF (ten little-endian words)
+;   hook-entry SP, callback return address (little-endian service metadata)
+;   service-time I/R, JIFFY (u16 LE), SCRMOD, control, service IFF2, reserved
+frame_cmd_cpu_context:
+    ld de,1
+    call frame_require_length
+    jp nz,frame_reply_bad_arg
+    ld a,(frame_request_buffer)
+    cp CPU_CONTEXT_VERSION
+    jp nz,frame_reply_unsupported
+    ld a,(in_hook)
+    or a
+    jp z,frame_reply_bad_state
+    ld a,(hook_kind)
+    cp 1
+    jp nz,frame_reply_bad_state
+
+    ld hl,frame_response_buffer
+    ld (hl),CPU_CONTEXT_VERSION
+    inc hl
+    ld (hl),CPU_CONTEXT_KIND_TIMI
+    inc hl
+    ld (hl),CPU_CONTEXT_SIZE
+    inc hl
+    ld (hl),CPU_CONTEXT_FLAGS
+    inc hl
+    ld a,(run_state)
+    ld (hl),a
+    inc hl
+    ld a,(hook_kind)
+    ld (hl),a
+    inc hl
+    ld a,(runtime_mode)
+    ld (hl),a
+    inc hl
+    ld a,(active_transport_id)
+    ld (hl),a
+
+    ld hl,(hook_context_sp)
+    ld de,frame_response_buffer + 8
+    ld bc,20
+    ldir                        ; HL now equals the hook-entry service SP
+    ld a,l
+    ld (de),a
+    inc de
+    ld a,h
+    ld (de),a
+    inc de
+    ld a,(hl)                  ; internal BIOS/MemMan callback return address
+    ld (de),a
+    inc hl
+    inc de
+    ld a,(hl)
+    ld (de),a
+    inc de
+    ld a,i
+    ld (de),a
+    inc de
+    jp po,frame_cpu_context_iff2_clear
+    ld a,CPU_SERVICE_IFF2_VALID | CPU_SERVICE_IFF2_SET
+    jr frame_cpu_context_iff2_ready
+frame_cpu_context_iff2_clear:
+    ld a,CPU_SERVICE_IFF2_VALID
+frame_cpu_context_iff2_ready:
+    ld (frame_response_buffer + 38),a
+    ld a,r
+    ld (de),a
+    inc de
+    ld hl,CPU_JIFFY
+    ld bc,2
+    ldir
+    ld a,(SCRMOD)
+    ld (de),a
+    inc de
+    ld a,(active_transport_control_level)
+    ld (de),a
+    inc de
+    inc de                      ; service-IFF2 byte was stored directly above
+    xor a
+    ld (de),a
+
+    ld hl,CPU_CONTEXT_SIZE
     ld (frame_response_length),hl
     xor a
     ld (frame_response_status),a
@@ -4432,14 +4552,15 @@ hook_timeout_state_done:
     jp hook_done
 
 ; Request and response deliberately share the negotiated work area. This keeps
-; both the page-1 TSR and the foreground monitor compact. Small responses
-; (including every state-changing command) are cached separately; bulk RAM/
-; VRAM reads are side-effect free and may be recomputed on retry.
+; both the page-1 TSR and the foreground monitor compact. Responses up through
+; the fixed CPU-context record (including every state-changing command) are
+; cached separately; bulk RAM/VRAM reads are side-effect free and may be
+; recomputed on retry.
 frame_request_buffer:
     ds FRAMED_MAX,0
 frame_response_buffer: equ frame_request_buffer
 last_response_small:
-    ds 16,0
+    ds FRAME_CACHE_MAX,0
 
 if MSXAI_TSR_BUILD
 ; TsrKill calls this only after MemMan has detached both registered hooks.

@@ -1,4 +1,5 @@
 import pathlib
+import importlib
 import sys
 import unittest
 from unittest import mock
@@ -50,6 +51,25 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             mock.patch.object(msx_client.threading.Thread, "start"),
             mock.patch.object(msx_client.time, "sleep"),
         )
+
+    def test_adapter_supports_package_import_and_snapshot_transaction(self):
+        packaged = importlib.import_module("server.msx_client")
+        machine = packaged.OpenMSX(bin="/fake/openmsx")
+
+        # The debugger snapshot is a multi-command transaction, so its lock
+        # must be re-entrant when capture_openmsx_cpu calls machine.cmd().
+        self.assertTrue(machine._lock.acquire(blocking=False))
+        try:
+            self.assertTrue(machine._lock.acquire(blocking=False))
+            machine._lock.release()
+        finally:
+            machine._lock.release()
+
+        with mock.patch.object(
+                packaged, "capture_openmsx_cpu", return_value={"ok": True}) \
+                as capture:
+            self.assertEqual(machine.cpu_snapshot(), {"ok": True})
+        capture.assert_called_once_with(machine)
 
     def test_headless_starts_and_exits_with_host_mixer_muted(self):
         process = _Process()

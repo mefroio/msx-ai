@@ -497,6 +497,11 @@ def t_status():
                        "screen_mode": m.screen_mode()}, sort_keys=True)
 
 
+def t_cpu_snapshot():
+    """Capture CPU debug state through the selected backend contract."""
+    return json.dumps(SESSION.require().cpu_snapshot(), sort_keys=True)
+
+
 def _require_real():
     if SESSION.profile != "real":
         raise OpenMSXError("this operation requires an active real ASM-agent session")
@@ -1321,6 +1326,14 @@ TOOLS = {
         "Return the active backend and state. A physical-agent session reports "
         "its resident or foreground-monitor runtime, execution state, selected "
         "transport, and negotiated capabilities.",
+        _s({})),
+    "msx_cpu_snapshot": (t_cpu_snapshot,
+        "Capture Z80 registers and useful debug context without changing the "
+        "selected backend. openMSX briefly stops at an exact instruction "
+        "boundary and returns PC/SP, code bytes, and stack words while "
+        "preserving its prior run/break state. A physical agent returns the "
+        "versioned BIOS H.TIMI callback-entry register frame; it explicitly "
+        "does not claim an arbitrary application PC/SP or NMI-style freeze.",
         _s({})),
     "msx_pause": (t_pause,
         "Pause code launched by the foreground monitor. Safe resident mode "

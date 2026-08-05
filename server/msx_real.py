@@ -27,6 +27,11 @@ import threading
 import time
 
 from msx_v3 import V3Session, V3SessionError
+from msx_cpu import (
+    CPU_CONTEXT_VERSION,
+    CPUSnapshotError,
+    parse_agent_cpu_context,
+)
 from msx_transfer import (
     FEATURE_FILE_TRANSFER_V2,
     TRANSFER_OPCODE,
@@ -107,6 +112,7 @@ FEATURE_SNAPSHOT_LEASE = 0x04
 FEATURE_FRAME_WAKE_ACK = 0x08
 FEATURE_TIMI_POLL_SAFE = 0x10
 FEATURE_KEYBUF_SPOOL = 0x20
+FEATURE_CPU_SNAPSHOT = 0x40
 FEATURE_FILE_TRANSFER = FEATURE_FILE_TRANSFER_V2
 DEBUG_PEER_MAX = 63
 SNAPSHOT_LEASE_TIMEOUTS = 8
@@ -119,6 +125,7 @@ AGENT_FEATURE_NAMES = {
     FEATURE_FRAME_WAKE_ACK: "frame-wake-ack",
     FEATURE_TIMI_POLL_SAFE: "timi-poll-safe",
     FEATURE_KEYBUF_SPOOL: "keybuf-spool",
+    FEATURE_CPU_SNAPSHOT: "cpu-snapshot-v1",
     FEATURE_FILE_TRANSFER: "file-transfer-v2",
 }
 AGENT_TRANSPORT_NAMES = {
@@ -974,6 +981,30 @@ class RealMSX:
             "state_code": state,
             "protocol": version,
         }
+
+    def cpu_snapshot(self):
+        """Capture the negotiated Z80 context without a raw-v2 fallback.
+
+        The physical-agent contract is the register frame saved at BIOS
+        H.TIMI callback entry. It deliberately does not claim to be an
+        arbitrary application instruction boundary; the decoder preserves
+        service-only stack/return values under debug metadata.
+        """
+        if self._v3 is None:
+            raise RealMSXError(
+                "CPU snapshots require the framed-v3 agent protocol")
+        if not self.feature_bits & FEATURE_CPU_SNAPSHOT:
+            raise RealMSXError(
+                "the connected agent does not advertise cpu-snapshot-v1; "
+                "install the current MSXAI.COM suite")
+        with self._lock:
+            reply = self._request_v3(
+                "D", bytes([CPU_CONTEXT_VERSION]))
+        try:
+            return parse_agent_cpu_context(reply)
+        except CPUSnapshotError as exc:
+            raise RealMSXProtocolError(
+                f"invalid CPU snapshot response: {exc}") from exc
 
     def pause(self):
         with self._lock:

@@ -32,6 +32,9 @@ BaDCaT-specific commands or depend on one network-adapter product.
 - Text input and special keys, including `STOP`, `CTRL+STOP`, and `CTRL+C`.
 - BASIC source entry, batched line input, file-based BASIC loading, and RUN.
 - Z80 assembly, binary application loading, and controlled memory injection.
+- Backend-neutral Z80 CPU snapshots: exact PC/SP, code, and stack state through
+  the openMSX debugger, or a versioned BIOS `H.TIMI` callback context through
+  the physical agent.
 - Host-rendered SCREEN 0-8 and SCREEN 10-12 captures from VRAM.
 - Resumable binary PUT and GET with 32-bit sizes, CRC-32, explicit block
   acknowledgement, and collision-safe publication.
@@ -77,6 +80,10 @@ not distributed by this repository.
 - The resident agent is cooperative and depends on the normal BIOS timer hook.
   Software that keeps interrupts disabled or replaces that path can make the
   agent temporarily unreachable.
+- A physical-agent CPU snapshot is the register frame visible at the BIOS
+  `H.TIMI` callback boundary. It is not an NMI or bus-master freeze and cannot
+  claim the interrupted application's arbitrary PC/SP. Direct openMSX snapshots
+  do provide exact instruction-boundary state.
 - Resident page and mapper restrictions protect the interrupted DOS or
   application context. Use the foreground monitor when persistent ownership is
   required.
@@ -90,9 +97,10 @@ The generic 16C550 driver is not a BaDCaT-specific build.
 
 ## Validation
 
-The automated suite currently contains more than 330 tests covering protocol
+The automated suite currently contains more than 340 tests covering protocol
 framing, memory safety, backend selection, keyboard input, screenshots,
-application loading, file-transfer recovery, and openMSX integration.
+CPU snapshots, application loading, file-transfer recovery, and openMSX
+integration.
 
 ## Documentation
 

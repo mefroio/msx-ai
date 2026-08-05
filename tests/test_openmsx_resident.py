@@ -119,6 +119,36 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
         except Exception as exc:
             return f"\nDIAGNOSTIC SNAPSHOT FAILED: {exc}"
 
+    def test_direct_openmsx_cpu_snapshot_preserves_run_and_break_states(self):
+        msx_mcp_server.SESSION.boot("basic", window=False)
+        machine = msx_mcp_server.SESSION.msx
+        self.assertIn(machine.cmd("set mute").strip().lower(),
+                      ("1", "true", "on", "yes"))
+        self.assertIn(machine.cmd("debug breaked").strip().lower(),
+                      ("0", "false", "off", "no"))
+
+        running = json.loads(
+            self.call_tool("msx_cpu_snapshot")[0]["text"])
+        self.assertEqual(running["backend"], "openmsx")
+        self.assertEqual(
+            running["capture"]["source"], "openmsx-debugger")
+        self.assertTrue(running["capture"]["exact_application_state"])
+        self.assertFalse(running["capture"]["was_already_breaked"])
+        self.assertIsNotNone(running["registers"]["pc"])
+        self.assertIsNotNone(running["registers"]["sp"])
+        self.assertEqual(len(running["debug"]["code_bytes"]), 32)
+        self.assertEqual(len(running["debug"]["stack_words"]), 8)
+        self.assertIn(machine.cmd("debug breaked").strip().lower(),
+                      ("0", "false", "off", "no"))
+
+        machine.cmd("debug break")
+        paused = json.loads(
+            self.call_tool("msx_cpu_snapshot")[0]["text"])
+        self.assertTrue(paused["capture"]["was_already_breaked"])
+        self.assertIn(machine.cmd("debug breaked").strip().lower(),
+                      ("1", "true", "on", "yes"))
+        machine.cmd("debug cont")
+
     def test_default_memman_resident_intervenes_in_dos_program(self):
         counter_source = """org 0100h
 start:  ei
@@ -156,6 +186,21 @@ mailbox: dw 0
         self.assertEqual(status["agent_transport_id"], 0)
         self.assertIn("snapshot-lease", status["features"])
         self.assertIn("frame-wake-ack", status["features"])
+        self.assertIn("cpu-snapshot-v1", status["features"])
+
+        cpu_snapshot = json.loads(
+            self.call_tool("msx_cpu_snapshot")[0]["text"])
+        self.assertEqual(cpu_snapshot["backend"], "real")
+        self.assertEqual(
+            cpu_snapshot["capture"]["source"],
+            "bios-h-timi-hook-entry")
+        self.assertFalse(
+            cpu_snapshot["capture"]["exact_application_state"])
+        self.assertIsNone(cpu_snapshot["registers"]["pc"])
+        self.assertIsNone(cpu_snapshot["registers"]["sp"])
+        self.assertEqual(
+            cpu_snapshot["debug"]["agent_state"], "running")
+        self.assertEqual(self.status()["state"], "running")
 
         mapping = self.tool_result(
             "msx_slot_select", page=0, slot_id=0)
@@ -298,7 +343,7 @@ mailbox: dw 0
         self.assertTrue(msx_mcp_server._dos_prompt_visible(absent), absent)
 
     def test_resident_types_and_runs_basic_only_through_agent_tcp(self):
-        self.start_bench(mode="resident")
+        machine = self.start_bench(mode="resident")
         status = self.status()
         self.assertEqual(status["runtime_mode"], "resident")
         self.assertIn("keybuf-input", status["features"])
@@ -351,7 +396,8 @@ mailbox: dw 0
         ]
         allowed_transfer_row = re.compile(
             r"^(?:(?:A:\\>)(?:MSXAIXF /(?:PUT|GET) [0-9A-F]*)?|"
-            r"[0-9A-F]{1,32}|MSXAI (?:PUT|GET) (?:READY|OK))$")
+            r"[0-9A-F]{1,32}|MSXAI (?:PUT|GET) (?:READY|OK)|"
+            r"\[[#-]{18}\]\s+\d{1,3}%\s+\d+\s+B/s)$")
         for row in transfer_rows:
             self.assertRegex(row, allowed_transfer_row, transfer_screen)
 
@@ -439,7 +485,13 @@ mailbox: dw 0
         self.assertEqual(status["state"], "monitor")
         self.assertTrue(status["debug"])
         self.assertIn("run", status["capabilities"])
+        self.assertIn("cpu-snapshot-v1", status["features"])
         self.assertIn("[71]", machine.screen_text())
+
+        idle_snapshot = self.tool_result("msx_cpu_snapshot")
+        self.assertTrue(idle_snapshot.get("isError"))
+        self.assertIn(
+            "invalid_state", idle_snapshot["content"][0]["text"].lower())
 
         demo = """org 08000h
 start:  ei
@@ -454,6 +506,14 @@ counter: dw 0
                        execute="run")
         machine.advance(0.3)
         self.assertEqual(self.status()["state"], "running")
+        running_cpu = json.loads(
+            self.call_tool("msx_cpu_snapshot")[0]["text"])
+        self.assertEqual(
+            running_cpu["capture"]["source"],
+            "bios-h-timi-hook-entry")
+        self.assertEqual(
+            running_cpu["debug"]["runtime_mode"], "foreground-monitor")
+        self.assertEqual(running_cpu["debug"]["agent_state"], "running")
         first = int.from_bytes(
             self.read_memory("ram", 0x800B, 2, atomic=False), "little")
         machine.advance(0.3)
@@ -463,6 +523,9 @@ counter: dw 0
             first)
 
         self.call_tool("msx_pause")
+        paused_cpu = json.loads(
+            self.call_tool("msx_cpu_snapshot")[0]["text"])
+        self.assertEqual(paused_cpu["debug"]["agent_state"], "paused")
         paused = int.from_bytes(self.read_memory("ram", 0x800B, 2), "little")
         machine.advance(0.4)
         self.assertEqual(

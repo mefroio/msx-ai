@@ -531,7 +531,7 @@ The negotiated payload limit of the current agent is 320 bytes. Eight
 consecutive credited `ESC` bytes reset a current framed protocol session after
 a lost peer; a single noise byte cannot downgrade it.
 
-In the negotiated feature bitmap, bit `0x40` is reserved and remains clear.
+In the negotiated feature bitmap, bit `0x40` advertises `cpu-snapshot-v1`.
 Bit `0x80` advertises `file-transfer-v2`, the only DOS-file transfer path in
 the current suite.
 
@@ -573,6 +573,52 @@ When the foreground monitor runs with `DEBUG`, the optional
 host sends the accepted IPv4 source endpoint as printable ASCII and the MSX
 displays it as `MCP client: <ipv4>:<port>`. The UART-facing agent remains
 transport-neutral: it never attempts to discover network metadata itself.
+
+The `cpu-snapshot-v1` feature enables framed opcode `D`. The request is one
+byte containing context version `1`; there is no raw-v2 fallback. An older
+agent leaves feature bit `0x40` clear, so the host rejects the operation before
+sending `D`. A current agent returns this fixed 40-byte little-endian record:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 1 | context version (`1`) |
+| 1 | 1 | capture kind (`1` = BIOS `H.TIMI` callback entry) |
+| 2 | 1 | record size (`40`) |
+| 3 | 1 | validity bits: main, alternate, index, service SP, callback return, service metadata |
+| 4 | 1 | agent run state |
+| 5 | 1 | hook kind (`1` = `H.TIMI`) |
+| 6 | 1 | runtime mode |
+| 7 | 1 | selected MSX transport ID |
+| 8 | 20 | `HL'`, `DE'`, `BC'`, `AF'`, `IY`, `IX`, `HL`, `DE`, `BC`, `AF` as ten 16-bit words |
+| 28 | 2 | hook-entry service SP |
+| 30 | 2 | internal BIOS/MemMan callback return address |
+| 32 | 1 | service-time `I` |
+| 33 | 1 | service-time `R` |
+| 34 | 2 | BIOS `JIFFY` |
+| 36 | 1 | BIOS screen mode |
+| 37 | 1 | transport control level |
+| 38 | 1 | service flags: bit 0 makes current `IFF2` valid; bit 1 is its value |
+| 39 | 1 | reserved, must be zero |
+
+The first 20 register bytes are copied from the agent's own frame before any
+protocol work. They describe the register state visible when BIOS and MemMan
+invoke the `H.TIMI` callback. BIOS has already entered its interrupt handler,
+and MemMan owns an internal dispatcher stack; neither layout is a portable MSX
+hook ABI. Consequently, `msx_cpu_snapshot` returns application `PC`, `SP`,
+`I/R`, `IFF`, and interrupt mode as unavailable on the physical-agent backend.
+Service SP, callback return, service-time `I/R`, and current service `IFF2` are
+kept under explicitly named debug metadata and are never presented as
+application registers. An idle foreground monitor returns `INVALID_STATE`;
+resident operation and a foreground payload currently being serviced through
+`H.TIMI` can return the record. Responses up to this 40-byte size are cached,
+so a permitted retry returns the same snapshot rather than sampling again.
+
+The direct openMSX backend uses a different, exact contract. It briefly enters
+the emulator debugger, reads all 28 bytes of `CPU regs`, the next instruction,
+16 code bytes, and eight stack words, then continues only if the CPU was
+running before the call. A CPU that was already debugger-paused remains paused.
+The common JSON result identifies either `openmsx-debugger` or
+`bios-h-timi-hook-entry` and states whether it is exact application state.
 
 The optional `snapshot-lease` feature enables v3 opcode `S`. Its one-byte
 payload is a lease of 1-255 bounded agent receive-timeout periods; these are not
@@ -727,6 +773,7 @@ normally from DOS.
 | Group | Tools |
 |---|---|
 | Session | `msx_boot`, `msx_attach`, `msx_tcp_bench_start`, `msx_agent_listen`, `msx_agent_connect`, `msx_status`, `msx_shutdown` |
+| Debug | `msx_cpu_snapshot` |
 | Execution | `msx_asm_load`, `msx_app_load`, `msx_pause`, `msx_resume`, `msx_stop` |
 | Memory/video | `msx_memory_read`, `msx_memory_write`, `msx_screen`, `msx_screenshot` |
 | Hardware | `msx_io_read`, `msx_io_write`, `msx_slot_select`, `msx_mapper_select` |
@@ -763,8 +810,12 @@ make test-integration
 
 The integration suite uses one openMSX process at a time and validates:
 
+- exact direct-openMSX CPU snapshots while preserving both running and
+  previously paused debugger states;
 - default MemMan installation returning to DOS;
 - intervention in a normally launched DOS COM program;
+- versioned agent CPU snapshots in resident mode and in foreground-monitor
+  running/paused states, plus safe rejection by an idle monitor;
 - repeated pause/resume, RAM/VRAM access, and a PNG rendered from agent-captured
   VRAM;
 - raw ZIP and PackBits protocol-X PUT/GET round trips through the resident TCP
@@ -789,6 +840,7 @@ server/msx_mcp_server.py  MCP JSON-RPC server and backend adapters
 server/msx_protocol.py    protocol-v3 codec and incremental parser
 server/msx_v3.py          framed stream session, retries, and correlation
 server/msx_real.py        physical-agent stream/TCP client
+server/msx_cpu.py         normalized exact-emulator and H.TIMI CPU snapshots
 server/msx_transfer.py    file-transfer-v2 wire contract and host helpers
 server/msx_screenshot.py  host-side VRAM renderer
 server/msx_application.py backend-neutral application parser/loader
@@ -937,6 +989,9 @@ retain the terms documented in their respective notices.
   `H.TIMI` chain; software that disables or replaces it times out without
   asynchronous intervention.
 - Resident RAM page 1 is unavailable; arbitrary page-3 writes are dangerous.
+- Physical-agent CPU state is cooperative `H.TIMI` callback context, not an
+  arbitrary-instruction freeze; exact application PC/SP requires the direct
+  openMSX debugger or future hardware supervisor support.
 - Slot/mapper selection and agent-side call/run/stop are foreground-monitor
   features only.
 - Exact physical screenshots may require palette/register overrides when

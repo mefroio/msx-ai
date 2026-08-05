@@ -443,6 +443,59 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r"ld \(snapshot_lease_reload\),a.*"
             r"jr frame_pause_service_loop")
 
+    def test_cpu_snapshot_is_versioned_cached_h_timi_context(self):
+        self.assertRegex(
+            self.source,
+            r"(?m)^FEATURE_CPU_SNAPSHOT:\s+equ\s+040h\b")
+        self.assertRegex(
+            self.source,
+            r"(?m)^CPU_CONTEXT_VERSION:\s+equ\s+1\b")
+        self.assertRegex(
+            self.source,
+            r"(?m)^CPU_CONTEXT_SIZE:\s+equ\s+40\b")
+        features = self.source.split("current_features:", 1)[1].split(
+            "cmd_status:", 1)[0]
+        self.assertIn("ld b,FEATURE_CPU_SNAPSHOT", features)
+
+        raw_dispatch = self.source.split("dispatch:", 1)[1].split(
+            "cmd_hello:", 1)[0]
+        self.assertNotRegex(raw_dispatch, r"cp 'D'")
+        framed_dispatch = self.source.split("frame_dispatch:", 1)[1].split(
+            "frame_require_length:", 1)[0]
+        self.assertRegex(
+            framed_dispatch,
+            r"(?s)cp 'D'.*jp z,frame_cmd_cpu_context")
+
+        context = self.source.split("frame_cmd_cpu_context:", 1)[1].split(
+            "frame_cmd_debug_peer:", 1)[0]
+        self.assertRegex(
+            context,
+            r"(?s)ld de,1.*call frame_require_length.*"
+            r"ld a,\(frame_request_buffer\).*cp CPU_CONTEXT_VERSION")
+        self.assertRegex(
+            context,
+            r"(?s)ld a,\(in_hook\).*or a.*"
+            r"ld a,\(hook_kind\).*cp 1")
+        self.assertRegex(
+            context,
+            r"(?s)ld hl,\(hook_context_sp\).*ld bc,20.*ldir")
+        self.assertIn("ld a,i", context)
+        self.assertIn("jp po,frame_cpu_context_iff2_clear", context)
+        self.assertIn("ld a,r", context)
+        self.assertIn("ld bc,2", context)
+        self.assertIn("ld hl,CPU_CONTEXT_SIZE", context)
+        for unsafe in ("call bdos_proxy", "call debug_putchar", "call 0005h"):
+            self.assertNotIn(unsafe, context)
+
+        self.assertEqual(
+            self.source.count("ld (hook_context_sp),sp"), 2)
+        cache = self.source.split("frame_cache_and_send:", 1)[1].split(
+            "frame_emit_response:", 1)[0]
+        self.assertIn("cp FRAME_CACHE_MAX + 1", cache)
+        storage = self.source.split("last_response_small:", 1)[1].split(
+            "if MSXAI_TSR_BUILD", 1)[0]
+        self.assertIn("ds FRAME_CACHE_MAX,0", storage)
+
     def test_snapshot_lease_timeout_and_manual_pause_semantics(self):
         raw_manual = self.source.split("cmd_pause:", 1)[1].split(
             "pause_service_loop:", 1)[0]

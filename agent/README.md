@@ -307,6 +307,15 @@ before `H.TIMI`. Each timer entry saves the normal and alternate Z80 register
 sets, moves protocol dispatch to a dedicated agent stack, and applies a fixed
 I/O wait budget. `H.TIMI` always continues its previous chain after service.
 
+Feature `cpu-snapshot-v1` exposes that fixed hook-entry register frame through
+framed opcode `D`. It is deliberately scoped to the state visible at the BIOS
+`H.TIMI` callback boundary. BIOS and MemMan have already entered their private
+interrupt/dispatcher paths, so the callback stack and return address are not
+the interrupted application's portable SP/PC. The host reports application
+PC/SP and interrupt state as unavailable, while retaining separately named
+service metadata. An idle foreground monitor rejects the request; a resident
+or a running/paused foreground payload can answer while servicing `H.TIMI`.
+
 The resident reports state `running` while DOS or a DOS-launched application is
 active. The safe host profile rejects persistent lowercase-`s`/`msx_pause` and
 uses only the bounded uppercase-`S` snapshot lease. The lease preserves the
@@ -466,7 +475,7 @@ The v3 HELLO appends an optional feature byte after the runtime-mode byte. Bit
 `debug-peer-label`; bit 2 advertises the resident-only `snapshot-lease`; bit 3
 advertises the transport-independent `frame-wake-ack`; and bit 4 advertises
 resident-only `timi-poll-safe`; bit 5 advertises the resident-only
-`keybuf-spool`; bit 6 (`0x40`) is reserved and must remain clear; and bit 7
+`keybuf-spool`; bit 6 (`0x40`) advertises `cpu-snapshot-v1`; and bit 7
 (`0x80`) advertises resident-assisted resumable `file-transfer-v2`. The safe
 features are valid only together with `frame-wake-ack`.
 Raw command `N` exposes the same bitmap before `F`, allowing
@@ -485,6 +494,19 @@ authorizes one line and bit 1 cancels when sent without data. Its seven-byte
 response is `accepted:u16 | pending:u16 | credits:u16 | flags:u8`; flag bits
 0..2 report the post-Return barrier, an active line, and unused authorization.
 `pending` includes both the private spool and BIOS ring.
+
+Opcode `D` accepts exactly one byte, context version `1`, and returns a cached
+40-byte CPU-context record. Bytes 0..7 are version, kind, size, validity flags,
+run state, hook kind, runtime mode, and transport ID. Bytes 8..27 contain
+`HL'`, `DE'`, `BC'`, `AF'`, `IY`, `IX`, `HL`, `DE`, `BC`, and `AF` as
+little-endian words copied from the fixed hook frame. Bytes 28..39 contain the
+hook-entry service SP, internal callback return address, service-time `I/R`,
+16-bit `JIFFY`, screen mode, transport control level, current-service `IFF2`
+valid/value bits, and one zero reserved byte. Main, alternate, and index
+registers are valid callback-entry values; service metadata must not be
+relabeled as application PC/SP. Unknown versions are `UNSUPPORTED`, malformed
+lengths are `BAD_ARG`, and a request outside an active `H.TIMI` callback is
+`BAD_STATE`.
 
 Opcode `X` carries file-transfer subprotocol version 1. Its subcommands are
 `CAPS=0`, `OPEN=1`, `STATUS=2`, `PUT_DATA=3`, `GET_READ=4`, `GET_ACK=5`,
@@ -709,6 +731,8 @@ The integration suite owns at most one openMSX process at a time. It validates:
 - MemMan installation returning to DOS;
 - intervention in a DOS-launched program;
 - bounded snapshot pause, patch, resume, and repeated `H.TIMI` entry;
+- versioned CPU-context snapshots in resident and active foreground-monitor
+  states, plus idle-monitor rejection;
 - an agent-VRAM PNG capture;
 - raw ZIP and PackBits protocol-X PUT/GET round trips through the resident TCP
   path in `test_resident_types_and_runs_basic_only_through_agent_tcp`;
