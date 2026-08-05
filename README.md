@@ -4,119 +4,95 @@
   <img src="assets/msx-ai-robot.png" alt="MSX-AI retro robot mascot" width="320">
 </p>
 
-MSX-AI is an open project that allows an AI assistant to interact with an MSX
-computer through the Model Context Protocol (MCP).
+Use MSX-AI to control MSX systems through the Model Context Protocol (MCP).
+Choose direct openMSX automation, an agent running inside a physical MSX, or the
+same agent path simulated in openMSX.
 
-It can be used in three ways:
+## Choose a backend
 
-- control openMSX directly, without TCP/IP or software running inside the MSX;
-- control a physical MSX through a small agent running on the machine; or
-- use both approaches, developing and testing in the emulator before moving to
-  physical hardware.
+| Mode | Select with | Requirements |
+|---|---|---|
+| Direct openMSX | `msx_boot` or `msx_attach` | openMSX; no TCP or MSX agent |
+| Physical MSX agent | `msx_agent_listen` or `msx_agent_connect` | MSX agent and a compatible host transport |
+| Simulated MSX agent | `msx_tcp_bench_start` | openMSX, MSX agent, and local TCP/IPv4 |
 
-openMSX, TCP/IP, and BaDCaT are optional parts of the project. MSX-AI is not
-locked to one emulator, computer model, network adapter, or AI interface.
+Backend selection is explicit. No emulator starts automatically. Keep one
+active target per MCP server session and switch modes when needed.
 
-## What it can do
+openMSX, TCP/IP, and BaDCaT are optional at the project level. The current agent
+host adapter uses TCP/IPv4, but the protocol and MCP tools do not contain
+BaDCaT-specific commands or depend on one network-adapter product.
 
-The current MSX agent can remain resident in memory while the user returns to
-MSX-DOS and runs compatible software.
+## Features
 
-Through MCP, an AI assistant can:
+- Direct headless or visible-window control of openMSX.
+- Resident MSX-DOS agent with an optional foreground development monitor.
+- RAM, VRAM, hardware I/O, slot, and mapper operations where the active mode
+  can perform them safely.
+- Text input and special keys, including `STOP`, `CTRL+STOP`, and `CTRL+C`.
+- BASIC source entry, batched line input, file-based BASIC loading, and RUN.
+- Z80 assembly, binary application loading, and controlled memory injection.
+- Host-rendered SCREEN 0-8 and SCREEN 10-12 captures from VRAM.
+- Resumable binary PUT and GET with 32-bit sizes, CRC-32, explicit block
+  acknowledgement, and collision-safe publication.
+- On-MSX transfer percentage, progress bar, and confirmed bytes per second.
+- Lightweight PackBits transport compression when it reduces the wire size;
+  already-compressed files remain byte-exact.
 
-- inspect the MSX and connection state;
-- read and modify RAM and VRAM;
-- type text and send special keys such as `STOP`, `CTRL+STOP`, and `CTRL+C`;
-- enter BASIC, write programs, and run them;
-- create drawings, animations, and small BASIC games;
-- assemble, transfer, and execute machine-language routines;
-- access hardware I/O ports;
-- load programs and data into memory;
-- upload and download binary files;
-- verify file transfers with CRC-32;
-- resume interrupted transfers without publishing corrupt files;
-- display transfer progress, percentage, and bytes per second on the MSX; and
-- capture and render screens from VRAM.
-
-File transfers support sizes above 64 KiB, preserve files that are already
-compressed, and can use lightweight transport compression when it actually
-reduces the amount of data sent.
-
-## Safe transfer recovery
-
-We tested a real connection failure during an upload. The link was disconnected
-while the MSX displayed 8%. The agent detected the failure, stopped the
-operation safely, and returned to MSX-DOS. After reconnecting, the same transfer
-continued and completed with the expected size and CRC-32.
-
-An incomplete file is never silently published as a successful transfer.
-
-## Development with openMSX
-
-Our current development environment can simulate the complete agent path:
+## Agent architecture
 
 ```text
-AI assistant -> MCP -> TCP/IP -> emulated serial port -> agent inside the MSX
+MCP client
+    |
+MSX-AI server
+    |
+agent protocol
+    |
+selected host transport
+    |
+8251 or 16C550-compatible MSX interface
+    |
+resident MSX-DOS agent
 ```
 
-In this mode, the AI communicates with the same MSX-side agent intended for
-physical hardware. It does not need to use openMSX debugger memory APIs. This
-allows the protocol, file transfers, recovery behavior, and agent features to
-be tested before physical hardware is available.
+Install the seven-file agent suite to use the physical or simulated agent path.
+The default MemMan resident returns to MSX-DOS and remains available while
+compatible software runs. Use the foreground monitor for direct call, run,
+stop, slot, mapper, and visible DEBUG workflows.
 
-MSX-AI can also control openMSX directly. Direct emulator control does not need
-TCP/IP or the MSX-side agent.
+## Requirements
 
-## Using a physical MSX
+- Python 3.10 or newer for the MCP server.
+- Optional openMSX is required only for direct emulator control or agent-path simulation.
+- Optional `z80asm` is required only to build the agent or assemble Z80 source.
+- MSX-DOS 2 or Nextor
+- A supported 8251 or 16C550-compatible interface and host transport for a
+  physical agent connection.
 
-The current physical-agent path supports standard MSX 8251 serial hardware and
-generic 16C550-compatible UART hardware.
+No third-party Python packages are required. ROM and bootable disk images are
+not distributed by this repository.
 
-BaDCaT SMD is one device planned for physical testing, but it is not a project
-dependency. Other adapters can be used when they expose a compatible serial
-interface and provide the ordered byte stream required by the selected host
-transport. The MCP protocol contains no BaDCaT-specific commands.
+## Safety and limitations
 
-The host adapter currently implemented for the agent uses TCP/IPv4. TCP/IP is
-not required when using direct openMSX control, and the protocol architecture
-allows other host transports to be added without changing the MCP tools or the
-MSX command core.
+- The resident agent is cooperative and depends on the normal BIOS timer hook.
+  Software that keeps interrupts disabled or replaces that path can make the
+  agent temporarily unreachable.
+- Resident page and mapper restrictions protect the interrupted DOS or
+  application context. Use the foreground monitor when persistent ownership is
+  required.
+- Slow serial links can make large VRAM captures expensive. Complex game
+  screenshots remain experimental.
+- Failed file transfers retain verified recovery state and never publish an
+  incomplete target as a successful file.
 
-## Current limitations
+Physical BaDCaT SMD validation and performance measurements remain pending.
+The generic 16C550 driver is not a BaDCaT-specific build.
 
-The resident agent is cooperative. It relies on the running software continuing
-to service the normal MSX BIOS timer hook. A game or demo that permanently
-disables interrupts, replaces the relevant BIOS path, or pages required system
-state out of memory can temporarily make the resident agent unreachable.
+## Validation
 
-Complex game screenshots are still experimental. Reading a large amount of
-VRAM can take time over a slower serial interface, and software that controls
-the video hardware in unusual ways may require additional handling.
-
-The goal is not to promise unconditional control of every program. The goal is
-to provide a safe and extensible platform for MSX development, automation,
-diagnostics, preservation, and experimentation.
-
-## Project status
-
-The project currently includes:
-
-- a resident MSX-DOS agent;
-- a foreground development monitor;
-- a protected binary protocol with retries and error detection;
-- resumable PUT and GET file transfers;
-- BASIC and machine-language workflows;
-- host-rendered screenshots from captured VRAM;
-- hardware-independent connector layers;
-- an English technical reference;
-- more than 330 automated tests; and
-- the MIT License.
-
-The next major milestone is validation on a physical MSX and performance testing
-with faster communication hardware.
-
-MSX-AI aims to make the MSX an interactive development platform for AI agents
-while respecting the real capabilities and limitations of these machines.
+The automated suite currently contains more than 330 tests covering protocol
+framing, memory safety, backend selection, keyboard input, screenshots,
+application loading, file-transfer recovery, and openMSX integration.
 
 ## Documentation
 
