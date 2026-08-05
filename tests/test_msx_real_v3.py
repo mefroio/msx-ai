@@ -1,6 +1,7 @@
 import socket
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,8 +17,11 @@ from msx_protocol import (  # noqa: E402
     FrameStatus,
     FrameType,
     GarbageDataError,
+    crc16_ccitt,
 )
 from msx_real import (  # noqa: E402
+    FEATURE_FILE_UPLOAD,
+    FEATURE_KEYBUF_SPOOL,
     FEATURE_SNAPSHOT_LEASE,
     FEATURE_TIMI_POLL_SAFE,
     FRAME_WAKE_ACK,
@@ -36,6 +40,8 @@ class FakeV3Resident:
     def __init__(self, sock, *, max_payload=64, corrupt_once=(), drop_once=(),
                  vram_size=0x20000, legacy_hello=False, start_framed=False,
                  runtime_mode=1, keybuf_feature=True,
+                 keybuf_spool_feature=True,
+                 file_upload_feature=True,
                  consume_keybuf=True, debug=False,
                  debug_peer_feature=False, frame_wake_ack_feature=None,
                  timi_poll_safe_feature=None,
@@ -53,6 +59,8 @@ class FakeV3Resident:
         self.start_framed = start_framed
         self.runtime_mode = runtime_mode
         self.keybuf_feature = bool(keybuf_feature)
+        self.keybuf_spool_feature = bool(keybuf_spool_feature)
+        self.file_upload_feature = bool(file_upload_feature)
         self.consume_keybuf = bool(consume_keybuf)
         self.debug = bool(debug)
         self.debug_peer_feature = bool(debug_peer_feature)
@@ -77,7 +85,20 @@ class FakeV3Resident:
         self.last_call = None
         self.last_run = None
         self.keybuf = bytearray()
+        self.keybuf_spool = bytearray()
+        self.keybuf_spool_barrier = False
+        self.keybuf_spool_active = False
+        self.keybuf_spool_authorized = False
         self.typed = bytearray()
+        self.upload_active = False
+        self.upload_finish_pending = False
+        self.upload_finish_delay = 0
+        self.upload_succeeded = False
+        self.upload_failed = False
+        self.upload_force_failure = False
+        self.upload_expected = 0
+        self.upload_crc = 0
+        self.uploaded = bytearray()
         self.debug_peer_labels = []
 
         self.bootstrap_queries = 0
@@ -124,6 +145,10 @@ class FakeV3Resident:
         features = 1 if self.keybuf_feature and self.runtime_mode == 0 else 0
         if self.runtime_mode == 0:
             features |= FEATURE_SNAPSHOT_LEASE
+            if self.keybuf_spool_feature:
+                features |= FEATURE_KEYBUF_SPOOL
+            if self.file_upload_feature:
+                features |= FEATURE_FILE_UPLOAD
         if (self.debug_peer_feature and self.runtime_mode == 1 and
                 self.debug):
             features |= 2
@@ -280,6 +305,90 @@ class FakeV3Resident:
                 if self.consume_keybuf:
                     self.keybuf.clear()
                 response_payload = bytes([accepted, len(self.keybuf)])
+        elif opcode == "T" and self.keybuf_spool_feature:
+            if self.runtime_mode != 0 or self.state != 1:
+                status = FrameStatus.INVALID_STATE
+                flags = FrameFlag.ERROR
+            elif len(payload) > 256:
+                status = FrameStatus.OUT_OF_RANGE
+                flags = FrameFlag.ERROR
+            else:
+                self._drain_keyboard_spool()
+                control = payload[0] if payload else 0
+                data = payload[1:] if payload else b""
+                if control & ~3 or control & 2 and (control != 2 or data):
+                    status = FrameStatus.INVALID_ARGUMENT
+                    flags = FrameFlag.ERROR
+                    return Frame(
+                        FrameType.RESPONSE, request.sequence, request.opcode,
+                        status=status, flags=flags)
+                if control & 2:
+                    self.keybuf_spool.clear()
+                    self.keybuf.clear()
+                    self.keybuf_spool_barrier = False
+                    self.keybuf_spool_active = False
+                    self.keybuf_spool_authorized = False
+                accepted = min(len(data), 255 - len(self.keybuf_spool))
+                self.keybuf_spool += data[:accepted]
+                if (control & 1 and self.keybuf_spool and
+                        not self.keybuf_spool_barrier and
+                        not self.keybuf_spool_active):
+                    self.keybuf_spool_authorized = True
+                pending = len(self.keybuf_spool) + len(self.keybuf)
+                credits = 255 - len(self.keybuf_spool)
+                spool_flags = (int(self.keybuf_spool_barrier) |
+                               int(self.keybuf_spool_active) << 1 |
+                               int(self.keybuf_spool_authorized) << 2)
+                response_payload = (
+                    accepted.to_bytes(2, "little")
+                    + pending.to_bytes(2, "little")
+                    + credits.to_bytes(2, "little")
+                    + bytes([spool_flags])
+                )
+        elif opcode == "U" and self.file_upload_feature:
+            if self.runtime_mode != 0 or self.state != 1 or len(payload) < 2:
+                status = FrameStatus.INVALID_STATE
+                flags = FrameFlag.ERROR
+            else:
+                if self.upload_finish_pending:
+                    if self.upload_finish_delay:
+                        self.upload_finish_delay -= 1
+                    else:
+                        self.upload_active = False
+                        self.upload_finish_pending = False
+                        self.upload_failed = self.upload_force_failure
+                        self.upload_succeeded = not self.upload_failed
+                offset = self._le16(payload[:2])
+                data = payload[2:]
+                accepted = 0
+                if self.upload_active:
+                    if offset != len(self.uploaded):
+                        status = FrameStatus.INVALID_ARGUMENT
+                        flags = FrameFlag.ERROR
+                    else:
+                        accepted = min(
+                            len(data), self.upload_expected - len(self.uploaded))
+                        self.uploaded += data[:accepted]
+                        if len(self.uploaded) == self.upload_expected:
+                            if crc16_ccitt(self.uploaded) != self.upload_crc:
+                                raise AssertionError("host sent the wrong file CRC")
+                            self.upload_finish_pending = True
+                received = len(self.uploaded)
+                remaining = max(0, self.upload_expected - received)
+                credits = min(318, remaining) if self.upload_active else 0
+                upload_flags = int(self.upload_active)
+                if self.upload_active and received == self.upload_expected:
+                    upload_flags |= 4
+                if self.upload_succeeded:
+                    upload_flags |= 8
+                if self.upload_failed:
+                    upload_flags |= 16
+                response_payload = (
+                    accepted.to_bytes(2, "little")
+                    + received.to_bytes(2, "little")
+                    + credits.to_bytes(2, "little")
+                    + bytes([upload_flags])
+                )
         elif opcode == "p" and len(payload) >= 2:
             address = self._le16(payload[:2])
             self.ram[address:address + len(payload) - 2] = payload[2:]
@@ -325,6 +434,43 @@ class FakeV3Resident:
             flags=flags,
             status=status,
         )
+
+    def _drain_keyboard_spool(self):
+        if not self.consume_keybuf:
+            return
+        if self.keybuf_spool_barrier:
+            self.keybuf_spool_barrier = False
+            return
+        if not self.keybuf_spool_authorized or not self.keybuf_spool:
+            return
+        self.keybuf_spool_authorized = False
+        self.keybuf_spool_active = True
+        try:
+            end = self.keybuf_spool.index(13) + 1
+        except ValueError:
+            end = len(self.keybuf_spool)
+        segment = bytes(self.keybuf_spool[:end])
+        del self.keybuf_spool[:end]
+        self.typed += segment
+        self.keybuf_spool_active = False
+        if segment.endswith(b"\r"):
+            self.keybuf_spool_barrier = True
+            self._observe_typed_line(segment[:-1])
+
+    def _observe_typed_line(self, line):
+        try:
+            fields = line.decode("ascii").split()
+        except UnicodeDecodeError:
+            return
+        if len(fields) != 5 or fields[:2] != ["MSXAI", "/PUT"]:
+            return
+        self.upload_expected = int(fields[3], 16)
+        self.upload_crc = int(fields[4], 16)
+        self.uploaded.clear()
+        self.upload_active = True
+        self.upload_finish_pending = False
+        self.upload_succeeded = False
+        self.upload_failed = False
 
 
 class RealMSXV3Test(unittest.TestCase):
@@ -560,13 +706,37 @@ class RealMSXV3Test(unittest.TestCase):
         with self.assertRaisesRegex(RealMSXError, "unavailable in resident"):
             self.msx.mapper_select(1, 31)
 
-    def test_resident_keyboard_input_is_chunked_and_preserves_cr_boundaries(self):
+    def test_resident_keyboard_spool_uses_wire_sized_batches(self):
         self.msx.close()
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
-        self.agent = FakeV3Resident(resident, runtime_mode=0)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, max_payload=320)
         info = self.msx.info()
+        self.agent.state = 1
+
+        lines = ["10 REM " + ("X" * 280), "20 PRINT \"MCP\"", "RUN"]
+        text = "\r".join(lines) + "\r"
+        self.assertEqual(self.msx.type_lines(lines), len(text))
+        self.assertEqual(bytes(self.agent.typed), text.encode("ascii"))
+        requests = [r.payload for r in self.agent.requests
+                    if r.opcode == ord("T") and len(r.payload) > 1]
+        self.assertEqual([len(payload) for payload in requests], [256, 53])
+        self.assertTrue(any(b"\r" in payload[1:] for payload in requests))
+        self.assertEqual(
+            info["features"],
+            ["keybuf-input", "snapshot-lease", "frame-wake-ack",
+             "timi-poll-safe", "keybuf-spool", "file-upload"])
+
+    def test_old_resident_keyboard_fallback_preserves_cr_boundaries(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, keybuf_spool_feature=False)
+        self.msx.info()
         self.agent.state = 1
 
         text = "10 PRINT \"A LONG BASIC LINE THAT EXCEEDS THE RING BUFFER\"\rRUN\r"
@@ -575,12 +745,105 @@ class RealMSXV3Test(unittest.TestCase):
         requests = [r.payload for r in self.agent.requests
                     if r.opcode == ord("t") and r.payload]
         self.assertTrue(all(len(payload) <= 39 for payload in requests))
-        self.assertTrue(all(
-            b"\r" not in payload[:-1] for payload in requests))
+        self.assertTrue(all(b"\r" not in payload[:-1] for payload in requests))
+
+    def test_keyboard_spool_uses_reported_credits_until_final_drain(self):
+        self.msx.feature_bits = FEATURE_KEYBUF_SPOOL
+        self.msx._v3.max_payload = 320
+        replies = iter([
+            (100, 100, 155, False, False, True),
+            (80, 180, 75, False, True, False),
+            (20, 200, 55, False, True, False),
+            (0, 0, 255, True, False, False),
+            (0, 0, 255, False, False, False),
+        ])
+        with (mock.patch.object(
+                  self.msx, "keybuf_spool_write", side_effect=replies) as write,
+              mock.patch.object(time, "sleep")):
+            self.assertEqual(self.msx.type("X" * 200), 200)
+
+        payloads = [call.args[0] for call in write.call_args_list]
+        self.assertEqual([len(payload) for payload in payloads],
+                         [200, 100, 20, 0, 0])
         self.assertEqual(
-            info["features"],
-            ["keybuf-input", "snapshot-lease", "frame-wake-ack",
-             "timi-poll-safe"])
+            [call.kwargs.get("pump", False) for call in write.call_args_list],
+            [True, False, False, False, False])
+
+    def test_keyboard_spool_timeout_attempts_explicit_cancellation(self):
+        self.msx.feature_bits = FEATURE_KEYBUF_SPOOL
+        self.msx._v3.max_payload = 320
+        with (mock.patch.object(
+                  self.msx, "keybuf_spool_write",
+                  return_value=(2, 2, 253, False, False, True)),
+              mock.patch.object(
+                  self.msx, "cancel_keybuf_spool") as cancel,
+              mock.patch.object(
+                  time, "monotonic", side_effect=(0.0, 0.0, 0.0, 11.0)),
+              mock.patch.object(time, "sleep")):
+            with self.assertRaisesRegex(Exception, "keyboard-spool progress"):
+                self.msx.type("AB", timeout=10.0)
+
+        cancel.assert_called_once_with(timeout=0.5)
+
+    def test_dos_file_sink_streams_credited_chunks_after_helper_command(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, max_payload=320)
+        self.msx.info()
+        self.agent.state = 1
+        payload = (b"10 PRINT \"MCP\"\r\n20 END\r\n\x1a" * 20)
+
+        self.assertEqual(
+            self.msx.put_dos_file("A:DEMO.BAS", payload), len(payload))
+
+        self.assertEqual(bytes(self.agent.uploaded), payload)
+        self.assertEqual(
+            bytes(self.agent.typed),
+            (f"MSXAI /PUT A:DEMO.BAS {len(payload):04X} "
+             f"{crc16_ccitt(payload):04X}\r").encode("ascii"))
+        chunks = [request.payload[2:] for request in self.agent.requests
+                  if request.opcode == ord("U") and len(request.payload) > 2]
+        self.assertEqual(b"".join(chunks), payload)
+        self.assertTrue(all(len(chunk) <= 318 for chunk in chunks))
+
+        self.msx.feature_bits &= ~FEATURE_FILE_UPLOAD
+        with self.assertRaisesRegex(RealMSXError, "does not support"):
+            self.msx.put_dos_file("A:OTHER.BAS", b"10 END\r\n\x1a")
+
+    def test_dos_file_sink_rejects_terminal_foreground_failure(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, max_payload=320)
+        self.msx.info()
+        self.agent.state = 1
+        self.agent.upload_force_failure = True
+
+        with self.assertRaisesRegex(RealMSXError, "reported a .* failure"):
+            self.msx.put_dos_file("A:FAILED.BAS", b"10 END\r\n\x1a")
+
+    def test_file_upload_has_a_separate_bounded_finalize_window(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, max_payload=320)
+        self.msx.info()
+        self.agent.state = 1
+        payload = b"X"
+        self.agent.upload_expected = len(payload)
+        self.agent.upload_crc = crc16_ccitt(payload)
+        self.agent.upload_active = True
+        self.agent.upload_finish_delay = 8
+
+        self.assertEqual(
+            self.msx.file_upload_write(payload, timeout=0.05), len(payload))
 
     def test_resident_special_keys_use_keybuf_or_bios_interrupt_flag(self):
         self.msx.close()

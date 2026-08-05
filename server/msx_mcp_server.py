@@ -11,12 +11,13 @@ Nothing here touches the user's own openMSX setups: OPENMSX_HOME points at the
 project-local .openmsx-home built for msx-ai.
 """
 import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re, time
+import secrets
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import base64
 from msx_client import OpenMSX, OpenMSXError, PROJ
 from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
-                      UART8251_BAUD)
+                      FEATURE_FILE_UPLOAD, UART8251_BAUD)
 from msx_application import load_application
 import msx_screenshot
 
@@ -40,14 +41,18 @@ MCP_SLOT_EXPANDER = os.environ.get(
 RESIDENT_INSTALL_SECONDS = 15
 RESIDENT_PROMPT_GRACE_SECONDS = 15
 BENCH_AGENT_NAME = "MSXAI.COM"
-REAL_BASIC_PROMPT_TIMEOUT_SECONDS = 10.0
+REAL_BASIC_PROMPT_TIMEOUT_SECONDS = 30.0
+REAL_BASIC_SCREEN_CAPTURE_TIMEOUT_SECONDS = 10.0
 REAL_BASIC_PROMPT_POLL_SECONDS = 0.10
+REAL_BASIC_FILE_THRESHOLD = 512
+REAL_BASIC_FILE_LIMIT = 0x4000
+REAL_BASIC_PUT_MARKER = "MSXAI PUT OK"
 UART_BITS_PER_BYTE = 10
 UART_SCREENSHOT_MARGIN = 1.15
 SLOW_SCREENSHOT_SECONDS = 10.0
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 
 
 def _build_agent_artifact():
@@ -74,6 +79,15 @@ def _dos_prompt_visible(screen):
     """Return whether the last non-blank text row is an MSX-DOS prompt."""
     rows = [row.strip() for row in str(screen).splitlines() if row.strip()]
     return bool(rows and re.fullmatch(r"[A-Za-z]:\\[^>]*>", rows[-1]))
+
+
+def _dos_prompt_drive(screen):
+    """Return the current DOS drive letter, or ``None`` without a prompt."""
+    rows = [row.strip() for row in str(screen).splitlines() if row.strip()]
+    if not rows:
+        return None
+    match = re.fullmatch(r"([A-Za-z]):\\[^>]*>", rows[-1])
+    return match.group(1).upper() if match else None
 
 
 def _basic_prompt_visible(screen):
@@ -353,14 +367,21 @@ def _screen():
 
 def _wait_for_real_screen(m, predicate,
                           timeout=REAL_BASIC_PROMPT_TIMEOUT_SECONDS):
-    """Poll a screen captured through the agent until predicate matches."""
+    """Poll agent-captured screens without starving the final capture.
+
+    The overall deadline is checked between captures.  Each capture keeps a
+    complete, fixed transfer budget because a shrinking remainder is divided
+    among all of the RAM/VRAM requests by the real backend.  Starting a slow
+    8251 capture with only milliseconds left would otherwise quarantine an
+    otherwise healthy session.
+    """
     deadline = time.monotonic() + float(timeout)
     screen = ""
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if screen and time.monotonic() >= deadline:
             return screen
-        screen = m.screen_text(timeout=remaining)
+        screen = m.screen_text(
+            timeout=REAL_BASIC_SCREEN_CAPTURE_TIMEOUT_SECONDS)
         if predicate(screen):
             return screen
         remaining = deadline - time.monotonic()
@@ -763,6 +784,17 @@ def t_type_line(text):
     return _screen()
 
 
+def t_type_lines(lines):
+    if not isinstance(lines, list):
+        raise TypeError("lines must be an array of strings")
+    if any(not isinstance(line, str) for line in lines):
+        raise TypeError("each line must be a string")
+    m = SESSION.require()
+    m.type_lines(lines)
+    # Each backend owns the per-Return pacing. Only this final screen is read.
+    return _screen()
+
+
 def t_type(text):
     m = SESSION.require()
     m.type(text)
@@ -782,13 +814,123 @@ def t_key(key):
     return _screen()
 
 
-def t_run_basic(program, clear=True, allow_existing_basic=False):
+def _basic_source_lines(program):
+    return [line.rstrip() for line in program.splitlines() if line.rstrip()]
+
+
+def _encode_basic_ascii(program):
+    lines = _basic_source_lines(program)
+    if not lines:
+        return b"\x1a"
+    try:
+        listing = ("\r\n".join(lines) + "\r\n").encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("MSX BASIC ASCII files support ASCII text only") from exc
+    return listing + b"\x1a"
+
+
+def _temporary_basic_filename(drive):
+    if not isinstance(drive, str) or not re.fullmatch(r"[A-Za-z]", drive):
+        raise ValueError("drive must be one DOS drive letter")
+    return drive.upper() + ":MX" + secrets.token_hex(3).upper() + ".BAS"
+
+
+def _run_real_basic_file(m, data, drive):
+    data = bytes(data)
+    if not 1 <= len(data) <= REAL_BASIC_FILE_LIMIT:
+        raise ValueError(
+            f"BASIC file must contain 1..{REAL_BASIC_FILE_LIMIT} bytes")
+    filename = _temporary_basic_filename(drive)
+    m.put_dos_file(filename, data)
+    screen = _wait_for_real_screen(m, _dos_prompt_visible)
+    if not _dos_prompt_visible(screen) or REAL_BASIC_PUT_MARKER not in screen:
+        raise OpenMSXError(
+            "MSXAI /PUT did not confirm the transferred BASIC file. "
+            "The current MSXAI.COM must be reachable from the DOS prompt. "
+            "Last captured screen:\n" + screen)
+
+    m.type_line("BASIC")
+    screen = _wait_for_real_screen(m, _basic_prompt_visible)
+    if not _basic_prompt_visible(screen):
+        raise OpenMSXError(
+            "BASIC did not reach its Ok prompt after the file transfer. "
+            "Last captured screen:\n" + screen)
+    m.type_line(f'LOAD"{filename}"')
+    screen = _wait_for_real_screen(m, _basic_prompt_visible)
+    if not _basic_prompt_visible(screen):
+        raise OpenMSXError(
+            "BASIC could not load the transferred file. "
+            "Last captured screen:\n" + screen)
+    # KILL and RUN share one direct statement: the temporary file is removed
+    # before execution without risking a second line being lost as type-ahead.
+    m.type_line(f'KILL"{filename}":RUN')
+    time.sleep(2.5)
+    return _screen()
+
+
+def _read_basic_file(path, format="auto"):
+    if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        raise ValueError("path must be a non-empty filesystem path")
+    if format not in ("auto", "ascii", "tokenized"):
+        raise ValueError("format must be 'auto', 'ascii' or 'tokenized'")
+    source = pathlib.Path(path).expanduser()
+    if not source.is_absolute():
+        source = PROJ / source
+    try:
+        data = source.read_bytes()
+    except OSError as exc:
+        raise OpenMSXError(f"could not read BASIC file {source}: {exc}") from exc
+    if format == "auto":
+        selected = "tokenized" if data.startswith(b"\xff") else "ascii"
+    else:
+        selected = format
+    if selected == "tokenized":
+        if not data.startswith(b"\xff"):
+            raise ValueError("tokenized MSX BASIC files must start with 0xFF")
+        payload = data
+    else:
+        try:
+            text = data.rstrip(b"\x1a").decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("ASCII BASIC file contains non-ASCII bytes") from exc
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        payload = (normalized.rstrip("\n").replace("\n", "\r\n")
+                   .encode("ascii") + b"\r\n\x1a")
+    if not 1 <= len(payload) <= REAL_BASIC_FILE_LIMIT:
+        raise ValueError(
+            f"BASIC file must contain 1..{REAL_BASIC_FILE_LIMIT} bytes")
+    return payload, selected, source
+
+
+def t_run_basic_file(path, format="auto"):
+    if SESSION.profile != "real":
+        raise OpenMSXError(
+            "direct BASIC-file transfer currently requires a real-agent "
+            "session at an MSX-DOS prompt")
+    data, _selected, _source = _read_basic_file(path, format=format)
+    m = SESSION.require()
+    if not m.feature_bits & FEATURE_FILE_UPLOAD:
+        raise OpenMSXError(
+            "the connected resident does not advertise foreground file upload; "
+            "reinstall the current MSXAI.COM")
+    screen = m.screen_text()
+    if not _dos_prompt_visible(screen):
+        raise OpenMSXError(
+            "msx_run_basic_file requires a visible MSX-DOS prompt; refusing "
+            "to overwrite a running program")
+    return _run_real_basic_file(m, data, _dos_prompt_drive(screen))
+
+
+def t_run_basic(program, clear=True, allow_existing_basic=False,
+                transfer="auto"):
     if not isinstance(program, str):
         raise TypeError("program must be a string")
     if not isinstance(clear, bool):
         raise TypeError("clear must be a boolean")
     if not isinstance(allow_existing_basic, bool):
         raise TypeError("allow_existing_basic must be a boolean")
+    if not isinstance(transfer, str) or transfer not in ("auto", "type", "file"):
+        raise ValueError("transfer must be 'auto', 'type' or 'file'")
     m = SESSION.require()
     real = SESSION.profile == "real"
     # A resident is normally installed from DOS.  Enter BASIC automatically
@@ -796,6 +938,28 @@ def t_run_basic(program, clear=True, allow_existing_basic=False):
     # BASIC over an arbitrary application or game.
     if real:
         screen = m.screen_text()
+        file_data = _encode_basic_ascii(program)
+        file_supported = bool(m.feature_bits & FEATURE_FILE_UPLOAD)
+        if transfer == "file" and not file_supported:
+            raise OpenMSXError(
+                "transfer='file' requires a resident that advertises "
+                "foreground file upload; reinstall the current MSXAI.COM")
+        use_file = (transfer == "file" or
+                    transfer == "auto" and clear and
+                    file_supported and
+                    REAL_BASIC_FILE_THRESHOLD <= len(file_data) <=
+                    REAL_BASIC_FILE_LIMIT and
+                    _dos_prompt_visible(screen))
+        if use_file:
+            if not clear:
+                raise ValueError(
+                    "file transfer replaces the BASIC program and requires "
+                    "clear=true")
+            if not _dos_prompt_visible(screen):
+                raise OpenMSXError(
+                    "BASIC file transfer requires a visible MSX-DOS prompt")
+            return _run_real_basic_file(
+                m, file_data, _dos_prompt_drive(screen))
         if _dos_prompt_visible(screen):
             m.type_line("BASIC")
             screen = _wait_for_real_screen(m, _basic_prompt_visible)
@@ -814,6 +978,9 @@ def t_run_basic(program, clear=True, allow_existing_basic=False):
                 "allow_existing_basic was requested, but the visible screen "
                 "does not end at an MSX BASIC Ok prompt; refusing to type over "
                 "a running application or game")
+    elif transfer == "file":
+        raise OpenMSXError(
+            "file transfer requires a real-agent session at an MSX-DOS prompt")
     if clear:
         m.type_line("NEW")
         if real:
@@ -824,17 +991,10 @@ def t_run_basic(program, clear=True, allow_existing_basic=False):
                     "Last captured screen:\n" + screen)
         else:
             m.advance(0.4)
-    for line in program.splitlines():
-        line = line.rstrip()
-        if not line:
-            continue
-        m.type_line(line)
-        # MSX BASIC does not print a fresh `Ok` after storing a numbered line.
-        # RealMSX.type_line() already waits for the BIOS queue to be consumed
-        # and gives the interpreter a short post-CR settle time.
-        if not real:
-            m.advance(0.3)
-    m.type_line("RUN")
+    lines = _basic_source_lines(program)
+    # One backend operation, one final screen capture. The resident spool keeps
+    # a hard Return barrier, and older agents retain the 39-byte-ring fallback.
+    m.type_lines(lines + ["RUN"])
     if real:
         time.sleep(2.5)
     else:
@@ -1128,6 +1288,13 @@ TOOLS = {
         "reads the hardware key matrix directly will not observe them. Returns "
         "the text screen.",
         _s({"text": {"type": "string"}}, ["text"])),
+    "msx_type_lines": (t_type_lines,
+        "Type multiple logical lines in one operation, adding RETURN after "
+        "each line and reading the text screen only once at the end. A new "
+        "real resident uses its negotiated credit-controlled keyboard spool; "
+        "older agents fall back to safe BIOS-ring pacing.",
+        _s({"lines": {"type": "array",
+                       "items": {"type": "string"}}}, ["lines"])),
     "msx_type": (t_type,
         "Type raw text without adding RETURN. A real resident agent uses the "
         "BIOS keyboard ring and waits for each batch to be consumed.",
@@ -1139,16 +1306,31 @@ TOOLS = {
         "reads the physical key matrix directly will not observe it.",
         _s({"key": {"type": "string"}}, ["key"])),
     "msx_run_basic": (t_run_basic,
-        "Enter a full BASIC program one line at a time, then RUN it and return "
-        "the text screen. On a real resident target, enters BASIC automatically "
+        "Enter and RUN a BASIC program, returning one final text screen. Short "
+        "listings use one credit-controlled batched input operation. On a real "
+        "resident at DOS, larger listings automatically use a temporary ASCII "
+        ".BAS file instead of simulated typing. Set transfer='type' or 'file' "
+        "to override that choice. The real target enters BASIC automatically "
         "when the current screen ends at a DOS prompt. An already-visible BASIC "
         "prompt requires explicit allow_existing_basic=true so an arbitrary "
         "application displaying 'Ok' is not modified. Does NEW first unless "
         "clear=false.",
         _s({"program": {"type": "string"},
             "clear": {"type": "boolean", "default": True},
+            "transfer": {"type": "string",
+                         "enum": ["auto", "type", "file"],
+                         "default": "auto"},
             "allow_existing_basic": {
                 "type": "boolean", "default": False}}, ["program"])),
+    "msx_run_basic_file": (t_run_basic_file,
+        "Transfer an ASCII or tokenized .BAS file over the active MCP/TCP "
+        "agent, load it from MSX-DOS, remove the temporary target file, and "
+        "RUN it. The same transport-neutral MSXAI.COM performs the DOS write "
+        "outside its resident hook. The target must be at a DOS prompt.",
+        _s({"path": {"type": "string", "minLength": 1},
+            "format": {"type": "string",
+                       "enum": ["auto", "ascii", "tokenized"],
+                       "default": "auto"}}, ["path"])),
     "msx_reset": (t_reset,
         "OpenMSX only: reset the MSX and return the boot screen.", _s({})),
     "msx_app_load": (t_app_load,

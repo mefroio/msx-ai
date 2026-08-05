@@ -43,9 +43,9 @@ server/msx_mcp_server.py
   quarantine for the safe resident profile.
 - RAM, VRAM, direct I/O-port access, pause/resume, and host-rendered
   screenshots through the physical agent.
-- BIOS keyboard-buffer input through the resident agent, enabling the same
-  `msx_type`, `msx_type_line`, and `msx_run_basic` MCP workflows on openMSX
-  and physical targets.
+- Credit-controlled BIOS keyboard input through the resident agent, including
+  255-byte batching for `msx_type_lines` and credited, whole-file-CRC-checked
+  ASCII or tokenized `.BAS` transfer for larger programs.
 - Rendering for standard SCREEN 0-8 and SCREEN 10-12 modes, including display
   pages, scroll, palettes, and sprites.
 - A backend-neutral loader for `msx-ai-app-v1` manifests, MSX-DOS COM files,
@@ -262,6 +262,7 @@ case-insensitive:
 | `MSXAI /DRIVER:16C550 /MONITOR` | Start the non-resident foreground monitor with the 16C550 driver |
 | `MSXAI /DRIVER:8251 /MONITOR DEBUG ON` | Start the foreground monitor with visible command tracing |
 | `MSXAI /UNINSTALL` | Remove the named resident TSR safely through MemMan |
+| `MSXAI /PUT <DOS-file> <hex-length> <crc16>` | Receive and write a 1..16 KiB file; used by the host BASIC-file flow |
 | `MSXAI /?` or `MSXAI /HELP` | Display command-line help |
 
 Exactly one `/DRIVER` is required for install or monitor mode.
@@ -269,6 +270,16 @@ Exactly one `/DRIVER` is required for install or monitor mode.
 existing named TSR and changes its selected driver through MemMan instead of
 installing a duplicate. Changing the live driver can disconnect the current
 link, so reconnect through the newly selected interface.
+
+`/PUT` is a transient file sink in the same universal executable. It does not
+install another agent. The host first starts it at the DOS prompt, then sends
+credited 318-byte `U` frames. The resident performs only framed UART and mailbox
+work from `H.TIMI`; the foreground process copies each complete chunk through
+MemMan `TsrCall` and performs the MSX-DOS 2 write. No remote staging write is
+made into the command processor's TPA. `CREATE_NEW` prevents overwriting an
+existing file, a whole-file CRC checks the completed stream, and a no-progress
+timeout deletes a partial file. This path is transport-neutral and works over
+either UART.
 
 Rebuilding or replacing `MSXAI.COM` does not modify a TSR that is already
 resident in MSX memory. To deploy this safety correction, copy the rebuilt
@@ -418,11 +429,32 @@ The negotiated payload limit of the current agent is 320 bytes. Eight
 consecutive credited `ESC` bytes reset a current framed protocol session after
 a lost peer; a single noise byte cannot downgrade it.
 
-The optional `keybuf-input` HELLO feature enables opcode `t`. It atomically
-enqueues bytes in the BIOS keyboard ring and returns accepted/pending counts.
-The host waits for each line to be consumed before sending the next one, so a
-BASIC line editor cannot discard commands queued after Return. Cached v3
-responses also prevent a retried request from typing duplicate characters.
+The optional `keybuf-input` HELLO feature enables compatibility opcode `t`. It
+atomically enqueues up to 39 bytes in the BIOS keyboard ring and returns
+accepted/pending counts. The host uses those counts as credits instead of
+waiting for the ring to become completely empty after every fragment.
+
+Current residents also advertise `keybuf-spool` and accept opcode `T`. It
+accepts a control byte followed by up to 255 bytes into a private circular
+spool and returns little-endian accepted, total-pending, and free-credit counts
+plus state flags. `H.TIMI` drains the spool into the BIOS ring without calling
+BIOS, BDOS, or BASIC. The host explicitly authorizes only one logical line at a
+time. After Return, the resident waits for the BIOS ring to empty and four more
+timer ticks before accepting authorization for the next line. This bounds stale
+input instead of letting several queued commands run after a lost client. If a
+request fails while the session can still transmit,
+the host attempts the cancel control; reconnect also drops private queued
+input. Hosts automatically fall back to opcode `t` with older
+agents, and cached v3 responses prevent duplicate characters after retries.
+
+The `file-upload` feature enables opcode `U`. Its request is
+`offset:u16 | data` with at most 318 data bytes; an offset-only request polls
+credits. Its seven-byte response reports accepted bytes, total received bytes,
+credits, and active/pending/complete/succeeded/failed flags. The terminal
+success flag is published only after foreground CRC, exact-write, and close
+checks pass. The foreground `/PUT` process owns all BDOS calls and exchanges
+one mailbox block at a time with the TSR.
+
 `msx_key` uses that operation for ESC, Return, Tab, Select, and Space. STOP and
 Ctrl+STOP use an idempotent one-byte RAM write to the documented BIOS `INTFLG`
 work-area variable (`FC9Bh`, values `04h` and `03h` respectively). On the real
@@ -540,6 +572,43 @@ Execution constraints depend on the runtime:
 - Bank-switched cartridge images require an explicitly mapper-aware backend;
   the generic loader does not emulate arbitrary cartridge hardware.
 
+## Batched BASIC input and file transfer
+
+`msx_type_lines` accepts an array of logical lines, appends Return to each one,
+and captures the text screen only once after the batch. On a current physical
+resident, the host fills the negotiated keyboard spool in large packets and
+uses its returned credits. On older residents it streams into available BIOS
+ring slots while retaining the same Return barrier.
+
+`msx_run_basic` uses one batched input operation for short listings. When a
+real target is visibly waiting at an MSX-DOS prompt and the normalized ASCII
+listing is at least 512 bytes, `transfer="auto"` instead:
+
+1. starts the transient `MSXAI /PUT` file sink;
+2. streams a CRLF/EOF `.BAS` image in credited, CRC-protected frames;
+3. enters BASIC and loads the temporary file;
+4. deletes the temporary file and runs the loaded program.
+
+Use `transfer="type"` to force keyboard entry or `transfer="file"` to require
+the file path. The latter requires `clear=true`, a DOS prompt, and a resident
+that advertises `file-upload`; `auto` falls back to typing otherwise. One file
+is limited to 16 KiB. `msx_run_basic_file` performs the same flow for a
+host-side `.BAS` file; `format="auto"` preserves tokenized files beginning with
+`0xFF` and normalizes other files as ASCII. No BASIC memory layout or
+host-generated token stream is injected. The temporary file uses the drive
+shown in the current DOS prompt. A disconnect during `/PUT` times out and
+deletes the partial file. A disconnect, BASIC-entry failure, or LOAD failure
+after successful transfer but before BASIC cleanup can leave the collision-safe
+`MXxxxxxx.BAS` file there; it may be deleted normally from DOS.
+
+After the last upload block, the host allows a separate bounded 30-second
+window for the foreground receiver to verify the CRC, close the file, and
+publish terminal success. Subsequent DOS/BASIC prompt polling gives every
+screen capture its full 10-second transfer budget and checks the overall
+30-second prompt deadline only between captures. This prevents a slow 8251
+screen read from being started with an unusably small remainder and
+quarantining an otherwise healthy MCP/TCP session.
+
 ## Main MCP tools
 
 | Group | Tools |
@@ -548,7 +617,7 @@ Execution constraints depend on the runtime:
 | Execution | `msx_asm_load`, `msx_app_load`, `msx_pause`, `msx_resume`, `msx_stop` |
 | Memory/video | `msx_memory_read`, `msx_memory_write`, `msx_screen`, `msx_screenshot` |
 | Hardware | `msx_io_read`, `msx_io_write`, `msx_slot_select`, `msx_mapper_select` |
-| Input | `msx_type`, `msx_type_line`, `msx_run_basic`, and `msx_key` (both backends) |
+| Input | `msx_type`, `msx_type_line`, `msx_type_lines`, `msx_run_basic`, `msx_run_basic_file`, and `msx_key` |
 | openMSX/DOS | `msx_dos_asm_run`, `msx_disk_put_text`, `msx_reset`, `msx_cmd` |
 
 Resident keyboard injection feeds the standard BIOS ring and therefore works

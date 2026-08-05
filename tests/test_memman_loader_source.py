@@ -157,6 +157,49 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld de,COM_ENTRY", handoff)
         self.assertIn("ldir\n    jp COM_ENTRY", handoff)
 
+    def test_put_action_streams_mailbox_chunks_only_from_foreground(self):
+        core = (ROOT / "agent" / "msx_agent_core.asm").read_text(
+            encoding="utf-8")
+        self.assertIn("LOADER_ACTION_PUT: equ 2", core)
+        self.assertIn('db "/PUT",0', core)
+        self.assertIn(
+            'db "  MSXAI /PUT <DOS-file> <hex-bytes> <crc16>"', core)
+        parser = core.split("loader_parse_put:", 1)[1].split(
+            "loader_parse_tokens_done:", 1)[0]
+        self.assertIn("call loader_copy_put_filename", parser)
+        self.assertIn("call loader_parse_put_length", parser)
+        self.assertIn("call loader_parse_put_crc", parser)
+        self.assertIn("ld a,(loader_action)", parser)
+        self.assertIn("ld a,LOADER_ACTION_PUT", parser)
+
+        put = self.source.split("loader_put_file:", 1)[1].split(
+            "; Both entry points consume", 1)[0]
+        self.assertNotIn("08000h", put)
+        self.assertIn("call memman_find_agent", put)
+        self.assertIn("TSR_TALK_UPLOAD_BEGIN", put)
+        self.assertIn("TSR_TALK_UPLOAD_POLL", put)
+        self.assertIn("TSR_TALK_UPLOAD_END", put)
+        self.assertIn("ld hl,loader_put_buffer", put)
+        self.assertIn("call loader_put_crc_update", put)
+        self.assertIn("FILE_UPLOAD_TIMEOUT_TICKS", put)
+        self.assertIn("ld b,CREATE_NEW", put)
+        self.assertIn("call write_exact", put)
+        self.assertIn("ld c,DOS_CLOSE", put)
+        self.assertIn("ld c,DOS_HDELETE", put)
+        self.assertIn("ld c,DOS_DELETE", put)
+        self.assertIn("MSXAI PUT READY", put)
+        self.assertIn("MSXAI PUT OK", put)
+        self.assertIn("MSXAI PUT ERROR", put)
+        talk = self.source.split("loader_put_tsr_call:", 1)[1].split(
+            "loader_put_commit_upload:", 1)[0]
+        self.assertIn("call EXTBIO", talk)
+        self.assertIn("ei", talk)
+        terminal = self.source.split("loader_put_commit_upload:", 1)[1].split(
+            "; Incremental CRC", 1)[0]
+        self.assertIn("ld hl,1", terminal)
+        self.assertIn("loader_put_abort_upload:", terminal)
+        self.assertIn("ld hl,0", terminal)
+
 
 if __name__ == "__main__":
     unittest.main()

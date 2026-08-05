@@ -297,17 +297,39 @@ mailbox: dw 0
         status = self.status()
         self.assertEqual(status["runtime_mode"], "resident")
         self.assertIn("keybuf-input", status["features"])
+        self.assertIn("keybuf-spool", status["features"])
+        self.assertIn("file-upload", status["features"])
+
+        # A listing above the automatic threshold is streamed through the
+        # resident mailbox and persisted by foreground MSXAI /PUT. No openMSX
+        # disk import, TPA staging write or keyboard API carries the file data.
+        file_lines = [
+            f"{10 + index * 10} REM " + ("X" * 36)
+            for index in range(14)
+        ]
+        file_lines.append('200 PRINT "MCP FILE OK"')
+        file_screen = self.call_tool(
+            "msx_run_basic", program="\n".join(file_lines),
+            clear=True)[0]["text"]
+        self.assertIn("MCP FILE OK", file_screen, file_screen)
 
         # The first source line exceeds the BIOS ring's 39-byte capacity.  The
         # host must split it without letting BASIC discard a following line at
-        # the Return boundary.  msx_run_basic also enters BASIC from DOS here.
+        # the Return boundary. The target is already at BASIC after the file
+        # transfer, so the safety opt-in is explicit.
         program = (
             '10 A$="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"\n'
             '20 PRINT "MCP TYPE OK ";LEN(A$)')
         screen = self.call_tool(
-            "msx_run_basic", program=program, clear=True)[0]["text"]
+            "msx_run_basic", program=program, clear=True,
+            allow_existing_basic=True, transfer="type")[0]["text"]
         self.assertIn("MCP TYPE OK", screen, screen)
         self.assertIn("36", screen, screen)
+
+        screen = self.call_tool(
+            "msx_type_lines",
+            lines=['PRINT "BATCH ONE"', 'PRINT "BATCH TWO"'])[0]["text"]
+        self.assertIn("BATCH TWO", screen, screen)
 
         # Exercise raw msx_type followed by msx_type_line on the same resident
         # connection; no openMSX input API participates in either operation.

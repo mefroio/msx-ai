@@ -157,6 +157,83 @@ class ResidentAgentSourceTests(unittest.TestCase):
         for forbidden in ("call bdos_proxy", "call CHGET", "call CHPUT"):
             self.assertNotIn(forbidden, keybuf)
 
+    def test_credit_controlled_keyboard_spool_is_bounded_and_return_safe(self):
+        self.assertRegex(
+            self.source,
+            r"(?m)^FEATURE_KEYBUF_SPOOL:\s+equ\s+020h\b")
+        self.assertRegex(
+            self.source,
+            r"(?m)^KEYBUF_SPOOL_CAPACITY:\s+equ\s+255\b")
+        features = self.source.split(
+            "current_features_resident:", 1)[1].split("cmd_status:", 1)[0]
+        self.assertIn("FEATURE_KEYBUF_SPOOL", features)
+        dispatch = self.source.split("frame_dispatch:", 1)[1].split(
+            "frame_require_length:", 1)[0]
+        self.assertRegex(
+            dispatch, r"(?s)cp 't'.*frame_cmd_keybuf_input.*"
+                      r"cp 'T'.*frame_cmd_keybuf_spool")
+
+        storage = self.source.split("keybuf_spool_get:", 1)[1].split(
+            "resident_initialize:", 1)[0]
+        self.assertIn("ds 256,0", storage)
+        self.assertIn("dw keybuf_spool_buffer", storage)
+        self.assertEqual(self.source.count("call nz,keybuf_spool_drain"), 2)
+
+        spool = self.source.split("keybuf_spool_reset:", 1)[1].split(
+            "frame_cmd_ram_read:", 1)[0]
+        self.assertIn("cp 13", spool)
+        self.assertIn("KEYBUF_SPOOL_SETTLE_TICKS", spool)
+        self.assertIn("ld (PUTPNT),hl", spool)
+        self.assertIn("ld hl,7", spool)
+        self.assertIn("cpl", spool)
+        self.assertRegex(
+            spool,
+            r"cpl\s+; 255 - count = writable spool credits\s+"
+            r"or a\s+; CPL preserves Z on Z80; test the credits now\s+"
+            r"jr z,frame_keybuf_spool_authorize")
+        self.assertIn("KEYBUF_SPOOL_REQUEST_PUMP", spool)
+        self.assertIn("KEYBUF_SPOOL_REQUEST_CANCEL", spool)
+        self.assertIn("keybuf_spool_authorized", spool)
+        self.assertIn("the host must authorize the next line", spool)
+        reconnect = self.source.split("frame_rebootstrap:", 1)[1].split(
+            "frame_magic_found:", 1)[0]
+        self.assertIn("call keybuf_spool_reset", reconnect)
+        for forbidden in ("call bdos_proxy", "call CHGET", "call CHPUT"):
+            self.assertNotIn(forbidden, spool)
+
+    def test_file_upload_uses_a_credited_resident_mailbox_without_bdos(self):
+        self.assertRegex(
+            self.source, r"(?m)^FEATURE_FILE_UPLOAD:\s+equ\s+040h\b")
+        features = self.source.split(
+            "current_features_resident:", 1)[1].split("cmd_status:", 1)[0]
+        self.assertIn("FEATURE_FILE_UPLOAD", features)
+        dispatch = self.source.split("frame_dispatch:", 1)[1].split(
+            "frame_require_length:", 1)[0]
+        self.assertRegex(dispatch, r"(?s)cp 'U'.*frame_cmd_file_upload")
+        upload = self.source.split("frame_cmd_file_upload:", 1)[1].split(
+            "frame_cmd_ram_read:", 1)[0]
+        self.assertIn("UPLOAD_CHUNK_CAPACITY", upload)
+        self.assertIn("ld de,upload_buffer", upload)
+        self.assertIn("ld (upload_pending),a", upload)
+        self.assertIn("ld hl,7", upload)
+        self.assertIn("UPLOAD_FLAG_SUCCEEDED", upload)
+        self.assertIn("UPLOAD_FLAG_FAILED", upload)
+        for forbidden in ("00005h", "bdos_proxy", "DOS_WRITE"):
+            self.assertNotIn(forbidden, upload)
+        talk = self.source.split("tsr_talk:", 1)[1].split(
+            "tsr_talk_unsupported:", 1)[0]
+        for action in ("TSR_TALK_UPLOAD_BEGIN", "TSR_TALK_UPLOAD_POLL",
+                       "TSR_TALK_UPLOAD_END"):
+            self.assertIn(action, talk)
+        poll = self.source.split("tsr_talk_upload_poll:", 1)[1].split(
+            "tsr_talk_upload_waiting:", 1)[0]
+        self.assertIn("cp 040h", poll)
+        self.assertIn("add hl,bc", poll)
+        end = self.source.split("tsr_talk_upload_end:", 1)[1].split(
+            "tsr_talk_unsupported:", 1)[0]
+        self.assertIn("UPLOAD_RESULT_SUCCEEDED", end)
+        self.assertIn("UPLOAD_RESULT_FAILED", end)
+
     def test_memman_registers_keyi_guard_and_timi_dispatch(self):
         hook_spec = self.tsr_builder_source.split("hooks=(", 1)[1].split(
             "record_size=", 1)[0]

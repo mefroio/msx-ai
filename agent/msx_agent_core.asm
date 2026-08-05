@@ -30,6 +30,14 @@
 ;   z                         -> 'K', uninstall (monitor state only)
 ; Framed v3 adds a resident-only bounded snapshot pause:
 ;   S lease                   -> OK, pause; 'g' resumes before lease expiry
+; and negotiated batched keyboard input:
+;   T [control data...]       -> accepted/pending/credits/input-state
+; and foreground file-receiver mailbox input:
+;   U offset-lo offset-hi data... -> accepted/received/credits/upload-state
+;
+; The transient universal COM also accepts `/PUT file hex-length crc16`. It
+; receives framed chunks through the resident and writes them through BDOS,
+; outside every resident hook and without pre-overwriting the DOS TPA.
 ;
 ; This cooperative monitor requires maskable interrupts and the BIOS H.TIMI
 ; chain to remain active. UART receive IRQs stay masked: a game that replaces
@@ -74,7 +82,29 @@ FEATURE_DEBUG_PEER:  equ 002h ; foreground DEBUG peer label, bit 1
 FEATURE_SNAPSHOT_LEASE: equ 004h ; bounded resident snapshot pause, bit 2
 FEATURE_FRAME_WAKE_ACK: equ 008h ; parser-ready ACK after framed magic byte
 FEATURE_TIMI_POLL_SAFE: equ 010h ; resident is polled only from BIOS H.TIMI
+FEATURE_KEYBUF_SPOOL:   equ 020h ; 255-byte resident keyboard spool, bit 5
+FEATURE_FILE_UPLOAD:    equ 040h ; foreground DOS file receiver, bit 6
 DEBUG_PEER_MAX:      equ 63
+KEYBUF_SPOOL_CAPACITY: equ 255
+KEYBUF_SPOOL_SETTLE_TICKS: equ 4 ; wait about 67 ms at the standard 60-Hz TIMI
+KEYBUF_SPOOL_REQUEST_PUMP: equ 1
+KEYBUF_SPOOL_REQUEST_CANCEL: equ 2
+KEYBUF_SPOOL_FLAG_BARRIER: equ 1
+KEYBUF_SPOOL_FLAG_ACTIVE: equ 2
+KEYBUF_SPOOL_FLAG_AUTHORIZED: equ 4
+UPLOAD_CHUNK_CAPACITY: equ FRAMED_MAX - 2 ; two request bytes carry the offset
+UPLOAD_FLAG_ACTIVE: equ 1
+UPLOAD_FLAG_PENDING: equ 2
+UPLOAD_FLAG_COMPLETE: equ 4
+UPLOAD_FLAG_SUCCEEDED: equ 8
+UPLOAD_FLAG_FAILED: equ 16
+UPLOAD_RESULT_NONE: equ 0
+UPLOAD_RESULT_SUCCEEDED: equ 1
+UPLOAD_RESULT_FAILED: equ 2
+TSR_TALK_CONFIG: equ 0A5h
+TSR_TALK_UPLOAD_BEGIN: equ 0A6h
+TSR_TALK_UPLOAD_POLL: equ 0A7h
+TSR_TALK_UPLOAD_END: equ 0A8h
 ; The hook stack has no recursion, no local frame buffers and never calls user
 ; code. A static high-water audit stays below 64 bytes; 224 bytes leaves more
 ; than three times that headroom while keeping the universal build below BDOS.
@@ -84,6 +114,7 @@ RUNTIME_RESIDENT: equ 0
 RUNTIME_MONITOR:  equ 1
 LOADER_ACTION_INSTALL: equ 0
 LOADER_ACTION_UNINSTALL: equ 1
+LOADER_ACTION_PUT: equ 2
 TRANSPORT_FLAG_KEYI_EXCLUSIVE: equ 1
 TRANSPORT_FLAG_TIMI_ONLY:      equ 2
 TRANSPORT_FLAG_FRAME_WAKE_ACK: equ 4
@@ -121,6 +152,10 @@ installer:
     ld (loader_entry_sp),sp
     call loader_parse_command_line
     jp c,loader_usage_exit
+
+    ld a,(loader_action)
+    cp LOADER_ACTION_PUT
+    jp z,loader_put_file
 
     ld de,install_banner
     ld c,9
@@ -378,6 +413,7 @@ usage_message:
     db "  MSXAI /DRIVER:8251 /MONITOR [DEBUG ON]",13,10
     db "  MSXAI /DRIVER:16C550 /MONITOR [DEBUG ON]",13,10
     db "  MSXAI /UNINSTALL",13,10
+    db "  MSXAI /PUT <DOS-file> <hex-bytes> <crc16>",13,10
     db "DEBUG ON is intentionally restricted to /MONITOR.",13,10,"$"
 driver_required_message:
     db "Select exactly one /DRIVER:8251 or /DRIVER:16C550",13,10,"$"
@@ -387,6 +423,8 @@ debug_syntax_message:
     db "DEBUG must be followed by ON",13,10,"$"
 uninstall_syntax_message:
     db "/UNINSTALL cannot be combined with driver, monitor, or debug options",13,10,"$"
+put_syntax_message:
+    db "/PUT requires a DOS filename, 0001h..4000h bytes, and CRC16",13,10,"$"
 unknown_option_message:
     db "Unknown command-line option",13,10,"$"
 loader_transport_id:
@@ -399,6 +437,16 @@ loader_action:
     db LOADER_ACTION_INSTALL
 loader_command_buffer:
     ds 128,0
+loader_put_filename:
+    ds 16,0
+loader_put_length:
+    dw 0
+loader_put_crc_expected:
+    dw 0
+; TsrCall temporarily maps the resident into page 1. Keep this foreground
+; transfer buffer in page 0 so it remains addressable throughout the copy.
+loader_put_buffer:
+    ds UPLOAD_CHUNK_CAPACITY,0
 
 loader_parse_command_line:
     ld a,0FFh
@@ -461,6 +509,9 @@ loader_parse_token_loop:
     ld de,option_uninstall
     call loader_token_equals
     jr z,loader_parse_uninstall
+    ld de,option_put
+    call loader_token_equals
+    jp z,loader_parse_put
     ld de,unknown_option_message
     jp loader_parse_error
 
@@ -475,7 +526,7 @@ loader_parse_8251:
 loader_parse_16c550:
     ld a,(loader_transport_id)
     cp 0FFh
-    jr nz,loader_parse_driver_error
+    jp nz,loader_parse_driver_error
     ld a,UART16C550_ID
     ld (loader_transport_id),a
     call loader_skip_token
@@ -490,7 +541,7 @@ loader_parse_debug:
     call loader_skip_spaces
     ld de,option_on
     call loader_token_equals
-    jr nz,loader_parse_debug_syntax_error
+    jp nz,loader_parse_debug_syntax_error
     ld a,1
     ld (loader_debug_enabled),a
     call loader_skip_token
@@ -498,11 +549,48 @@ loader_parse_debug:
 loader_parse_uninstall:
     ld a,(loader_action)
     or a
-    jr nz,loader_parse_uninstall_error
+    jp nz,loader_parse_uninstall_error
     ld a,LOADER_ACTION_UNINSTALL
     ld (loader_action),a
     call loader_skip_token
     jp loader_parse_token_loop
+
+loader_parse_put:
+    ; /PUT is a complete foreground action, not an install option. It receives
+    ; framed data through the installed resident and writes it through BDOS.
+    ld a,(loader_action)
+    or a
+    jr nz,loader_parse_put_error
+    ld a,(loader_transport_id)
+    cp 0FFh
+    jr nz,loader_parse_put_error
+    ld a,(loader_runtime_mode)
+    or a
+    jr nz,loader_parse_put_error
+    ld a,(loader_debug_enabled)
+    or a
+    jr nz,loader_parse_put_error
+    call loader_skip_token
+    call loader_skip_spaces
+    call loader_copy_put_filename
+    jr c,loader_parse_put_error
+    call loader_skip_spaces
+    call loader_parse_put_length
+    jr c,loader_parse_put_error
+    call loader_skip_spaces
+    call loader_parse_put_crc
+    jr c,loader_parse_put_error
+    call loader_skip_spaces
+    ld a,(hl)
+    or a
+    jr nz,loader_parse_put_error
+    ld a,LOADER_ACTION_PUT
+    ld (loader_action),a
+    or a
+    ret
+loader_parse_put_error:
+    ld de,put_syntax_message
+    jp loader_parse_error
 
 loader_parse_tokens_done:
     ld a,(loader_action)
@@ -634,8 +722,161 @@ option_on:
     db "ON",0
 option_uninstall:
     db "/UNINSTALL",0
+option_put:
+    db "/PUT",0
 loader_old_bdos:
     dw 0
+
+; Copy one whitespace-delimited DOS pathname. The direct DOS API receives the
+; ASCIIZ value, so this is not shell text; the limit prevents buffer overflow.
+loader_copy_put_filename:
+    ld de,loader_put_filename
+    ld b,15
+    ld c,0
+loader_copy_put_filename_loop:
+    ld a,(hl)
+    or a
+    jr z,loader_copy_put_filename_done
+    cp ' '
+    jr z,loader_copy_put_filename_done
+    cp 9
+    jr z,loader_copy_put_filename_done
+    ld a,b
+    or a
+    jr z,loader_copy_put_filename_error
+    ld a,(hl)
+    ld (de),a
+    inc hl
+    inc de
+    inc c
+    dec b
+    jr loader_copy_put_filename_loop
+loader_copy_put_filename_done:
+    ld a,c
+    or a
+    jr z,loader_copy_put_filename_error
+    xor a
+    ld (de),a
+    ret
+loader_copy_put_filename_error:
+    scf
+    ret
+
+; Parse a 1..4-digit hexadecimal byte count and constrain it to 16 KiB.
+; Input/output HL points into loader_command_buffer.
+loader_parse_put_length:
+    ld de,0
+    ld b,0
+loader_parse_put_length_loop:
+    ld a,(hl)
+    or a
+    jr z,loader_parse_put_length_done
+    cp ' '
+    jr z,loader_parse_put_length_done
+    cp 9
+    jr z,loader_parse_put_length_done
+    call loader_hex_nibble
+    jr c,loader_parse_put_length_error
+    ld c,a
+    ld a,d
+    and 0F0h
+    jr nz,loader_parse_put_length_error
+    sla e
+    rl d
+    sla e
+    rl d
+    sla e
+    rl d
+    sla e
+    rl d
+    ld a,e
+    or c
+    ld e,a
+    inc b
+    inc hl
+    jr loader_parse_put_length_loop
+loader_parse_put_length_done:
+    ld a,b
+    or a
+    jr z,loader_parse_put_length_error
+    ld a,d
+    or e
+    jr z,loader_parse_put_length_error
+    ld (loader_put_length),de
+    push hl
+    ld hl,04000h
+    or a
+    sbc hl,de
+    pop hl
+    ret nc
+loader_parse_put_length_error:
+    scf
+    ret
+
+; Parse exactly four hexadecimal CRC-16 digits. Input/output HL points into
+; loader_command_buffer, matching loader_parse_put_length's calling contract.
+loader_parse_put_crc:
+    ld de,0
+    ld b,0
+loader_parse_put_crc_loop:
+    ld a,(hl)
+    or a
+    jr z,loader_parse_put_crc_done
+    cp ' '
+    jr z,loader_parse_put_crc_done
+    cp 9
+    jr z,loader_parse_put_crc_done
+    ld a,b
+    cp 4
+    jr nc,loader_parse_put_crc_error
+    ld a,(hl)
+    call loader_hex_nibble
+    jr c,loader_parse_put_crc_error
+    ld c,a
+    sla e
+    rl d
+    sla e
+    rl d
+    sla e
+    rl d
+    sla e
+    rl d
+    ld a,e
+    or c
+    ld e,a
+    inc b
+    inc hl
+    jr loader_parse_put_crc_loop
+loader_parse_put_crc_done:
+    ld a,b
+    cp 4
+    jr nz,loader_parse_put_crc_error
+    ld (loader_put_crc_expected),de
+    or a
+    ret
+loader_parse_put_crc_error:
+    scf
+    ret
+
+loader_hex_nibble:
+    cp '0'
+    jr c,loader_hex_nibble_error
+    cp '9' + 1
+    jr c,loader_hex_nibble_digit
+    cp 'A'
+    jr c,loader_hex_nibble_error
+    cp 'F' + 1
+    jr nc,loader_hex_nibble_error
+    sub 'A' - 10
+    or a
+    ret
+loader_hex_nibble_digit:
+    sub '0'
+    or a
+    ret
+loader_hex_nibble_error:
+    scf
+    ret
 
 install_inconsistent:
     ld de,inconsistent_message
@@ -789,6 +1030,43 @@ saved_context_sp:
     dw 0
 hook_dispatch_sp:
     dw 0
+keybuf_spool_get:
+    dw keybuf_spool_buffer
+keybuf_spool_put:
+    dw keybuf_spool_buffer
+keybuf_spool_count:
+    db 0
+keybuf_spool_barrier:
+    db 0
+keybuf_spool_settle:
+    db 0
+keybuf_spool_line_active:
+    db 0
+keybuf_spool_authorized:
+    db 0
+keybuf_spool_accepted:
+    dw 0
+keybuf_spool_buffer:
+    ds 256,0
+keybuf_spool_buffer_end:
+upload_active:
+    db 0
+upload_pending:
+    db 0
+upload_expected:
+    dw 0
+upload_received:
+    dw 0
+upload_chunk_length:
+    dw 0
+upload_request_length:
+    dw 0
+upload_accepted:
+    dw 0
+upload_result:
+    db UPLOAD_RESULT_NONE
+upload_buffer:
+    ds UPLOAD_CHUNK_CAPACITY,0
 
 resident_initialize:
     di
@@ -811,6 +1089,8 @@ resident_initialize:
     ld (snapshot_lease_reload),a
     ld (post_action_pending),a
     ld (debug_column),a
+    call keybuf_spool_reset
+    call upload_reset
     ld a,(runtime_mode)
     cp RUNTIME_RESIDENT
     ret nz
@@ -828,6 +1108,8 @@ monitor_reset:
     ld (snapshot_lease),a
     ld (snapshot_lease_reload),a
     ld (post_action_pending),a
+    call keybuf_spool_reset
+    call upload_reset
 main_loop:
     call receive_dispatch
     jr main_loop
@@ -952,6 +1234,9 @@ hook_chain_ready:
     ld (chain_keyi),a
     ld a,(hook_kind)
     or a
+    call nz,keybuf_spool_drain
+    ld a,(hook_kind)
+    or a
     jr nz,hook_poll_transport
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_TIMI_ONLY
@@ -1067,6 +1352,9 @@ hook_initial_chain:
     ld a,1
 hook_chain_ready:
     ld (chain_keyi),a
+    ld a,(hook_kind)
+    or a
+    call nz,keybuf_spool_drain
     ld a,(hook_kind)
     or a
     jr nz,hook_poll_transport
@@ -1301,7 +1589,7 @@ current_features_transport_ready:
     ret
 current_features_resident:
     ld a,b
-    or FEATURE_KEYBUF_INPUT | FEATURE_SNAPSHOT_LEASE
+    or FEATURE_KEYBUF_INPUT | FEATURE_SNAPSHOT_LEASE | FEATURE_KEYBUF_SPOOL | FEATURE_FILE_UPLOAD
     ld b,a
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_TIMI_ONLY
@@ -1840,6 +2128,8 @@ frame_rebootstrap:
     ld (last_response_valid),a
     ld (last_request_valid),a
     ld (frame_reconnect_count),a
+    call keybuf_spool_reset
+    call upload_reset
     ld hl,0
     ld (next_sequence),hl
     jp cmd_hello
@@ -2017,6 +2307,10 @@ frame_dispatch:
     jp z,frame_cmd_status
     cp 't'
     jp z,frame_cmd_keybuf_input
+    cp 'T'
+    jp z,frame_cmd_keybuf_spool
+    cp 'U'
+    jp z,frame_cmd_file_upload
     cp 'I'
     jp z,frame_cmd_debug_peer
     cp 'r'
@@ -2390,6 +2684,17 @@ frame_cmd_keybuf_input:
     ld a,(run_state)
     cp 1
     jp nz,frame_reply_bad_state
+    ld a,(keybuf_spool_count)
+    ld b,a
+    ld a,(keybuf_spool_barrier)
+    or b
+    ld b,a
+    ld a,(keybuf_spool_line_active)
+    or b
+    ld b,a
+    ld a,(keybuf_spool_authorized)
+    or b
+    jp nz,frame_reply_bad_state ; never interleave legacy and spooled input
     ld hl,(frame_length)
     ld a,h
     or a
@@ -2516,6 +2821,471 @@ keybuf_pointer_invalid:
     pop hl
     scf
     ret
+
+; The negotiated uppercase-T command decouples wire-sized input frames from
+; the BIOS ring's 39-byte capacity. The resident drains at most one explicitly
+; host-authorized line at a time. After publishing Return it waits for the BIOS
+; queue to empty and four more H.TIMI ticks. A lost peer therefore cannot make
+; the remaining queued lines execute autonomously.
+keybuf_spool_reset:
+    xor a
+    ld (keybuf_spool_count),a
+    ld (keybuf_spool_barrier),a
+    ld (keybuf_spool_settle),a
+    ld (keybuf_spool_line_active),a
+    ld (keybuf_spool_authorized),a
+    ld (keybuf_spool_accepted),a
+    ld (keybuf_spool_accepted + 1),a
+    ld hl,keybuf_spool_buffer
+    ld (keybuf_spool_get),hl
+    ld (keybuf_spool_put),hl
+    ret
+
+; Abort only input owned by MCP. Explicit host cancellation also calls the
+; variant below to discard bytes already published in the BIOS keyboard ring.
+keybuf_spool_cancel:
+    call keybuf_spool_reset
+    ld hl,(GETPNT)
+    ld (PUTPNT),hl
+    ret
+
+upload_reset:
+    xor a
+    ld (upload_active),a
+    ld (upload_pending),a
+    ld (upload_expected),a
+    ld (upload_expected + 1),a
+    ld (upload_received),a
+    ld (upload_received + 1),a
+    ld (upload_chunk_length),a
+    ld (upload_chunk_length + 1),a
+    ld (upload_request_length),a
+    ld (upload_request_length + 1),a
+    ld (upload_accepted),a
+    ld (upload_accepted + 1),a
+    ld (upload_result),a
+    ret
+
+; Called only from H.TIMI after the interrupted context is fully saved. It
+; touches the BIOS work area directly and never calls BIOS, BDOS or BASIC.
+keybuf_spool_drain:
+    ld a,(runtime_mode)
+    cp RUNTIME_RESIDENT
+    ret nz
+    ld a,(run_state)
+    cp 1
+    ret nz
+    ld a,(keybuf_spool_count)
+    ld b,a
+    ld a,(keybuf_spool_barrier)
+    or b
+    ret z                       ; zero overhead beyond this guard when idle
+    call keybuf_pending
+    ret c
+
+    ld a,(keybuf_spool_barrier)
+    or a
+    jr z,keybuf_spool_drain_ready
+    ld a,b                     ; Return is not consumed until KEYBUF is empty
+    or a
+    ret nz
+    ld a,(keybuf_spool_settle)
+    or a
+    jr z,keybuf_spool_release_barrier
+    dec a
+    ld (keybuf_spool_settle),a
+    ret
+keybuf_spool_release_barrier:
+    xor a
+    ld (keybuf_spool_barrier),a
+    ret                         ; the host must authorize the next line
+
+keybuf_spool_drain_ready:
+    ld a,(keybuf_spool_count)
+    or a
+    ret z
+    ld a,(keybuf_spool_line_active)
+    or a
+    jr nz,keybuf_spool_line_ready
+    ld a,(keybuf_spool_authorized)
+    or a
+    ret z
+    xor a
+    ld (keybuf_spool_authorized),a
+    inc a
+    ld (keybuf_spool_line_active),a
+keybuf_spool_line_ready:
+    ld a,KEYBUF_SIZE - 1
+    sub b
+    ret z
+    ld c,a                     ; available BIOS-ring credits
+    ld hl,(PUTPNT)
+    ld de,(keybuf_spool_get)
+
+keybuf_spool_drain_loop:
+    ld a,(keybuf_spool_count)
+    or a
+    jr z,keybuf_spool_drain_publish
+    ld a,c
+    or a
+    jr z,keybuf_spool_drain_publish
+
+    ld a,(de)
+    ld b,a                     ; preserve the byte for the Return barrier
+    ld (hl),a
+    inc de
+    push hl
+    ld hl,keybuf_spool_buffer_end
+    or a
+    sbc hl,de
+    pop hl
+    jr nz,keybuf_spool_drain_spool_ready
+    ld de,keybuf_spool_buffer
+keybuf_spool_drain_spool_ready:
+    inc hl
+    ld a,h
+    cp KEYBUF_END >> 8
+    jr nz,keybuf_spool_drain_ring_ready
+    ld a,l
+    cp KEYBUF_END & 0FFh
+    jr nz,keybuf_spool_drain_ring_ready
+    ld hl,KEYBUF
+keybuf_spool_drain_ring_ready:
+    ld a,(keybuf_spool_count)
+    dec a
+    ld (keybuf_spool_count),a
+    dec c
+    ld a,b
+    cp 13
+    jr nz,keybuf_spool_drain_loop
+    ld a,1
+    ld (keybuf_spool_barrier),a
+    xor a
+    ld (keybuf_spool_line_active),a
+    ld (keybuf_spool_authorized),a
+    ld a,KEYBUF_SPOOL_SETTLE_TICKS
+    ld (keybuf_spool_settle),a
+
+keybuf_spool_drain_publish:
+    ; Publish the BIOS write pointer only after every copied byte is present.
+    ld (keybuf_spool_get),de
+    ld (PUTPNT),hl
+    ld a,(keybuf_spool_count)
+    or a
+    ret nz
+    ld a,(keybuf_spool_barrier)
+    or a
+    ret nz
+    xor a
+    ld (keybuf_spool_line_active),a
+    ret
+
+; Request payload: empty to query, otherwise control:u8 plus up to 255 keyboard
+; bytes. Control bit 0 authorizes one logical line; bit 1 atomically cancels the
+; spool and BIOS queue and must be sent alone. Response (little-endian):
+; accepted:u16, pending:u16, credits:u16, flags:u8. Response flag bits report
+; Return barrier, active line and unused line authorization respectively.
+frame_cmd_keybuf_spool:
+    ld a,(runtime_mode)
+    cp RUNTIME_RESIDENT
+    jp nz,frame_reply_bad_state
+    ld a,(in_hook)
+    or a
+    jp z,frame_reply_bad_state
+    ld a,(run_state)
+    cp 1
+    jp nz,frame_reply_bad_state
+    call keybuf_pending
+    jp c,frame_reply_range
+    xor a
+    ld (keybuf_spool_accepted),a
+    ld (keybuf_spool_accepted + 1),a
+    ld de,(frame_length)
+    ld hl,0100h                ; control plus at most 255 data bytes
+    or a
+    sbc hl,de
+    jp c,frame_reply_range
+    ld hl,(frame_length)
+    ld a,h
+    or l
+    jp z,frame_keybuf_spool_reply
+
+    ld a,(frame_request_buffer)
+    ld b,a
+    and 0FFh - KEYBUF_SPOOL_REQUEST_PUMP - KEYBUF_SPOOL_REQUEST_CANCEL
+    jp nz,frame_reply_bad_arg
+    ld a,b
+    and KEYBUF_SPOOL_REQUEST_CANCEL
+    jr z,frame_keybuf_spool_data
+    ld a,b
+    cp KEYBUF_SPOOL_REQUEST_CANCEL
+    jp nz,frame_reply_bad_arg
+    ld hl,(frame_length)
+    ld de,1
+    or a
+    sbc hl,de
+    jp nz,frame_reply_bad_arg
+    call keybuf_spool_cancel
+    jr frame_keybuf_spool_reply
+
+frame_keybuf_spool_data:
+    ld hl,(frame_length)
+    dec hl                      ; exclude the control byte
+    ld c,l                     ; high byte is zero after the 0100h bound
+    ld a,(keybuf_spool_count)
+    cpl                        ; 255 - count = writable spool credits
+    or a                       ; CPL preserves Z on Z80; test the credits now
+    jr z,frame_keybuf_spool_authorize
+    cp c
+    jr c,frame_keybuf_spool_accept_ready
+    ld a,c
+frame_keybuf_spool_accept_ready:
+    ld (keybuf_spool_accepted),a
+    or a
+    jr z,frame_keybuf_spool_authorize
+    ld b,a
+    ld hl,(keybuf_spool_put)
+    ld de,frame_request_buffer + 1
+frame_keybuf_spool_copy_loop:
+    ld a,(de)
+    ld (hl),a
+    inc de
+    inc hl
+    push hl
+    push de
+    ld de,keybuf_spool_buffer_end
+    or a
+    sbc hl,de
+    pop de
+    pop hl
+    jr nz,frame_keybuf_spool_copy_ready
+    ld hl,keybuf_spool_buffer
+frame_keybuf_spool_copy_ready:
+    djnz frame_keybuf_spool_copy_loop
+    ld (keybuf_spool_put),hl
+    ld a,(keybuf_spool_accepted)
+    ld b,a
+    ld a,(keybuf_spool_count)
+    add a,b
+    ld (keybuf_spool_count),a
+
+frame_keybuf_spool_authorize:
+    ld a,(frame_request_buffer)
+    and KEYBUF_SPOOL_REQUEST_PUMP
+    jr z,frame_keybuf_spool_reply
+    ld a,(keybuf_spool_barrier)
+    or a
+    jr nz,frame_keybuf_spool_reply
+    ld a,(keybuf_spool_line_active)
+    or a
+    jr nz,frame_keybuf_spool_reply
+    ld a,(keybuf_spool_count)
+    or a
+    jr z,frame_keybuf_spool_reply
+    ld a,1
+    ld (keybuf_spool_authorized),a
+
+frame_keybuf_spool_reply:
+    call keybuf_pending
+    jp c,frame_reply_range
+    ld hl,frame_response_buffer
+    ld a,(keybuf_spool_accepted)
+    ld (hl),a
+    inc hl
+    xor a
+    ld (hl),a                  ; accepted high byte
+    inc hl
+    ld a,(keybuf_spool_count)
+    add a,b                    ; total pending can reach 294 bytes
+    ld (hl),a
+    inc hl
+    ld a,0
+    adc a,0
+    ld (hl),a
+    inc hl
+    ld a,(keybuf_spool_count)
+    cpl                        ; credits = 255 - private-spool count
+    ld (hl),a
+    inc hl
+    xor a
+    ld (hl),a                  ; credits high byte
+    inc hl
+    ld a,(keybuf_spool_barrier)
+    and 1
+    ld c,a
+    ld a,(keybuf_spool_line_active)
+    or a
+    jr z,frame_keybuf_spool_flags_authorized
+    ld a,c
+    or KEYBUF_SPOOL_FLAG_ACTIVE
+    ld c,a
+frame_keybuf_spool_flags_authorized:
+    ld a,(keybuf_spool_authorized)
+    or a
+    jr z,frame_keybuf_spool_flags_ready
+    ld a,c
+    or KEYBUF_SPOOL_FLAG_AUTHORIZED
+    ld c,a
+frame_keybuf_spool_flags_ready:
+    ld a,c
+    ld (hl),a
+    ld hl,7
+    ld (frame_response_length),hl
+    xor a
+    ld (frame_response_status),a
+    jp frame_cache_and_send
+
+; Foreground /PUT owns the DOS handle while the resident keeps all UART work
+; inside its normal framed H.TIMI path. Request: offset:u16 plus up to 318 data
+; bytes; offset alone is a credit query. Response: accepted:u16, received:u16,
+; credits:u16, flags:u8. Flags distinguish bytes accepted from the terminal
+; foreground success/failure result. The one-chunk mailbox prevents the hook
+; from calling BDOS and gives the foreground writer deterministic backpressure.
+frame_cmd_file_upload:
+    ld a,(runtime_mode)
+    cp RUNTIME_RESIDENT
+    jp nz,frame_reply_bad_state
+    ld a,(in_hook)
+    or a
+    jp z,frame_reply_bad_state
+    ld a,(run_state)
+    cp 1
+    jp nz,frame_reply_bad_state
+    ld hl,(frame_length)
+    ld de,2
+    or a
+    sbc hl,de
+    jp c,frame_reply_bad_arg
+    ld (upload_request_length),hl
+    xor a
+    ld (upload_accepted),a
+    ld (upload_accepted + 1),a
+
+    ld a,(upload_active)
+    or a
+    jr z,frame_file_upload_reply
+    ld hl,(frame_request_buffer)
+    ld de,(upload_received)
+    or a
+    sbc hl,de
+    jp nz,frame_reply_bad_arg
+    ld hl,(upload_request_length)
+    ld a,h
+    or l
+    jr z,frame_file_upload_reply
+    ld a,(upload_pending)
+    or a
+    jr nz,frame_file_upload_reply
+
+    ; Refuse a chunk that crosses the length negotiated by foreground /PUT.
+    ld hl,(upload_expected)
+    ld de,(upload_received)
+    or a
+    sbc hl,de
+    ld de,(upload_request_length)
+    or a
+    sbc hl,de
+    jp c,frame_reply_range
+
+    ld bc,(upload_request_length)
+    ld hl,frame_request_buffer + 2
+    ld de,upload_buffer
+    ldir
+    ld hl,(upload_request_length)
+    ld (upload_chunk_length),hl
+    ld (upload_accepted),hl
+    ld de,(upload_received)
+    add hl,de
+    ld (upload_received),hl
+    ld a,1                     ; publish the mailbox only after the copy
+    ld (upload_pending),a
+
+frame_file_upload_reply:
+    ld hl,frame_response_buffer
+    ld de,(upload_accepted)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld de,(upload_received)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+
+    ; A free mailbox grants one frame-sized credit, capped by bytes remaining.
+    ld de,0
+    ld a,(upload_active)
+    or a
+    jr z,frame_file_upload_credit_ready
+    ld a,(upload_pending)
+    or a
+    jr nz,frame_file_upload_credit_ready
+    push hl
+    ld hl,(upload_expected)
+    ld bc,(upload_received)
+    or a
+    sbc hl,bc
+    ld bc,UPLOAD_CHUNK_CAPACITY
+    push hl
+    or a
+    sbc hl,bc
+    pop hl
+    jr c,frame_file_upload_credit_remaining
+    jr z,frame_file_upload_credit_remaining
+    ld hl,UPLOAD_CHUNK_CAPACITY
+frame_file_upload_credit_remaining:
+    ex de,hl
+    pop hl
+frame_file_upload_credit_ready:
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+
+    ld c,0
+    ld a,(upload_active)
+    or a
+    jr z,frame_file_upload_flags_result
+    ld c,UPLOAD_FLAG_ACTIVE
+    ld a,(upload_pending)
+    or a
+    jr z,frame_file_upload_flags_complete
+    ld a,c
+    or UPLOAD_FLAG_PENDING
+    ld c,a
+frame_file_upload_flags_complete:
+    ld de,(upload_expected)
+    ld hl,(upload_received)
+    or a
+    sbc hl,de
+    jr nz,frame_file_upload_flags_result
+    ld a,c
+    or UPLOAD_FLAG_COMPLETE
+    ld c,a
+frame_file_upload_flags_result:
+    ld a,(upload_result)
+    cp UPLOAD_RESULT_SUCCEEDED
+    jr nz,frame_file_upload_flags_failed
+    ld a,c
+    or UPLOAD_FLAG_SUCCEEDED
+    ld c,a
+    jr frame_file_upload_flags_ready
+frame_file_upload_flags_failed:
+    cp UPLOAD_RESULT_FAILED
+    jr nz,frame_file_upload_flags_ready
+    ld a,c
+    or UPLOAD_FLAG_FAILED
+    ld c,a
+frame_file_upload_flags_ready:
+    ld hl,frame_response_buffer + 6
+    ld a,c
+    ld (hl),a
+    ld hl,7
+    ld (frame_response_length),hl
+    xor a
+    ld (frame_response_status),a
+    jp frame_cache_and_send
 
 frame_cmd_ram_read:
     ld de,4
@@ -3271,15 +4041,23 @@ tsr_kill:
     call transport_restore
     ret
 
-; Foreground MSXAI.COM invocations use TsrCall to verify or change the selected
-; hardware driver without installing a duplicate TSR. Input: A=A5h, H=driver.
-; Output: A=active driver, or FFh for an unsupported request.
+; Foreground MSXAI.COM invocations use TsrCall both to configure the selected
+; driver and to bridge one file-upload mailbox into a DOS-owned page-0 buffer.
 tsr_talk:
-    cp 0A5h
-    jr nz,tsr_talk_unsupported
+    cp TSR_TALK_CONFIG
+    jr z,tsr_talk_config
+    cp TSR_TALK_UPLOAD_BEGIN
+    jr z,tsr_talk_upload_begin
+    cp TSR_TALK_UPLOAD_POLL
+    jr z,tsr_talk_upload_poll
+    cp TSR_TALK_UPLOAD_END
+    jp z,tsr_talk_upload_end
+    jp tsr_talk_unsupported
+
+tsr_talk_config:
     ld a,h
     cp 2
-    jr nc,tsr_talk_unsupported
+    jp nc,tsr_talk_unsupported
     ld b,a
     ld a,(active_transport_id)
     cp b
@@ -3292,6 +4070,8 @@ tsr_talk:
     ld (active_transport_id),a
     call transport_bind
     call transport_init
+    call keybuf_spool_reset     ; never carry synthetic input to a new driver
+    call upload_reset           ; foreground receiver must fail closed
     xor a
     ld (framed_mode),a
     ld (last_response_valid),a
@@ -3301,6 +4081,108 @@ tsr_talk:
     ld (next_sequence),hl
 tsr_talk_done:
     ld a,(active_transport_id)
+    ret
+
+; Begin input: HL=total bytes (1..4000h). Return A=0 on success.
+tsr_talk_upload_begin:
+    ld a,h
+    or l
+    jp z,tsr_talk_unsupported
+    push hl
+    ld de,04000h
+    or a
+    sbc hl,de
+    pop hl
+    jr c,tsr_talk_upload_begin_ready
+    jp nz,tsr_talk_unsupported
+tsr_talk_upload_begin_ready:
+    call upload_reset
+    ld (upload_expected),hl
+    ld a,1
+    ld (upload_active),a         ; publish only after every field is initialized
+    xor a
+    ret
+
+; Poll input: HL=caller destination in page 0. Return A=0 while waiting,
+; A=1 with HL=chunk length after a copy, or FFh when no upload is active.
+tsr_talk_upload_poll:
+    ld a,(upload_active)
+    or a
+    jr z,tsr_talk_unsupported
+    ld a,(upload_pending)
+    or a
+    jr z,tsr_talk_upload_waiting
+    ; TsrCall maps the resident into page 1. Keep the complete destination
+    ; range in caller-owned page 0 so a malformed caller cannot overwrite the
+    ; resident or an unrelated page while the mailbox is copied.
+    ld a,h
+    cp 040h
+    jr nc,tsr_talk_unsupported
+    push hl
+    ld bc,(upload_chunk_length)
+    add hl,bc
+    ld a,h
+    cp 040h
+    jr c,tsr_talk_upload_destination_ready
+    jr nz,tsr_talk_upload_destination_invalid
+    ld a,l
+    or a
+    jr z,tsr_talk_upload_destination_ready
+tsr_talk_upload_destination_invalid:
+    pop hl
+    jr tsr_talk_unsupported
+tsr_talk_upload_destination_ready:
+    pop hl
+    push hl
+    ld bc,(upload_chunk_length)
+    ld hl,upload_buffer
+    pop de
+    ldir
+    ld hl,(upload_chunk_length)
+    xor a
+    ld (upload_pending),a        ; release credit only after the complete copy
+    inc a
+    ret
+tsr_talk_upload_waiting:
+    ld hl,0
+    xor a
+    ret
+
+tsr_talk_upload_end:
+    ld a,(upload_active)
+    or a
+    jr z,tsr_talk_unsupported
+    ld a,h
+    or l
+    jr z,tsr_talk_upload_abort
+
+    ; Foreground validates the whole-file CRC and DOS write/close before
+    ; acknowledging success. Also require the resident mailbox to be empty and
+    ; every negotiated byte to have been accepted.
+    ld a,(upload_pending)
+    or a
+    jr nz,tsr_talk_upload_invalid_success
+    ld hl,(upload_received)
+    ld de,(upload_expected)
+    or a
+    sbc hl,de
+    jr nz,tsr_talk_upload_invalid_success
+    ld a,UPLOAD_RESULT_SUCCEEDED
+    jr tsr_talk_upload_finish
+tsr_talk_upload_invalid_success:
+    ld a,UPLOAD_RESULT_FAILED
+    call tsr_talk_upload_finish
+    ld a,0FFh
+    ret
+tsr_talk_upload_abort:
+    ld a,UPLOAD_RESULT_FAILED
+tsr_talk_upload_finish:
+    ld (upload_result),a
+    xor a
+    ld (upload_active),a
+    ld (upload_pending),a
+    ld (upload_chunk_length),a
+    ld (upload_chunk_length + 1),a
     ret
 tsr_talk_unsupported:
     ld a,0FFh

@@ -27,6 +27,7 @@ import threading
 import time
 
 from msx_v3 import V3Session, V3SessionError
+from msx_protocol import crc16_ccitt
 
 PROJ = pathlib.Path(__file__).resolve().parent.parent
 Z80ASM = (os.environ.get("Z80ASM") or shutil.which("z80asm") or
@@ -71,6 +72,8 @@ FEATURE_DEBUG_PEER = 0x02
 FEATURE_SNAPSHOT_LEASE = 0x04
 FEATURE_FRAME_WAKE_ACK = 0x08
 FEATURE_TIMI_POLL_SAFE = 0x10
+FEATURE_KEYBUF_SPOOL = 0x20
+FEATURE_FILE_UPLOAD = 0x40
 DEBUG_PEER_MAX = 63
 SNAPSHOT_LEASE_TIMEOUTS = 8
 SNAPSHOT_PAUSE_ATTEMPTS = 2
@@ -81,6 +84,8 @@ AGENT_FEATURE_NAMES = {
     FEATURE_SNAPSHOT_LEASE: "snapshot-lease",
     FEATURE_FRAME_WAKE_ACK: "frame-wake-ack",
     FEATURE_TIMI_POLL_SAFE: "timi-poll-safe",
+    FEATURE_KEYBUF_SPOOL: "keybuf-spool",
+    FEATURE_FILE_UPLOAD: "file-upload",
 }
 AGENT_TRANSPORT_NAMES = {
     0: "uart-8251",
@@ -98,6 +103,22 @@ INTFLG = 0xFC9B
 KEYBUF_INPUT_TIMEOUT = 10.0
 KEYBUF_POLL_INTERVAL = 0.02
 KEYBUF_LINE_SETTLE = 0.05
+KEYBUF_SPOOL_CAPACITY = 255
+KEYBUF_SPOOL_MAX_PENDING = KEYBUF_SPOOL_CAPACITY + KEYBUF_CAPACITY
+KEYBUF_SPOOL_FLAG_BARRIER = 0x01
+KEYBUF_SPOOL_FLAG_ACTIVE = 0x02
+KEYBUF_SPOOL_FLAG_AUTHORIZED = 0x04
+KEYBUF_SPOOL_REQUEST_PUMP = 0x01
+KEYBUF_SPOOL_REQUEST_CANCEL = 0x02
+KEYBUF_SPOOL_REFILL_TARGET = 128
+DOS_FILE_MAX_SIZE = 0x4000
+FILE_UPLOAD_CHUNK_CAPACITY = 318
+FILE_UPLOAD_FINALIZE_TIMEOUT = 30.0
+FILE_UPLOAD_FLAG_ACTIVE = 0x01
+FILE_UPLOAD_FLAG_PENDING = 0x02
+FILE_UPLOAD_FLAG_COMPLETE = 0x04
+FILE_UPLOAD_FLAG_SUCCEEDED = 0x08
+FILE_UPLOAD_FLAG_FAILED = 0x10
 SPECIAL_KEY_BYTES = {
     "ESC": 0x1B,
     "RET": 0x0D,
@@ -1312,17 +1333,103 @@ class RealMSX:
             return accepted, pending
         return self._keybuf_write_legacy(data, timeout=timeout)
 
+    def keybuf_spool_write(self, data, timeout=None, *, pump=False,
+                           cancel=False):
+        """Query or update the resident keyboard spool.
+
+        ``pump`` authorizes one logical line. ``cancel`` atomically discards
+        the MCP spool and BIOS queue and cannot carry data. Return
+        ``(accepted, pending, credits, barrier, active, authorized)``.
+        """
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("keyboard data must be bytes-like")
+        data = bytes(data)
+        if not isinstance(pump, bool) or not isinstance(cancel, bool):
+            raise TypeError("pump and cancel must be booleans")
+        if cancel and (pump or data):
+            raise ValueError("keyboard spool cancellation must be sent alone")
+        if len(data) > KEYBUF_SPOOL_CAPACITY:
+            raise RealMSXRangeError(
+                f"keyboard spool batch exceeds {KEYBUF_SPOOL_CAPACITY} bytes")
+        if self._v3 is None or not self.feature_bits & FEATURE_KEYBUF_SPOOL:
+            raise RealMSXError(
+                "resident keyboard spool was not negotiated")
+        control = ((KEYBUF_SPOOL_REQUEST_PUMP if pump else 0) |
+                   (KEYBUF_SPOOL_REQUEST_CANCEL if cancel else 0))
+        payload = b"" if not control and not data else bytes([control]) + data
+        if len(payload) > self._v3.max_payload:
+            raise RealMSXRangeError(
+                "keyboard spool batch exceeds the negotiated frame payload")
+        request_timeout = None
+        if timeout is not None:
+            timeout = float(timeout)
+            if timeout <= 0:
+                raise RealMSXKeyboardTimeoutError(
+                    "keyboard input timeout expired before request")
+            request_timeout = max(
+                0.001, timeout / (self._v3.retries + 1))
+        with self._lock:
+            reply = self._request_v3("T", payload, timeout=request_timeout)
+        if len(reply) != 7:
+            raise RealMSXProtocolError(
+                f"invalid keybuf spool response: {reply!r}")
+        accepted = int.from_bytes(reply[0:2], "little")
+        pending = int.from_bytes(reply[2:4], "little")
+        credits = int.from_bytes(reply[4:6], "little")
+        flags = reply[6]
+        if (accepted > len(data) or pending > KEYBUF_SPOOL_MAX_PENDING or
+                credits > KEYBUF_SPOOL_CAPACITY or
+                flags & ~(KEYBUF_SPOOL_FLAG_BARRIER |
+                          KEYBUF_SPOOL_FLAG_ACTIVE |
+                          KEYBUF_SPOOL_FLAG_AUTHORIZED)):
+            raise RealMSXProtocolError(
+                "invalid keybuf spool counts "
+                f"accepted={accepted}, pending={pending}, credits={credits}, "
+                f"flags=0x{flags:02X}")
+        return (accepted, pending, credits,
+                bool(flags & KEYBUF_SPOOL_FLAG_BARRIER),
+                bool(flags & KEYBUF_SPOOL_FLAG_ACTIVE),
+                bool(flags & KEYBUF_SPOOL_FLAG_AUTHORIZED))
+
+    def cancel_keybuf_spool(self, timeout=None):
+        """Discard pending MCP keyboard input after an interrupted operation."""
+        return self.keybuf_spool_write(
+            b"", timeout=timeout, cancel=True)
+
     def wait_keybuf_empty(self, timeout=KEYBUF_INPUT_TIMEOUT):
         deadline = time.monotonic() + float(timeout)
+        previous = None
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RealMSXKeyboardTimeoutError(
                     "timeout waiting for software to consume BIOS keyboard input; "
                     "the target may read the key matrix directly")
-            _accepted, pending = self.keybuf_write(b"", timeout=remaining)
-            if pending == 0:
-                return
+            if (self._v3 is not None and
+                    self.feature_bits & FEATURE_KEYBUF_SPOOL):
+                (_accepted, pending, credits, barrier, active,
+                 authorized) = self.keybuf_spool_write(
+                    b"", timeout=remaining)
+                state = (pending, credits, barrier, active, authorized)
+                if (pending == 0 and not barrier and not active and
+                        not authorized):
+                    return
+            else:
+                _accepted, pending = self.keybuf_write(
+                    b"", timeout=remaining)
+                state = (pending,)
+                if pending == 0:
+                    return
+            if previous is not None:
+                progressed = (state[0] < previous[0])
+                if len(state) > 1:
+                    progressed = (progressed or state[1] > previous[1] or
+                                  (previous[2] and not state[2]) or
+                                  (previous[3] and not state[3]) or
+                                  (previous[4] and not state[4]))
+                if progressed:
+                    deadline = time.monotonic() + float(timeout)
+            previous = state
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RealMSXKeyboardTimeoutError(
@@ -1342,37 +1449,288 @@ class RealMSX:
                 "real-agent keyboard input currently supports ASCII only") from exc
 
     def type(self, text, timeout=KEYBUF_INPUT_TIMEOUT):
-        """Type text through the BIOS ring and wait until it is consumed."""
+        """Type text and wait until it is consumed.
+
+        ``timeout`` is a no-progress timeout, not a total-program deadline.
+        New residents accept 255-byte frames into a private credit-controlled
+        spool. Older residents are streamed directly into free BIOS-ring slots
+        while retaining a hard drain barrier at every Return.
+        """
         payload = self._encode_keyboard_text(text)
-        deadline = time.monotonic() + float(timeout)
+        timeout = float(timeout)
+        if timeout <= 0:
+            raise RealMSXKeyboardTimeoutError(
+                "keyboard input timeout must be positive")
+        if not payload:
+            return 0
+        if (self._v3 is not None and
+                self.feature_bits & FEATURE_KEYBUF_SPOOL):
+            return self._type_spooled(payload, timeout)
+
         offset = 0
         while offset < len(payload):
             remaining = payload[offset:]
-            batch_size = min(len(remaining), KEYBUF_CAPACITY)
-            carriage_return = remaining.find(b"\r", 0, batch_size)
+            carriage_return = remaining.find(b"\r")
             if carriage_return >= 0:
-                batch_size = carriage_return + 1
-            batch = remaining[:batch_size]
+                batch = remaining[:carriage_return + 1]
+            else:
+                batch = remaining
             batch_offset = 0
+            credits = KEYBUF_CAPACITY
+            deadline = time.monotonic() + timeout
+            previous_pending = None
             while batch_offset < len(batch):
                 remaining_time = deadline - time.monotonic()
                 if remaining_time <= 0:
                     raise RealMSXKeyboardTimeoutError(
                         "timeout while typing through the BIOS keyboard buffer")
-                accepted, _pending = self.keybuf_write(
-                    batch[batch_offset:], timeout=remaining_time)
+                if credits:
+                    request = batch[
+                        batch_offset:batch_offset + min(
+                            credits, KEYBUF_CAPACITY)]
+                else:
+                    request = b""
+                accepted, pending = self.keybuf_write(
+                    request, timeout=remaining_time)
                 batch_offset += accepted
-                remaining_time = deadline - time.monotonic()
-                if remaining_time <= 0:
-                    raise RealMSXKeyboardTimeoutError(
-                        "timeout while typing through the BIOS keyboard buffer")
-                self.wait_keybuf_empty(remaining_time)
-                if accepted == 0 and batch_offset < len(batch):
-                    continue
+                credits = KEYBUF_CAPACITY - pending
+                if (accepted or previous_pending is not None and
+                        pending < previous_pending):
+                    deadline = time.monotonic() + timeout
+                previous_pending = pending
+                if batch_offset < len(batch) and not credits:
+                    time.sleep(KEYBUF_POLL_INTERVAL)
+            self.wait_keybuf_empty(timeout)
             offset += len(batch)
             if batch.endswith(b"\r"):
                 time.sleep(KEYBUF_LINE_SETTLE)
         return len(payload)
+
+    def _type_spooled(self, payload, timeout):
+        deadline = time.monotonic() + timeout
+        offset = 0
+        credits = KEYBUF_SPOOL_CAPACITY
+        pending = 0
+        barrier = False
+        active = False
+        authorized = False
+        previous = None
+        max_batch = min(KEYBUF_SPOOL_CAPACITY, self._v3.max_payload - 1)
+        if max_batch <= 0:
+            raise RealMSXProtocolError(
+                "negotiated frame payload cannot carry keyboard spool data")
+        try:
+            while True:
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    raise RealMSXKeyboardTimeoutError(
+                        "timeout while waiting for resident keyboard-spool "
+                        "progress")
+                bytes_left = len(payload) - offset
+                refill_goal = min(bytes_left, KEYBUF_SPOOL_REFILL_TARGET)
+                if (bytes_left and credits and
+                        (previous is None or credits >= refill_goal)):
+                    request = payload[
+                        offset:offset + min(credits, max_batch)]
+                else:
+                    request = b""
+                pump = (not barrier and not active and not authorized and
+                        bool(pending or request))
+                (accepted, pending, credits, barrier, active,
+                 authorized) = self.keybuf_spool_write(
+                    request, timeout=remaining_time, pump=pump)
+                offset += accepted
+                state = (pending, credits, barrier, active, authorized)
+                progressed = bool(accepted)
+                if previous is not None:
+                    progressed = (
+                        progressed or pending < previous[0] or
+                        credits > previous[1] or
+                        (previous[2] and not barrier) or
+                        (not previous[3] and active) or
+                        (previous[3] and not active) or
+                        (not previous[4] and authorized) or
+                        (previous[4] and not authorized))
+                if progressed:
+                    deadline = time.monotonic() + timeout
+                previous = state
+                if (offset == len(payload) and pending == 0 and not barrier and
+                        not active and not authorized):
+                    return len(payload)
+                if not accepted:
+                    time.sleep(KEYBUF_POLL_INTERVAL)
+        except BaseException:
+            # A timed-out caller must not leave complete future commands queued
+            # for execution when BASIC/DOS later resumes consuming KEYBUF.
+            try:
+                self.cancel_keybuf_spool(timeout=min(timeout, 0.5))
+            except Exception:
+                pass
+            raise
+
+    def type_lines(self, lines, timeout=KEYBUF_INPUT_TIMEOUT):
+        """Type several logical lines in one operation, each with Return."""
+        if isinstance(lines, (str, bytes, bytearray)):
+            raise TypeError("lines must be an iterable of strings")
+        try:
+            lines = tuple(lines)
+        except TypeError as exc:
+            raise TypeError("lines must be an iterable of strings") from exc
+        for line in lines:
+            if not isinstance(line, str):
+                raise TypeError("each line must be a string")
+            if "\r" in line or "\n" in line:
+                raise ValueError("each item must contain exactly one logical line")
+        if not lines:
+            return 0
+        return self.type("\r".join(lines) + "\r", timeout=timeout)
+
+    def file_upload_write(self, data, timeout=KEYBUF_INPUT_TIMEOUT):
+        """Stream bytes to an active foreground ``MSXAI /PUT`` receiver."""
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("file data must be bytes-like")
+        data = bytes(data)
+        timeout = float(timeout)
+        if timeout <= 0:
+            raise RealMSXTimeoutError("file upload timeout must be positive")
+        if self._v3 is None or not self.feature_bits & FEATURE_FILE_UPLOAD:
+            raise RealMSXError("resident file upload was not negotiated")
+        max_batch = min(
+            FILE_UPLOAD_CHUNK_CAPACITY, self._v3.max_payload - 2)
+        if max_batch <= 0:
+            raise RealMSXProtocolError(
+                "negotiated frame payload cannot carry file data")
+
+        offset = 0
+        credits = 0
+        started = False
+        previous = None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                raise RealMSXTimeoutError(
+                    "timeout waiting for foreground MSX-DOS file receiver")
+            if started and offset < len(data) and credits:
+                chunk = data[offset:offset + min(credits, max_batch)]
+            else:
+                chunk = b""
+            request_timeout = max(
+                0.001, remaining_time / (self._v3.retries + 1))
+            with self._lock:
+                reply = self._request_v3(
+                    "U", self._le16(offset) + chunk,
+                    timeout=request_timeout)
+            if len(reply) != 7:
+                raise RealMSXProtocolError(
+                    f"invalid file-upload response: {reply!r}")
+            accepted = int.from_bytes(reply[0:2], "little")
+            received = int.from_bytes(reply[2:4], "little")
+            new_credits = int.from_bytes(reply[4:6], "little")
+            flags = reply[6]
+            active = bool(flags & FILE_UPLOAD_FLAG_ACTIVE)
+            pending = bool(flags & FILE_UPLOAD_FLAG_PENDING)
+            complete = bool(flags & FILE_UPLOAD_FLAG_COMPLETE)
+            succeeded = bool(flags & FILE_UPLOAD_FLAG_SUCCEEDED)
+            failed = bool(flags & FILE_UPLOAD_FLAG_FAILED)
+            if (accepted > len(chunk) or
+                    (active or started) and received > len(data) or
+                    new_credits > FILE_UPLOAD_CHUNK_CAPACITY or
+                    flags & ~(FILE_UPLOAD_FLAG_ACTIVE |
+                              FILE_UPLOAD_FLAG_PENDING |
+                              FILE_UPLOAD_FLAG_COMPLETE |
+                              FILE_UPLOAD_FLAG_SUCCEEDED |
+                              FILE_UPLOAD_FLAG_FAILED) or
+                    (succeeded and failed) or
+                    (active and (succeeded or failed))):
+                raise RealMSXProtocolError(
+                    "invalid file-upload state "
+                    f"accepted={accepted}, received={received}, "
+                    f"credits={new_credits}, flags=0x{flags:02X}")
+            if active and received != offset + accepted:
+                raise RealMSXProtocolError(
+                    "file-upload offset diverged: "
+                    f"host={offset + accepted}, agent={received}")
+            offset += accepted
+            state = (active, pending, complete, new_credits, received)
+            progressed = bool(accepted)
+            if active and not started:
+                started = True
+                progressed = True
+            if previous is not None:
+                progressed = (progressed or
+                              previous[1] and not pending or
+                              not previous[2] and complete or
+                              new_credits > previous[3])
+            if progressed:
+                # Once every byte is accepted, foreground still has to copy
+                # the last mailbox, update CRC, write, close, and publish the
+                # terminal result. On an interrupt-driven 8251 that can take
+                # longer than the normal no-progress budget even though every
+                # poll is answered. Keep a separate bounded finalize window.
+                progress_timeout = (
+                    max(timeout, FILE_UPLOAD_FINALIZE_TIMEOUT)
+                    if offset == len(data) else timeout)
+                deadline = time.monotonic() + progress_timeout
+            previous = state
+            credits = new_credits
+
+            if not active:
+                if not started:
+                    time.sleep(KEYBUF_POLL_INTERVAL)
+                    continue
+                if failed:
+                    raise RealMSXError(
+                        "foreground MSX-DOS file receiver reported a "
+                        "CRC, write or close failure")
+                if not succeeded:
+                    raise RealMSXProtocolError(
+                        "foreground file receiver ended without a terminal "
+                        "success status")
+                if offset != len(data):
+                    raise RealMSXError(
+                        "foreground file receiver aborted before all bytes "
+                        f"were accepted ({offset}/{len(data)})")
+                return offset
+            if complete and offset != len(data):
+                raise RealMSXProtocolError(
+                    "agent reported file completion at the wrong offset")
+            if not accepted:
+                time.sleep(KEYBUF_POLL_INTERVAL)
+
+    def put_dos_file(self, name, data, timeout=KEYBUF_INPUT_TIMEOUT):
+        """Launch the foreground ``/PUT`` sink and stream one DOS file.
+
+        The resident performs framed UART I/O into a one-chunk mailbox. The
+        same universal MSXAI.COM copies each credited chunk in foreground and
+        performs BDOS writes, so no DOS call occurs from H.TIMI.
+        """
+        if not isinstance(name, str) or not name or len(name) > 15:
+            raise ValueError("DOS filename must contain 1..15 characters")
+        try:
+            encoded_name = name.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("DOS filename must be ASCII") from exc
+        if (any(byte <= 0x20 or byte == 0x7F for byte in encoded_name) or
+                "\x00" in name):
+            raise ValueError("DOS filename cannot contain whitespace or controls")
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("file data must be bytes-like")
+        data = bytes(data)
+        if not 1 <= len(data) <= DOS_FILE_MAX_SIZE:
+            raise RealMSXRangeError(
+                f"DOS file must contain 1..{DOS_FILE_MAX_SIZE} bytes")
+        if self.runtime_mode != "resident":
+            raise RealMSXError(
+                "DOS file transfer requires the resident agent")
+        if self._v3 is None or not self.feature_bits & FEATURE_FILE_UPLOAD:
+            raise RealMSXError(
+                "the resident does not support foreground DOS file transfer")
+        checksum = crc16_ccitt(data)
+        self.type_line(
+            f"MSXAI /PUT {name} {len(data):04X} {checksum:04X}",
+            timeout=timeout)
+        return self.file_upload_write(data, timeout=timeout)
 
     def type_line(self, text, timeout=KEYBUF_INPUT_TIMEOUT):
         """Type one text line followed by the MSX Return key."""

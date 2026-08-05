@@ -53,12 +53,15 @@ MSXAI /DRIVER:16C550 /MONITOR
 MSXAI /DRIVER:8251 /MONITOR DEBUG ON
 MSXAI /DRIVER:16C550 /MONITOR DEBUG ON
 MSXAI /UNINSTALL
+MSXAI /PUT A:PROGRAM.BAS 1234 29B1
 MSXAI /?
 MSXAI /HELP
 ~~~~
 
 `/UNINSTALL` must be used alone. `DEBUG ON` is accepted only with
-`/MONITOR`; it is rejected for the default resident lifecycle.
+`/MONITOR`; it is rejected for the default resident lifecycle. `/PUT` is a
+separate host-driven transient action: its arguments include a hexadecimal byte
+count from `0001` through `4000` and a four-digit CRC-16/CCITT-FALSE value.
 
 The startup banner reports the selected driver and runtime mode before control
 passes to MemMan or the foreground monitor.
@@ -72,6 +75,7 @@ passes to MemMan or the foreground monitor.
 | RAM/VRAM and direct I/O | Yes, with resident memory restrictions | Yes, outside protected monitor memory |
 | Pause/resume | Bounded snapshot lease; persistent manual pause disabled | Yes |
 | BIOS keyboard-buffer input | Yes | No |
+| Transient DOS file sink | Yes, by launching the same COM from DOS | Not applicable |
 | Direct call/run/stop | No | Yes |
 | Slot/mapper selection | No | Yes, pages 0 and 1 |
 | `DEBUG ON` | Rejected | Optional |
@@ -116,6 +120,32 @@ MemMan versions older than 2.4 are rejected. A loader failure removes only
 temporary files proven to have been created by the current invocation and
 reports incomplete cleanup rather than overwriting or deleting an existing
 file.
+
+### Transient DOS file sink
+
+The host can transfer a 1..16 KiB file without simulating every character. It
+types `MSXAI /PUT <name> <hex-length> <crc16>` at the DOS prompt, waits for the
+foreground receiver, and sends credited `U` frames containing up to 318 data
+bytes. The resident places one validated frame in a mailbox. The foreground
+process copies that mailbox through MemMan `TsrCall`, writes it with MSX-DOS 2,
+and releases the next credit. No host write is made into the command processor's
+TPA before the transient process owns it. `CREATE_NEW` prevents overwriting an
+existing pathname; exact-write checks and a whole-file CRC protect completion.
+A terminal success state is exposed to the host only after the CRC, exact-write,
+and close checks pass. A ten-second NTSC/twelve-second PAL no-progress timeout
+deletes a partial file.
+
+The resident hook itself never calls DOS. `/PUT` runs as an ordinary transient
+foreground process, which is why the file operation is safe and independent of
+the selected 8251 or 16C550 transport. The host uses random 8.3 names on the
+drive shown by the current DOS prompt and deletes the temporary file after
+BASIC loads it.
+The host uses a separate bounded 30-second finalization window after all bytes
+have been accepted, allowing the foreground process to verify the CRC, close
+the file, and publish its terminal result even over a slow 8251 connection.
+If the host disappears, BASIC cannot start, or LOAD fails between successful
+file creation and BASIC cleanup, the random `MXxxxxxx.BAS` pathname can remain
+on that drive and may be deleted normally.
 
 ### Foreground monitor
 
@@ -198,6 +228,19 @@ pending counts. Host code stops batches at each Return and waits for pending
 input to reach zero before sending another line, because BASIC may clear the
 remaining keyboard buffer after accepting a line. Software that scans the
 hardware keyboard matrix directly is outside this mechanism.
+
+A current resident additionally advertises `keybuf-spool` and accepts framed
+opcode `T`. Its private 256-byte circular allocation holds at most 255 bytes,
+preserving an unambiguous empty state. Each response contains
+`accepted:u16`, total `pending:u16`, free `credits:u16`, and a one-byte flags
+field. A non-empty request starts with a control byte; bit 0 authorizes one
+logical line and bit 1 cancels queued MCP/BIOS input when sent alone. `H.TIMI`
+drains the spool directly into `KEYBUF`, stopping at every Return. It waits until
+the BIOS ring is empty and then four further timer ticks before the host may
+authorize the next line. The host can therefore submit multiple lines in one
+255-byte data batch and refill only when reported credits are available, while
+a lost peer cannot autonomously drain all later commands. Older agents continue
+to use opcode `t`.
 
 The host-side `msx_key` tool maps ESC, Return, Tab, Select, and Space to the
 same atomic keyboard-ring operation. STOP and Ctrl+STOP are BIOS events, not
@@ -298,8 +341,10 @@ The v3 HELLO appends an optional feature byte after the runtime-mode byte. Bit
 0 advertises `keybuf-input`; bit 1 advertises the foreground-debug-only
 `debug-peer-label`; bit 2 advertises the resident-only `snapshot-lease`; bit 3
 advertises the transport-independent `frame-wake-ack`; and bit 4 advertises
-resident-only `timi-poll-safe`. The safe feature is valid only together with
-`frame-wake-ack`. Raw command `N` exposes the same bitmap before `F`, allowing
+resident-only `timi-poll-safe`; bit 5 advertises the resident-only
+`keybuf-spool`; and bit 6 advertises resident-assisted foreground
+`file-upload`. The safe features are valid only together with `frame-wake-ack`.
+Raw command `N` exposes the same bitmap before `F`, allowing
 the first framed request to use the negotiated wake and no-retry policy. Older
 9-byte and 14-byte framed HELLO responses remain valid.
 Opcode `t` accepts zero bytes as a queue-status query or up to 39 input bytes
@@ -308,6 +353,21 @@ bytes and displays the host-provided peer label. The one unused ring position
 preserves the BIOS convention that equal get/put pointers mean empty. Because
 the result is cached by sequence, response loss and retry cannot repeat either
 side effect.
+
+Opcode `T` accepts zero bytes as a read-only queue/credit query. A non-empty
+request is `control:u8 | data`; data is limited to 255 bytes. Control bit 0
+authorizes one line and bit 1 cancels when sent without data. Its seven-byte
+response is `accepted:u16 | pending:u16 | credits:u16 | flags:u8`; flag bits
+0..2 report the post-Return barrier, an active line, and unused authorization.
+`pending` includes both the private spool and BIOS ring.
+
+Opcode `U` is available only while a foreground `/PUT` receiver has registered
+its mailbox. A request is `offset:u16 | data` with up to 318 data bytes; an
+offset-only request polls credit. The response is
+`accepted:u16 | received:u16 | credits:u16 | flags:u8`, where flag bits 0..4
+mean active, mailbox pending, all bytes accepted, foreground success, and
+foreground failure. Success is terminal and is published only after the
+foreground CRC, exact-write, and close checks. The hook never calls BDOS.
 
 Opcode `S` accepts exactly one non-zero lease byte while the resident is
 servicing a running program from a hook. After acknowledging it, the agent

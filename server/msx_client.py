@@ -252,6 +252,28 @@ class OpenMSX:
         """Type a line and press Enter (Tcl \\r -> CR, openMSX maps it to RETURN)."""
         self.cmd(f'type "{self._esc(text)}\\r"')
 
+    def type_lines(self, lines):
+        """Type logical lines without reading the screen between them.
+
+        A small emulated-time barrier after each Return prevents MSX-BASIC
+        from clearing characters from the following line while it processes
+        the current one.
+        """
+        if isinstance(lines, (str, bytes, bytearray)):
+            raise TypeError("lines must be an iterable of strings")
+        try:
+            lines = tuple(lines)
+        except TypeError as exc:
+            raise TypeError("lines must be an iterable of strings") from exc
+        for line in lines:
+            if not isinstance(line, str):
+                raise TypeError("each line must be a string")
+            if "\r" in line or "\n" in line:
+                raise ValueError("each item must contain exactly one logical line")
+            self.type_line(line)
+            self.advance(0.3)
+        return sum(len(line) + 1 for line in lines)
+
     # MSX keyboard matrix positions (row, mask) for the special keys we need
     KEYS = {"RET": (7, 0x80), "ESC": (7, 0x04), "SPACE": (8, 0x01),
             "STOP": (7, 0x10), "SELECT": (7, 0x40), "TAB": (7, 0x08)}

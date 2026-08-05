@@ -57,8 +57,274 @@ MEMMAN_COMMAND_MAX:      equ 40
 ; Leave normal transient-program stack space above the relocation trampoline.
 ; Once MEMMAN.COM starts, the old loader image and trampoline are disposable.
 OVERLAY_STACK_HEADROOM:  equ 00080h
+FILE_UPLOAD_TIMEOUT_TICKS: equ 600 ; ten seconds at NTSC, twelve at PAL
 
 include 'work/agent/MSXAI_TSR.INC'
+
+; ---------------------------------------------------------------------------
+; Foreground file sink. The resident receives one CRC-protected framed chunk
+; into a mailbox; TsrCall copies it into this process's page-0 buffer, and only
+; then does the foreground process call BDOS. No target RAM is overwritten
+; before MSXAI.COM owns the TPA. CREATE_NEW protects existing user files, and a
+; whole-file CRC detects corruption across mailbox copying and disk writes.
+
+loader_put_file:
+    xor a
+    ld (dos2_available),a
+    ld (loader_put_upload_started),a
+    ld a,INVALID_HANDLE
+    ld (loader_put_handle),a
+
+    ld c,DOS_VERSION
+    call 00005h
+    or a
+    jp nz,loader_put_bad_version
+    ld a,b
+    cp 2
+    jp c,loader_put_bad_version
+    ld a,1
+    ld (dos2_available),a
+
+    call memman_find_agent
+    jp c,loader_put_internal_error
+    ld (loader_put_tsr_id),bc
+
+    ld de,loader_put_filename
+    ld a,CREATE_WRITE_ONLY
+    ld b,CREATE_NEW
+    ld c,DOS_CREATE
+    call 00005h
+    or a
+    jp nz,loader_put_error
+    ld a,b
+    ld (loader_put_handle),a
+
+    ld hl,(loader_put_length)
+    ld a,TSR_TALK_UPLOAD_BEGIN
+    call loader_put_tsr_call
+    or a
+    jp nz,loader_put_internal_open_error
+    ld a,1
+    ld (loader_put_upload_started),a
+    xor a
+    ld (loader_put_written),a
+    ld (loader_put_written + 1),a
+    ld hl,0FFFFh
+    ld (loader_put_crc),hl
+    ld hl,(JIFFY)
+    ld (loader_put_last_progress),hl
+
+    ld de,loader_put_ready_message
+    ld c,9
+    call 00005h
+
+loader_put_receive_loop:
+    ld hl,loader_put_buffer
+    ld a,TSR_TALK_UPLOAD_POLL
+    call loader_put_tsr_call
+    cp 0FFh
+    jp z,loader_put_internal_open_error
+    or a
+    jr z,loader_put_wait_for_chunk
+    ld a,h
+    or l
+    jp z,loader_put_internal_open_error
+    ld (loader_put_chunk_length),hl
+
+    ; The resident already enforces the negotiated total. Check it again on
+    ; the DOS side so a malformed or incompatible talk implementation fails
+    ; closed before touching the file.
+    ld de,(loader_put_written)
+    add hl,de
+    push hl
+    ld de,(loader_put_length)
+    or a
+    sbc hl,de
+    pop hl
+    jr c,loader_put_chunk_size_ok
+    jr z,loader_put_chunk_size_ok
+    jr loader_put_internal_open_error
+loader_put_chunk_size_ok:
+    ld (loader_put_next_written),hl
+
+    ld bc,(loader_put_chunk_length)
+    ld hl,loader_put_buffer
+    call loader_put_crc_update
+
+    ld de,loader_put_buffer
+    ld hl,(loader_put_chunk_length)
+    ld a,(loader_put_handle)
+    ld b,a
+    call write_exact
+    or a
+    jr nz,loader_put_open_error
+    ld hl,(loader_put_next_written)
+    ld (loader_put_written),hl
+    ld de,(loader_put_length)
+    or a
+    sbc hl,de
+    jr z,loader_put_receive_complete
+    ld hl,(JIFFY)
+    ld (loader_put_last_progress),hl
+    jr loader_put_receive_loop
+
+loader_put_wait_for_chunk:
+    ld hl,(JIFFY)
+    ld de,(loader_put_last_progress)
+    or a
+    sbc hl,de
+    ld de,FILE_UPLOAD_TIMEOUT_TICKS
+    or a
+    sbc hl,de
+    jr nc,loader_put_internal_open_error
+    halt
+    jr loader_put_receive_loop
+
+loader_put_receive_complete:
+    ld hl,(loader_put_crc)
+    ld de,(loader_put_crc_expected)
+    or a
+    sbc hl,de
+    jr nz,loader_put_internal_open_error
+
+    ld a,(loader_put_handle)
+    ld b,a
+    ld c,DOS_CLOSE
+    call 00005h
+    or a
+    jr nz,loader_put_open_error
+    ld a,INVALID_HANDLE
+    ld (loader_put_handle),a
+    call loader_put_commit_upload
+    or a
+    jr nz,loader_put_closed_error
+    ld de,loader_put_ok_message
+    ld c,9
+    call 00005h
+    ld c,0
+    jp 00005h
+
+loader_put_internal_open_error:
+    ld a,ERR_INTERNAL
+    jr loader_put_open_error
+loader_put_internal_error:
+    ld a,ERR_INTERNAL
+    jr loader_put_error
+
+loader_put_open_error:
+    ld (last_error),a
+    call loader_put_abort_upload
+    ld a,(loader_put_handle)
+    cp INVALID_HANDLE
+    jr z,loader_put_saved_error
+    ld b,a
+    ld c,DOS_HDELETE
+    call 00005h
+    ld a,INVALID_HANDLE
+    ld (loader_put_handle),a
+loader_put_saved_error:
+    ld a,(last_error)
+    jr loader_put_error
+
+; A failed terminal acknowledgement occurs after the DOS handle was closed.
+; Remove that closed file by pathname before reporting failure to both sides.
+loader_put_closed_error:
+    ld a,ERR_INTERNAL
+    ld (last_error),a
+    ld de,loader_put_filename
+    ld c,DOS_DELETE
+    call 00005h
+    ld a,(last_error)
+    jr loader_put_error
+
+loader_put_bad_version:
+    ld a,ERR_BAD_VERSION
+loader_put_error:
+    ld (last_error),a
+    ld de,loader_put_error_message
+    ld c,9
+    call 00005h
+    ld a,(dos2_available)
+    or a
+    jp z,00000h
+    ld a,(last_error)
+    ld b,a
+    ld c,DOS_TERM_ERROR
+    call 00005h
+    jp 00000h
+
+; Invoke the resident's upload mailbox through the standardized MemMan talk
+; entry. A selects begin/poll/end, HL is the action-specific argument.
+loader_put_tsr_call:
+    ld bc,(loader_put_tsr_id)
+    ld d,'M'
+    ld e,63                    ; TsrCall
+    call EXTBIO
+    ei                          ; MemMan returns from TsrCall with DI
+    ret
+
+loader_put_commit_upload:
+    ld a,(loader_put_upload_started)
+    or a
+    jr z,loader_put_commit_missing
+    xor a
+    ld (loader_put_upload_started),a
+    ld hl,1                    ; non-zero acknowledges verified success
+    ld a,TSR_TALK_UPLOAD_END
+    jp loader_put_tsr_call
+loader_put_commit_missing:
+    ld a,0FFh
+    ret
+
+loader_put_abort_upload:
+    ld a,(loader_put_upload_started)
+    or a
+    ret z
+    xor a
+    ld (loader_put_upload_started),a
+    ld hl,0                    ; zero publishes a terminal failure
+    ld a,TSR_TALK_UPLOAD_END
+    jp loader_put_tsr_call
+
+; Incremental CRC-16/CCITT-FALSE. Input HL=buffer, BC=count. The accumulated
+; value starts at FFFFh and is compared with the command-line CRC at EOF.
+loader_put_crc_update:
+    ld de,(loader_put_crc)
+loader_put_crc_byte_loop:
+    ld a,b
+    or c
+    jr z,loader_put_crc_done
+    ld a,(hl)
+    inc hl
+    xor d
+    ld d,a
+    push bc
+    ld b,8
+loader_put_crc_bit_loop:
+    sla e
+    rl d
+    jr nc,loader_put_crc_no_poly
+    ld a,e
+    xor 021h
+    ld e,a
+    ld a,d
+    xor 010h
+    ld d,a
+loader_put_crc_no_poly:
+    djnz loader_put_crc_bit_loop
+    pop bc
+    dec bc
+    jr loader_put_crc_byte_loop
+loader_put_crc_done:
+    ld (loader_put_crc),de
+    ret
+
+loader_put_ok_message:
+    db 13,10,"MSXAI PUT OK",13,10,"$"
+loader_put_ready_message:
+    db 13,10,"MSXAI PUT READY",13,10,"$"
+loader_put_error_message:
+    db 13,10,"MSXAI PUT ERROR",13,10,"$"
 
 ; Both entry points consume the current process.  On success MEMMAN.COM takes
 ; over address 0100h and warm-boots through the supplied command chain; on an
@@ -713,6 +979,22 @@ memman_tsr_name:
 ; Mutable state and command/name templates.
 
 loader_entry_sp:
+    dw 0
+loader_put_handle:
+    db INVALID_HANDLE
+loader_put_upload_started:
+    db 0
+loader_put_tsr_id:
+    dw 0
+loader_put_written:
+    dw 0
+loader_put_next_written:
+    dw 0
+loader_put_chunk_length:
+    dw 0
+loader_put_crc:
+    dw 0FFFFh
+loader_put_last_progress:
     dw 0
 overlay_target:
     dw 0
