@@ -7,11 +7,6 @@
 Control emulated and physical MSX computers through one Python MCP
 server.
 
-Created by **Rodrigo Galhardi M. Garcia**, originator of the project's central
-concept: use MCP to control both emulated MSX systems and real MSX hardware
-through an agent executing on the target. See [authorship and project
-origin](https://github.com/mefroio/msx-ai/blob/main/AUTHORS.md).
-
 MSX-AI gives an MCP client a common set of tools for direct openMSX automation,
 an agent running on physical MSX hardware, or that same physical-agent path
 simulated through openMSX. Backend selection is explicit: starting the server
