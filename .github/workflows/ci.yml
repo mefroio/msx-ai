@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e .
+      - name: Run hardware-free unit suite
+        env:
+          MSX_RUN_INTEGRATION: "0"
+        run: python -m unittest discover -s tests
+
+  release-gate:
+    name: Distribution and MCP release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install Z80 assembler
+        run: sudo apt-get update && sudo apt-get install --yes z80asm
+      - name: Install project and build frontend
+        run: python -m pip install -e . 'build>=1'
+      - name: Validate source, distributions, agent suite, and MCP transports
+        env:
+          MSX_RUN_INTEGRATION: "0"
+        run: make PYTHON=python release-check

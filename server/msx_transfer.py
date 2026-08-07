@@ -54,7 +54,7 @@ import secrets
 import stat
 import struct
 import tempfile
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 import zlib
 
 
@@ -165,6 +165,10 @@ class TransferPayloadError(TransferError):
 
 class TransferBindingError(TransferError):
     """A reply or saved journal belongs to a different transfer."""
+
+
+class TransferCancelledError(TransferError):
+    """A caller cancelled host-side transfer preparation before completion."""
 
 
 class TransferJournalError(TransferError):
@@ -774,16 +778,54 @@ def crc32_update(data: bytes | bytearray | memoryview,
     return zlib.crc32(data, checksum) & UINT32_MAX
 
 
+ProgressCallback = Callable[[float, float | None, str | None], None]
+CancellationCallback = Callable[[], bool]
+
+
+def _check_cancelled(cancelled: CancellationCallback | None,
+                     phase: str) -> None:
+    if cancelled is not None and cancelled():
+        raise TransferCancelledError(
+            f"transfer cancelled during host-side {phase}")
+
+
+def _report_host_progress(progress: ProgressCallback | None, completed: int,
+                          total: int | None, phase: str) -> None:
+    if progress is None:
+        return
+    detail = (f"{completed}/{total} bytes" if total is not None else
+              f"{completed} bytes")
+    try:
+        progress(float(completed),
+                 None if total is None else float(total),
+                 f"{phase}: {detail}")
+    except Exception:
+        # Progress is observation only. A failed client/UI callback must not
+        # turn a deterministic local preparation step into a transfer failure.
+        pass
+
+
 def crc32_stream(stream: BinaryIO, *, chunk_size: int = DEFAULT_IO_CHUNK_SIZE,
-                 max_size: int = UINT32_MAX) -> FileDigest:
+                 max_size: int = UINT32_MAX,
+                 progress: ProgressCallback | None = None,
+                 cancelled: CancellationCallback | None = None,
+                 progress_total: int | None = None,
+                 progress_phase: str = "CRC-32") -> FileDigest:
     """Hash a stream incrementally, refusing to read beyond ``max_size``."""
 
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise TransferError("chunk_size must be a positive integer")
     max_size = _u32("max_size", max_size)
+    if (progress_total is not None and
+            (isinstance(progress_total, bool) or
+             not isinstance(progress_total, int) or progress_total < 0)):
+        raise TransferError("progress_total must be a non-negative integer")
     size = 0
     checksum = 0
+    _check_cancelled(cancelled, progress_phase)
+    _report_host_progress(progress, size, progress_total, progress_phase)
     while True:
+        _check_cancelled(cancelled, progress_phase)
         remaining = max_size - size
         # One extra byte distinguishes an exact-limit file from an oversized one.
         block = stream.read(min(chunk_size, remaining + 1))
@@ -796,20 +838,33 @@ def crc32_stream(stream: BinaryIO, *, chunk_size: int = DEFAULT_IO_CHUNK_SIZE,
             raise TransferError(f"stream exceeds maximum size {max_size}")
         size += len(block)
         checksum = crc32_update(block, checksum)
+        _report_host_progress(progress, size, progress_total, progress_phase)
+    _check_cancelled(cancelled, progress_phase)
     return FileDigest(size, checksum & UINT32_MAX)
 
 
 def crc32_file(path: str | os.PathLike[str], *,
                chunk_size: int = DEFAULT_IO_CHUNK_SIZE,
-               max_size: int = UINT32_MAX) -> FileDigest:
+               max_size: int = UINT32_MAX,
+               progress: ProgressCallback | None = None,
+               cancelled: CancellationCallback | None = None,
+               progress_phase: str = "CRC-32") -> FileDigest:
     """Hash a file without loading it into memory."""
 
-    with open(path, "rb") as source:
-        return crc32_stream(source, chunk_size=chunk_size, max_size=max_size)
+    source_path = Path(path)
+    total = source_path.stat().st_size
+    with source_path.open("rb") as source:
+        return crc32_stream(
+            source, chunk_size=chunk_size, max_size=max_size,
+            progress=progress, cancelled=cancelled, progress_total=total,
+            progress_phase=progress_phase)
 
 
 def crc32_file_prefix(path: str | os.PathLike[str], length: int, *,
-                      chunk_size: int = DEFAULT_IO_CHUNK_SIZE) -> FileDigest:
+                      chunk_size: int = DEFAULT_IO_CHUNK_SIZE,
+                      progress: ProgressCallback | None = None,
+                      cancelled: CancellationCallback | None = None,
+                      progress_phase: str = "CRC-32 prefix") -> FileDigest:
     """Hash exactly ``length`` leading bytes for safe resume reconciliation."""
 
     length = _u32("length", length)
@@ -817,14 +872,19 @@ def crc32_file_prefix(path: str | os.PathLike[str], length: int, *,
         raise TransferError("chunk_size must be a positive integer")
     size = 0
     checksum = 0
+    _check_cancelled(cancelled, progress_phase)
+    _report_host_progress(progress, size, length, progress_phase)
     with open(path, "rb") as source:
         while size < length:
+            _check_cancelled(cancelled, progress_phase)
             block = source.read(min(chunk_size, length - size))
             if not block:
                 raise TransferError(
                     f"file ended at {size} bytes; resume prefix requires {length}")
             size += len(block)
             checksum = crc32_update(block, checksum)
+            _report_host_progress(progress, size, length, progress_phase)
+    _check_cancelled(cancelled, progress_phase)
     return FileDigest(size, checksum)
 
 
@@ -904,8 +964,12 @@ class PreparedBasicSource:
                 pass
 
 
-def _normalize_msx_basic_stream(source: BinaryIO, output: BinaryIO, *,
-                                chunk_size: int) -> int:
+def _normalize_msx_basic_stream(
+        source: BinaryIO, output: BinaryIO, *, chunk_size: int,
+        progress: ProgressCallback | None = None,
+        cancelled: CancellationCallback | None = None,
+        progress_total: int | None = None,
+        progress_phase: str = "BASIC normalization") -> int:
     """Stream a numbered 8-bit listing into canonical MSX-DOS text."""
     if (isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or
             chunk_size <= 0):
@@ -918,6 +982,8 @@ def _normalize_msx_basic_stream(source: BinaryIO, output: BinaryIO, *,
     pending_cr = False
     eof_seen = False
     pending_output = bytearray()
+    _check_cancelled(cancelled, progress_phase)
+    _report_host_progress(progress, source_size, progress_total, progress_phase)
 
     def flush_pending() -> None:
         if pending_output:
@@ -939,11 +1005,14 @@ def _normalize_msx_basic_stream(source: BinaryIO, output: BinaryIO, *,
         line_numbered = False
 
     while True:
+        _check_cancelled(cancelled, progress_phase)
         block = source.read(chunk_size)
         if not block:
             break
         source_size += len(block)
-        for value in block:
+        for index, value in enumerate(block):
+            if (index & 0x0FFF) == 0:
+                _check_cancelled(cancelled, progress_phase)
             if eof_seen:
                 if value != 0x1A:
                     raise TransferError(
@@ -980,7 +1049,10 @@ def _normalize_msx_basic_stream(source: BinaryIO, output: BinaryIO, *,
                 pending_output.append(value)
                 if len(pending_output) >= chunk_size:
                     flush_pending()
+        _report_host_progress(
+            progress, source_size, progress_total, progress_phase)
 
+    _check_cancelled(cancelled, progress_phase)
     if pending_cr:
         finish_line()
     elif not eof_seen:
@@ -988,24 +1060,32 @@ def _normalize_msx_basic_stream(source: BinaryIO, output: BinaryIO, *,
     if not saw_statement:
         raise TransferError("ASCII MSX BASIC contains no numbered program lines")
     _write_stream_exact(output, b"\x1a")
+    _check_cancelled(cancelled, progress_phase)
     return source_size
 
 
 def normalize_msx_basic_text(data: bytes, *,
-                             chunk_size: int = DEFAULT_IO_CHUNK_SIZE) -> bytes:
+                             chunk_size: int = DEFAULT_IO_CHUNK_SIZE,
+                             progress: ProgressCallback | None = None,
+                             cancelled: CancellationCallback | None = None
+                             ) -> bytes:
     """Normalize an in-memory 8-bit listing with the streaming implementation."""
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
     source = io.BytesIO(data)
     output = io.BytesIO()
-    _normalize_msx_basic_stream(source, output, chunk_size=chunk_size)
+    _normalize_msx_basic_stream(
+        source, output, chunk_size=chunk_size, progress=progress,
+        cancelled=cancelled, progress_total=len(data))
     return output.getvalue()
 
 
 def prepare_msx_basic_source(
         source: str | os.PathLike[str], target: str, *,
         state_directory: str | os.PathLike[str],
-        chunk_size: int = DEFAULT_IO_CHUNK_SIZE) -> PreparedBasicSource:
+        chunk_size: int = DEFAULT_IO_CHUNK_SIZE,
+        progress: ProgressCallback | None = None,
+        cancelled: CancellationCallback | None = None) -> PreparedBasicSource:
     """Stage textual `.BAS` as canonical MSX-DOS text when unambiguous.
 
     Non-BASIC targets and tokenized BASIC beginning with FFh remain byte-exact.
@@ -1013,14 +1093,24 @@ def prepare_msx_basic_source(
     or any target I/O.
     """
     source_path = Path(source)
+    _check_cancelled(cancelled, "BASIC source inspection")
     source_stat = source_path.stat()
     source_size = source_stat.st_size
     target_name = str(target).replace("\\", "/").rsplit("/", 1)[-1]
     if not target_name.lower().endswith(".bas"):
+        _check_cancelled(cancelled, "BASIC source inspection")
+        _report_host_progress(
+            progress, source_size, source_size, "BASIC source inspection")
+        _check_cancelled(cancelled, "BASIC source inspection")
         return PreparedBasicSource(
             source_path, source_path, source_size, None, None, False)
     with source_path.open("rb") as handle:
+        _check_cancelled(cancelled, "BASIC source inspection")
         if handle.read(1) == b"\xff":
+            _check_cancelled(cancelled, "BASIC source inspection")
+            _report_host_progress(
+                progress, source_size, source_size, "BASIC source inspection")
+            _check_cancelled(cancelled, "BASIC source inspection")
             return PreparedBasicSource(
                 source_path, source_path, source_size,
                 "tokenized", "none", False)
@@ -1034,7 +1124,10 @@ def prepare_msx_basic_source(
         with source_path.open("rb") as input_file, os.fdopen(
                 descriptor, "w+b") as output_file:
             counted_size = _normalize_msx_basic_stream(
-                input_file, output_file, chunk_size=chunk_size)
+                input_file, output_file, chunk_size=chunk_size,
+                progress=progress, cancelled=cancelled,
+                progress_total=source_size)
+        _check_cancelled(cancelled, "BASIC normalization")
         final_stat = source_path.stat()
         if (counted_size != source_size or
                 (final_stat.st_dev, final_stat.st_ino, final_stat.st_size,
@@ -1074,8 +1167,10 @@ class _PackBitsWireLimit(TransferError):
     """The encoded representation overflowed a valid raw size field."""
 
 
-def _deterministic_packbits(source_path: Path, directory: Path, *,
-                            chunk_size: int, max_size: int) -> PreparedPayload:
+def _deterministic_packbits(
+        source_path: Path, directory: Path, *, chunk_size: int, max_size: int,
+        progress: ProgressCallback | None = None,
+        cancelled: CancellationCallback | None = None) -> PreparedPayload:
     """Create a canonical bounded-memory PackBits stream.
 
     Literal packets contain 1..128 bytes. Runs are emitted only for lengths
@@ -1095,6 +1190,10 @@ def _deterministic_packbits(source_path: Path, directory: Path, *,
     literal = bytearray()
     run_byte: int | None = None
     run_length = 0
+    source_total = source_path.stat().st_size
+    phase = "PackBits preparation"
+    _check_cancelled(cancelled, phase)
+    _report_host_progress(progress, final_size, source_total, phase)
 
     def emit(output: BinaryIO, packet: bytes) -> None:
         nonlocal wire_size, wire_crc
@@ -1126,6 +1225,7 @@ def _deterministic_packbits(source_path: Path, directory: Path, *,
     try:
         with source_path.open("rb") as source, os.fdopen(descriptor, "wb") as output:
             while True:
+                _check_cancelled(cancelled, phase)
                 remaining = max_size - final_size
                 block = source.read(min(chunk_size, remaining + 1))
                 if not block:
@@ -1134,7 +1234,9 @@ def _deterministic_packbits(source_path: Path, directory: Path, *,
                     raise TransferError(f"source exceeds maximum size {max_size}")
                 final_size += len(block)
                 final_crc = zlib.crc32(block, final_crc)
-                for value in block:
+                for index, value in enumerate(block):
+                    if (index & 0x0FFF) == 0:
+                        _check_cancelled(cancelled, phase)
                     if run_length and value == run_byte:
                         if run_length == 128:
                             settle_run(output)
@@ -1146,6 +1248,9 @@ def _deterministic_packbits(source_path: Path, directory: Path, *,
                         settle_run(output)
                         run_byte = value
                         run_length = 1
+                _report_host_progress(
+                    progress, final_size, source_total, phase)
+            _check_cancelled(cancelled, phase)
             settle_run(output)
             flush_literals(output, final=True)
         return PreparedPayload(
@@ -1173,7 +1278,9 @@ def prepare_put_payload(
         source: str | os.PathLike[str], *,
         state_directory: str | os.PathLike[str], mode: str = "auto",
         chunk_size: int = DEFAULT_IO_CHUNK_SIZE,
-        max_size: int = UINT32_MAX) -> PreparedPayload:
+        max_size: int = UINT32_MAX,
+        progress: ProgressCallback | None = None,
+        cancelled: CancellationCallback | None = None) -> PreparedPayload:
     """Choose raw or deterministic PackBits for a PUT.
 
     ``auto`` keeps known compressed formats (including ZIP) byte-for-byte raw.
@@ -1188,33 +1295,49 @@ def prepare_put_payload(
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise TransferError("chunk_size must be a positive integer")
     max_size = _u32("max_size", max_size)
+    _check_cancelled(cancelled, "PUT preparation")
 
     def raw_result(reason: str, digest: FileDigest | None = None) -> PreparedPayload:
+        _check_cancelled(cancelled, "PUT preparation")
         digest = digest or crc32_file(
-            source_path, chunk_size=chunk_size, max_size=max_size)
+            source_path, chunk_size=chunk_size, max_size=max_size,
+            progress=progress, cancelled=cancelled,
+            progress_phase="raw PUT CRC-32")
+        _check_cancelled(cancelled, "PUT preparation")
         return PreparedPayload(
             source_path, source_path, TransferEncoding.RAW,
             digest, digest, False, reason)
 
     if mode == "raw":
         return raw_result("raw requested")
+    _check_cancelled(cancelled, "PUT preparation")
     if mode == "auto" and looks_already_compressed(source_path):
         return raw_result("already compressed")
 
     try:
         compressed = _deterministic_packbits(
             source_path, Path(state_directory), chunk_size=chunk_size,
-            max_size=max_size)
+            max_size=max_size, progress=progress, cancelled=cancelled)
     except _PackBitsWireLimit:
         if mode == "packbits":
             raise
         return raw_result("PackBits expansion exceeds the wire-size limit")
     if mode == "packbits":
+        try:
+            _check_cancelled(cancelled, "PackBits preparation")
+        except BaseException:
+            compressed.cleanup()
+            raise
         return compressed
 
     savings = compressed.final_digest.size - compressed.wire_digest.size
     required = max(256, (compressed.final_digest.size * 3 + 99) // 100)
     if savings >= required:
+        try:
+            _check_cancelled(cancelled, "PackBits preparation")
+        except BaseException:
+            compressed.cleanup()
+            raise
         return replace(compressed, reason=f"PackBits saves {savings} bytes")
     compressed.cleanup()
     return raw_result(

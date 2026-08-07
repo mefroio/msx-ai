@@ -277,6 +277,13 @@ result returns the same interval as `stream_bytes`, `stream_seconds`, and
 `stream_rate_bps`. The display code is compiled only into `MSXAIXF.COM`; it adds
 no resident TSR memory and disappears when DOS terminates the helper.
 
+When an MCP client cancels a host PUT/GET call, the host keeps its target lock,
+signals the synchronous transfer worker, and sends protocol-X `CANCEL` at the
+next safe frame boundary. The helper closes foreground handles without
+publishing incomplete output; valid sidecar, partial, and host-journal state is
+kept for a later bound resume. A lost CANCEL response therefore does not turn a
+cancelled operation into success or authorize an unrelated transfer.
+
 Protocol version 1 advertises RAW plus PUT-side `PACKBITS_DECODE`; GET remains
 RAW. The host uses deterministic standard PackBits only after capability
 negotiation and only when the requested compression policy selects it. A

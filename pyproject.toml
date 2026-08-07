@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msx-ai"
+dynamic = ["version"]
+description = "Control emulated and physical MSX computers through MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT AND GPL-2.0-only"
+license-files = [
+  "LICENSE",
+  "third_party/memman/NOTICE",
+  "third_party/openmsx/NOTICE",
+  "third_party/openmsx/GPL-2.0.txt",
+]
+authors = [
+  { name = "Rodrigo Galhardi M. Garcia" },
+]
+keywords = ["MSX", "MCP", "openMSX", "retrocomputing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: System :: Emulators",
+]
+dependencies = [
+  "anyio>=4.5,<5",
+  "jsonschema>=4.20,<5",
+  "mcp>=2,<3",
+  "uvicorn>=0.30,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/mefroio/msx-ai"
+Repository = "https://github.com/mefroio/msx-ai"
+Issues = "https://github.com/mefroio/msx-ai/issues"
+
+[project.scripts]
+msx-ai-mcp = "msx_ai.mcp_runtime:main"
+
+[tool.setuptools]
+packages = [
+  "msx_ai",
+  "msx_ai.resources",
+  "msx_ai.resources.docs",
+  "msx_ai.resources.openmsx",
+]
+package-dir = { msx_ai = "server" }
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { attr = "msx_ai._version.__version__" }
+
+[tool.setuptools.package-data]
+"msx_ai.resources.docs" = ["*.md", "manifest.json"]
+"msx_ai.resources.openmsx" = [
+  "share/extensions/README",
+  "share/extensions/rs232_proto.xml",
+  "share/machines/Gradiente_Expert20.xml",
+  "share/machines/Gradiente_Expert20_64K.xml",
+  "share/machines/Sony_HB-F1XDJ_128K_Lite.xml",
+  "share/machines/Sony_HB-F1XDJ_64K_Lite.xml",
+  "share/settings.xml",
+  "share/software/README",
+]

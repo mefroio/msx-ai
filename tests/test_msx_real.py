@@ -354,7 +354,7 @@ class RealMSXTransportTest(unittest.TestCase):
         msx_mcp_server.SESSION.msx = None
         msx_mcp_server.SESSION.profile = None
         try:
-            status = json.loads(msx_mcp_server.t_status())
+            status = msx_mcp_server.t_status()
             self.assertEqual(status, {"backend": "none", "state": "disconnected"})
         finally:
             (msx_mcp_server.SESSION.msx,

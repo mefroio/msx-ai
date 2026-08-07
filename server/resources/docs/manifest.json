@@ -1,0 +1,270 @@
+{
+  "schema_version": 1,
+  "project": "MSX-AI",
+  "license": "MIT",
+  "corpus_license": "MIT",
+  "project_license": "MIT",
+  "authored_by": "MSX-AI project",
+  "provenance": {
+    "origin": "project-authored",
+    "repository_url": "https://github.com/mefroio/msx-ai",
+    "distribution_version": "0.6.0",
+    "source_distribution": "msx_ai-0.6.0.tar.gz",
+    "evidence_paths_relative_to": "source distribution root"
+  },
+  "reviewed_at": "2026-08-07",
+  "documents": [
+    {
+      "id": "overview",
+      "path": "overview.md",
+      "title": "MSX-AI overview",
+      "summary": "Purpose, architecture paths, capabilities, and navigation for the MSX-AI documentation corpus.",
+      "license": "MIT",
+      "authored_by": "MSX-AI project",
+      "origin": "project-authored",
+      "provenance": {
+        "origin": "project-authored",
+        "evidence": [
+          "README.md",
+          "TECHNICAL.md",
+          "server/mcp_runtime.py",
+          "server/msx_mcp_server.py",
+          "tests/test_backend_optionality.py"
+        ]
+      },
+      "tags": [
+        "overview",
+        "architecture",
+        "mcp",
+        "msx"
+      ],
+      "audience": [
+        "users",
+        "integrators",
+        "developers"
+      ],
+      "backends": [
+        "openmsx-direct",
+        "agent-simulated",
+        "agent-physical"
+      ],
+      "reviewed_at": "2026-08-07",
+      "sha256": "eec3caac50dbf57899ed948dfeeb2ac4b21969933448b5f3b5be67c28f4a2186",
+      "external_references": []
+    },
+    {
+      "id": "getting-started",
+      "path": "getting-started.md",
+      "title": "Getting started",
+      "summary": "Host installation and minimal successful workflows for direct, simulated-agent, and physical-agent targets.",
+      "license": "MIT",
+      "authored_by": "MSX-AI project",
+      "origin": "project-authored",
+      "provenance": {
+        "origin": "project-authored",
+        "evidence": [
+          ".mcp.json",
+          "Makefile",
+          "TECHNICAL.md",
+          "agent/README.md",
+          "pyproject.toml",
+          "server/mcp_runtime.py",
+          "server/msx_mcp_server.py",
+          "tests/test_backend_optionality.py",
+          "tests/test_openmsx_launcher.py"
+        ]
+      },
+      "tags": [
+        "installation",
+        "quick-start",
+        "connection",
+        "configuration"
+      ],
+      "audience": [
+        "users",
+        "integrators"
+      ],
+      "backends": [
+        "openmsx-direct",
+        "agent-simulated",
+        "agent-physical"
+      ],
+      "reviewed_at": "2026-08-07",
+      "sha256": "01ed2adab304a0176190adcbe675d2e8c031de086bc2e7a3f9545be13a08e55e",
+      "external_references": [
+        {
+          "url": "https://github.com/mefroio/msx-ai.git",
+          "origin": "MSX-AI project repository",
+          "purpose": "source installation command",
+          "license_status": "same-project source under the declared repository licenses"
+        }
+      ]
+    },
+    {
+      "id": "backends",
+      "path": "backends.md",
+      "title": "Backends and runtime modes",
+      "summary": "Capability matrix and selection guidance for direct openMSX, simulated agents, physical agents, residents, and monitors.",
+      "license": "MIT",
+      "authored_by": "MSX-AI project",
+      "origin": "project-authored",
+      "provenance": {
+        "origin": "project-authored",
+        "evidence": [
+          "TECHNICAL.md",
+          "agent/README.md",
+          "server/msx_client.py",
+          "server/msx_mcp_server.py",
+          "server/msx_real.py",
+          "tests/test_backend_optionality.py",
+          "tests/test_mcp_cpu_snapshot.py"
+        ]
+      },
+      "tags": [
+        "backends",
+        "capabilities",
+        "resident",
+        "monitor"
+      ],
+      "audience": [
+        "users",
+        "integrators",
+        "developers"
+      ],
+      "backends": [
+        "openmsx-direct",
+        "agent-simulated",
+        "agent-physical"
+      ],
+      "reviewed_at": "2026-08-07",
+      "sha256": "e825966e6f128657e83f9dab6120fc374fe618c94e0417ed124370f2ad162ace",
+      "external_references": []
+    },
+    {
+      "id": "safety",
+      "path": "safety.md",
+      "title": "Safety and operational limits",
+      "summary": "Fail-closed behavior, cooperative-control boundaries, memory hazards, input limits, and screenshot constraints.",
+      "license": "MIT",
+      "authored_by": "MSX-AI project",
+      "origin": "project-authored",
+      "provenance": {
+        "origin": "project-authored",
+        "evidence": [
+          "TECHNICAL.md",
+          "agent/README.md",
+          "server/msx_real.py",
+          "server/msx_screenshot.py",
+          "tests/test_snapshot_safety.py",
+          "tests/test_screenshot.py"
+        ]
+      },
+      "tags": [
+        "safety",
+        "memory",
+        "timeouts",
+        "screenshots"
+      ],
+      "audience": [
+        "users",
+        "operators",
+        "developers"
+      ],
+      "backends": [
+        "openmsx-direct",
+        "agent-simulated",
+        "agent-physical"
+      ],
+      "reviewed_at": "2026-08-07",
+      "sha256": "622f731f9d37f0ba6c4ce25c6f48e0dfb9515ab5d76dd86b8743799929d894a1",
+      "external_references": []
+    },
+    {
+      "id": "transfers",
+      "path": "transfers.md",
+      "title": "Resumable MSX-DOS file transfer",
+      "summary": "Requirements, integrity model, fast data plane, encodings, publication rules, and recovery behavior for PUT and GET.",
+      "license": "MIT",
+      "authored_by": "MSX-AI project",
+      "origin": "project-authored",
+      "provenance": {
+        "origin": "project-authored",
+        "evidence": [
+          "TECHNICAL.md",
+          "agent/msx_xfer_protocol.inc",
+          "server/execution.py",
+          "server/mcp_runtime.py",
+          "server/msx_real.py",
+          "server/msx_transfer.py",
+          "tests/test_agent_fast_transfer.py",
+          "tests/test_msx_real_transfer.py",
+          "tests/test_msx_transfer.py"
+        ]
+      },
+      "tags": [
+        "file-transfer",
+        "resume",
+        "crc",
+        "packbits"
+      ],
+      "audience": [
+        "users",
+        "operators",
+        "developers"
+      ],
+      "backends": [
+        "agent-simulated",
+        "agent-physical"
+      ],
+      "reviewed_at": "2026-08-07",
+      "sha256": "1b49e9085b2bd6acf2bc78d1728d329bbc47d78b79248dbbfed6a8539e3844e5",
+      "external_references": []
+    },
+    {
+      "id": "development",
+      "path": "development.md",
+      "title": "Development and validation",
+      "summary": "Deterministic tests, integration tests, agent builds, deployable artifacts, release hygiene, and documentation provenance.",
+      "license": "MIT",
+      "authored_by": "MSX-AI project",
+      "origin": "project-authored",
+      "provenance": {
+        "origin": "project-authored",
+        "evidence": [
+          "LICENSE",
+          "Makefile",
+          "pyproject.toml",
+          "TECHNICAL.md",
+          "agent/README.md",
+          "tests/test_agent_source.py",
+          "tests/test_mcp_runtime.py",
+          "tests/test_openmsx_resident.py",
+          "tests/test_packaging_paths.py",
+          "tools/release_check.py",
+          "third_party/memman/NOTICE",
+          "third_party/memman/SHA256SUMS"
+        ]
+      },
+      "tags": [
+        "development",
+        "testing",
+        "build",
+        "provenance",
+        "release"
+      ],
+      "audience": [
+        "contributors",
+        "maintainers",
+        "developers"
+      ],
+      "backends": [
+        "openmsx-direct",
+        "agent-simulated",
+        "agent-physical"
+      ],
+      "reviewed_at": "2026-08-07",
+      "sha256": "ddc41c8df99a131a2ef291b7ab23559a97c9cd01a75841eb1ee833b587a20ee5",
+      "external_references": []
+    }
+  ]
+}

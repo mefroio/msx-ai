@@ -34,6 +34,7 @@ class _FakeEmulatorBackend:
         self.started_headless = None
         self.powered = False
         self.advanced = []
+        self.closed = False
 
     def start(self, *, headless):
         self.started_headless = headless
@@ -49,7 +50,7 @@ class _FakeEmulatorBackend:
         return "MSX BASIC"
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class BackendOptionalityTest(unittest.TestCase):
@@ -123,6 +124,37 @@ class BackendOptionalityTest(unittest.TestCase):
         self.assertEqual(emulator.advanced, [2])
         openmsx.assert_called_once()
         real.assert_not_called()
+
+    def test_failed_openmsx_boot_closes_partial_backend(self):
+        session = msx_mcp_server.Session()
+        emulator = _FakeEmulatorBackend()
+        emulator.power_on = mock.Mock(
+            side_effect=msx_client.OpenMSXError("power failed"))
+        with mock.patch.object(
+                msx_mcp_server, "OpenMSX", return_value=emulator):
+            with self.assertRaisesRegex(msx_client.OpenMSXError, "power failed"):
+                session.boot("basic", boot_seconds=2, window=False)
+
+        self.assertTrue(emulator.closed)
+        self.assertIsNone(session.msx)
+        self.assertIsNone(session.profile)
+
+    def test_failed_openmsx_attach_screen_read_closes_without_publishing(self):
+        session = msx_mcp_server.Session()
+        emulator = mock.Mock()
+        emulator.screen_text.side_effect = msx_client.OpenMSXError(
+            "screen failed")
+        with mock.patch.object(
+                msx_mcp_server, "OpenMSX", return_value=emulator):
+            with self.assertRaisesRegex(msx_client.OpenMSXError, "screen failed"):
+                session.attach("/tmp/openmsx-user/socket.1")
+
+        emulator.attach.assert_called_once_with(
+            "/tmp/openmsx-user/socket.1")
+        emulator.enable_keybuf.assert_called_once_with()
+        emulator.close.assert_called_once_with()
+        self.assertIsNone(session.msx)
+        self.assertIsNone(session.profile)
 
     def test_physical_host_protocol_has_no_badcat_runtime_branch(self):
         for relative in (

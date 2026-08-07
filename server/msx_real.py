@@ -16,7 +16,9 @@ while the MSX-side UART/Wi-Fi implementation is negotiated independently.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import ipaddress
+import math
 import os
 import pathlib
 import shutil
@@ -26,53 +28,104 @@ import tempfile
 import threading
 import time
 
-from msx_v3 import V3Session, V3SessionError
-from msx_cpu import (
-    CPU_CONTEXT_VERSION,
-    CPUSnapshotError,
-    parse_agent_cpu_context,
-)
-from msx_transfer import (
-    FEATURE_FILE_TRANSFER_V2,
-    TRANSFER_OPCODE,
-    TransferBindingError,
-    TransferCapability,
-    TransferDescriptor,
-    TransferDirection,
-    TransferEncoding,
-    TransferError,
-    TransferFastCapability,
-    TransferJournal,
-    TransferRemoteError,
-    TransferReplyFlag,
-    TransferState,
-    crc32_file_prefix,
-    crc32_update,
-    encode_cancel,
-    encode_capabilities_request,
-    encode_close,
-    encode_get_ack,
-    encode_get_read,
-    encode_fast_capabilities_request,
-    encode_fast_begin,
-    encode_open,
-    encode_put_data,
-    encode_status,
-    new_transfer_id,
-    parse_cancel_reply,
-    parse_capabilities_reply,
-    parse_close_reply,
-    parse_get_ack_reply,
-    parse_get_read_reply,
-    parse_fast_capabilities_reply,
-    parse_open_reply,
-    parse_put_data_reply,
-    parse_status_reply,
-    prepare_msx_basic_source,
-    prepare_put_payload,
-)
+if __package__:
+    from .msx_v3 import V3Session, V3SessionError
+    from .msx_cpu import (
+        CPU_CONTEXT_VERSION,
+        CPUSnapshotError,
+        parse_agent_cpu_context,
+    )
+    from .msx_transfer import (
+        FEATURE_FILE_TRANSFER_V2,
+        TRANSFER_OPCODE,
+        TransferBindingError,
+        TransferCapability,
+        TransferCancelledError,
+        TransferDescriptor,
+        TransferDirection,
+        TransferEncoding,
+        TransferError,
+        TransferFastCapability,
+        TransferJournal,
+        TransferRemoteError,
+        TransferReplyFlag,
+        TransferState,
+        crc32_file_prefix,
+        crc32_update,
+        encode_cancel,
+        encode_capabilities_request,
+        encode_close,
+        encode_get_ack,
+        encode_get_read,
+        encode_fast_capabilities_request,
+        encode_fast_begin,
+        encode_open,
+        encode_put_data,
+        encode_status,
+        new_transfer_id,
+        parse_cancel_reply,
+        parse_capabilities_reply,
+        parse_close_reply,
+        parse_get_ack_reply,
+        parse_get_read_reply,
+        parse_fast_capabilities_reply,
+        parse_open_reply,
+        parse_put_data_reply,
+        parse_status_reply,
+        prepare_msx_basic_source,
+        prepare_put_payload,
+    )
+    from .paths import source_root, transfer_state_directory, user_root
+else:  # pragma: no cover - repository-style top-level import
+    from msx_v3 import V3Session, V3SessionError
+    from msx_cpu import (
+        CPU_CONTEXT_VERSION,
+        CPUSnapshotError,
+        parse_agent_cpu_context,
+    )
+    from msx_transfer import (
+        FEATURE_FILE_TRANSFER_V2,
+        TRANSFER_OPCODE,
+        TransferBindingError,
+        TransferCapability,
+        TransferCancelledError,
+        TransferDescriptor,
+        TransferDirection,
+        TransferEncoding,
+        TransferError,
+        TransferFastCapability,
+        TransferJournal,
+        TransferRemoteError,
+        TransferReplyFlag,
+        TransferState,
+        crc32_file_prefix,
+        crc32_update,
+        encode_cancel,
+        encode_capabilities_request,
+        encode_close,
+        encode_get_ack,
+        encode_get_read,
+        encode_fast_capabilities_request,
+        encode_fast_begin,
+        encode_open,
+        encode_put_data,
+        encode_status,
+        new_transfer_id,
+        parse_cancel_reply,
+        parse_capabilities_reply,
+        parse_close_reply,
+        parse_get_ack_reply,
+        parse_get_read_reply,
+        parse_fast_capabilities_reply,
+        parse_open_reply,
+        parse_put_data_reply,
+        parse_status_reply,
+        prepare_msx_basic_source,
+        prepare_put_payload,
+    )
+    from paths import source_root, transfer_state_directory, user_root
 
-PROJ = pathlib.Path(__file__).resolve().parent.parent
+PROJ = source_root() or user_root()
 Z80ASM = (os.environ.get("Z80ASM") or shutil.which("z80asm") or
           "/opt/homebrew/bin/z80asm")
 PROTOCOL_VERSION = 2
@@ -156,7 +209,7 @@ KEYBUF_SPOOL_FLAG_AUTHORIZED = 0x04
 KEYBUF_SPOOL_REQUEST_PUMP = 0x01
 KEYBUF_SPOOL_REQUEST_CANCEL = 0x02
 KEYBUF_SPOOL_REFILL_TARGET = 128
-FILE_TRANSFER_STATE_DIR = PROJ / "work" / "transfers"
+FILE_TRANSFER_STATE_DIR = transfer_state_directory()
 FILE_TRANSFER_POLL_INTERVAL = 0.05
 FILE_TRANSFER_PROGRESS_TIMEOUT = 600.0
 FILE_TRANSFER_JOURNAL_INTERVAL = 64 * 1024
@@ -190,6 +243,10 @@ class RealMSXTimeoutError(RealMSXError):
     pass
 
 
+class RealMSXCancelledError(RealMSXError):
+    """A resumable transfer was cancelled by its caller."""
+
+
 class RealMSXRangeError(RealMSXError, ValueError):
     pass
 
@@ -207,7 +264,7 @@ class RealMSX:
     in the MSX.
     """
 
-    def __init__(self, host="0.0.0.0", port=DEFAULT_PORT, socket_timeout=15,
+    def __init__(self, host="127.0.0.1", port=DEFAULT_PORT, socket_timeout=15,
                  file_transfer_state_directory=FILE_TRANSFER_STATE_DIR):
         self.host, self.port = host, int(port)
         self.socket_timeout = float(socket_timeout)
@@ -266,11 +323,28 @@ class RealMSX:
         self.network_role = "listen"
         return self
 
-    def accept(self, timeout=60, handshake=True):
+    def accept(self, timeout=60, handshake=True, cancelled=None):
         if self.srv is None:
             raise RealMSXError("listener is not open")
-        self.srv.settimeout(float(timeout))
-        conn, peer = self.srv.accept()
+        if isinstance(timeout, bool):
+            raise TypeError("accept timeout must be a number")
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or not 0 < timeout <= 86400:
+            raise ValueError("accept timeout must be finite and at most 86400 seconds")
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancelled is not None and cancelled():
+                raise RealMSXCancelledError(
+                    "MSX agent listener cancelled before a connection arrived")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RealMSXTimeoutError("timeout waiting for an MSX agent connection")
+            self.srv.settimeout(min(0.1, remaining))
+            try:
+                conn, peer = self.srv.accept()
+                break
+            except socket.timeout:
+                continue
         try:
             self._configure_tcp_nodelay(conn)
         except Exception:
@@ -1898,17 +1972,90 @@ class RealMSX:
             timeout = float(timeout)
         except (TypeError, ValueError) as exc:
             raise TypeError("transfer timeout must be a number") from exc
-        if timeout <= 0:
-            raise ValueError("transfer timeout must be positive")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("transfer timeout must be a positive finite number")
         return timeout
 
+    @staticmethod
+    def _report_file_transfer(progress, completed, total, message):
+        if progress is not None:
+            try:
+                progress(
+                    float(completed),
+                    None if total is None else float(total),
+                    message)
+            except Exception:
+                # Progress is observation only. A broken UI/client callback
+                # cannot be allowed to strand a foreground DOS helper.
+                pass
+
+    @classmethod
+    def _host_transfer_progress(cls, progress, *, completed, total, label):
+        """Adapt local work to the monotonic byte-transfer progress stream.
+
+        Preparation and prefix hashing can traverse the source more than once.
+        Their own byte counters therefore live in the descriptive message,
+        while the public completed value stays at the next wire boundary and
+        never moves backwards when the actual transfer begins.
+        """
+        if progress is None:
+            return None
+
+        def report(local_completed, local_total, message):
+            if message is None:
+                denominator = ("?" if local_total is None else
+                               str(int(local_total)))
+                message = f"{int(local_completed)}/{denominator} bytes"
+            cls._report_file_transfer(
+                progress, completed, total, f"{label}: {message}")
+
+        return report
+
+    @staticmethod
+    def _raise_pre_open_transfer_cancelled(exc):
+        raise RealMSXCancelledError(
+            "MSX file transfer cancelled during local preparation before "
+            "the remote worker opened") from exc
+
+    def _raise_active_local_transfer_cancelled(self, transfer_id, exc):
+        try:
+            self._cancel_file_transfer_if_requested(
+                transfer_id, lambda: True)
+        except RealMSXCancelledError as cancelled_exc:
+            raise cancelled_exc from exc
+        raise AssertionError("forced transfer cancellation did not raise")
+
+    def _cancel_file_transfer_if_requested(self, transfer_id, cancelled):
+        if cancelled is None or not cancelled():
+            return
+        detail = ""
+        try:
+            self.file_transfer_cancel(transfer_id)
+        except Exception as exc:
+            # Preserve cancellation as the primary outcome. The durable host
+            # journal still makes a later reconnect/resume fail closed even if
+            # the best-effort remote CANCEL could not cross a broken link.
+            detail = f"; remote CANCEL could not be confirmed: {exc}"
+        raise RealMSXCancelledError(
+            "MSX file transfer cancelled; durable resume state was preserved"
+            + detail)
+
+    @staticmethod
+    def _cancel_before_open_if_requested(cancelled):
+        if cancelled is not None and cancelled():
+            raise RealMSXCancelledError(
+                "MSX file transfer cancelled before the remote worker opened")
+
     def _wait_file_transfer(self, transfer_id, states, *, timeout,
-                            previous=None):
+                            previous=None, progress=None,
+                            progress_total=None, direction="transfer",
+                            cancelled=None):
         """Poll STATUS until one of ``states`` with a no-progress deadline."""
         states = frozenset(states)
         deadline = time.monotonic() + timeout
         marker = previous
         while True:
+            self._cancel_file_transfer_if_requested(transfer_id, cancelled)
             status = self.file_transfer_status(transfer_id)
             self._raise_transfer_remote(status, "file transfer")
             current = (
@@ -1917,6 +2064,11 @@ class RealMSX:
             if current != marker:
                 marker = current
                 deadline = time.monotonic() + timeout
+                if progress_total is not None:
+                    self._report_file_transfer(
+                        progress, status.durable_offset, progress_total,
+                        f"{direction}: {status.state.name.lower()} "
+                        f"({status.durable_offset}/{progress_total} durable bytes)")
             if status.state in states:
                 return status
             if status.state is TransferState.SUSPENDED:
@@ -1985,7 +2137,8 @@ class RealMSX:
     def put_file(self, source, target, *, compression="auto", resume=True,
                  existing_only=False,
                  state_directory=None,
-                 timeout=FILE_TRANSFER_PROGRESS_TIMEOUT):
+                 timeout=FILE_TRANSFER_PROGRESS_TIMEOUT,
+                 progress=None, cancelled=None):
         """Stream a local file to MSX-DOS with CRC-32 and durable resume.
 
         Compression is negotiated independently. ``auto`` falls back to raw
@@ -1994,6 +2147,7 @@ class RealMSX:
         Existing archive/media formats selected by the planner remain raw.
         """
         timeout = self._validate_progress_timeout(timeout)
+        self._cancel_before_open_if_requested(cancelled)
         if not isinstance(resume, bool):
             raise TypeError("resume must be a boolean")
         if not isinstance(existing_only, bool):
@@ -2001,6 +2155,7 @@ class RealMSX:
         source_path = pathlib.Path(source).expanduser().resolve(strict=True)
         if not source_path.is_file():
             raise ValueError(f"local PUT source is not a regular file: {source_path}")
+        source_size = source_path.stat().st_size
         state_directory = pathlib.Path(
             self.file_transfer_state_directory
             if state_directory is None else state_directory).expanduser()
@@ -2022,13 +2177,25 @@ class RealMSX:
         planning_mode = (
             "raw" if raw_fallback_reason is not None
             else compression)
-        basic_source = prepare_msx_basic_source(
-            source_path, target_path, state_directory=state_directory)
+        preparation_progress = self._host_transfer_progress(
+            progress, completed=0, total=source_size,
+            label="PUT preparation")
+        try:
+            basic_source = prepare_msx_basic_source(
+                source_path, target_path, state_directory=state_directory,
+                progress=preparation_progress, cancelled=cancelled)
+        except TransferCancelledError as exc:
+            self._raise_pre_open_transfer_cancelled(exc)
         prepared = None
         try:
-            prepared = prepare_put_payload(
-                basic_source.transfer_path,
-                state_directory=state_directory, mode=planning_mode)
+            try:
+                prepared = prepare_put_payload(
+                    basic_source.transfer_path,
+                    state_directory=state_directory, mode=planning_mode,
+                    progress=preparation_progress, cancelled=cancelled)
+            except TransferCancelledError as exc:
+                self._raise_pre_open_transfer_cancelled(exc)
+            self._cancel_before_open_if_requested(cancelled)
             caller_binding = str(source_path)
             candidate = TransferDescriptor(
                 direction=TransferDirection.PUT,
@@ -2057,8 +2224,17 @@ class RealMSX:
                 confirmed_crc = record.prefix_crc32
                 close_intent = record.close_intent
 
-            local_prefix = crc32_file_prefix(
-                prepared.wire_path, confirmed_offset).crc32
+            try:
+                local_prefix = crc32_file_prefix(
+                    prepared.wire_path, confirmed_offset,
+                    progress=self._host_transfer_progress(
+                        progress, completed=0,
+                        total=prepared.wire_digest.size,
+                        label="PUT resume validation"),
+                    cancelled=cancelled,
+                    progress_phase="local PUT resume prefix CRC-32").crc32
+            except TransferCancelledError as exc:
+                self._raise_pre_open_transfer_cancelled(exc)
             if local_prefix != confirmed_crc:
                 raise TransferBindingError(
                     "local PUT prefix no longer matches its resume journal")
@@ -2068,12 +2244,14 @@ class RealMSX:
                 caller_binding=caller_binding,
                 close_intent=close_intent)
 
+            self._cancel_before_open_if_requested(cancelled)
             status = (self._recover_active_transfer(descriptor)
                       if record is not None else None)
             if existing_only and status is None:
                 raise RealMSXError(
                     "the journalled PUT is no longer active on the MSX")
             if status is None:
+                self._cancel_before_open_if_requested(cancelled)
                 opened = self.file_transfer_open(descriptor)
                 self._raise_transfer_remote(opened, "PUT open")
                 if opened.state not in (TransferState.STAGED,
@@ -2085,6 +2263,8 @@ class RealMSX:
             else:
                 status_state = status.state
 
+            self._cancel_file_transfer_if_requested(
+                descriptor.transfer_id, cancelled)
             if status_state is TransferState.STAGED:
                 if existing_only:
                     raise RealMSXError(
@@ -2099,7 +2279,9 @@ class RealMSX:
                     descriptor.transfer_id,
                     (TransferState.READY, TransferState.TRANSFERRING,
                      TransferState.VERIFYING, TransferState.POSTPROCESS,
-                     TransferState.COMPLETE), timeout=timeout)
+                     TransferState.COMPLETE), timeout=timeout,
+                    progress=progress, progress_total=descriptor.wire_size,
+                    direction="PUT", cancelled=cancelled)
             self._validate_transfer_binding(status, descriptor)
             if status.state in (
                     TransferState.READY, TransferState.TRANSFERRING):
@@ -2108,8 +2290,18 @@ class RealMSX:
 
             with prepared.wire_path.open("rb") as stream:
                 durable_offset = status.durable_offset
-                durable_crc = crc32_file_prefix(
-                    prepared.wire_path, durable_offset).crc32
+                try:
+                    durable_crc = crc32_file_prefix(
+                        prepared.wire_path, durable_offset,
+                        progress=self._host_transfer_progress(
+                            progress, completed=durable_offset,
+                            total=descriptor.wire_size,
+                            label="PUT recovery validation"),
+                        cancelled=cancelled,
+                        progress_phase="active PUT prefix CRC-32").crc32
+                except TransferCancelledError as exc:
+                    self._raise_active_local_transfer_cancelled(
+                        descriptor.transfer_id, exc)
                 if durable_crc != status.prefix_crc32:
                     raise TransferBindingError(
                         "MSX PUT partial prefix differs from the local source")
@@ -2148,6 +2340,10 @@ class RealMSX:
                 stream_completed_at = (
                     stream_started_at
                     if durable_offset == descriptor.wire_size else None)
+                self._report_file_transfer(
+                    progress, accepted_offset, descriptor.wire_size,
+                    f"PUT: {accepted_offset}/{descriptor.wire_size} accepted bytes; "
+                    f"{durable_offset} durable")
 
                 def reconcile_durable(remote_offset, remote_crc=None):
                     nonlocal durable_offset, durable_crc, journal_checkpoint
@@ -2176,6 +2372,10 @@ class RealMSX:
                         if (durable_offset == descriptor.wire_size and
                                 stream_completed_at is None):
                             stream_completed_at = time.monotonic()
+                        self._report_file_transfer(
+                            progress, accepted_offset, descriptor.wire_size,
+                            f"PUT: {accepted_offset}/{descriptor.wire_size} "
+                            f"accepted bytes; {durable_offset} durable")
                     if remote_crc is not None and remote_crc != durable_crc:
                         raise TransferBindingError(
                             "MSX PUT rolling CRC differs from local source")
@@ -2241,6 +2441,8 @@ class RealMSX:
                             "MSX PUT was suspended; retry with resume enabled")
 
                 while status.state is not TransferState.COMPLETE:
+                    self._cancel_file_transfer_if_requested(
+                        descriptor.transfer_id, cancelled)
                     if accepted_offset < descriptor.wire_size:
                         # The foreground pump consumes exactly one large frame,
                         # returns its response, writes that RAM block through
@@ -2275,23 +2477,28 @@ class RealMSX:
                             raise RealMSXProtocolError(
                                 "local fast PUT source ended before its "
                                 "declared size")
-                        progress = self.file_transfer_put_data(
+                        put_reply = self.file_transfer_put_data(
                             descriptor.transfer_id, accepted_offset, block)
-                        self._raise_transfer_remote(progress, "fast PUT data")
-                        if (progress.accepted != len(block) or
-                                progress.accepted_end !=
+                        self._raise_transfer_remote(put_reply, "fast PUT data")
+                        if (put_reply.accepted != len(block) or
+                                put_reply.accepted_end !=
                                 accepted_offset + len(block) or
-                                progress.durable_end >
-                                progress.accepted_end):
+                                put_reply.durable_end >
+                                put_reply.accepted_end):
                             raise RealMSXProtocolError(
                                 "MSX fast PUT did not accept the complete "
                                 "sequential RAM block")
                         inflight.extend(block)
-                        accepted_offset = progress.accepted_end
-                        reconcile_durable(progress.durable_end)
+                        accepted_offset = put_reply.accepted_end
+                        reconcile_durable(put_reply.durable_end)
+                        self._report_file_transfer(
+                            progress, accepted_offset,
+                            descriptor.wire_size,
+                            f"PUT: {accepted_offset}/{descriptor.wire_size} "
+                            f"accepted bytes; {durable_offset} durable")
                         progress_marker = (
-                            progress.state, progress.durable_end,
-                            progress.accepted_end, progress.credit)
+                            put_reply.state, put_reply.durable_end,
+                            put_reply.accepted_end, put_reply.credit)
                         progress_deadline = time.monotonic() + timeout
                         continue
 
@@ -2345,6 +2552,9 @@ class RealMSX:
             if stream_completed_at is None:
                 raise RealMSXProtocolError(
                     "PUT completed without a measured durable stream boundary")
+            self._report_file_transfer(
+                progress, descriptor.wire_size, descriptor.wire_size,
+                f"PUT complete: {descriptor.wire_size} durable bytes")
             stream_bytes = descriptor.wire_size - stream_start_offset
             stream_seconds = max(
                 0.0, stream_completed_at - stream_started_at)
@@ -2380,9 +2590,11 @@ class RealMSX:
     def get_file(self, source, target, *, resume=True,
                  existing_only=False,
                  state_directory=None,
-                 timeout=FILE_TRANSFER_PROGRESS_TIMEOUT):
+                 timeout=FILE_TRANSFER_PROGRESS_TIMEOUT,
+                 progress=None, cancelled=None):
         """Stream one MSX-DOS file to a collision-safe local destination."""
         timeout = self._validate_progress_timeout(timeout)
+        self._cancel_before_open_if_requested(cancelled)
         if not isinstance(resume, bool):
             raise TypeError("resume must be a boolean")
         if not isinstance(existing_only, bool):
@@ -2434,7 +2646,17 @@ class RealMSX:
             if part_size < confirmed_offset:
                 raise TransferBindingError(
                     "local GET partial is shorter than its resume journal")
-            actual = crc32_file_prefix(part, confirmed_offset).crc32
+            try:
+                actual = crc32_file_prefix(
+                    part, confirmed_offset,
+                    progress=self._host_transfer_progress(
+                        progress, completed=0,
+                        total=(descriptor.wire_size or confirmed_offset),
+                        label="GET resume validation"),
+                    cancelled=cancelled,
+                    progress_phase="local GET resume prefix CRC-32").crc32
+            except TransferCancelledError as exc:
+                self._raise_pre_open_transfer_cancelled(exc)
             if actual != confirmed_crc:
                 raise TransferBindingError(
                     "local GET partial CRC differs from its resume journal")
@@ -2448,6 +2670,7 @@ class RealMSX:
                 descriptor, confirmed_offset=confirmed_offset,
                 prefix_crc32=confirmed_crc,
                 caller_binding=caller_binding)
+            self._cancel_before_open_if_requested(cancelled)
             status = (self._recover_active_transfer(descriptor)
                       if record is not None else None)
             if existing_only and status is None:
@@ -2462,12 +2685,15 @@ class RealMSX:
                     stream.flush()
                     os.fsync(stream.fileno())
                     part_size = confirmed_offset
+                self._cancel_before_open_if_requested(cancelled)
                 opened = self.file_transfer_open(descriptor)
                 self._raise_transfer_remote(opened, "GET open")
                 status_state = opened.state
             else:
                 status_state = status.state
 
+            self._cancel_file_transfer_if_requested(
+                descriptor.transfer_id, cancelled)
             if status_state is TransferState.STAGED:
                 if existing_only:
                     raise RealMSXError(
@@ -2481,7 +2707,10 @@ class RealMSX:
                 status = self._wait_file_transfer(
                     descriptor.transfer_id,
                     (TransferState.READY, TransferState.TRANSFERRING,
-                     TransferState.COMPLETE), timeout=timeout)
+                     TransferState.COMPLETE), timeout=timeout,
+                    progress=progress,
+                    progress_total=(descriptor.wire_size or None),
+                    direction="GET", cancelled=cancelled)
             self._validate_transfer_binding(status, descriptor)
             if status.state in (
                     TransferState.READY, TransferState.TRANSFERRING):
@@ -2515,15 +2744,29 @@ class RealMSX:
             # The journal prefix was already hashed before recovery. Reuse it
             # at the same boundary; hash again only if the active MSX worker
             # committed additional bytes that are already durable locally.
-            actual = (
-                confirmed_crc
-                if status.durable_offset == confirmed_offset
-                else crc32_file_prefix(part, status.durable_offset).crc32)
+            if status.durable_offset == confirmed_offset:
+                actual = confirmed_crc
+            else:
+                try:
+                    actual = crc32_file_prefix(
+                        part, status.durable_offset,
+                        progress=self._host_transfer_progress(
+                            progress, completed=status.durable_offset,
+                            total=descriptor.wire_size,
+                            label="GET recovery validation"),
+                        cancelled=cancelled,
+                        progress_phase="active GET prefix CRC-32").crc32
+                except TransferCancelledError as exc:
+                    self._raise_active_local_transfer_cancelled(
+                        descriptor.transfer_id, exc)
             if actual != status.prefix_crc32:
                 raise TransferBindingError(
                     "MSX GET prefix CRC differs from the local partial")
             confirmed_offset = status.durable_offset
             confirmed_crc = status.prefix_crc32
+            self._report_file_transfer(
+                progress, confirmed_offset, descriptor.wire_size,
+                f"GET: {confirmed_offset}/{descriptor.wire_size} durable bytes")
             journal.save(
                 descriptor, confirmed_offset=confirmed_offset,
                 prefix_crc32=confirmed_crc,
@@ -2537,6 +2780,8 @@ class RealMSX:
             stream_started_at = time.monotonic()
             stream.seek(offset)
             while offset < descriptor.wire_size:
+                self._cancel_file_transfer_if_requested(
+                    descriptor.transfer_id, cancelled)
                 maximum = min(
                     transfer_limits.max_get_chunk,
                     descriptor.wire_size - offset)
@@ -2558,6 +2803,10 @@ class RealMSX:
                 self._exact_local_write(stream, block.data)
                 checksum = crc32_update(block.data, checksum)
                 offset += len(block.data)
+                self._report_file_transfer(
+                    progress, offset, descriptor.wire_size,
+                    f"GET: {offset}/{descriptor.wire_size} received bytes; "
+                    f"{journal_checkpoint} durable")
                 checkpoint_due = (
                     offset == descriptor.wire_size or
                     offset - journal_checkpoint >=
@@ -2592,13 +2841,17 @@ class RealMSX:
             stream_rate_hint = (
                 min(0xFFFF, int(stream_count / stream_elapsed + 0.5))
                 if stream_elapsed > 0 and stream_count > 0 else 0)
+            self._cancel_file_transfer_if_requested(
+                descriptor.transfer_id, cancelled)
             closing = self.file_transfer_close(
                 descriptor.transfer_id,
                 rate_bps=stream_rate_hint)
             self._raise_transfer_remote(closing, "GET end-of-stream")
             status = self._wait_file_transfer(
                 descriptor.transfer_id, (TransferState.COMPLETE,),
-                timeout=timeout)
+                timeout=timeout, progress=progress,
+                progress_total=descriptor.wire_size,
+                direction="GET", cancelled=cancelled)
             self._validate_transfer_binding(status, descriptor)
             required_flags = (
                 TransferReplyFlag.WIRE_VERIFIED |
@@ -2620,8 +2873,20 @@ class RealMSX:
                 raise FileExistsError(
                     f"local GET destination appeared during transfer: "
                     f"{destination}")
+            except OSError as exc:
+                if exc.errno in {
+                        errno.EXDEV, errno.EPERM, errno.EACCES,
+                        errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                    raise RealMSXError(
+                        "atomic no-overwrite GET publication requires hard-link "
+                        "support in the destination filesystem; the verified "
+                        f"partial and resume journal were preserved: {part}") from exc
+                raise
             part.unlink()
             journal.remove(descriptor, caller_binding=caller_binding)
+            self._report_file_transfer(
+                progress, descriptor.wire_size, descriptor.wire_size,
+                f"GET complete: {descriptor.wire_size} durable bytes")
             stream_bytes = descriptor.wire_size - stream_start_offset
             stream_seconds = max(
                 0.0, stream_completed_at - stream_started_at)

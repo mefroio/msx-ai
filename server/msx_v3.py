@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Deque
 
-try:  # Support both ``import server.msx_v3`` and a server/ sys.path entry.
+if __package__:  # Installed/package import.
     from .msx_protocol import (
         MAX_WIRE_PAYLOAD,
         Frame,
@@ -29,7 +29,7 @@ try:  # Support both ``import server.msx_v3`` and a server/ sys.path entry.
         SequenceMismatchError,
         validate_response,
     )
-except ImportError:  # pragma: no cover - exercised by this repository's tests
+else:  # pragma: no cover - repository-style top-level import
     from msx_protocol import (
         MAX_WIRE_PAYLOAD,
         Frame,

@@ -1,6 +1,8 @@
 import pathlib
 import importlib
+import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -9,6 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 import msx_client
+import paths
 from msx_client import OpenMSX, OpenMSXError
 
 
@@ -42,6 +45,25 @@ class _Process:
 
     def kill(self):
         pass
+
+
+class _ControlSocket:
+    def __init__(self, *, connect_error=None):
+        self.connect_error = connect_error
+        self.connected_path = None
+        self.sent = []
+        self.closed = False
+
+    def connect(self, path):
+        if self.connect_error is not None:
+            raise self.connect_error
+        self.connected_path = path
+
+    def sendall(self, data):
+        self.sent.append(bytes(data))
+
+    def close(self):
+        self.closed = True
 
 
 class OpenMSXHeadlessAudioTests(unittest.TestCase):
@@ -112,6 +134,53 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             command.assert_not_called()
             machine.close()
 
+    def test_control_channel_failure_after_spawn_terminates_process(self):
+        process = _Process()
+        popen_patch, thread_patch, sleep_patch = self._start_patches(process)
+        machine = OpenMSX(bin="/fake/openmsx")
+        with popen_patch, thread_patch, sleep_patch, \
+                mock.patch.object(
+                    machine, "_write", side_effect=BrokenPipeError("closed")):
+            with self.assertRaises(BrokenPipeError):
+                machine.start(headless=False)
+
+        self.assertTrue(process.waited)
+        self.assertIsNone(machine.proc)
+        self.assertIsNone(machine._runtime_settings_dir)
+
+    def test_installed_start_materializes_public_configs_before_popen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            state = temporary / "state"
+            missing_checkout = temporary / "installed"
+            process = _Process()
+
+            def spawn(*_args, **_kwargs):
+                home = state.resolve() / "openmsx-home"
+                actual = {
+                    path.relative_to(home)
+                    for path in home.rglob("*") if path.is_file()
+                }
+                self.assertEqual(actual, set(paths.OPENMSX_PUBLIC_FILES))
+                return process
+
+            with (mock.patch.dict(
+                      os.environ, {"MSX_AI_STATE_DIR": str(state)}, clear=False),
+                  mock.patch.object(
+                      paths, "_CHECKOUT_CANDIDATE", missing_checkout)):
+                os.environ.pop("MSX_AI_SOURCE_ROOT", None)
+                os.environ.pop("MSX_AI_OPENMSX_HOME", None)
+                home = paths.openmsx_home()
+                machine = OpenMSX(home=home, bin="/fake/openmsx")
+                with (mock.patch.object(
+                          msx_client.subprocess, "Popen", side_effect=spawn) as popen,
+                      mock.patch.object(msx_client.threading.Thread, "start"),
+                      mock.patch.object(msx_client.time, "sleep"),
+                      mock.patch.object(machine, "cmd", return_value="")):
+                    machine.start(headless=False)
+                    popen.assert_called_once()
+                    machine.close()
+
     def test_headless_spawn_fails_closed_when_mute_is_not_active(self):
         process = _Process()
         calls = []
@@ -131,6 +200,57 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
 
         self.assertIn("quit", calls)
         self.assertIsNone(machine.proc)
+
+    def test_attach_refuses_to_choose_between_multiple_live_instances(self):
+        first = _ControlSocket()
+        second = _ControlSocket()
+        machine = OpenMSX(bin="/fake/openmsx")
+        with (mock.patch.object(
+                  msx_client, "list_sockets",
+                  return_value=["/tmp/openmsx-user/socket.1",
+                                "/tmp/openmsx-user/socket.2"]),
+              mock.patch.object(
+                  msx_client.socket, "socket", side_effect=[first, second])):
+            with self.assertRaisesRegex(
+                    OpenMSXError, "multiple running openMSX instances"):
+                machine.attach()
+
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertIsNone(machine.sock)
+        self.assertIsNone(machine.socket_path)
+        self.assertFalse(machine.attached)
+
+    def test_attach_can_select_one_exact_discovered_socket(self):
+        selected = _ControlSocket()
+        machine = OpenMSX(bin="/fake/openmsx")
+        requested = "/tmp/openmsx-user/socket.2"
+        with (mock.patch.object(
+                  msx_client, "list_sockets",
+                  return_value=["/tmp/openmsx-user/socket.1", requested]),
+              mock.patch.object(
+                  msx_client.socket, "socket", return_value=selected),
+              mock.patch.object(msx_client.threading.Thread, "start"),
+              mock.patch.object(msx_client.time, "sleep")):
+            self.assertIs(machine.attach(requested), machine)
+
+        self.assertEqual(selected.connected_path, requested)
+        self.assertEqual(selected.sent, [b"<openmsx-control>\n"])
+        self.assertEqual(machine.socket_path, requested)
+        self.assertTrue(machine.attached)
+        machine.close()
+        self.assertTrue(selected.closed)
+        self.assertIsNone(machine.socket_path)
+
+    def test_attach_rejects_an_undiscovered_unix_socket(self):
+        machine = OpenMSX(bin="/fake/openmsx")
+        with (mock.patch.object(
+                  msx_client, "list_sockets",
+                  return_value=["/tmp/openmsx-user/socket.1"]),
+              mock.patch.object(msx_client.socket, "socket") as socket_factory,
+              self.assertRaisesRegex(OpenMSXError, "not among the discovered")):
+            machine.attach("/tmp/unrelated-service.sock")
+        socket_factory.assert_not_called()
 
 
 if __name__ == "__main__":

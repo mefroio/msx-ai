@@ -1,10 +1,7 @@
 {
   "mcpServers": {
     "msx-ai": {
-      "command": "python3",
-      "args": [
-        "server/msx_mcp_server.py"
-      ]
+      "command": "msx-ai-mcp"
     }
   }
 }

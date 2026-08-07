@@ -25,10 +25,12 @@ physical target, and select `msx_boot`, `msx_attach`, or `msx_tcp_bench_start`
 only when the optional emulator backend is wanted.
 
 ~~~~text
-AI client / MCP
+AI client / MCP (STDIO or local Streamable HTTP)
        |
        v
-server/msx_mcp_server.py
+server/mcp_runtime.py (official Python MCP SDK)
+       |
+server/msx_mcp_server.py (synchronous tool/backend core)
        |
        +-- openMSX control API ----------------------> emulated MSX
        |
@@ -92,6 +94,10 @@ core server or installing a product-specific edition.
   pages, scroll, palettes, and sprites.
 - A backend-neutral loader for `msx-ai-app-v1` manifests, MSX-DOS COM files,
   BLOAD binaries, and flat 16/32 KiB ROM images.
+- A standards-based MCP runtime with structured results, output schemas,
+  explicit safety annotations, resources, prompts, STDIO, and loopback-only
+  Streamable HTTP. PUT/GET report MCP progress and honor cooperative
+  cancellation while retaining resumable state.
 
 ## Hardware control boundary
 
@@ -116,10 +122,14 @@ itself.
 ### Core MCP server
 
 - Python 3.10 or newer.
+- The official Python MCP SDK version 2.x, installed automatically by the
+  package together with the directly used AnyIO and JSON Schema libraries.
 
-The server has no mandatory third-party Python packages. Starting it, listing
-its tools, and accepting or initiating a physical-agent TCP connection do not
-look for openMSX or any particular network-adapter product.
+The Python distribution declares `mcp>=2,<3`, `anyio>=4.5,<5`, and
+`jsonschema>=4.20,<5`. These are ordinary auditable Python dependencies; the
+project does not vendor a private MCP implementation. Starting it, listing its
+tools, and accepting or initiating a physical-agent TCP connection do not look
+for openMSX or any particular network-adapter product.
 
 TCP/IP is not required for direct openMSX control. It is currently required
 only when selecting the real-agent protocol path, whether that agent runs on a
@@ -170,39 +180,94 @@ variables:
 | `MSX_AI_DISK_EXTENSION` | Storage extension used by the `disk` profile |
 | `MSX_AI_DOS_EXTENSION` | Storage extension used by the `dos` profile |
 
-The repository includes machine XML definitions but not their ROM files. Place
-local ROMs below `.openmsx-home/share/systemroms/`, or point
-`MSX_AI_OPENMSX_HOME` at another isolated configuration. This command helps
-diagnose missing firmware:
+The repository includes machine XML definitions but not their ROM files. In a
+source checkout, place local ROMs below `.openmsx-home/share/systemroms/`. An
+installed wheel materializes public templates under
+`~/.msx-ai/openmsx-home`, so its default firmware location is
+`~/.msx-ai/openmsx-home/share/systemroms/`. Alternatively, point
+`MSX_AI_OPENMSX_HOME` at an existing isolated configuration. This command helps
+diagnose missing firmware from a source checkout (the raw openMSX executable
+reads `OPENMSX_HOME`, not the Python host's `MSX_AI_OPENMSX_HOME`):
 
 ~~~~sh
-openmsx -machine Gradiente_Expert20 -testconfig
+OPENMSX_HOME="$PWD/.openmsx-home" "${OPENMSX_BIN:-openmsx}" \
+  -machine Gradiente_Expert20 -testconfig
 ~~~~
+
+After an installed package has materialized its templates, use
+`OPENMSX_HOME="$HOME/.msx-ai/openmsx-home"` instead. For a custom directory,
+pass the same path to `MSX_AI_OPENMSX_HOME` when running MSX-AI and to
+`OPENMSX_HOME` when invoking openMSX directly.
 
 ## MCP setup
 
-The project-local `.mcp.json` uses a relative path:
+Install the current public source and use its stable entry point:
+
+~~~~sh
+git clone https://github.com/mefroio/msx-ai.git
+cd msx-ai
+pipx install .
+msx-ai-mcp
+~~~~
+
+`pipx install msx-ai` becomes the equivalent short form after the first PyPI
+publication. Existing checkouts must install once after this migration because
+`.mcp.json` now invokes `msx-ai-mcp` rather than the direct legacy script.
+
+The default transport is STDIO. A client configuration needs only the command:
 
 ~~~~json
 {
   "mcpServers": {
     "msx-ai": {
-      "command": "python3",
-      "args": ["server/msx_mcp_server.py"]
+      "command": "msx-ai-mcp"
     }
   }
 }
 ~~~~
 
-Clients with a global configuration should use the absolute path to
-`server/msx_mcp_server.py`.
+An editable checkout can use `pipx install .` or `python -m pip install -e .`.
+`python3 server/msx_mcp_server.py` remains a compatibility entry point for the
+original newline-delimited STDIO implementation, but new integrations should
+use `msx-ai-mcp` so the official SDK provides structured output, negotiated
+modern/legacy protocol behavior, resources, prompts, progress, and
+cancellation.
+
+Optional Streamable HTTP is local-only:
+
+~~~~sh
+msx-ai-mcp --transport http --host 127.0.0.1 --port 8000
+~~~~
+
+The endpoint is `/mcp`. The CLI rejects wildcard, non-loopback, hostname, and
+IPv6 binds because this release has no HTTP authentication and exposes expert
+hardware mutations. Use STDIO unless a local HTTP client specifically needs
+the transport.
+
+Runtime state is not written into `site-packages`. `MSX_AI_STATE_DIR` selects
+the private writable state root (default `~/.msx-ai`),
+`MSX_AI_USER_ROOT` selects the base for relative user paths, and
+`MSX_AI_SOURCE_ROOT` selects a checkout for source-only build operations.
+Imports and `--version` create no directories.
+
+`MSX_AI_USER_ROOT` is a resolution base, not a sandbox: absolute paths and
+explicit `..` traversal are preserved for application and file-transfer tools.
+Contain host access with process permissions and a dedicated working directory
+when required by the threat model.
+
+The installed openMSX XML/settings templates are a separate configuration
+resource set containing adapted GPL-2.0 material. Their notice and complete
+license are under `third_party/openmsx`; the Python host, Z80 agent, and
+project-authored documentation remain MIT-licensed.
 
 ## Physical-only workflow
 
 Do not run `open-msx.command` or `open-msx-mcp.command`. Start the MCP server
 through the configuration above, then select exactly one physical TCP role:
 
-- call `msx_agent_listen` when the transparent adapter connects to the host;
+- call `msx_agent_listen` with the host's specific LAN IPv4 address when the
+  transparent adapter connects to the host (the safe default `127.0.0.1` is
+  local-only);
 - call `msx_agent_connect` when the adapter listens as a TCP server.
 
 After the TCP handshake, backend-neutral tools operate through the resident
@@ -226,7 +291,10 @@ shared instance and attach to it:
 ~~~~
 
 Then call `msx_attach`. Attaching does not change the existing instance's
-power, throttle, renderer, or audio settings.
+power, throttle, renderer, or audio settings. With exactly one live control
+socket, no selector is needed. If several are live, attachment fails before
+sending a command and reports their paths; call `msx_attach` again with the
+chosen exact `socket_path`. It never selects the newest instance implicitly.
 
 Available profiles are:
 
@@ -478,7 +546,8 @@ Slot and mapper commands are unavailable in resident mode. An inter-slot return
 restores slot state, and changing the interrupted program's mapper segment is
 not safe. Both capabilities remain available only in the foreground monitor.
 
-Direct I/O is an expert escape hatch. Writing the active UART, VDP ports, mapper
+Direct I/O is an expert escape hatch. A read can consume FIFO data or clear a
+device latch or status flag. Writing the active UART, VDP ports, mapper
 ports, or unrelated hardware can terminate the protocol session or damage live
 machine state.
 
@@ -488,6 +557,12 @@ The external contract is a transparent, ordered, full-duplex byte stream over
 TCP/IPv4. IPv6 endpoints are intentionally unsupported. The MSX-side driver
 knows only UART bytes; the host protocol does not depend on how the adapter was
 configured.
+
+This stream has no TLS, encryption, authentication, or replay protection.
+Frame and file CRCs detect accidental corruption only; they do not establish
+peer identity or confidentiality. Because the protocol can expose RAM, VRAM,
+I/O, and code execution, use an isolated trusted LAN or carry it through a
+VPN/secure tunnel. Never expose the raw endpoint directly to the internet.
 
 ~~~~text
 MCP/backend operations
@@ -506,6 +581,12 @@ Use `msx_agent_listen` when the adapter is a TCP client. Use
 `msx_real_listen` name remains as a compatibility alias. `msx_status`
 reports `network_transport`, `network_role`, `agent_transport`, and
 `agent_transport_id` separately.
+
+Version identifiers belong to separate compatibility layers. The Python
+distribution is version 0.6.0; the current MSX executable banner identifies
+Agent 2.0; framed transport is protocol v3; and protocol-X file transfer is
+version 1. Release artifacts group compatible builds, so none of those numbers
+should be compared as if they were one shared semantic version.
 
 Host-created IPv4 TCP streams enable `TCP_NODELAY`. Both current UART drivers
 advertise the transport-independent `frame-wake-ack` feature. For each framed
@@ -815,6 +896,7 @@ normally from DOS.
 | Input | `msx_type`, `msx_type_line`, `msx_type_lines`, `msx_run_basic`, `msx_run_basic_file`, and `msx_key` |
 | Files | `msx_file_put`, `msx_file_get` |
 | openMSX/DOS | `msx_dos_asm_run`, `msx_disk_put_text`, `msx_reset`, `msx_cmd` |
+| Documentation | `msx_docs_search` |
 
 Resident keyboard injection feeds the standard BIOS ring and therefore works
 with DOS, BASIC, and software that calls BIOS character input. Games that read
@@ -829,18 +911,104 @@ the mutually exclusive `allow_existing_basic=true` opt-in. These confirmations
 prevent a tool from typing over a running application without first reading
 VRAM and disturbing the resident target's live VDP state.
 
+### MCP metadata, resources, prompts, progress, and cancellation
+
+`server/mcp_runtime.py` adapts the synchronous registry through the official
+Python SDK. Every listed tool has an object `outputSchema`, returns
+`structuredContent` on success, and explicitly declares the four MCP behavior
+hints: read-only, destructive, idempotent, and open-world. These hints are
+client planning metadata, not authorization. The target still validates every
+range, runtime restriction, capability, and protocol state.
+
+Target operations are serialized by one runtime lock and execute in a worker
+thread so STDIO and HTTP framing remain responsive. Documentation search does
+not acquire the target lock. An MCP cancellation never releases that lock while
+the synchronous hardware worker is still alive: the runtime signals a
+request-scoped cancellation flag and waits under a shield for safe cleanup.
+PUT/GET inspect that flag at protocol boundaries, send best-effort protocol-X
+`CANCEL`, and preserve journals and partial files. If the CANCEL frame itself
+cannot be confirmed, the original cancellation remains the primary result and
+a later resume revalidates the complete binding before writing.
+
+PUT progress reports accepted bytes and the corresponding durable boundary;
+GET progress reports received bytes and its latest fsync-backed checkpoint.
+Final progress is emitted only after the complete size, CRC-32, and publication
+contract succeeds. Clients that did not supply a progress token incur only the
+small callback/queue checks.
+
+The bundled resources are `msx-ai://docs/index`, one URI per compact Markdown
+document, and `msx-ai://docs/manifest`. The manifest records MIT licensing,
+project-authored provenance, internal evidence paths, review date, and SHA-256
+for every document; reads verify the digest. `msx_docs_search` uses a
+deterministic weighted lexical index rather than embeddings or external
+services. `start_msx_session` and `diagnose_msx_connection` are original,
+backend-aware prompts that recommend status/read-only evidence before mutation.
+
 ## Validation
 
-Run the deterministic suite:
+From the repository root, create an editable environment and install the
+release frontend:
 
 ~~~~sh
-make test
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e . 'build>=1'
 ~~~~
+
+Run the deterministic suite with that interpreter:
+
+~~~~sh
+make PYTHON=python test
+~~~~
+
+Run the packaging and protocol gate (requires the Python `build` package and
+Bas Wijnen `z80asm` 1.8, either on `PATH` or selected with `Z80ASM`):
+
+~~~~sh
+make PYTHON=python release-check
+~~~~
+
+Release validation additionally builds the sdist and wheel, creates the wheel
+from the sdist, installs it into a clean environment outside the checkout, runs
+`pip check`, inspects archive contents, and exercises STDIO and local HTTP with
+the official MCP client. Import and CLI tests assert that no runtime state is
+created merely by loading the package.
+
+The normal gate intentionally accepts the checkout's current on-disk source so
+it can validate work before a commit. For the final release, require a clean
+Git worktree and stage exactly committed `HEAD`:
+
+~~~~sh
+make PYTHON=python publish-check
+~~~~
+
+To persist the three validated artifacts under ignored `dist/`, use:
+
+~~~~sh
+make PYTHON=python release-assets
+~~~~
+
+The result is the source distribution, the wheel rebuilt from that source
+distribution, and `msx-ai-agent-<host-version>.zip`. The agent archive contains
+exactly the seven deployable binaries plus `LICENSE`, `MEMMAN-NOTICE.txt`,
+`SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records Host 0.6.0, Agent
+2.0, framed wire v3, transfer `fast-v1`, and the pinned assembler identity.
+Publication is atomic per file, refuses overwrite, and rolls back files created
+by the attempt if a later publication fails. Repeated builds prove equivalence
+between the staged and sdist source on the same host and toolchain; this is not
+a claim of cross-toolchain byte reproducibility.
+
+Final GET publication uses a hard link to provide one atomic, no-overwrite
+operation after the part file has been verified. The destination filesystem
+must support hard links; FAT/exFAT is not suitable. On an unsupported
+filesystem, the verified `.msxpart` file and its resume journal are preserved.
+The same hard-link requirement applies to first-run materialization of packaged
+openMSX templates under the managed state directory.
 
 Run the opt-in end-to-end suite:
 
 ~~~~sh
-make test-integration
+make PYTHON=python test-integration
 ~~~~
 
 The integration suite uses one openMSX process at a time and validates:
@@ -872,7 +1040,12 @@ agent/msx_xfer.asm        transient protocol-X PUT/GET helper and DOS ABI
 agent/msx_xfer_engine.inc transfer engine compiled only by msx_xfer.asm
 agent/transports/         hardware-specific byte-stream implementations
 server/msx_client.py      openMSX control client
-server/msx_mcp_server.py  MCP JSON-RPC server and backend adapters
+server/mcp_runtime.py     official-SDK MCP transports and structured adapter
+server/mcp_metadata.py    output schemas and explicit tool behavior hints
+server/msx_mcp_server.py  synchronous tool registry and backend adapters
+server/msx_docs.py        validated resources and deterministic lexical search
+server/resources/docs/   bundled MIT corpus and provenance manifest
+server/paths.py           immutable/source/user/runtime path separation
 server/msx_protocol.py    protocol-v3 codec and incremental parser
 server/msx_v3.py          framed stream session, retries, and correlation
 server/msx_real.py        physical-agent stream/TCP client

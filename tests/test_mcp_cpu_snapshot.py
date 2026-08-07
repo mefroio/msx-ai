@@ -40,7 +40,7 @@ class MCPUSnapshotToolTests(unittest.TestCase):
         msx_mcp_server.SESSION.msx = backend
         msx_mcp_server.SESSION.profile = "real"
 
-        result = json.loads(msx_mcp_server.t_cpu_snapshot())
+        result = msx_mcp_server.t_cpu_snapshot()
 
         self.assertEqual(result, expected)
         self.assertEqual(backend.calls, 1)

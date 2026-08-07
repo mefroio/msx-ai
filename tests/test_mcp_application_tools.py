@@ -9,6 +9,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 
 import msx_mcp_server  # noqa: E402
+from execution import bind_execution_hooks  # noqa: E402
 
 
 class FakeRealMSX:
@@ -115,8 +116,8 @@ class MCPApplicationToolsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "demo.com"
             path.write_bytes(b"\x00\xC9")
-            result = json.loads(msx_mcp_server.t_app_load(
-                str(path), execute="call", verify=True))
+            result = msx_mcp_server.t_app_load(
+                str(path), execute="call", verify=True)
 
         self.assertEqual(self.backend.ram[0x100:0x102], b"\x00\xC9")
         self.assertEqual(self.backend.calls, [("call", 0x100)])
@@ -130,20 +131,20 @@ class MCPApplicationToolsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "headerless.dat"
             path.write_bytes(b"\xC9")
-            result = json.loads(msx_mcp_server.t_app_load(
-                str(path), format="com", execute="none"))
+            result = msx_mcp_server.t_app_load(
+                str(path), format="com", execute="none")
 
         self.assertEqual(result["entry"], {"address": None, "mode": "none"})
         self.assertEqual(self.backend.calls, [])
 
     def test_hardware_control_handlers_validate_and_dispatch(self):
-        self.assertEqual(json.loads(msx_mcp_server.t_io_read(0x98)),
+        self.assertEqual(msx_mcp_server.t_io_read(0x98),
                          {"port": 0x98, "value": 0xA5})
-        self.assertTrue(json.loads(
-            msx_mcp_server.t_io_write(0x99, 0x34, verify=True))["verified"])
-        self.assertEqual(json.loads(msx_mcp_server.t_slot_select(1, 0x83)),
+        self.assertTrue(
+            msx_mcp_server.t_io_write(0x99, 0x34, verify=True)["verified"])
+        self.assertEqual(msx_mcp_server.t_slot_select(1, 0x83),
                          {"page": 1, "slot_id": 0x83})
-        self.assertEqual(json.loads(msx_mcp_server.t_mapper_select(1, 7)),
+        self.assertEqual(msx_mcp_server.t_mapper_select(1, 7),
                          {"page": 1, "segment": 7})
         self.assertEqual(self.backend.hardware, [
             ("io_read", 0x98),
@@ -162,15 +163,96 @@ class MCPApplicationToolsTest(unittest.TestCase):
             with self.subTest(call=call), self.assertRaises((TypeError, ValueError)):
                 call()
 
+    def test_memory_tools_use_direct_openmsx_debug_blocks_without_agent(self):
+        machine = mock.Mock()
+        machine.cmd.side_effect = (
+            lambda command: "cafe" if "debug read_block memory" in command
+            else "")
+        msx_mcp_server.SESSION.msx = machine
+        msx_mcp_server.SESSION.profile = "basic"
+
+        read = msx_mcp_server.t_memory_read("ram", 0x100, 2)
+        written = msx_mcp_server.t_memory_write(
+            "ram", 0x100, "cafe", verify=True)
+
+        self.assertEqual(read, "[ram 0x100+2]\ncafe")
+        self.assertIn("verified", written)
+        commands = [call.args[0] for call in machine.cmd.call_args_list]
+        self.assertTrue(any(
+            "debug read_block memory 256 2" in command
+            for command in commands))
+        self.assertTrue(any(
+            "debug write_block memory 256" in command and "cafe" in command
+            for command in commands))
+
+    def test_agent_endpoints_are_literal_unicast_ipv4_and_bounded(self):
+        with mock.patch.object(
+                msx_mcp_server.SESSION, "listen_agent",
+                return_value=("127.0.0.1", 12345)) as listen:
+            msx_mcp_server.t_agent_listen()
+        listen.assert_called_once_with(
+            host="127.0.0.1", port=6603, timeout=60.0, cancelled=None)
+
+        invalid = (
+            lambda: msx_mcp_server.t_agent_listen(host="0.0.0.0"),
+            lambda: msx_mcp_server.t_agent_listen(host="localhost"),
+            lambda: msx_mcp_server.t_agent_listen(host="::1"),
+            lambda: msx_mcp_server.t_agent_listen(port=0),
+            lambda: msx_mcp_server.t_agent_connect("224.0.0.1"),
+            lambda: msx_mcp_server.t_agent_connect(
+                "127.0.0.1", timeout=float("nan")),
+        )
+        for call in invalid:
+            with self.subTest(call=call), self.assertRaises(
+                    (TypeError, ValueError)):
+                call()
+
+    def test_simulated_bench_is_loopback_only_and_bounded(self):
+        cancelled = object()
+        with mock.patch.object(msx_mcp_server.SESSION, "start_tcp_bench") as start, \
+                mock.patch.object(
+                    msx_mcp_server, "current_cancellation_callback",
+                    return_value=cancelled):
+            with mock.patch.object(
+                    msx_mcp_server, "t_status", return_value="status"):
+                self.assertEqual(msx_mcp_server.t_tcp_bench_start(), "status")
+        start.assert_called_once_with(
+            host="127.0.0.1", port=0, timeout=60.0, window=False,
+            mode="resident", debug=False, cancelled=cancelled)
+
+        invalid = (
+            lambda: msx_mcp_server.t_tcp_bench_start(host="0.0.0.0"),
+            lambda: msx_mcp_server.t_tcp_bench_start(host="192.168.1.2"),
+            lambda: msx_mcp_server.t_tcp_bench_start(port=-1),
+            lambda: msx_mcp_server.t_tcp_bench_start(port=65536),
+            lambda: msx_mcp_server.t_tcp_bench_start(timeout=float("inf")),
+            lambda: msx_mcp_server.t_tcp_bench_start(timeout=301),
+        )
+        for call in invalid:
+            with self.subTest(call=call), self.assertRaises(
+                    (TypeError, ValueError)):
+                call()
+
+    def test_dos_staging_names_reject_host_path_traversal(self):
+        self.assertEqual(msx_mcp_server._dos_basename("demo.bas"), "DEMO.BAS")
+        for name in ("../PWN", "A/BAS", "A\\BAS", "/tmp/PWN", "A:BAD",
+                     "TOO-LONG9.BAS", "A..COM", "{BAD}.COM", "\x00.COM"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                msx_mcp_server._dos_basename(name)
+
+        with self.assertRaises(ValueError):
+            msx_mcp_server.t_disk_put_text("../../escape", "data")
+        with self.assertRaises(ValueError):
+            msx_mcp_server.t_dos_asm_run("ret", name="../../escape.com")
+
     def test_real_type_tools_dispatch_through_backend_keyboard_api(self):
         with (mock.patch.object(msx_mcp_server.time, "sleep"),
               mock.patch.object(
                   self.backend, "screen_text",
                   side_effect=AssertionError("unexpected VRAM read"))):
-            typed = json.loads(msx_mcp_server.t_type("PRINT 1"))
-            line = json.loads(msx_mcp_server.t_type_line("RUN"))
-            lines = json.loads(msx_mcp_server.t_type_lines(
-                ["10 PRINT 1", "RUN"]))
+            typed = msx_mcp_server.t_type("PRINT 1")
+            line = msx_mcp_server.t_type_line("RUN")
+            lines = msx_mcp_server.t_type_lines(["10 PRINT 1", "RUN"])
 
         self.assertEqual(typed["bytes_consumed"], 7)
         self.assertEqual(line["bytes_consumed"], 4)
@@ -189,7 +271,7 @@ class MCPApplicationToolsTest(unittest.TestCase):
               mock.patch.object(
                   self.backend, "screen_text",
                   side_effect=AssertionError("unexpected VRAM read"))):
-            result = json.loads(msx_mcp_server.t_key("CTRL+STOP"))
+            result = msx_mcp_server.t_key("CTRL+STOP")
 
         self.assertFalse(result["screen_capture_performed"])
         self.assertEqual(self.backend.typed, [("key", "CTRL+STOP")])
@@ -200,8 +282,8 @@ class MCPApplicationToolsTest(unittest.TestCase):
         with mock.patch.object(
                 self.backend, "screen_text",
                 side_effect=AssertionError("unexpected VRAM read")):
-            result = json.loads(msx_mcp_server.t_run_basic(
-                program, clear=True, dos_prompt_confirmed=True))
+            result = msx_mcp_server.t_run_basic(
+                program, clear=True, dos_prompt_confirmed=True)
 
         self.assertTrue(result["run_submitted"])
         self.assertFalse(result["screen_capture_performed"])
@@ -230,8 +312,8 @@ class MCPApplicationToolsTest(unittest.TestCase):
               mock.patch.object(
                   self.backend, "screen_text",
                   side_effect=AssertionError("unexpected VRAM read"))):
-            result = json.loads(msx_mcp_server.t_run_basic(
-                program, dos_prompt_confirmed=True))
+            result = msx_mcp_server.t_run_basic(
+                program, dos_prompt_confirmed=True)
 
         self.assertEqual(result["delivery"], "file-transfer-v2")
         self.assertFalse(result["screen_capture_performed"])
@@ -260,8 +342,7 @@ class MCPApplicationToolsTest(unittest.TestCase):
         with mock.patch.object(
                 self.backend, "screen_text",
                 side_effect=AssertionError("unexpected VRAM read")) as capture:
-            result = json.loads(msx_mcp_server.t_type_lines(
-                ["10 PRINT 1", "RUN"]))
+            result = msx_mcp_server.t_type_lines(["10 PRINT 1", "RUN"])
 
         self.assertFalse(result["screen_capture_performed"])
         capture.assert_not_called()
@@ -286,6 +367,23 @@ class MCPApplicationToolsTest(unittest.TestCase):
         self.assertEqual(options["compression"], "raw")
         self.assertFalse(options["resume"])
 
+    def test_basic_file_transfer_forwards_mcp_progress_and_cancellation(self):
+        progress = mock.Mock()
+        cancelled = mock.Mock(return_value=False)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DEMO.BAS"
+            path.write_bytes(b"10 END\r\n\x1a")
+            with (bind_execution_hooks(
+                      progress=progress, cancelled=cancelled),
+                  mock.patch.object(msx_mcp_server, "_temporary_basic_filename",
+                                    return_value="A:MXABCDEF.BAS")):
+                msx_mcp_server.t_run_basic_file(
+                    str(path), dos_prompt_confirmed=True, format="ascii")
+
+        _name, _transferred, options = self.backend.put_payloads[0]
+        self.assertIs(options["progress"], progress)
+        self.assertIs(options["cancelled"], cancelled)
+
     def test_basic_file_normalizer_preserves_msx_graphical_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "GAME.BAS"
@@ -305,9 +403,9 @@ class MCPApplicationToolsTest(unittest.TestCase):
             source = Path(directory) / "GAME.BAS"
             source.write_bytes(b"10 PRINT \x80\n20 END\n")
 
-            json.loads(msx_mcp_server.t_file_put(
+            msx_mcp_server.t_file_put(
                 str(source), "A:\\GAME.BAS",
-                dos_prompt_confirmed=True))
+                dos_prompt_confirmed=True)
 
         name, payload, options = self.backend.put_payloads[0]
         self.assertEqual(name, "A:\\GAME.BAS")
@@ -397,14 +495,14 @@ class MCPApplicationToolsTest(unittest.TestCase):
             with mock.patch.object(
                     self.backend, "screen_text",
                     side_effect=AssertionError("unexpected VRAM read")) as capture:
-                put = json.loads(msx_mcp_server.t_file_put(
+                put = msx_mcp_server.t_file_put(
                     str(source), "B:\\ARCHIVE.ZIP",
                     dos_prompt_confirmed=True, compression="auto",
-                    resume=True, timeout=45))
+                    resume=True, timeout=45)
                 destination = Path(directory) / "download.bin"
-                get = json.loads(msx_mcp_server.t_file_get(
+                get = msx_mcp_server.t_file_get(
                     "B:\\REMOTE.BIN", str(destination),
-                    dos_prompt_confirmed=True, resume=False, timeout=90))
+                    dos_prompt_confirmed=True, resume=False, timeout=90)
 
         capture.assert_not_called()
         self.assertEqual(put["direction"], "put")

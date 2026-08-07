@@ -1,5 +1,6 @@
 Z80ASM ?= z80asm
 PYTHON ?= python3
+RELEASE_OUTPUT ?= dist
 AGENT_SRC := agent/msx_agent.asm
 AGENT_TSR_SRC := agent/msx_agent_tsr.asm
 AGENT_CORE := agent/msx_agent_core.asm
@@ -29,7 +30,7 @@ MSX_DOS_BENCH_COM_MAX := 36760
 # images load at 0100h, the helper file itself must end no later than 3FFFh.
 MSX_XFER_PAGE0_COM_MAX := 16128
 
-.PHONY: agent agent-prerequisites agent-tsr memman-assets test test-integration
+.PHONY: agent agent-prerequisites agent-tsr memman-assets test test-integration release-check publish-check release-assets
 
 agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM)
 	@test -s $(AGENT_COM)
@@ -70,3 +71,12 @@ test:
 
 test-integration:
 	MSX_RUN_INTEGRATION=1 $(PYTHON) -m unittest tests.test_openmsx_resident -v
+
+release-check:
+	$(PYTHON) tools/release_check.py
+
+publish-check:
+	$(PYTHON) tools/release_check.py --publish
+
+release-assets:
+	$(PYTHON) tools/release_check.py --publish --output-dir "$(RELEASE_OUTPUT)"

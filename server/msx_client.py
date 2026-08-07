@@ -10,24 +10,40 @@ high-level emulator helpers.
 import os, subprocess, threading, queue, time, re, html, pathlib, glob, socket, shutil
 import tempfile
 
-try:
+if __package__:
     from .msx_cpu import capture_openmsx_cpu
-except ImportError:  # pragma: no cover - exercised by repository-style imports
+    from .paths import (
+        ensure_directory,
+        openmsx_home,
+        prepare_openmsx_home,
+        source_root,
+        user_root,
+        work_root,
+    )
+else:  # pragma: no cover - exercised by repository-style imports
     from msx_cpu import capture_openmsx_cpu
+    from paths import (
+        ensure_directory,
+        openmsx_home,
+        prepare_openmsx_home,
+        source_root,
+        user_root,
+        work_root,
+    )
 
-PROJ = pathlib.Path(__file__).resolve().parent.parent
-DEFAULT_HOME = pathlib.Path(os.environ.get(
-    "MSX_AI_OPENMSX_HOME", PROJ / ".openmsx-home")).expanduser()
+PROJ = source_root() or user_root()
+DEFAULT_HOME = openmsx_home()
 
 _REPLY = re.compile(r'<reply result="(ok|nok)">(.*?)</reply>', re.S)
 _TCL_TRUE = frozenset(("1", "true", "on", "yes"))
 
 
 def list_sockets():
-    """Live openMSX control sockets, newest first (one per running instance).
+    """Candidate openMSX control sockets, newest first.
 
     openMSX puts the socket in openmsx-<user>/ under the first of the env vars
-    TMPDIR, TMP, TEMP, falling back to /tmp -- so scan all of them.
+    TMPDIR, TMP, TEMP, falling back to /tmp -- so scan all of them. Stale
+    filesystem entries are filtered only when attach() attempts a connection.
     """
     user = os.environ.get("USER", "")
     bases = [os.environ.get(v) for v in ("TMPDIR", "TMP", "TEMP")] + ["/tmp"]
@@ -36,7 +52,15 @@ def list_sockets():
         if b:
             socks += glob.glob(os.path.join(b, f"openmsx-{user}", "socket.*"))
     socks = list(dict.fromkeys(socks))          # dedupe, keep order
-    return sorted(socks, key=os.path.getmtime, reverse=True)
+    candidates = []
+    for path in socks:
+        try:
+            candidates.append((os.path.getmtime(path), path))
+        except OSError:
+            # A process may exit between glob() and stat(). attach() will also
+            # filter socket files that remain on disk but refuse a connection.
+            continue
+    return [path for _mtime, path in sorted(candidates, reverse=True)]
 
 
 class OpenMSXError(RuntimeError):
@@ -59,6 +83,7 @@ class OpenMSX:
         self.bin = _default_binary() if bin is None else bin
         self.proc = None
         self.sock = None            # set when attached to an existing instance
+        self.socket_path = None     # exact selected external control socket
         self.attached = False
         self._buf = ""
         self._replies = queue.Queue()
@@ -108,6 +133,9 @@ class OpenMSX:
         and exits while still muted, so no audible shutdown window or persisted
         setting can leak into a later visible session.
         """
+        # Installed wheels materialize only the eight public, ROM-free openMSX
+        # templates, and only when an emulator is actually about to start.
+        prepare_openmsx_home(self.home)
         env = dict(os.environ, OPENMSX_HOME=self.home)
         argv = [self.bin, "-control", "stdio", "-machine", self.machine]
         for ext in self.extensions:
@@ -134,9 +162,17 @@ class OpenMSX:
         except Exception:
             self._cleanup_runtime_settings()
             raise
-        threading.Thread(target=self._reader, daemon=True).start()
-        self._write(b"<openmsx-control>\n")
-        time.sleep(0.3)
+        try:
+            threading.Thread(target=self._reader, daemon=True).start()
+            self._write(b"<openmsx-control>\n")
+            time.sleep(0.3)
+        except Exception:
+            # Popen succeeded, so this object owns a live process even when
+            # control-channel setup fails.  Always terminate it before
+            # reporting the startup error; otherwise a failed boot can leak a
+            # hidden emulator process.
+            self.close()
+            raise
         if headless:
             try:
                 muted = self.cmd("set mute").strip().lower()
@@ -155,28 +191,61 @@ class OpenMSX:
 
     def attach(self, sockpath=None):
         """Attach to an ALREADY-RUNNING openMSX (e.g. the user's window) via its
-        UNIX control socket. Shares the same live instance; does not spawn."""
-        candidates = [sockpath] if sockpath else list_sockets()
+        UNIX control socket. Shares the same live instance; does not spawn.
+
+        With no explicit path, attachment is allowed only when exactly one
+        discovered socket is live. This prevents a destructive MCP call from
+        silently selecting the wrong emulator when several windows are open.
+        """
+        discovered = list_sockets()
+        if sockpath is not None:
+            requested = pathlib.Path(os.fspath(sockpath)).resolve(strict=False)
+            matches = [candidate for candidate in discovered
+                       if pathlib.Path(candidate).resolve(strict=False) == requested]
+            if not matches:
+                raise OpenMSXError(
+                    "requested openMSX socket is not among the discovered "
+                    f"control sockets: {sockpath}")
+            candidates = [matches[0]]
+        else:
+            candidates = discovered
         if not candidates:
             raise OpenMSXError(
                 "no running openMSX found. Launch one first "
                 "(e.g. ./open-msx.command) so its control socket exists.")
         last = None
+        connected = []
         for path in candidates:                 # skip stale/dead socket files
             sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 sk.connect(path)
-                self.sock = sk
-                break
+                connected.append((path, sk))
             except OSError as e:
                 last = e
                 sk.close()
-        if self.sock is None:
+        if not connected:
             raise OpenMSXError(f"could not connect to any openMSX socket ({last})")
+        if sockpath is None and len(connected) > 1:
+            for _path, sk in connected:
+                sk.close()
+            paths = ", ".join(path for path, _sk in connected)
+            raise OpenMSXError(
+                "multiple running openMSX instances were found; refusing to "
+                "choose one implicitly. Call msx_attach again with one of "
+                f"these socket_path values: {paths}")
+        selected_path, self.sock = connected[0]
+        self.socket_path = selected_path
         self.attached = True
-        threading.Thread(target=self._reader, daemon=True).start()
-        self._write(b"<openmsx-control>\n")
-        time.sleep(0.3)
+        try:
+            threading.Thread(target=self._reader, daemon=True).start()
+            self._write(b"<openmsx-control>\n")
+            time.sleep(0.3)
+        except Exception:
+            self.sock.close()
+            self.sock = None
+            self.socket_path = None
+            self.attached = False
+            raise
         return self
 
     # ---- transport helpers ---------------------------------------------
@@ -345,6 +414,7 @@ class OpenMSX:
             except Exception:
                 pass
             self.sock = None
+            self.socket_path = None
             self.attached = False
             return
         proc = self.proc
@@ -384,7 +454,7 @@ if __name__ == "__main__":
     m.advance(6)
     print("emulated time :", round(m.emutime(), 1), "s")
     print("screen mode   :", m.screen_mode())
-    shot = PROJ / "work" / "boot.png"
+    shot = ensure_directory(work_root()) / "boot.png"
     try:
         print("screenshot    :", m.screenshot(str(shot)), "->", shot.exists())
     except OpenMSXError as e:

@@ -16,6 +16,7 @@ from msx_transfer import (  # noqa: E402
     TRANSFER_OPCODE,
     FileDigest,
     TransferBindingError,
+    TransferCancelledError,
     TransferCapability,
     TransferDescriptor,
     TransferDirection,
@@ -382,6 +383,35 @@ class BasicSourcePreparationTest(unittest.TestCase):
 
             self.assertEqual(list(state.glob(".msx-basic-*.bas")), [])
 
+    def test_basic_normalization_progress_is_cooperatively_cancellable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "large.bas"
+            source.write_bytes(
+                b"".join(
+                    f"{line} PRINT {line}\n".encode("ascii")
+                    for line in range(10, 5010, 10)))
+            state = root / "state"
+            events = []
+            stop = False
+
+            def progress(completed, total, message):
+                nonlocal stop
+                events.append((completed, total, message))
+                if completed >= 128:
+                    stop = True
+
+            with self.assertRaisesRegex(
+                    TransferCancelledError, "BASIC normalization"):
+                prepare_msx_basic_source(
+                    source, "A:\\LARGE.BAS", state_directory=state,
+                    chunk_size=64, progress=progress,
+                    cancelled=lambda: stop)
+
+            self.assertEqual(list(state.glob(".msx-basic-*.bas")), [])
+            self.assertGreaterEqual(events[-1][0], 128)
+            self.assertEqual(events[-1][1], source.stat().st_size)
+
 
 class HashAndCompressionTest(unittest.TestCase):
     def test_crc32_iso_hdlc_reference_and_bounded_reads(self):
@@ -403,6 +433,57 @@ class HashAndCompressionTest(unittest.TestCase):
                 crc32_stream(io.BytesIO(b"abcd")))
             with self.assertRaisesRegex(TransferError, "ended"):
                 crc32_file_prefix(source, 11)
+
+    def test_hash_and_prefix_rehash_report_progress_and_honor_cancel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(bytes(range(256)) * 64)
+
+            for operation in (
+                    lambda callback, cancelled: crc32_file(
+                        source, chunk_size=512, progress=callback,
+                        cancelled=cancelled),
+                    lambda callback, cancelled: crc32_file_prefix(
+                        source, source.stat().st_size, chunk_size=512,
+                        progress=callback, cancelled=cancelled)):
+                events = []
+                stop = False
+
+                def progress(completed, total, message):
+                    nonlocal stop
+                    events.append((completed, total, message))
+                    if completed >= 1024:
+                        stop = True
+
+                with self.assertRaises(TransferCancelledError):
+                    operation(progress, lambda: stop)
+                self.assertGreaterEqual(events[-1][0], 1024)
+                self.assertEqual(events[-1][1], source.stat().st_size)
+
+    def test_packbits_cancellation_removes_staged_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "compressible.bin"
+            source.write_bytes(b"A" * 16384)
+            state = root / "state"
+            events = []
+            stop = False
+
+            def progress(completed, total, message):
+                nonlocal stop
+                events.append((completed, total, message))
+                if completed >= 1024:
+                    stop = True
+
+            with self.assertRaisesRegex(
+                    TransferCancelledError, "PackBits preparation"):
+                prepare_put_payload(
+                    source, state_directory=state, mode="packbits",
+                    chunk_size=512, progress=progress,
+                    cancelled=lambda: stop)
+
+            self.assertEqual(list(state.glob("*.packbits")), [])
+            self.assertGreaterEqual(events[-1][0], 1024)
 
     def test_deterministic_packbits_is_streaming_and_canonical(self):
         with tempfile.TemporaryDirectory() as directory:

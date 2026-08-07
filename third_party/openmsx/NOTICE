@@ -1,0 +1,44 @@
+openMSX configuration resources
+================================
+
+The files distributed under `server/resources/openmsx/share/` and their
+source-checkout counterparts under `.openmsx-home/share/` are configuration
+templates for the openMSX emulator. They include adapted machine definitions
+and small documentation files based in part on material from the openMSX
+project, pinned here to the openMSX 21.0 release (`RELEASE_21_0`, commit
+`cb61db7`):
+
+    https://github.com/openMSX/openMSX/tree/RELEASE_21_0
+
+Copyright belongs to the respective openMSX authors and MSX-AI contributors.
+These configuration resources are distributed under the GNU General Public
+License, version 2. A copy is included as `GPL-2.0.txt` in this directory.
+
+The machine-template source inputs are:
+
+    share/machines/Gradiente_Expert_Plus.xml
+      SHA-256 1c50edbe852374719fa4d3ffbf975653bda98b113c3edf153264b42c48e369d7
+    share/machines/Sony_HB-F1XDJ.xml
+      SHA-256 c7577e176780faf301a4ca1525ecb7fd0292fb8c257c778b424b568d9b6d0b17
+
+The two Gradiente variants combine the upstream Expert identity, keyboard,
+PPI, PSG, printer, and slot conventions with the upstream MSX2 engine, VDP,
+RTC, and mapper configuration pattern. The two Sony variants are reduced
+forms of the exact HB-F1XDJ file above. The copied documentation inputs are:
+
+    share/extensions/README
+      SHA-256 95f627b9088d69e1029f8b6bf1d25980956b4cf81dd93acfc98770fe44da85ac
+    share/software/README
+      SHA-256 2be4799826517cc6bf391d713fa3d280669b41e0e19d3c231678615f161d7d07
+
+`rs232_proto.xml` and `settings.xml` are MSX-AI-authored configuration files,
+distributed with the adapted/copy resources as one GPL-2.0 template set.
+
+MSX-AI modifications, recorded no later than 2026-08-07, include reduced
+machine profiles, mapper-size variants, an RS-232 test extension,
+firmware-independent descriptions, and local settings used by the isolated
+test environment. The complete preferred form for modification is the XML,
+settings, and README source present in this repository and in the source
+distribution. The MSX-AI Python implementation, Z80 agent, and
+project-authored documentation remain under the project MIT license except
+where another bundled notice says otherwise.

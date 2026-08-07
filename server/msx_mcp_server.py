@@ -13,33 +13,81 @@ executable nor emulator ROMs. Emulator sessions use the project-local
 OPENMSX_HOME and never touch the user's normal setup.
 """
 import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re, time
+import ipaddress, math
 import secrets
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import base64
-from msx_client import OpenMSX, OpenMSXError, PROJ
-from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
-                      FEATURE_FILE_TRANSFER, UART8251_BAUD)
-from msx_application import load_application
-import msx_screenshot
-from msx_transfer import TransferError, normalize_msx_basic_text
+if __package__:
+    from ._version import __version__
+    from .msx_client import OpenMSX, OpenMSXError
+    from .msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
+                           FEATURE_FILE_TRANSFER, UART8251_BAUD)
+    from .msx_application import load_application
+    from . import msx_screenshot
+    from .msx_transfer import TransferError, normalize_msx_basic_text
+    from .execution import (current_cancellation_callback,
+                            current_progress_callback)
+    from . import msx_docs
+    from .paths import (
+        agent_directory,
+        disks_directory,
+        ensure_directory,
+        openmsx_home,
+        prepare_openmsx_home,
+        require_source_root,
+        resolve_user_path,
+        source_root,
+        source_work_root,
+        user_root,
+        work_root,
+    )
+else:  # Preserve ``python server/msx_mcp_server.py`` and existing imports.
+    from _version import __version__
+    from msx_client import OpenMSX, OpenMSXError
+    from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
+                          FEATURE_FILE_TRANSFER, UART8251_BAUD)
+    from msx_application import load_application
+    import msx_screenshot
+    from msx_transfer import TransferError, normalize_msx_basic_text
+    from execution import (current_cancellation_callback,
+                           current_progress_callback)
+    import msx_docs
+    from paths import (
+        agent_directory,
+        disks_directory,
+        ensure_directory,
+        openmsx_home,
+        prepare_openmsx_home,
+        require_source_root,
+        resolve_user_path,
+        source_root,
+        source_work_root,
+        user_root,
+        work_root,
+    )
 
 Z80ASM = (os.environ.get("Z80ASM") or shutil.which("z80asm") or
           "/opt/homebrew/bin/z80asm")
 MAKE = os.environ.get("MAKE") or shutil.which("make") or "make"
-WORK = PROJ / "work"
-DISKS = WORK / "disks"
-DISKS.mkdir(parents=True, exist_ok=True)
-AGENT_COM = WORK / "agent" / "MSXAI.COM"
-AGENT_XFER_COM = WORK / "agent" / "MSXAIXF.COM"
-AGENT_TSR_8251 = WORK / "agent" / "MCP8251.TSR"
-AGENT_TSR_16C550 = WORK / "agent" / "MCP16550.TSR"
-AGENT_MEMMAN_COM = WORK / "agent" / "MEMMAN.COM"
-AGENT_TL_COM = WORK / "agent" / "TL.COM"
-AGENT_TK_COM = WORK / "agent" / "TK.COM"
+SOURCE_ROOT = source_root()
+# Compatibility name retained for callers/tests that inspect the checkout.
+PROJ = SOURCE_ROOT if SOURCE_ROOT is not None else user_root()
+WORK = work_root()
+DISKS = disks_directory()
+SOURCE_WORK = source_work_root()
+AGENT_DIR = agent_directory()
+OPENMSX_HOME = openmsx_home()
+AGENT_COM = AGENT_DIR / "MSXAI.COM"
+AGENT_XFER_COM = AGENT_DIR / "MSXAIXF.COM"
+AGENT_TSR_8251 = AGENT_DIR / "MCP8251.TSR"
+AGENT_TSR_16C550 = AGENT_DIR / "MCP16550.TSR"
+AGENT_MEMMAN_COM = AGENT_DIR / "MEMMAN.COM"
+AGENT_TL_COM = AGENT_DIR / "TL.COM"
+AGENT_TK_COM = AGENT_DIR / "TK.COM"
 # Local Nextor / MSX-DOS 2 hard-disk image (never distributed by this project).
 DOS_HDD = pathlib.Path(os.environ.get(
-    "MSX_AI_DOS_HDD", WORK / "system-disks" / "msxdos.dsk")).expanduser()
+    "MSX_AI_DOS_HDD",
+    SOURCE_WORK / "system-disks" / "msxdos.dsk")).expanduser()
 BASIC_MACHINE = os.environ.get("MSX_AI_BASIC_MACHINE", "Gradiente_Expert20")
 MSX2PLUS_MACHINE = os.environ.get(
     "MSX_AI_MSX2PLUS_MACHINE", "Sony_HB-F1XDJ_128K_Lite")
@@ -69,16 +117,20 @@ UART_SCREENSHOT_MARGIN = 1.15
 SLOW_SCREENSHOT_SECONDS = 10.0
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = __version__
 
 
 def _build_agent_artifacts():
     """Build and return the agent executable package used by MSX-DOS."""
+    try:
+        project = require_source_root()
+    except RuntimeError as exc:
+        raise OpenMSXError(str(exc)) from exc
     environment = os.environ.copy()
     environment["Z80ASM"] = Z80ASM
     try:
         build = subprocess.run(
-            [MAKE, "agent"], cwd=PROJ, env=environment,
+            [MAKE, "agent"], cwd=project, env=environment,
             capture_output=True, text=True)
     except OSError as exc:
         raise OpenMSXError(f"could not run the canonical agent build: {exc}") from exc
@@ -155,51 +207,69 @@ class Session:
 
     def boot(self, profile="basic", boot_seconds=6, window=False):
         self.shutdown()
+        machine = None
         if profile == "dos":
             if not DOS_HDD.exists():
                 raise OpenMSXError(f"MSX-DOS image not found: {DOS_HDD}")
-            self.msx = OpenMSX(machine=BASIC_MACHINE,
-                               extensions=[DOS_EXTENSION],
-                               harddisk=str(DOS_HDD)).start(headless=not window)
+            machine = OpenMSX(machine=BASIC_MACHINE,
+                              extensions=[DOS_EXTENSION],
+                              harddisk=str(DOS_HDD))
         elif profile == "disk":
-            self.msx = OpenMSX(machine=BASIC_MACHINE,
-                               extensions=[DISK_EXTENSION]).start(headless=not window)
+            machine = OpenMSX(machine=BASIC_MACHINE,
+                              extensions=[DISK_EXTENSION])
         elif profile == "msx2plus":
-            self.msx = OpenMSX(machine=MSX2PLUS_MACHINE,
-                               extensions=[]).start(headless=not window)
+            machine = OpenMSX(machine=MSX2PLUS_MACHINE, extensions=[])
         else:
-            self.msx = OpenMSX(machine=BASIC_MACHINE, extensions=[]).start(
-                headless=not window)
-        self.msx.power_on()
-        if window:
-            # Show a real openMSX window on the user's screen (renderer none ->
-            # SDLGL-PP). Works because the MCP server runs in the GUI session.
-            # The same -control channel still drives it, so the user types in the
-            # window AND the AI operates the same shared instance.
-            self.msx.cmd("set renderer SDLGL-PP")
-            self.msx.cmd("set throttle on")   # real speed for interactive use
-        self.msx.advance(boot_seconds if profile != "dos" else 14)
-        if profile == "disk":
-            # DDX shows its insert-disk prompt; ESC drops into DDX-BASIC.
-            self.msx.press("ESC")
-            self.msx.advance(3)
+            machine = OpenMSX(machine=BASIC_MACHINE, extensions=[])
+        try:
+            machine.start(headless=not window)
+            machine.power_on()
+            if window:
+                # Show a real openMSX window on the user's screen (renderer none ->
+                # SDLGL-PP). Works because the MCP server runs in the GUI session.
+                # The same -control channel still drives it, so the user types in the
+                # window AND the AI operates the same shared instance.
+                machine.cmd("set renderer SDLGL-PP")
+                machine.cmd("set throttle on")   # real speed for interactive use
+            machine.advance(boot_seconds if profile != "dos" else 14)
+            if profile == "disk":
+                # DDX shows its insert-disk prompt; ESC drops into DDX-BASIC.
+                machine.press("ESC")
+                machine.advance(3)
+            screen = machine.screen_text()
+        except Exception:
+            # A partially booted emulator is still owned by this session.  Do
+            # not publish it as the active backend, and never leave its process
+            # running after a failed renderer, power, or boot command.
+            machine.close()
+            raise
+        self.msx = machine
         self.profile = profile
-        return self.msx.screen_text()
+        return screen
 
-    def attach(self):
+    def attach(self, socket_path=None):
         """Connect to the user's already-running openMSX window (shared instance)."""
         self.shutdown()
-        self.msx = OpenMSX().attach()
-        self.msx.enable_keybuf()      # do NOT touch throttle/power of their session
+        machine = OpenMSX()
+        try:
+            machine.attach(socket_path)
+            # Do not touch throttle/power of the user's session.
+            machine.enable_keybuf()
+            screen = machine.screen_text()
+        except Exception:
+            machine.close()
+            raise
+        self.msx = machine
         self.profile = "attach"
-        return self.msx.screen_text()
+        return screen
 
-    def listen_agent(self, host="0.0.0.0", port=6603, timeout=60):
+    def listen_agent(self, host="127.0.0.1", port=6603, timeout=60,
+                     cancelled=None):
         """Wait for an ASM agent or transparent adapter to connect over TCP."""
         self.shutdown()
         real = RealMSX(host=host, port=int(port)).listen()
         try:
-            peer = real.accept(timeout=float(timeout))
+            peer = real.accept(timeout=float(timeout), cancelled=cancelled)
         except Exception:
             real.close()
             raise
@@ -222,7 +292,7 @@ class Session:
 
     def start_tcp_bench(self, host="127.0.0.1", port=0, timeout=60,
                         window=False, mode="resident", debug=False,
-                        preload_files=()):
+                        preload_files=(), cancelled=None):
         """Start one isolated openMSX as a physical-agent TCP simulation."""
         self.shutdown()
         if mode not in ("resident", "monitor"):
@@ -248,12 +318,13 @@ class Session:
             if len(canonical_artifacts) != len(AGENT_PACKAGE_NAMES):
                 raise OpenMSXError("agent build returned an incomplete package")
             shutil.copyfile(DOS_HDD, disk)
+            prepared_openmsx_home = prepare_openmsx_home(OPENMSX_HOME)
             shutil.copytree(
-                PROJ / ".openmsx-home", home,
+                prepared_openmsx_home, home,
                 ignore=shutil.ignore_patterns(
                     ".DS_Store", "persistent", "savestates", "replays",
                     "screenshots", "recordings", "settings.local.xml",
-                    ".filecache", "imgui.ini"))
+                    ".filecache", "imgui.ini", "software"))
             runtime_artifacts = []
             for dos_name, canonical in zip(
                     AGENT_PACKAGE_NAMES, canonical_artifacts, strict=True):
@@ -353,7 +424,8 @@ class Session:
             machine.cmd("set rs232-net-ip232 off")
             machine.cmd("plug msx-rs232 rs232-net")
             try:
-                peer = real.accept(timeout=float(timeout))
+                peer = real.accept(
+                    timeout=float(timeout), cancelled=cancelled)
             except Exception as exc:
                 try:
                     failed_screen = machine.screen_text()
@@ -448,12 +520,14 @@ def t_boot(profile="basic", window=False):
     return f"[boot profile={profile} {tag}]\n{scr}"
 
 
-def t_attach():
-    scr = SESSION.attach()
-    return ("[attached to your running openMSX window — shared instance]\n" + scr)
+def t_attach(socket_path=None):
+    scr = SESSION.attach(socket_path)
+    selected = SESSION.require().socket_path
+    return (f"[attached to openMSX socket={selected} — shared instance]\n" +
+            scr)
 
 
-def t_real_listen(host="0.0.0.0", port=6603, timeout=60):
+def t_real_listen(host="127.0.0.1", port=6603, timeout=60):
     return t_agent_listen(host=host, port=port, timeout=timeout)
 
 
@@ -463,13 +537,49 @@ def _format_endpoint(endpoint):
     return str(endpoint)
 
 
-def t_agent_listen(host="0.0.0.0", port=6603, timeout=60):
-    peer = SESSION.listen_agent(host=host, port=port, timeout=timeout)
+def _validate_agent_endpoint(host, port, timeout, *, maximum_timeout):
+    if not isinstance(host, str):
+        raise TypeError("host must be an IPv4 address string")
+    try:
+        address = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError as exc:
+        raise ValueError("host must be a literal IPv4 address") from exc
+    if (address.is_unspecified or address.is_multicast or
+            int(address) == 0xFFFFFFFF):
+        raise ValueError(
+            "host must be a specific unicast IPv4 address, not a wildcard, "
+            "multicast, or broadcast address")
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise TypeError("port must be an integer")
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be in range 1..65535")
+    if isinstance(timeout, bool):
+        raise TypeError("timeout must be a number")
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("timeout must be a number") from exc
+    if (not math.isfinite(timeout) or timeout <= 0 or
+            timeout > maximum_timeout):
+        raise ValueError(
+            f"timeout must be a positive finite number no greater than "
+            f"{maximum_timeout}")
+    return str(address), port, timeout
+
+
+def t_agent_listen(host="127.0.0.1", port=6603, timeout=60):
+    host, port, timeout = _validate_agent_endpoint(
+        host, port, timeout, maximum_timeout=86400)
+    peer = SESSION.listen_agent(
+        host=host, port=port, timeout=timeout,
+        cancelled=current_cancellation_callback())
     return (f"[MSX agent connected from {_format_endpoint(peer)} "
             f"over TCP/IP to {host}:{int(port)}]")
 
 
 def t_agent_connect(host, port=6603, timeout=60):
+    host, port, timeout = _validate_agent_endpoint(
+        host, port, timeout, maximum_timeout=300)
     peer = SESSION.connect_agent(host=host, port=port, timeout=timeout)
     return f"[MSX agent connected over TCP/IP to {_format_endpoint(peer)}]"
 
@@ -477,9 +587,24 @@ def t_agent_connect(host, port=6603, timeout=60):
 def t_tcp_bench_start(host="127.0.0.1", port=0, timeout=60, window=False,
                       mode="resident", debug=False):
     """Boot one isolated openMSX and reach its resident agent only over TCP."""
+    if host != "127.0.0.1":
+        raise ValueError("the simulated TCP bench host must be 127.0.0.1")
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise TypeError("port must be an integer")
+    if not 0 <= port <= 65535:
+        raise ValueError("port must be in range 0..65535")
+    if isinstance(timeout, bool):
+        raise TypeError("timeout must be a number")
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("timeout must be a number") from exc
+    if not math.isfinite(timeout) or not 0 < timeout <= 300:
+        raise ValueError("timeout must be a positive finite number at most 300")
     SESSION.start_tcp_bench(
         host=host, port=port, timeout=timeout, window=window,
-        mode=mode, debug=debug)
+        mode=mode, debug=debug,
+        cancelled=current_cancellation_callback())
     return t_status()
 
 
@@ -489,14 +614,15 @@ def t_screen():
 
 def t_status():
     if SESSION.msx is None:
-        return json.dumps({"backend": "none", "state": "disconnected"},
-                          sort_keys=True)
+        return {"backend": "none", "state": "disconnected"}
     m = SESSION.msx
     if SESSION.profile == "real":
         state = m.status()
         state.update({
             "backend": "real",
-            "peer": m.peer,
+            # Socket endpoints are tuples in Python but arrays on the MCP JSON
+            # boundary. Normalize them before output-schema validation.
+            "peer": list(m.peer) if isinstance(m.peer, tuple) else m.peer,
             "capabilities": [name for bit, name in CAPABILITY_NAMES.items()
                              if m.capabilities & bit],
             "resident_base": m.resident_base,
@@ -507,7 +633,10 @@ def t_status():
             "agent_transport_id": getattr(m, "agent_transport_id", None),
             "network_transport": getattr(m, "network_transport", None),
             "network_role": getattr(m, "network_role", None),
-            "local_endpoint": getattr(m, "local_endpoint", None),
+            "local_endpoint": (
+                list(m.local_endpoint)
+                if isinstance(getattr(m, "local_endpoint", None), tuple)
+                else getattr(m, "local_endpoint", None)),
             "simulation": getattr(m, "simulation", None),
             "max_payload": (m._v3.max_payload if m._v3 is not None else 255),
             "control_level": getattr(m, "control_level", None),
@@ -521,14 +650,17 @@ def t_status():
             "vram_size": m.vram_size,
             "vram_banks": getattr(m, "vram_banks", None),
         })
-        return json.dumps(state, sort_keys=True)
-    return json.dumps({"backend": "openmsx", "profile": SESSION.profile,
-                       "screen_mode": m.screen_mode()}, sort_keys=True)
+        return state
+    status = {"backend": "openmsx", "profile": SESSION.profile,
+              "screen_mode": m.screen_mode()}
+    if getattr(m, "attached", False):
+        status["control_socket"] = getattr(m, "socket_path", None)
+    return status
 
 
 def t_cpu_snapshot():
     """Capture CPU debug state through the selected backend contract."""
-    return json.dumps(SESSION.require().cpu_snapshot(), sort_keys=True)
+    return SESSION.require().cpu_snapshot()
 
 
 def _require_real():
@@ -562,7 +694,7 @@ def t_io_read(port):
     """Read one hardware I/O port through the resident agent."""
     port = _int_in_range(port, "port", 0, 0xFF)
     value = _require_real().io_read(port)
-    return json.dumps({"port": port, "value": value}, sort_keys=True)
+    return {"port": port, "value": value}
 
 
 def t_io_write(port, value, verify=False):
@@ -572,8 +704,7 @@ def t_io_write(port, value, verify=False):
     if not isinstance(verify, bool):
         raise TypeError("verify must be a boolean")
     _require_real().io_write(port, value, verify=verify)
-    return json.dumps({"port": port, "value": value, "verified": verify},
-                      sort_keys=True)
+    return {"port": port, "value": value, "verified": verify}
 
 
 def t_slot_select(page, slot_id):
@@ -581,7 +712,7 @@ def t_slot_select(page, slot_id):
     page = _int_in_range(page, "page", 0, 1)
     slot_id = _int_in_range(slot_id, "slot_id", 0, 0xFF)
     _require_real().slot_select(page, slot_id)
-    return json.dumps({"page": page, "slot_id": slot_id}, sort_keys=True)
+    return {"page": page, "slot_id": slot_id}
 
 
 def t_mapper_select(page, segment):
@@ -589,7 +720,7 @@ def t_mapper_select(page, segment):
     page = _int_in_range(page, "page", 0, 1)
     segment = _int_in_range(segment, "segment", 0, 0xFF)
     _require_real().mapper_select(page, segment)
-    return json.dumps({"page": page, "segment": segment}, sort_keys=True)
+    return {"page": page, "segment": segment}
 
 
 def _atomic_real(m, atomic, operation):
@@ -598,33 +729,37 @@ def _atomic_real(m, atomic, operation):
 
 
 def t_memory_read(space, address, length, atomic=True):
-    m = _require_real()
+    m = SESSION.require()
+    real = SESSION.profile == "real"
+    backend = m if real else _OpenMSXApplicationBackend(m)
     if space == "ram":
-        read = lambda: m.peek(int(address), int(length))
+        read = lambda: backend.peek(int(address), int(length))
     elif space == "vram":
-        read = lambda: m.vpeek(int(address), int(length))
+        read = lambda: backend.vpeek(int(address), int(length))
     else:
         raise ValueError("space must be 'ram' or 'vram'")
-    data = _atomic_real(m, atomic, read)
+    data = _atomic_real(m, atomic, read) if real else read()
     return f"[{space} 0x{int(address):X}+{len(data)}]\n{data.hex()}"
 
 
 def t_memory_write(space, address, data_hex, verify=False, atomic=True):
-    m = _require_real()
+    m = SESSION.require()
+    real = SESSION.profile == "real"
+    backend = m if real else _OpenMSXApplicationBackend(m)
     try:
         data = bytes.fromhex(data_hex)
     except ValueError as exc:
         raise ValueError("data_hex must contain an even number of hexadecimal digits") from exc
     address = int(address)
     if space == "ram":
-        write = lambda: (m.poke(address, data),
-                         m.peek(address, len(data)) if verify else None)[1]
+        write = lambda: (backend.poke(address, data),
+                         backend.peek(address, len(data)) if verify else None)[1]
     elif space == "vram":
-        write = lambda: (m.vpoke(address, data),
-                         m.vpeek(address, len(data)) if verify else None)[1]
+        write = lambda: (backend.vpoke(address, data),
+                         backend.vpeek(address, len(data)) if verify else None)[1]
     else:
         raise ValueError("space must be 'ram' or 'vram'")
-    check = _atomic_real(m, atomic, write)
+    check = _atomic_real(m, atomic, write) if real else write()
     if check is not None and check != data:
         raise OpenMSXError("write verification failed")
     suffix = " verified" if verify else ""
@@ -717,9 +852,7 @@ def t_app_load(path, format=None, execute=None, verify=False):
     if not isinstance(verify, bool):
         raise TypeError("verify must be a boolean")
 
-    source = pathlib.Path(path).expanduser()
-    if not source.is_absolute():
-        source = PROJ / source
+    source = resolve_user_path(path)
     msx = SESSION.require()
     real = SESSION.profile == "real"
     backend = msx if real else _OpenMSXApplicationBackend(msx)
@@ -727,7 +860,7 @@ def t_app_load(path, format=None, execute=None, verify=False):
         backend, source, format=format, execute=execute, verify=verify,
         stop_before_load=real))
     result["backend"] = "real" if real else "openmsx"
-    return json.dumps(result, sort_keys=True)
+    return result
 
 
 def _real_screenshot_estimate(m, plan):
@@ -834,12 +967,12 @@ def t_type_line(text):
     m = SESSION.require()
     consumed = m.type_line(text)
     if SESSION.profile == "real":
-        return json.dumps({
+        return {
             "backend": "real",
             "bytes_consumed": consumed,
             "input": "line",
             "screen_capture_performed": False,
-        }, sort_keys=True)
+        }
     m.advance(0.6)
     return _screen()
 
@@ -852,13 +985,13 @@ def t_type_lines(lines):
     m = SESSION.require()
     consumed = m.type_lines(lines)
     if SESSION.profile == "real":
-        return json.dumps({
+        return {
             "backend": "real",
             "bytes_consumed": consumed,
             "input": "lines",
             "lines": len(lines),
             "screen_capture_performed": False,
-        }, sort_keys=True)
+        }
     return _screen()
 
 
@@ -866,12 +999,12 @@ def t_type(text):
     m = SESSION.require()
     consumed = m.type(text)
     if SESSION.profile == "real":
-        return json.dumps({
+        return {
             "backend": "real",
             "bytes_consumed": consumed,
             "input": "text",
             "screen_capture_performed": False,
-        }, sort_keys=True)
+        }
     m.advance(0.4)
     return _screen()
 
@@ -881,12 +1014,12 @@ def t_key(key):
     if SESSION.profile == "real":
         m.press(key)
         time.sleep(0.1)
-        return json.dumps({
+        return {
             "backend": "real",
             "input": "key",
             "key": key,
             "screen_capture_performed": False,
-        }, sort_keys=True)
+        }
     else:
         m.press(key.upper())
         m.advance(0.6)
@@ -931,9 +1064,18 @@ def _run_real_basic_file(m, data, drive):
     with tempfile.TemporaryDirectory(prefix="msx-ai-basic-xfer-") as staging:
         source = pathlib.Path(staging) / "PROGRAM.BAS"
         source.write_bytes(data)
-        transfer = m.put_file(
-            source, filename, compression="raw", resume=False,
-            state_directory=staging)
+        options = {
+            "compression": "raw",
+            "resume": False,
+            "state_directory": staging,
+        }
+        progress = current_progress_callback()
+        cancelled = current_cancellation_callback()
+        if progress is not None:
+            options["progress"] = progress
+        if cancelled is not None:
+            options["cancelled"] = cancelled
+        transfer = m.put_file(source, filename, **options)
     # Protocol-X COMPLETE is emitted only after the transient worker has
     # finished its DOS cleanup and final console message. The BASIC command can
     # therefore be queued immediately; COMMAND2 consumes it after the helper's
@@ -959,9 +1101,7 @@ def _read_basic_file(path, format="auto"):
         raise ValueError("path must be a non-empty filesystem path")
     if format not in ("auto", "ascii", "tokenized"):
         raise ValueError("format must be 'auto', 'ascii' or 'tokenized'")
-    source = pathlib.Path(path).expanduser()
-    if not source.is_absolute():
-        source = PROJ / source
+    source = resolve_user_path(path)
     try:
         data = source.read_bytes()
     except OSError as exc:
@@ -1006,17 +1146,13 @@ def t_run_basic_file(path, dos_prompt_confirmed, format="auto", drive="A"):
         raise OpenMSXError(
             "the connected resident does not advertise file-transfer-v2; "
             "reinstall the current agent suite")
-    return json.dumps(
-        _run_real_basic_file(m, data, drive), sort_keys=True)
+    return _run_real_basic_file(m, data, drive)
 
 
 def _resolve_host_transfer_path(path, *, must_exist):
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         raise ValueError("path must be a non-empty filesystem path")
-    resolved = pathlib.Path(path).expanduser()
-    if not resolved.is_absolute():
-        resolved = PROJ / resolved
-    resolved = resolved.resolve(strict=must_exist)
+    resolved = resolve_user_path(path).resolve(strict=must_exist)
     if must_exist and not resolved.is_file():
         raise ValueError(f"local transfer source is not a regular file: {resolved}")
     return resolved
@@ -1060,10 +1196,20 @@ def t_file_put(local_path, msx_path, dos_prompt_confirmed,
             "valid only for active resume recovery")
     source = _resolve_host_transfer_path(local_path, must_exist=True)
     _m, method = _require_file_transfer_backend("put_file")
-    result = method(
-        source, msx_path, compression=compression, resume=resume,
-        existing_only=not dos_prompt_confirmed, timeout=timeout)
-    return json.dumps(_finish_file_transfer_tool(result), indent=2)
+    options = {
+        "compression": compression,
+        "resume": resume,
+        "existing_only": not dos_prompt_confirmed,
+        "timeout": timeout,
+    }
+    progress = current_progress_callback()
+    cancelled = current_cancellation_callback()
+    if progress is not None:
+        options["progress"] = progress
+    if cancelled is not None:
+        options["cancelled"] = cancelled
+    result = method(source, msx_path, **options)
+    return _finish_file_transfer_tool(result)
 
 
 def t_file_get(msx_path, local_path, dos_prompt_confirmed,
@@ -1079,10 +1225,25 @@ def t_file_get(msx_path, local_path, dos_prompt_confirmed,
             "valid only for active resume recovery")
     destination = _resolve_host_transfer_path(local_path, must_exist=False)
     _m, method = _require_file_transfer_backend("get_file")
-    result = method(
-        msx_path, destination, resume=resume,
-        existing_only=not dos_prompt_confirmed, timeout=timeout)
-    return json.dumps(_finish_file_transfer_tool(result), indent=2)
+    options = {
+        "resume": resume,
+        "existing_only": not dos_prompt_confirmed,
+        "timeout": timeout,
+    }
+    progress = current_progress_callback()
+    cancelled = current_cancellation_callback()
+    if progress is not None:
+        options["progress"] = progress
+    if cancelled is not None:
+        options["cancelled"] = cancelled
+    result = method(msx_path, destination, **options)
+    return _finish_file_transfer_tool(result)
+
+
+def t_docs_search(query, backend=None, audience=None, limit=5):
+    """Search the bundled, project-authored documentation corpus."""
+    return msx_docs.search(
+        query, backend=backend, audience=audience, limit=limit)
 
 
 def t_run_basic(program, clear=True, allow_existing_basic=False,
@@ -1130,8 +1291,7 @@ def t_run_basic(program, clear=True, allow_existing_basic=False,
             if not dos_prompt_confirmed:
                 raise OpenMSXError(
                     "BASIC file transfer requires dos_prompt_confirmed=true")
-            return json.dumps(
-                _run_real_basic_file(m, file_data, dos_drive), sort_keys=True)
+            return _run_real_basic_file(m, file_data, dos_drive)
         if dos_prompt_confirmed:
             m.type_line("BASIC")
     elif transfer == "file":
@@ -1144,7 +1304,7 @@ def t_run_basic(program, clear=True, allow_existing_basic=False,
     lines = _basic_source_lines(program)
     consumed = m.type_lines(lines + ["RUN"])
     if real:
-        return json.dumps({
+        return {
             "backend": "real",
             "bytes_consumed": consumed,
             "delivery": "keyboard-spool",
@@ -1152,7 +1312,7 @@ def t_run_basic(program, clear=True, allow_existing_basic=False,
             "operation": "run-basic",
             "run_submitted": True,
             "screen_capture_performed": False,
-        }, sort_keys=True)
+        }
     m.advance(2.5)
     return _screen()
 
@@ -1223,16 +1383,35 @@ def _pairs(addr, data):
     return " ".join(f"{addr + i} {b}" for i, b in enumerate(data))
 
 
+def _dos_basename(name, *, required_extension=None):
+    """Return one conservative 8.3 DOS basename safe for host/Tcl staging."""
+    if not isinstance(name, str):
+        raise TypeError("name must be a string")
+    if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_~-]{0,7}(?:\.[A-Za-z0-9]{1,3})?",
+            name):
+        raise ValueError(
+            "name must be one DOS 8.3 basename using letters, digits, _, ~, "
+            "or -, without a path")
+    normalized = name.upper()
+    if required_extension is not None:
+        extension = "." + required_extension.upper().lstrip(".")
+        if not normalized.endswith(extension):
+            raise ValueError(f"name must end with {extension}")
+    return normalized
+
+
 def t_dos_asm_run(source, name="A.COM", run=True):
     """Assemble a Z80 MSX-DOS .COM (org 0x100), import it onto the Nextor hard
     disk (partition 1) and optionally run it. Boots the 'dos' profile if needed."""
+    if not name.lower().endswith(".com"):
+        name += ".COM"
+    name = _dos_basename(name, required_extension="COM")
     if SESSION.profile == "real":
         raise OpenMSXError("MSX-DOS disk import is only available on openMSX")
     if SESSION.profile != "dos":
         SESSION.boot("dos")
     m = SESSION.require()
-    if not name.lower().endswith(".com"):
-        name += ".COM"
     text = source
     if "org" not in source.lower():
         text = "    org 0100h\n" + source
@@ -1256,11 +1435,13 @@ def t_dos_asm_run(source, name="A.COM", run=True):
 
 def t_disk_put_text(name, content):
     """Write a text file (e.g. a .BAS listing or .asm) into drive A's disk image."""
+    name = _dos_basename(name)
     if SESSION.profile == "real":
         raise OpenMSXError("host disk-image import is only available on openMSX")
     if SESSION.profile != "disk":
         SESSION.boot("disk")
     m = SESSION.require()
+    ensure_directory(DISKS)
     disk = DISKS / "work.dsk"
     if not disk.exists():
         m.cmd(f'diskmanipulator create {{{disk}}} 720k')
@@ -1284,9 +1465,28 @@ def t_shutdown():
 # Tool registry (name -> (fn, description, schema))
 # --------------------------------------------------------------------------
 def _s(props, required=()):
-    return {"type": "object", "properties": props, "required": list(required)}
+    return {
+        "type": "object",
+        "properties": props,
+        "required": list(required),
+        "additionalProperties": False,
+    }
 
 TOOLS = {
+    "msx_docs_search": (t_docs_search,
+        "Search the bundled MSX-AI documentation using a deterministic lexical "
+        "index. Results link to exact msx-ai://docs resources and include short "
+        "snippets. The corpus is project-authored, MIT-licensed and carries "
+        "machine-readable provenance; no target connection is required.",
+        _s({"query": {"type": "string", "minLength": 1},
+            "backend": {"type": "string",
+                        "enum": ["openmsx-direct", "agent-simulated",
+                                 "agent-physical"]},
+            "audience": {"type": "string",
+                         "enum": ["user", "integrator", "operator",
+                                  "developer", "contributor", "maintainer"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20,
+                      "default": 5}}, ["query"])),
     "msx_boot": (t_boot,
         "Boot an isolated MSX. profile='basic' starts the Gradiente Expert 2.0 "
         "in BASIC; profile='disk' adds its DDX 3.0 floppy; profile='dos' boots "
@@ -1303,35 +1503,51 @@ TOOLS = {
         "Attach to the user's ALREADY-RUNNING openMSX window (shared instance) via "
         "its control socket, instead of spawning a headless one. Use this when the "
         "user opened openMSX themselves (e.g. via ./open-msx.command) and wants to "
-        "collaborate on the same live machine. Does not change their throttle/power.",
-        _s({})),
+        "collaborate on the same live machine. Does not change their throttle/power. "
+        "If more than one live socket exists, the call fails safely and lists them; "
+        "repeat it with the exact socket_path instead of choosing implicitly.",
+        _s({"socket_path": {"type": ["string", "null"], "minLength": 1}})),
     "msx_real_listen": (t_real_listen,
         "Compatibility alias for msx_agent_listen. Listen for a physical MSX "
         "running the ASM agent to connect over TCP. "
         "After it connects, msx_screen and msx_screenshot read RAM/VRAM only "
         "through the agent protocol, without using openMSX control APIs.",
-        _s({"host": {"type": "string", "default": "0.0.0.0"},
-            "port": {"type": "integer", "default": 6603},
-            "timeout": {"type": "number", "default": 60}})),
+        _s({"host": {"type": "string", "default": "127.0.0.1"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535,
+                     "default": 6603},
+            "timeout": {"type": "number", "exclusiveMinimum": 0,
+                        "maximum": 86400,
+                        "default": 60}})),
     "msx_agent_listen": (t_agent_listen,
         "Listen for an MSX resident agent or transparent hardware adapter to "
         "connect over TCP/IPv4. Use this when a physical adapter is configured "
         "as a TCP client; the optional openMSX test profile can use the same "
-        "endpoint. The MCP protocol is independent of emulator and adapter "
-        "brands.",
-        _s({"host": {"type": "string", "default": "0.0.0.0"},
-            "port": {"type": "integer", "default": 6603},
-            "timeout": {"type": "number", "default": 60}})),
+        "endpoint. The safe default listens only on 127.0.0.1; for physical "
+        "hardware, pass the host machine's specific LAN IPv4 address and keep "
+        "the unauthenticated endpoint on a trusted network. The MCP protocol "
+        "is independent of emulator and adapter brands.",
+        _s({"host": {"type": "string", "default": "127.0.0.1"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535,
+                     "default": 6603},
+            "timeout": {"type": "number", "exclusiveMinimum": 0,
+                        "maximum": 86400,
+                        "default": 60}})),
     "msx_agent_connect": (t_agent_connect,
         "Connect over TCP/IP to an MSX resident agent or transparent adapter "
         "configured as a TCP server. This is the inverse connection direction "
         "of msx_agent_listen and uses the identical transport-neutral protocol.",
         _s({"host": {"type": "string", "minLength": 1},
-            "port": {"type": "integer", "default": 6603},
-            "timeout": {"type": "number", "default": 60}}, ["host"])),
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535,
+                     "default": 6603},
+            "timeout": {"type": "number", "exclusiveMinimum": 0,
+                        "maximum": 300,
+                        "default": 60}}, ["host"])),
     "msx_tcp_bench_start": (t_tcp_bench_start,
         "Start one isolated openMSX instance, install the resident ASM "
         "agent, and connect to it through RS232-Net and TCP/IP. A headless "
+        "bench requires a source checkout; set MSX_AI_SOURCE_ROOT when the "
+        "MCP host itself was installed with pipx. It is restricted to the "
+        "IPv4 loopback host. A headless "
         "bench is host-muted; window=true enables its visible renderer with "
         "normal sound after the TCP handshake. It remains alive until "
         "msx_shutdown. Supported memory, "
@@ -1341,9 +1557,12 @@ TOOLS = {
         "on cooperative DOS-launched software; persistent pause is disabled. "
         "Direct call/run/stop and slot/mapper selection require "
         "mode='monitor'. debug=true is valid only for monitor mode.",
-        _s({"host": {"type": "string", "default": "127.0.0.1"},
-            "port": {"type": "integer", "default": 0},
-            "timeout": {"type": "number", "default": 60},
+        _s({"host": {"const": "127.0.0.1", "default": "127.0.0.1"},
+            "port": {"type": "integer", "minimum": 0, "maximum": 65535,
+                     "default": 0},
+            "timeout": {"type": "number", "exclusiveMinimum": 0,
+                        "maximum": 300,
+                        "default": 60},
             "window": {"type": "boolean", "default": False},
             "mode": {"type": "string", "enum": ["resident", "monitor"],
                      "default": "resident"},
@@ -1403,8 +1622,8 @@ TOOLS = {
             "segment": {"type": "integer", "minimum": 0, "maximum": 255}},
            ["page", "segment"])),
     "msx_memory_read": (t_memory_read,
-        "Read RAM or VRAM through the resident agent; returns hex. With atomic=true "
-        "(default), a running application uses the bounded snapshot lease and "
+        "Read RAM or VRAM through the selected backend; returns hex. On a real "
+        "agent, atomic=true (default) uses the bounded snapshot lease and "
         "resumes immediately after the read. Older agents require atomic=false. "
         "MemMan resident mode reserves RAM page 1 (0x4000-0x7FFF) "
         "but leaves pages 2 and 3 accessible.",
@@ -1414,9 +1633,9 @@ TOOLS = {
             "atomic": {"type": "boolean", "default": True}},
            ["space", "address", "length"])),
     "msx_memory_write": (t_memory_write,
-        "Write hexadecimal bytes to RAM or VRAM through the resident agent. "
-        "Set verify=true to read back and compare. With atomic=true (default), "
-        "a running application uses the bounded snapshot lease for the complete "
+        "Write hexadecimal bytes to RAM or VRAM through the selected backend. "
+        "Set verify=true to read back and compare. On a real agent, "
+        "atomic=true (default) uses the bounded snapshot lease for the complete "
         "write and then resumes. Older agents require atomic=false. "
         "MemMan resident mode reserves RAM page 1 while allowing pages 2 and 3; "
         "page 3 contains live BIOS/DOS state and arbitrary writes can crash the "
@@ -1562,7 +1781,8 @@ TOOLS = {
         "Load an application through the active backend using the shared, "
         "interface-independent loader. Detects msx-ai-app-v1 manifests, COM, "
         "BLOAD BIN and flat 16/32 KiB ROM files by extension/header. Relative "
-        "paths are resolved from the project root. Optional execute overrides "
+        "paths are resolved from MSX_AI_USER_ROOT, or the server's current "
+        "working directory by default. Optional execute overrides "
         "the file entry mode; verify reads every segment back (slower over TCP). "
         "A MemMan resident target accepts safe segment transfers but rejects "
         "call/run entry modes and RAM page 1; use the foreground monitor for "
@@ -1638,8 +1858,15 @@ def handle(msg):
                     "error": {"code": -32601, "message": f"unknown tool {name}"}}
         try:
             out = entry[0](**args)
-            # tools may return a str (wrapped as text) or a ready content list
-            content = out if isinstance(out, list) else [{"type": "text", "text": out}]
+            # The compatibility server exposes structured handler results as
+            # JSON text. The SDK runtime publishes the same dict as native
+            # structuredContent. Ready content lists pass through unchanged.
+            if isinstance(out, list):
+                content = out
+            else:
+                text = (json.dumps(out, sort_keys=True)
+                        if isinstance(out, dict) else str(out))
+                content = [{"type": "text", "text": text}]
             return {"jsonrpc": "2.0", "id": mid, "result": {"content": content}}
         except Exception as e:
             tb = traceback.format_exc(limit=3)

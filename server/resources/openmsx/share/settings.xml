@@ -1,0 +1,8 @@
+<!DOCTYPE settings SYSTEM 'settings.dtd'>
+<settings>
+  <settings>
+    <setting id="default_type_proc">type_via_keybuf</setting>
+  </settings>
+  <bindings/>
+  <shortcuts/>
+</settings>

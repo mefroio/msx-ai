@@ -1,0 +1,28 @@
+<?xml version="1.0" ?>
+<!DOCTYPE msxconfig SYSTEM 'msxconfig2.dtd'>
+<msxconfig>
+  <info>
+    <name>RS-232C (msx-ai proto)</name>
+    <manufacturer>msx-ai</manufacturer>
+    <code/>
+    <release_year/>
+    <description>Generic MSX RS-232C (8251 UART at ports 0x80-0x87) for the msx-ai
+    physical-agent test bench. Pair with the RS232-Net pluggable to tunnel the
+    serial line through a transparent serial-to-TCP bridge.</description>
+    <type>RS-232C cartridge</type>
+  </info>
+  <devices>
+    <primary slot="any">
+      <secondary slot="any">
+        <MSX-RS232 id="msx-ai RS-232">
+          <io base="0x80" num="8"/>
+          <mem base="0x4000" size="0x4000"/>
+          <rom>
+            <filename>rs232.rom</filename>
+            <sha1>92a433e877626461a6481ca75c252e643752f0c4</sha1>
+          </rom>
+        </MSX-RS232>
+      </secondary>
+    </primary>
+  </devices>
+</msxconfig>

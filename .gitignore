@@ -25,6 +25,9 @@ __pycache__/
 htmlcov/
 .venv/
 venv/
+*.egg-info/
+build/
+dist/
 
 # openMSX runtime artifacts (regenerated every run, not source)
 .openmsx-home/savestates/

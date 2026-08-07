@@ -157,13 +157,15 @@ class _FakeRealAgent:
         self.runtime_mode = runtime_mode
         self.simulation = None
         self.accepted_timeout = None
+        self.accepted_cancelled = None
         self.closed = False
 
     def listen(self):
         return self
 
-    def accept(self, timeout):
+    def accept(self, timeout, cancelled=None):
         self.accepted_timeout = timeout
+        self.accepted_cancelled = cancelled
         return ("127.0.0.1", 65000)
 
     def status(self):
@@ -202,7 +204,10 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                           return_value=artifacts) as build,
                       mock.patch.object(
                           msx_mcp_server.shutil, "copytree",
-                          side_effect=copy_home),
+                          side_effect=copy_home) as copytree,
+                      mock.patch.object(
+                          msx_mcp_server, "prepare_openmsx_home",
+                          return_value=root / "prepared-openmsx-home") as prepare,
                       mock.patch.object(
                           msx_mcp_server, "OpenMSX",
                           return_value=machine) as openmsx,
@@ -213,6 +218,9 @@ class TCPBenchHostFlowTest(unittest.TestCase):
 
                 self.assertEqual(peer, ("127.0.0.1", 65000))
                 build.assert_called_once_with()
+                prepare.assert_called_once_with(msx_mcp_server.OPENMSX_HOME)
+                ignore = copytree.call_args.kwargs["ignore"]
+                self.assertIn("software", ignore("unused", ["software"]))
                 self.assertEqual(
                     openmsx.call_args.kwargs["extensions"],
                     [msx_mcp_server.MCP_SLOT_EXPANDER,
@@ -248,6 +256,7 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                     msx_mcp_server.RESIDENT_INSTALL_SECONDS,
                     machine.advances)
                 self.assertEqual(real.accepted_timeout, 12.0)
+                self.assertIsNone(real.accepted_cancelled)
                 self.assertEqual(real.simulation, "openmsx-rs232-net")
                 transfer_state = Path(
                     real_cls.call_args.kwargs[

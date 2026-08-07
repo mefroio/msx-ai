@@ -1,3 +1,4 @@
+import errno
 import pathlib
 import sys
 import tempfile
@@ -11,6 +12,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "server"))
 import msx_real  # noqa: E402
 from msx_real import (  # noqa: E402
     RealMSX,
+    RealMSXCancelledError,
     RealMSXError,
     RealMSXProtocolError,
     RealMSXTimeoutError,
@@ -336,6 +338,222 @@ class FastStreamTransferMSX(ScriptedTransferMSX):
 
 
 class RealMSXStreamingTransferTest(unittest.TestCase):
+    def test_non_finite_transfer_timeouts_are_rejected_before_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source.bin"
+            source.write_bytes(b"timeout")
+
+            for timeout in (float("nan"), float("inf")):
+                with self.subTest(operation="put", timeout=timeout):
+                    target = ScriptedTransferMSX()
+                    with self.assertRaisesRegex(ValueError, "finite"):
+                        target.put_file(
+                            source, "A:\\TIMEOUT.BIN", compression="raw",
+                            state_directory=root / "put-state",
+                            timeout=timeout)
+                    self.assertEqual(target.open_calls, 0)
+
+                with self.subTest(operation="get", timeout=timeout):
+                    target = ScriptedTransferMSX(get_source=b"timeout")
+                    with self.assertRaisesRegex(ValueError, "finite"):
+                        target.get_file(
+                            "A:\\TIMEOUT.BIN", root / "destination.bin",
+                            state_directory=root / "get-state",
+                            timeout=timeout)
+                    self.assertEqual(target.open_calls, 0)
+
+    def test_put_preparation_cancel_is_translated_before_remote_open(self):
+        payload = bytes(range(256)) * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "prepare.bin"
+            source.write_bytes(payload)
+            target = ScriptedTransferMSX()
+            events = []
+            stop = False
+
+            def progress(completed, total, message):
+                nonlocal stop
+                events.append((completed, total, message))
+                if "raw PUT CRC-32: 0/" in message:
+                    stop = True
+
+            with self.assertRaisesRegex(
+                    RealMSXCancelledError, "before the remote worker opened"):
+                target.put_file(
+                    source, "A:\\PREPARE.BIN", compression="raw",
+                    state_directory=root / "state", progress=progress,
+                    cancelled=lambda: stop)
+
+        self.assertEqual(target.open_calls, 0)
+        self.assertEqual(target.typed_commands, [])
+        self.assertTrue(any("raw PUT CRC-32" in event[2]
+                            for event in events))
+        self.assertEqual([event[0] for event in events],
+                         sorted(event[0] for event in events))
+
+    def test_active_put_prefix_rehash_cancel_sends_remote_cancel(self):
+        payload = b"active-prefix-" * 1000
+        prefix = payload[:4096]
+
+        class ActiveCancellablePut(ScriptedTransferMSX):
+            def __init__(self):
+                super().__init__(initial_put=prefix)
+                self.cancelled_ids = []
+
+            def file_transfer_cancel(self, transfer_id):
+                self.assert_id(transfer_id)
+                self.cancelled_ids.append(bytes(transfer_id))
+                self.transfer_state = TransferState.CANCELLED
+                return TransferTerminalReply(
+                    TransferState.CANCELLED, TransferRemoteError.NONE)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "active.bin"
+            source.write_bytes(payload)
+            checksum = zlib.crc32(payload) & 0xFFFFFFFF
+            descriptor = TransferDescriptor(
+                TransferDirection.PUT, TransferEncoding.RAW, b"H" * 16,
+                len(payload), checksum, len(payload), checksum,
+                "A:\\ACTIVE.BIN")
+            TransferJournal(root / "state").save(
+                descriptor, confirmed_offset=0, prefix_crc32=0,
+                caller_binding=str(source.resolve()))
+            target = ActiveCancellablePut()
+            target.descriptor = descriptor
+            target.transfer_state = TransferState.TRANSFERRING
+            stop = False
+
+            def progress(_completed, _total, message):
+                nonlocal stop
+                if "PUT recovery validation" in message:
+                    stop = True
+
+            with self.assertRaisesRegex(
+                    RealMSXCancelledError, "resume state was preserved"):
+                target.put_file(
+                    source, descriptor.path, compression="raw",
+                    state_directory=root / "state", progress=progress,
+                    cancelled=lambda: stop)
+
+        self.assertEqual(target.open_calls, 0)
+        self.assertEqual(target.cancelled_ids, [descriptor.transfer_id])
+
+    def test_put_reports_monotonic_progress_and_cancellation_preserves_resume(self):
+        payload = bytes(range(251)) * 40
+
+        class CancellablePut(ScriptedTransferMSX):
+            def __init__(self):
+                super().__init__()
+                self.cancelled_ids = []
+
+            def file_transfer_cancel(self, transfer_id):
+                self.assert_id(transfer_id)
+                self.cancelled_ids.append(bytes(transfer_id))
+                self.transfer_state = TransferState.CANCELLED
+                return TransferTerminalReply(
+                    TransferState.CANCELLED, TransferRemoteError.NONE)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "cancel-put.bin"
+            source.write_bytes(payload)
+            state = root / "state"
+            target = CancellablePut()
+            events = []
+
+            with self.assertRaisesRegex(
+                    RealMSXCancelledError, "resume state was preserved"):
+                target.put_file(
+                    source, "A:\\CANCEL.BIN", compression="raw",
+                    state_directory=state,
+                    progress=lambda done, total, message: events.append(
+                        (done, total, message)),
+                    cancelled=lambda: target.put_blocks >= 1)
+
+            record = TransferJournal(state).load(
+                target.descriptor, caller_binding=str(source.resolve()))
+
+        self.assertEqual(target.cancelled_ids, [target.descriptor.transfer_id])
+        self.assertGreater(len(target.put_bytes), 0)
+        self.assertLess(len(target.put_bytes), len(payload))
+        self.assertLessEqual(record.confirmed_offset, len(target.put_bytes))
+        completed = [event[0] for event in events]
+        self.assertEqual(completed, sorted(completed))
+        self.assertTrue(all(event[1] == len(payload) for event in events))
+
+    def test_get_cancellation_keeps_partial_unpublished_and_resumable(self):
+        payload = bytes(range(239)) * 40
+
+        class CancellableGet(ScriptedTransferMSX):
+            def __init__(self):
+                super().__init__(get_source=payload)
+                self.cancelled_ids = []
+
+            def file_transfer_cancel(self, transfer_id):
+                self.assert_id(transfer_id)
+                self.cancelled_ids.append(bytes(transfer_id))
+                self.transfer_state = TransferState.CANCELLED
+                return TransferTerminalReply(
+                    TransferState.CANCELLED, TransferRemoteError.NONE)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            destination = root / "cancel-get.bin"
+            state = root / "state"
+            target = CancellableGet()
+            events = []
+
+            with self.assertRaisesRegex(
+                    RealMSXCancelledError, "resume state was preserved"):
+                target.get_file(
+                    "A:\\CANCEL.BIN", destination,
+                    state_directory=state,
+                    progress=lambda done, total, message: events.append(
+                        (done, total, message)),
+                    cancelled=lambda: target.get_blocks >= 1)
+
+            partials = list(root.glob("*.msxpart"))
+            candidate = TransferDescriptor(
+                TransferDirection.GET, TransferEncoding.RAW, b"N" * 16,
+                0, 0, 0, 0, "A:\\CANCEL.BIN")
+            record = TransferJournal(state).find_matching(
+                candidate,
+                caller_binding=str(destination.resolve(strict=False)))
+
+        self.assertFalse(destination.exists())
+        self.assertEqual(len(partials), 1)
+        self.assertEqual(target.cancelled_ids, [target.descriptor.transfer_id])
+        self.assertIsNotNone(record)
+        self.assertEqual(record.confirmed_offset, 0)
+        completed = [event[0] for event in events]
+        self.assertEqual(completed, sorted(completed))
+
+    def test_successful_transfers_report_terminal_progress(self):
+        payload = b"progress" * 1200
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "source.bin"
+            destination = root / "destination.bin"
+            source.write_bytes(payload)
+            put_events = []
+            get_events = []
+            ScriptedTransferMSX().put_file(
+                source, "A:\\PROGRESS.BIN", compression="raw",
+                state_directory=root / "put-state",
+                progress=lambda *event: put_events.append(event))
+            ScriptedTransferMSX(get_source=payload).get_file(
+                "A:\\PROGRESS.BIN", destination,
+                state_directory=root / "get-state",
+                progress=lambda *event: get_events.append(event))
+
+        self.assertEqual(put_events[-1][0:2], (len(payload), len(payload)))
+        self.assertEqual(get_events[-1][0:2], (len(payload), len(payload)))
+        self.assertIn("complete", put_events[-1][2].lower())
+        self.assertIn("complete", get_events[-1][2].lower())
+
     def test_fast_stream_removes_per_block_status_and_get_ack(self):
         payload = bytes(range(251)) * 37
         with tempfile.TemporaryDirectory() as directory:
@@ -754,6 +972,28 @@ class RealMSXStreamingTransferTest(unittest.TestCase):
         self.assertGreater(target.get_blocks, 1)
         self.assertEqual(result["wire_bytes"], len(payload))
         self.assertEqual(len(target.closed_ids), 1)
+
+    def test_get_fails_closed_when_destination_has_no_hard_links(self):
+        payload = b"portable-publication" * 300
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            destination = root / "download.bin"
+            target = ScriptedTransferMSX(get_source=payload)
+
+            with (mock.patch.object(
+                      msx_real.os, "link", side_effect=OSError(
+                          errno.EOPNOTSUPP, "hard links unsupported")),
+                  self.assertRaisesRegex(
+                      RealMSXError, "requires hard-link support")):
+                target.get_file(
+                    "A:\\REMOTE.BIN", destination,
+                    state_directory=root / "state")
+
+            self.assertFalse(destination.exists())
+            partials = list(root.glob("*.msxpart"))
+            self.assertEqual(len(partials), 1)
+            self.assertEqual(partials[0].read_bytes(), payload)
+            self.assertTrue(list((root / "state").glob("*.json")))
 
     def test_get_resume_validates_local_prefix_before_requesting_more(self):
         payload = b"GET-RESUME" * 1500

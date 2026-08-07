@@ -1,73 +1,196 @@
 # MSX-AI
 
 <p align="center">
-  <img src="assets/msx-ai-robot.png" alt="MSX-AI retro robot mascot" width="320">
+  <img src="https://raw.githubusercontent.com/mefroio/msx-ai/main/assets/msx-ai-robot.png" alt="MSX-AI retro robot mascot" width="320">
 </p>
 
-Use MSX-AI to control MSX systems through the Model Context Protocol (MCP).
-Choose direct openMSX automation, an agent running inside a physical MSX, or the
-same agent path simulated in openMSX.
+Control emulated and physical MSX computers through one Python MCP
+server.
+
+MSX-AI gives an MCP client a common set of tools for direct openMSX automation,
+an agent running on physical MSX hardware, or that same physical-agent path
+simulated through openMSX. Backend selection is explicit: starting the server
+does not launch an emulator or connect to hardware.
+
+## What you can do
+
+- Read screens, capture host-rendered PNG screenshots, and inspect CPU context.
+- Type BASIC, send BIOS-visible keys, load applications, and inject Z80 code.
+- Inspect or patch RAM and VRAM, and access I/O, slots, and mapper segments where
+  the selected runtime can do so safely.
+- Transfer arbitrary MSX-DOS files with CRC-32, durable resume, atomic
+  publication, optional PackBits compression, progress, and cancellation.
+- Use the same framed agent protocol with a simulated target and a real MSX.
+- Search a bundled, hash-verified documentation corpus directly through MCP.
+
+## Install and start
+
+MSX-AI requires Python 3.10 or newer. Until the first PyPI release, install the
+current public source in an isolated environment:
+
+```sh
+git clone https://github.com/mefroio/msx-ai.git
+cd msx-ai
+pipx install .
+msx-ai-mcp
+```
+
+After publication on PyPI, the shorter equivalent will be:
+
+```sh
+pipx install msx-ai
+msx-ai-mcp
+```
+
+The default transport is STDIO. A typical MCP client entry is:
+
+```json
+{
+  "mcpServers": {
+    "msx-ai": {
+      "command": "msx-ai-mcp"
+    }
+  }
+}
+```
+
+Local Streamable HTTP is optional:
+
+```sh
+msx-ai-mcp --transport http --host 127.0.0.1 --port 8000
+```
+
+The HTTP endpoint is `http://127.0.0.1:8000/mcp`. It is intentionally restricted
+to unauthenticated IPv4 loopback. STDIO remains the recommended default.
 
 ## Choose a backend
 
-| Mode | Select with | Requirements |
-|---|---|---|
-| Direct openMSX | `msx_boot` or `msx_attach` | openMSX; no TCP or MSX agent |
-| Physical MSX agent | `msx_agent_listen` or `msx_agent_connect` | MSX agent and a compatible host transport |
-| Simulated MSX agent | `msx_tcp_bench_start` | openMSX, MSX agent, and local TCP/IPv4 |
+### Direct openMSX
 
-Backend selection is explicit. No emulator starts automatically. Keep one
-active target per MCP server session and switch modes when needed.
+Use this path for fast emulator automation and exact debugger snapshots. It
+does not require TCP or the MSX-side agent.
 
-openMSX, TCP/IP, and BaDCaT are optional at the project level. The current agent
-host adapter uses TCP/IPv4, but the protocol and MCP tools do not contain
-BaDCaT-specific commands or depend on one network-adapter product.
+1. Call `msx_boot` with `profile="basic"` and optionally `window=true`.
+2. Call `msx_status`; confirm `backend` is `openmsx`.
+3. Call `msx_screen`, or use `msx_run_basic` for a first visible result.
 
-## Features
+Use `msx_attach` instead when openMSX is already running. MSX-AI then shares
+that instance without changing its power, throttle, or audio state. If several
+live openMSX sockets exist, the call refuses to guess: repeat it with one of the
+exact `socket_path` values reported by the error.
 
-- Direct headless or visible-window control of openMSX.
-- Resident MSX-DOS agent with an optional foreground development monitor.
-- RAM, VRAM, hardware I/O, slot, and mapper operations where the active mode
-  can perform them safely.
-- Text input and special keys, including `STOP`, `CTRL+STOP`, and `CTRL+C`.
-- BASIC source entry, batched line input, file-based BASIC loading, and RUN.
-- Z80 assembly, binary application loading, and controlled memory injection.
-- Backend-neutral Z80 CPU snapshots: exact PC/SP, code, and stack state through
-  the openMSX debugger, or a versioned BIOS `H.TIMI` callback context through
-  the physical agent.
-- Host-rendered SCREEN 0-8 and SCREEN 10-12 captures from VRAM.
-- Resumable binary PUT and GET with 32-bit sizes, end-to-end CRC-32, durable
-  restart checkpoints, and collision-safe publication.
-- The `fast-v1` PUT/GET data path groups near-2 KiB wire frames into transient
-  16 KiB disk-I/O windows, with no extra STATUS round trip per PUT frame and
-  sparse durable GET checkpoints.
-- On-MSX transfer percentage, progress bar, and host-measured final bytes per
-  second, also returned to the MCP client as structured stream metrics.
-- Lightweight PackBits transport compression when it reduces the wire size;
-  already-compressed files remain byte-exact.
+### Simulated physical agent
 
-## Agent architecture
+Use this path to validate the real resident/monitor protocol and restrictions
+without physical hardware.
+
+This workflow is source-checkout-only in version 0.6.0 because it builds the
+agent and isolated bench locally. A pipx-installed host can use it when
+`MSX_AI_SOURCE_ROOT` points to a checkout.
+
+1. In that checkout, build the agent suite with `make agent` and prepare the
+   local test ROMs and MSX-DOS/Nextor image.
+2. Call `msx_tcp_bench_start` with `mode="resident"`; add `window=true` for a
+   visible emulator.
+3. Call `msx_status` and verify the negotiated agent features.
+
+Use `mode="monitor"` for direct call, run, stop, slot, and mapper experiments.
+The bench uses one isolated openMSX process and reaches the agent through TCP,
+not through debugger shortcuts.
+
+### Physical MSX
+
+Use this path when actual MSX hardware behavior is the subject of the session.
+
+1. Install the seven-file suite described below and run either
+   `MSXAI /DRIVER:8251` or `MSXAI /DRIVER:16C550`.
+2. Configure a compatible adapter as a transparent binary TCP/IPv4 bridge with
+   matching UART settings and flow control.
+3. If the adapter connects outward, call `msx_agent_listen` with the host
+   machine's specific LAN IPv4 address. The safe default `127.0.0.1` accepts
+   only local simulation. If the adapter accepts an incoming connection, call
+   `msx_agent_connect` with its IPv4 address.
+4. Call `msx_status` before any mutation and verify runtime, transport, and
+   feature negotiation.
+
+The agent does not configure Wi-Fi, issue modem AT commands, or depend on a
+specific network-adapter brand. BaDCaT is one planned 16C550-compatible
+transport, not a project requirement.
+
+## Reproducible demonstrations
+
+With a visible direct-openMSX BASIC session, these MCP calls draw a simple
+test card and return a PNG without proprietary game media:
+
+```text
+msx_boot(profile="basic", window=true)
+msx_run_basic(program="10 SCREEN 2\n20 COLOR 15,4,4\n30 CIRCLE(128,96),50,15\n40 LINE(40,40)-(216,152),8,B\n50 GOTO 50")
+msx_screenshot()
+```
+
+For an already installed physical agent, begin read-only and verify the
+selected path before doing anything mutable:
+
+```text
+msx_agent_listen(host="192.168.1.20", port=6603)
+msx_status()
+msx_cpu_snapshot()
+```
+
+The status result is structured; a resident agent reports, for example,
+`{"backend":"real","state":"running","runtime_mode":"resident",...}` before
+the snapshot call. An idle foreground monitor cannot provide a CPU snapshot;
+run a payload there first. The capability matrix below defines the two capture
+semantics.
+
+## Architecture
 
 ```text
 MCP client
     |
-MSX-AI server
+    v
+MSX-AI Python server
     |
-agent protocol
+    +-- openMSX control API ----------------------> emulated MSX
     |
-selected host transport
-    |
-8251 or 16C550-compatible MSX interface
-    |
-resident MSX-DOS agent
+    `-- protocol v3 over a byte stream
+            |
+            `-- TCP/IPv4
+                  |
+                  +-- RS232-Net -----------------> simulated MSX agent
+                  |
+                  `-- transparent UART bridge --> physical MSX agent
+                                                     |
+                                                     +-- 8251
+                                                     `-- 16C550-compatible UART
 ```
 
-Install the seven-file agent suite to use the physical or simulated agent path.
-The default MemMan resident returns to MSX-DOS and remains available while
-compatible software runs. Use the foreground monitor for direct call, run,
-stop, slot, mapper, and visible DEBUG workflows.
+The MCP interface, target protocol, network link, and MSX UART driver are
+separate layers. A user can run only direct openMSX, only a physical target, or
+both workflows at different times without installing every optional backend.
+One MCP server process owns at most one active target session.
 
-The recommended MSX-DOS layout keeps the suite out of the disk root:
+## Capability matrix
+
+| Capability | Direct openMSX | Agent resident | Agent monitor |
+|---|---:|---:|---:|
+| Text screen and standard PNG capture | Yes | Cooperative | Cooperative |
+| CPU snapshot | Exact instruction boundary | `H.TIMI` callback context | `H.TIMI` callback while a payload runs; unavailable when idle |
+| BIOS text and special-key input | Yes | Yes | No resident keyboard spool |
+| RAM/VRAM inspect and patch | Yes | Bounded; page restrictions | Yes; monitor image protected |
+| MSX-DOS PUT/GET | No | Yes | No |
+| Application load | Yes | Safe segments; no call/run | Yes |
+| Direct call/run/stop | Yes | No | Yes |
+| I/O-port access | Via expert Tcl/debug tools | Yes | Yes |
+| Slot/mapper selection | Via expert Tcl/debug tools | No | Yes |
+| Reset/raw openMSX Tcl | Yes | No | No |
+
+“Cooperative” is important: the resident runs through the normal BIOS timer
+hook. It is not an NMI, bus master, or universal freeze mechanism.
+
+## Install the MSX-side suite
+
+The physical and simulated agent paths use these files:
 
 ```text
 A:\MSXAI\
@@ -75,66 +198,144 @@ A:\MSXAI\
   MEMMAN.COM   TL.COM       TK.COM
 ```
 
-Configure it once from `AUTOEXEC.BAT`:
+Build them from source with `make agent`, or use matching binaries from a
+project release. Keep the suite together and configure MSX-DOS once:
 
 ```bat
 SET MSXAI_HOME=A:\MSXAI
 PATH A:\MSXAI;%PATH%
 ```
 
-`MSXAI` and `MSXAIXF` can then be called from any DOS directory. Keeping all
-seven files in the current directory remains a compatibility fallback when
-`MSXAI_HOME` is not set.
+The default MemMan resident returns to MSX-DOS. `MSXAIXF.COM` is its transient
+foreground file helper; the other COM/TSR files are part of the same versioned
+suite. MSX-DOS 2 or Nextor and a memory mapper are required for resident mode.
 
-## Requirements
+## MCP interface
 
-- Python 3.10 or newer for the MCP server.
-- Optional openMSX is required only for direct emulator control or agent-path simulation.
-- Optional `z80asm` is required only to build the agent or assemble Z80 source.
-- MSX-DOS 2 or Nextor
-- A supported 8251 or 16C550-compatible interface and host transport for a
-  physical agent connection.
+The `msx-ai-mcp` entry point uses the official Python MCP SDK and negotiates
+current and supported older MCP protocol revisions. It provides:
 
-No third-party Python packages are required. ROM and bootable disk images are
-not distributed by this repository.
+- STDIO and local Streamable HTTP transports.
+- Structured results and output schemas for every tool.
+- Explicit read-only, destructive, idempotent, and open-world annotations.
+- Cooperative MCP progress and safe cancellation for PUT/GET transfers.
+- Documentation resources under `msx-ai://docs/`.
+- The read-only `msx_docs_search` tool.
+- `start_msx_session` and `diagnose_msx_connection` prompts.
 
-## Safety and limitations
+Start with `msx-ai://docs/index` when a client supports resources, or call:
 
-- The resident agent is cooperative and depends on the normal BIOS timer hook.
-  Software that keeps interrupts disabled or replaces that path can make the
-  agent temporarily unreachable.
-- A physical-agent CPU snapshot is the register frame visible at the BIOS
-  `H.TIMI` callback boundary. It is not an NMI or bus-master freeze and cannot
-  claim the interrupted application's arbitrary PC/SP. Direct openMSX snapshots
-  do provide exact instruction-boundary state.
-- Resident page and mapper restrictions protect the interrupted DOS or
-  application context. Use the foreground monitor when persistent ownership is
-  required.
-- Slow serial links can make large VRAM captures expensive. Complex game
-  screenshots remain experimental.
-- Failed file transfers retain verified recovery state and never publish an
-  incomplete target as a successful file.
-- File transfer requires a matched current resident and `MSXAIXF.COM`. Existing
-  version-3 `fast-v1` journals migrate, but sessions and journals from the
-  retired legacy transfer path cannot resume with the current suite.
+```text
+msx_docs_search(query="resident screenshot safety")
+```
 
-Physical BaDCaT SMD validation and performance measurements remain pending.
-The generic 16C550 driver is not a BaDCaT-specific build.
+## Safety and current limits
 
-## Validation
+- Software that disables interrupts, replaces the timer-hook chain, or pages
+  required state away can make a resident temporarily unreachable.
+- A resident CPU snapshot is the register frame visible at the BIOS callback
+  boundary. It must not be described as the interrupted application's exact
+  arbitrary PC/SP. Direct openMSX snapshots have exact debugger semantics.
+- Resident RAM page 1 is reserved while servicing requests. Page 3 contains
+  live BIOS, DOS, stack, hook, and system state; arbitrary writes can crash the
+  machine.
+- Resident input feeds the BIOS keyboard ring. Games that scan the physical
+  keyboard matrix directly will not observe it.
+- Screenshots reconstruct standard SCREEN 0-8 and 10-12 from readable state.
+  SCREEN 9, raster effects, exact interlaced timing, and write-only palette
+  changes have limits. Large captures are expensive over slow 8251 links.
+- PUT/GET never publishes an incomplete file as success. Cancellation keeps
+  verified recovery state so the operation can resume.
+- Atomic, no-overwrite GET publication and first-run openMSX-template
+  materialization require hard-link support on the relevant host filesystem.
+  FAT/exFAT destinations are therefore unsuitable. If publication is refused,
+  the verified `.msxpart` file and journal remain available for resume on a
+  supported destination.
+- TCP agent framing is binary but has no authentication, encryption, TLS, or
+  replay protection. CRC detects accidental corruption; it is not a security
+  mechanism. Because the channel exposes RAM, VRAM, I/O, and execution, keep
+  it on an isolated trusted LAN or carry it through a VPN/secure tunnel. Never
+  expose it directly to the internet.
+- `MSX_AI_USER_ROOT` is the base for relative host paths, not a filesystem
+  sandbox. Absolute paths remain available to explicit MCP calls with the same
+  permissions as the server process; use an appropriately restricted account
+  and working directory.
+- ROMs and bootable disk images are not distributed. Physical BaDCaT SMD
+  validation and measured performance remain pending until hardware testing.
 
-The automated suite currently contains more than 340 tests covering protocol
-framing, memory safety, backend selection, keyboard input, screenshots,
-CPU snapshots, application loading, file-transfer recovery, and openMSX
-integration.
+## Development and validation
+
+For an editable environment:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e . 'build>=1'
+make PYTHON=python test
+make PYTHON=python agent
+make PYTHON=python release-check
+```
+
+The unit and explicit integration suites together cover protocol framing,
+backend isolation, memory safety,
+keyboard input, screenshots, CPU snapshots, application loading, transfer
+recovery, MCP metadata/resources, packaging paths, and openMSX integration.
+The release gate additionally requires Bas Wijnen `z80asm` 1.8 on `PATH` (or
+`Z80ASM` set to that executable). It builds and installs the wheel outside the
+source tree and exercises both STDIO and local HTTP with an official MCP
+client. This regular gate can validate uncommitted work. Once the intended
+tree is committed and clean, run the strict committed-source gate or persist
+the release assets with:
+
+```sh
+make PYTHON=python publish-check
+make PYTHON=python release-assets
+```
+
+`release-assets` writes the sdist, the wheel rebuilt from it, and
+`msx-ai-agent-0.6.0.zip` under ignored `dist/`. The agent ZIP contains the
+seven matching MSX files, the project license, the MemMan notice, checksums,
+and an explicit host/agent/wire/transfer compatibility manifest. Existing
+artifacts are never overwritten. The gate proves same-host equivalence with
+the pinned assembler; it does not claim byte-identical output across unrelated
+toolchains.
+
+The emulator end-to-end suite is deliberately separate and serialized. With
+the required ROMs and ignored MSX-DOS/Nextor image installed, opt in with:
+
+```sh
+make PYTHON=python test-integration
+```
+
+Version labels describe separate layers: `0.6.0` is the Python distribution,
+the current MSX-side banner is Agent `2.0`, protocol v3 is the framed wire
+transport, and protocol-X v1 is the file-transfer contract. Release assets
+group mutually compatible host and agent builds; these numbers are not
+interchangeable.
 
 ## Documentation
 
-- [Technical reference](TECHNICAL.md): architecture, setup, protocols, hardware,
-  safety rules, development, and testing.
-- [MSX agent reference](agent/README.md): agent lifecycle, command line, memory
-  model, drivers, and MSX-side implementation.
+- [Getting started](https://github.com/mefroio/msx-ai/blob/main/server/resources/docs/getting-started.md)
+- [Backends and runtime modes](https://github.com/mefroio/msx-ai/blob/main/server/resources/docs/backends.md)
+- [Safety and operational limits](https://github.com/mefroio/msx-ai/blob/main/server/resources/docs/safety.md)
+- [File transfers](https://github.com/mefroio/msx-ai/blob/main/server/resources/docs/transfers.md)
+- [Development](https://github.com/mefroio/msx-ai/blob/main/server/resources/docs/development.md)
+- [Technical reference](https://github.com/mefroio/msx-ai/blob/main/TECHNICAL.md)
+- [MSX agent reference](https://github.com/mefroio/msx-ai/blob/main/agent/README.md)
+- [Documentation provenance manifest](https://github.com/mefroio/msx-ai/blob/main/server/resources/docs/manifest.json)
+
+The bundled corpus is original project documentation. Its manifest records
+MIT licensing, internal evidence paths, review date, and a SHA-256 digest for
+every MCP-readable document. Third-party MemMan material is identified
+separately in `third_party/memman/NOTICE`. The small openMSX configuration
+resource set includes adapted GPL-2.0 material and is identified in
+`third_party/openmsx/NOTICE`; it does not change the license of the independent
+MSX-AI host, agent, or documentation.
 
 ## License
 
-MSX-AI is released under the [MIT License](LICENSE).
+MSX-AI code and project-authored documentation are released under the
+[MIT License](https://github.com/mefroio/msx-ai/blob/main/LICENSE). Bundled
+third-party or derived resources retain the licenses named in their notices.
+The original mascot artwork and its provenance statement are described in
+[`assets/NOTICE.md`](https://github.com/mefroio/msx-ai/blob/main/assets/NOTICE.md).
