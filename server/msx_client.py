@@ -400,8 +400,23 @@ class OpenMSX:
     # MSX keyboard matrix positions (row, mask) for the special keys we need
     KEYS = {"RET": (7, 0x80), "ESC": (7, 0x04), "SPACE": (8, 0x01),
             "STOP": (7, 0x10), "SELECT": (7, 0x40), "TAB": (7, 0x08)}
+    KEY_CHORDS = {
+        # BREAKX scans the physical matrix; INTFLG/key-buffer injection is not
+        # equivalent while the foreground monitor owns the CPU.
+        "CTRL+STOP": ((6, 0x02), (7, 0x10)),
+    }
 
     def press(self, key):
+        key = key.upper()
+        chord = self.KEY_CHORDS.get(key)
+        if chord is not None:
+            downs = "; ".join(
+                f"keymatrixdown {row} {mask}" for row, mask in chord)
+            ups = "; ".join(
+                f"keymatrixup {row} {mask}"
+                for row, mask in reversed(chord))
+            self.cmd(f"{downs}; after time 0.10 {{{ups}}}")
+            return
         row, mask = self.KEYS[key]
         self.cmd(f"keymatrixdown {row} {mask}; "
                  f"after time 0.06 {{keymatrixup {row} {mask}}}")

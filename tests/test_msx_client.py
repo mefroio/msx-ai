@@ -74,6 +74,16 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             mock.patch.object(msx_client.time, "sleep"),
         )
 
+    def test_ctrl_stop_uses_a_real_keyboard_matrix_chord(self):
+        machine = OpenMSX(bin="/fake/openmsx")
+        machine.cmd = mock.Mock(return_value="")
+
+        machine.press("ctrl+stop")
+
+        machine.cmd.assert_called_once_with(
+            "keymatrixdown 6 2; keymatrixdown 7 16; "
+            "after time 0.10 {keymatrixup 7 16; keymatrixup 6 2}")
+
     def test_adapter_supports_package_import_and_snapshot_transaction(self):
         packaged = importlib.import_module("server.msx_client")
         machine = packaged.OpenMSX(bin="/fake/openmsx")

@@ -2292,7 +2292,8 @@ EXPLICIT_DESCRIPTIONS = {
         "API and return the resulting text screen."),
     "msx_local_key": (
         "Send one named key through the local openMSX input API and return "
-        "the resulting text screen."),
+        "the resulting text screen. CTRL+STOP is emitted as a real CTRL and "
+        "STOP keyboard-matrix chord, suitable for the foreground monitor."),
     "msx_agent_type_line": (
         "Send one line through the ASM agent's credited BIOS keyboard spool; "
         "returns an acknowledgement without capturing VRAM."),
