@@ -33,7 +33,7 @@ class MCPUSnapshotToolTests(unittest.TestCase):
     def test_backend_neutral_tool_delegates_and_returns_stable_json(self):
         expected = {
             "schema": "msx-ai-cpu-snapshot-v1",
-            "backend": "real",
+            "backend": "agent",
             "registers": {"af": "0x1234"},
         }
         backend = FakeSnapshotBackend(expected)
@@ -47,11 +47,11 @@ class MCPUSnapshotToolTests(unittest.TestCase):
 
     def test_tool_is_published_without_backend_specific_arguments(self):
         implementation, description, schema = (
-            msx_mcp_server.TOOLS["msx_cpu_snapshot"])
-        self.assertIs(implementation, msx_mcp_server.t_cpu_snapshot)
+            msx_mcp_server.TOOLS["msx_agent_cpu_snapshot"])
+        self.assertTrue(callable(implementation))
         self.assertEqual(schema["type"], "object")
         self.assertEqual(schema["properties"], {})
-        self.assertIn("exact instruction", description)
+        self.assertIn("ASM-agent protocol", description)
         self.assertIn("H.TIMI", description)
         self.assertIn("does not claim", description)
 

@@ -107,7 +107,7 @@ _ENDPOINT_SCHEMA: dict[str, Any] = {
 
 STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "description": "State of the currently selected MSX backend.",
+    "description": "Explicit state of local, agent, or paired bench channels.",
     "oneOf": [
         {
             "type": "object",
@@ -122,19 +122,29 @@ STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "backend": {"const": "openmsx"},
+                "target": {"const": "local"},
+                "channel": {"const": "openmsx-control"},
+                "target_id": {"type": ["string", "null"]},
+                "bench_id": {"type": ["string", "null"]},
+                "state": {"enum": ["connected", "disconnected"]},
                 "profile": {
-                    "enum": ["basic", "disk", "dos", "msx2plus", "attach"],
+                    "enum": ["basic", "disk", "dos", "msx2plus", "attach",
+                             "bench"],
                 },
                 "screen_mode": {"type": "integer", "minimum": 0, "maximum": 255},
                 "control_socket": {"type": ["string", "null"]},
             },
-            "required": ["backend", "profile", "screen_mode"],
-            "additionalProperties": False,
+            "required": ["backend", "target", "state"],
+            "additionalProperties": True,
         },
         {
             "type": "object",
             "properties": {
-                "backend": {"const": "real"},
+                "backend": {"const": "agent"},
+                "target": {"const": "agent"},
+                "channel": {"const": "agent-protocol"},
+                "target_id": {"type": ["string", "null"]},
+                "bench_id": {"type": ["string", "null"]},
                 "state": {"type": "string", "minLength": 1},
                 "state_code": {"type": "integer", "minimum": 0, "maximum": 255},
                 "protocol": {"type": "integer", "minimum": 1},
@@ -180,14 +190,165 @@ STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
                 },
             },
             "required": [
-                "backend", "state", "state_code", "protocol", "capabilities",
-                "resident_base", "max_payload", "features", "feature_bits",
-                "vram_size",
+                "backend", "target", "state",
             ],
             # Handshake metadata can grow while retaining the stable fields above.
             "additionalProperties": True,
         },
+        {
+            "type": "object",
+            "properties": {
+                "backend": {"enum": ["hybrid-bench", "multiple"]},
+                "bench_id": {"type": ["string", "null"]},
+                "state": {"enum": ["connected", "disconnected"]},
+                "targets": {
+                    "type": "object",
+                    "properties": {
+                        "local": {"type": "object"},
+                        "agent": {"type": "object"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["backend", "state", "targets"],
+            "additionalProperties": False,
+        },
     ],
+}
+
+_LOCAL_STATUS_PROPERTIES = dict(STATUS_OUTPUT_SCHEMA["oneOf"][1]["properties"])
+_AGENT_STATUS_PROPERTIES = dict(STATUS_OUTPUT_SCHEMA["oneOf"][2]["properties"])
+
+LOCAL_STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": _LOCAL_STATUS_PROPERTIES,
+    "required": [
+        "backend", "target", "channel", "target_id", "bench_id", "state",
+    ],
+    "additionalProperties": False,
+    "allOf": [{
+        "if": {
+            "properties": {"state": {"const": "connected"}},
+            "required": ["state"],
+        },
+        "then": {
+            "properties": {"target_id": {"type": "string"}},
+            "required": ["profile", "screen_mode"],
+        },
+    }],
+}
+
+AGENT_STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": _AGENT_STATUS_PROPERTIES,
+    "required": [
+        "backend", "target", "channel", "target_id", "bench_id", "state",
+    ],
+    # Negotiated protocol revisions may append handshake metadata while the
+    # stable identity and capability fields below remain mandatory.
+    "additionalProperties": True,
+    "allOf": [{
+        "if": {
+            "properties": {"state": {"const": "disconnected"}},
+            "required": ["state"],
+        },
+        "else": {
+            "properties": {"target_id": {"type": "string"}},
+            "required": [
+                "state_code", "protocol", "peer", "capabilities",
+                "resident_base", "transport", "agent_transport",
+                "network_transport", "network_role", "local_endpoint",
+                "max_payload", "features", "feature_bits", "vram_size",
+            ],
+        },
+    }],
+}
+
+LOCAL_IDENTITY_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        name: _LOCAL_STATUS_PROPERTIES[name]
+        for name in (
+            "backend", "target", "channel", "target_id", "bench_id", "state",
+            "profile")
+    },
+    "required": [
+        "backend", "target", "channel", "target_id", "bench_id", "state",
+    ],
+    "additionalProperties": False,
+}
+
+AGENT_IDENTITY_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        name: _AGENT_STATUS_PROPERTIES[name]
+        for name in (
+            "backend", "target", "channel", "target_id", "bench_id", "state",
+            "peer", "local_endpoint", "runtime_mode", "agent_transport")
+    },
+    "required": [
+        "backend", "target", "channel", "target_id", "bench_id", "state",
+    ],
+    "additionalProperties": False,
+}
+
+TARGETS_STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "oneOf": [
+        STATUS_OUTPUT_SCHEMA["oneOf"][0],
+        LOCAL_IDENTITY_OUTPUT_SCHEMA,
+        AGENT_IDENTITY_OUTPUT_SCHEMA,
+        {
+            "type": "object",
+            "properties": {
+                "backend": {"enum": ["hybrid-bench", "multiple"]},
+                "state": {"enum": ["connected", "degraded"]},
+                "bench_id": {"type": ["string", "null"]},
+                "targets": {
+                    "type": "object",
+                    "properties": {
+                        "local": LOCAL_IDENTITY_OUTPUT_SCHEMA,
+                        "agent": AGENT_IDENTITY_OUTPUT_SCHEMA,
+                    },
+                    "required": ["local", "agent"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["backend", "state", "bench_id", "targets"],
+            "additionalProperties": False,
+        },
+    ],
+}
+
+BENCH_STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "backend": {"const": "hybrid-bench"},
+        "bench_id": {"type": ["string", "null"]},
+        "state": {"enum": ["connected", "degraded", "disconnected"]},
+        "targets": {
+            "type": "object",
+            "properties": {
+                "local": LOCAL_STATUS_OUTPUT_SCHEMA,
+                "agent": AGENT_STATUS_OUTPUT_SCHEMA,
+            },
+            "additionalProperties": False,
+        },
+    },
+    "required": ["backend", "bench_id", "state", "targets"],
+    "additionalProperties": False,
+    "allOf": [{
+        "if": {
+            "properties": {"state": {"enum": ["connected", "degraded"]}},
+            "required": ["state"],
+        },
+        "then": {
+            "properties": {
+                "bench_id": {"type": "string"},
+                "targets": {"required": ["local", "agent"]},
+            },
+        },
+    }],
 }
 
 CPU_SNAPSHOT_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -209,7 +370,7 @@ CPU_SNAPSHOT_OUTPUT_SCHEMA: dict[str, Any] = {
     },
     "properties": {
         "schema": {"const": "msx-ai-cpu-snapshot-v1"},
-        "backend": {"enum": ["real", "openmsx"]},
+        "backend": {"enum": ["agent", "openmsx"]},
         "capture": {"type": "object"},
         "registers": {
             "type": "object",
@@ -254,7 +415,7 @@ CPU_SNAPSHOT_OUTPUT_SCHEMA: dict[str, Any] = {
     "allOf": [
         {
             "if": {
-                "properties": {"backend": {"const": "real"}},
+                "properties": {"backend": {"const": "agent"}},
                 "required": ["backend"],
             },
             "then": {
@@ -445,7 +606,7 @@ APP_LOAD_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": "Application segments loaded into the selected MSX backend.",
     "properties": {
-        "backend": {"enum": ["real", "openmsx"]},
+        "backend": {"enum": ["agent", "openmsx"]},
         "name": {"type": "string", "minLength": 1},
         "format": {"enum": ["msx-ai-app-v1", "com", "bload", "flat-rom"]},
         "origin": {"type": ["string", "null"]},
@@ -512,7 +673,7 @@ INPUT_ACKNOWLEDGEMENT_SCHEMA: dict[str, Any] = {
     "oneOf": [
         {
             "properties": {
-                "backend": {"const": "real"},
+                "backend": {"const": "agent"},
                 "bytes_consumed": {"type": "integer", "minimum": 0},
                 "input": {"const": "line"},
                 "screen_capture_performed": {"const": False},
@@ -524,7 +685,7 @@ INPUT_ACKNOWLEDGEMENT_SCHEMA: dict[str, Any] = {
         },
         {
             "properties": {
-                "backend": {"const": "real"},
+                "backend": {"const": "agent"},
                 "bytes_consumed": {"type": "integer", "minimum": 0},
                 "input": {"const": "lines"},
                 "lines": {"type": "integer", "minimum": 0},
@@ -538,7 +699,7 @@ INPUT_ACKNOWLEDGEMENT_SCHEMA: dict[str, Any] = {
         },
         {
             "properties": {
-                "backend": {"const": "real"},
+                "backend": {"const": "agent"},
                 "bytes_consumed": {"type": "integer", "minimum": 0},
                 "input": {"const": "text"},
                 "screen_capture_performed": {"const": False},
@@ -550,7 +711,7 @@ INPUT_ACKNOWLEDGEMENT_SCHEMA: dict[str, Any] = {
         },
         {
             "properties": {
-                "backend": {"const": "real"},
+                "backend": {"const": "agent"},
                 "input": {"const": "key"},
                 "key": {"type": "string", "minLength": 1},
                 "screen_capture_performed": {"const": False},
@@ -586,7 +747,7 @@ DUAL_INPUT_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
 RUN_BASIC_FILE_ACK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "backend": {"const": "real"},
+        "backend": {"const": "agent"},
         "bytes_transferred": {"type": "integer", "minimum": 1},
         "delivery": {"const": "file-transfer-v2"},
         "operation": {"const": "run-basic"},
@@ -609,7 +770,7 @@ RUN_BASIC_FILE_ACK_SCHEMA: dict[str, Any] = {
 RUN_BASIC_KEYBOARD_ACK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "backend": {"const": "real"},
+        "backend": {"const": "agent"},
         "bytes_consumed": {"type": "integer", "minimum": 0},
         "delivery": {"const": "keyboard-spool"},
         "lines": {"type": "integer", "minimum": 0},
@@ -693,6 +854,26 @@ OBJECT_RESULT_TOOLS = frozenset({
 })
 
 
+def canonical_tool_name(name: str) -> str:
+    """Map fixed-route public names to their shared implementation contract."""
+    if name in {"msx_targets_status", "msx_tcp_bench_status"}:
+        return "msx_status"
+    if name == "msx_tcp_bench_shutdown":
+        return "msx_shutdown"
+    if name.startswith("msx_local_"):
+        return "msx_" + name.removeprefix("msx_local_")
+    if name.startswith("msx_agent_"):
+        suffix = name.removeprefix("msx_agent_")
+        if suffix == "disconnect":
+            return "msx_shutdown"
+        # Connection setup tools are already canonical and have no neutral
+        # operational counterpart.
+        if suffix in {"listen", "connect"}:
+            return name
+        return "msx_" + suffix
+    return name
+
+
 def title_for(name: str) -> str:
     words = name.removeprefix("msx_").split("_")
     return "MSX " + " ".join(word.upper() if word in {"cpu", "io"}
@@ -700,20 +881,76 @@ def title_for(name: str) -> str:
 
 
 def hints_for(name: str) -> ToolHints:
+    canonical = canonical_tool_name(name)
     return ToolHints(
-        read_only=name in READ_ONLY_TOOLS,
-        destructive=name in DESTRUCTIVE_TOOLS,
-        idempotent=name in IDEMPOTENT_TOOLS,
-        open_world=name not in LOCAL_ONLY_TOOLS,
+        read_only=canonical in READ_ONLY_TOOLS,
+        destructive=canonical in DESTRUCTIVE_TOOLS,
+        idempotent=canonical in IDEMPOTENT_TOOLS,
+        open_world=canonical not in LOCAL_ONLY_TOOLS,
     )
 
 
+def _backend_specific_schema(schema: Mapping[str, Any], backend: str):
+    """Constrain a structured dual-backend schema to one public route."""
+    return {
+        **schema,
+        "properties": {
+            **schema["properties"],
+            "backend": {"const": backend},
+        },
+    }
+
+
 def output_schema_for(name: str) -> Mapping[str, Any]:
+    public_name = name
+    if public_name == "msx_targets_status":
+        return TARGETS_STATUS_OUTPUT_SCHEMA
+    if public_name in {"msx_tcp_bench_start", "msx_tcp_bench_status"}:
+        return BENCH_STATUS_OUTPUT_SCHEMA
+    if public_name == "msx_local_status":
+        return LOCAL_STATUS_OUTPUT_SCHEMA
+    if public_name == "msx_agent_status":
+        return AGENT_STATUS_OUTPUT_SCHEMA
+    if public_name == "msx_local_cpu_snapshot":
+        return _backend_specific_schema(
+            CPU_SNAPSHOT_OUTPUT_SCHEMA, "openmsx")
+    if public_name == "msx_agent_cpu_snapshot":
+        return _backend_specific_schema(CPU_SNAPSHOT_OUTPUT_SCHEMA, "agent")
+    if public_name == "msx_local_app_load":
+        return _backend_specific_schema(APP_LOAD_OUTPUT_SCHEMA, "openmsx")
+    if public_name == "msx_agent_app_load":
+        return _backend_specific_schema(APP_LOAD_OUTPUT_SCHEMA, "agent")
+    if public_name in {
+            "msx_local_type_line", "msx_local_type_lines", "msx_local_type",
+            "msx_local_key", "msx_local_run_basic"}:
+        return TEXT_OUTPUT_SCHEMA
+    agent_input_names = {
+        "msx_agent_type_line": 0,
+        "msx_agent_type_lines": 1,
+        "msx_agent_type": 2,
+        "msx_agent_key": 3,
+    }
+    if public_name in agent_input_names:
+        return {
+            "type": "object",
+            **INPUT_ACKNOWLEDGEMENT_SCHEMA["oneOf"][
+                agent_input_names[public_name]],
+        }
+    if public_name == "msx_agent_run_basic":
+        return {
+            "type": "object",
+            "oneOf": [
+                RUN_BASIC_FILE_ACK_SCHEMA,
+                RUN_BASIC_KEYBOARD_ACK_SCHEMA,
+            ],
+        }
+
+    name = canonical_tool_name(public_name)
     if name == "msx_screenshot":
         return SCREENSHOT_OUTPUT_SCHEMA
     if name == "msx_docs_search":
         return DOCS_OUTPUT_SCHEMA
-    if name in {"msx_status", "msx_tcp_bench_start"}:
+    if name == "msx_status":
         return STATUS_OUTPUT_SCHEMA
     if name == "msx_cpu_snapshot":
         return CPU_SNAPSHOT_OUTPUT_SCHEMA

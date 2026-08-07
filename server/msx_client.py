@@ -272,7 +272,7 @@ class OpenMSX:
             paths = ", ".join(path for path, _sk in connected)
             raise OpenMSXError(
                 "multiple running openMSX instances were found; refusing to "
-                "choose one implicitly. Call msx_attach again with one of "
+                "choose one implicitly. Call msx_local_attach again with one of "
                 f"these socket_path values: {paths}")
         selected_path, self.sock = connected[0]
         self.socket_path = selected_path

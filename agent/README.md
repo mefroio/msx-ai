@@ -383,7 +383,7 @@ service metadata. An idle foreground monitor rejects the request; a resident
 or a running/paused foreground payload can answer while servicing `H.TIMI`.
 
 The resident reports state `running` while DOS or a DOS-launched application is
-active. The safe host profile rejects persistent lowercase-`s`/`msx_pause` and
+active. The safe host profile rejects persistent lowercase-`s`/`msx_agent_pause` and
 uses only the bounded uppercase-`S` snapshot lease. The lease preserves the
 interrupted CPU context, refreshes on valid traffic, and auto-resumes after
 bounded transport silence. A partial request or missing peer times out and
@@ -424,9 +424,9 @@ authorize the next line. The host can therefore submit multiple lines in one
 a lost peer cannot autonomously drain all later commands. Older agents continue
 to use opcode `t`.
 
-The host-side `msx_key` tool maps ESC, Return, Tab, Select, and Space to the
+The host-side `msx_agent_key` tool maps ESC, Return, Tab, Select, and Space to the
 same atomic keyboard-ring operation. STOP and Ctrl+STOP are BIOS events, not
-character bytes: the real backend writes `04h` or `03h` respectively to the
+character bytes: the agent backend writes `04h` or `03h` respectively to the
 documented `INTFLG` byte at `FC9Bh` through the framed RAM-write command.
 Ctrl+C is exposed as a convenience alias for the Ctrl+STOP break event. This
 interrupts MSX-BASIC and other cooperative BIOS software without claiming to

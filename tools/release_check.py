@@ -959,6 +959,22 @@ def _assert_no_state(probe: Path, operation: str) -> None:
             f"{operation} created runtime state: {entries or ['state/']}")
 
 
+_RUNTIME_REQUIRED_TOOLS = frozenset({
+    "msx_targets_status",
+    "msx_local_boot", "msx_local_status", "msx_local_screen",
+    "msx_local_screenshot", "msx_local_memory_read", "msx_local_type_line",
+    "msx_agent_listen", "msx_agent_connect", "msx_agent_status",
+    "msx_agent_screen", "msx_agent_screenshot", "msx_agent_memory_read",
+    "msx_agent_type_line", "msx_agent_disconnect",
+    "msx_tcp_bench_start", "msx_tcp_bench_status",
+    "msx_tcp_bench_shutdown",
+})
+_RUNTIME_FORBIDDEN_TOOLS = frozenset({
+    "msx_status", "msx_screen", "msx_screenshot", "msx_shutdown",
+    "msx_real_listen",
+})
+
+
 def _mcp_assertions(client, transport: str) -> Callable[[], Awaitable[str]]:
     """Return an async MCP smoke coroutine without importing the SDK globally."""
     async def run() -> str:
@@ -968,9 +984,19 @@ def _mcp_assertions(client, transport: str) -> Callable[[], Awaitable[str]]:
             if len(tools.tools) < 35:
                 raise ReleaseCheckError(
                     f"{transport} exposed only {len(tools.tools)} tools")
-            status = await client.call_tool("msx_status", {})
+            tool_names = {tool.name for tool in tools.tools}
+            missing = sorted(_RUNTIME_REQUIRED_TOOLS - tool_names)
+            forbidden = sorted(_RUNTIME_FORBIDDEN_TOOLS & tool_names)
+            if missing:
+                raise ReleaseCheckError(
+                    f"{transport} omitted explicit tools: {missing}")
+            if forbidden:
+                raise ReleaseCheckError(
+                    f"{transport} exposed ambiguous tools: {forbidden}")
+            status = await client.call_tool("msx_targets_status", {})
             if status.is_error or not status.structured_content:
-                raise ReleaseCheckError(f"{transport} msx_status failed")
+                raise ReleaseCheckError(
+                    f"{transport} msx_targets_status failed")
             if status.structured_content.get("state") != "disconnected":
                 raise ReleaseCheckError(
                     f"{transport} fresh server was not disconnected")

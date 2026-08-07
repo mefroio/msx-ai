@@ -51,7 +51,7 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
 
     def status(self):
         try:
-            return json.loads(self.call_tool("msx_status")[0]["text"])
+            return json.loads(self.call_tool("msx_agent_status")[0]["text"])
         except Exception:
             machine = msx_mcp_server.SESSION.bench_machine
             if machine is not None:
@@ -61,7 +61,7 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
     def read_memory(self, space, address, length, *, atomic=True):
         try:
             content = self.call_tool(
-                "msx_memory_read", space=space, address=address,
+                "msx_agent_memory_read", space=space, address=address,
                 length=length, atomic=atomic)
         except Exception:
             machine = msx_mcp_server.SESSION.bench_machine
@@ -85,7 +85,7 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
                       ("1", "true", "on", "yes"))
         # Keep failures in this opt-in hardware-loopback test actionable. The
         # production default remains deliberately conservative for real links.
-        real = msx_mcp_server.SESSION.msx
+        real = msx_mcp_server.SESSION.require("agent")
         real.socket_timeout = 3
         if real._v3 is not None:
             real._v3.timeout = 3
@@ -120,16 +120,38 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
         except Exception as exc:
             return f"\nDIAGNOSTIC SNAPSHOT FAILED: {exc}"
 
+    def test_hybrid_bench_alternates_explicit_backends(self):
+        machine = self.start_bench(mode="resident")
+
+        local_before = json.loads(self.call_tool(
+            "msx_local_status")[0]["text"])
+        agent = json.loads(self.call_tool(
+            "msx_agent_status")[0]["text"])
+        local_screen = self.call_tool("msx_local_screen")[0]["text"]
+        agent_screen = self.call_tool("msx_agent_screen")[0]["text"]
+        local_after = json.loads(self.call_tool(
+            "msx_local_status")[0]["text"])
+
+        self.assertEqual(local_before["channel"], "openmsx-control")
+        self.assertEqual(agent["channel"], "agent-protocol")
+        self.assertEqual(local_after["target_id"], local_before["target_id"])
+        self.assertEqual(local_before["bench_id"], agent["bench_id"])
+        self.assertEqual(agent["bench_id"], local_after["bench_id"])
+        self.assertTrue(local_screen.strip())
+        self.assertTrue(agent_screen.strip())
+        self.assertIs(machine, msx_mcp_server.SESSION.require("local"))
+        self.assertIsNot(machine, msx_mcp_server.SESSION.require("agent"))
+
     def test_direct_openmsx_cpu_snapshot_preserves_run_and_break_states(self):
         msx_mcp_server.SESSION.boot("basic", window=False)
-        machine = msx_mcp_server.SESSION.msx
+        machine = msx_mcp_server.SESSION.require("local")
         self.assertIn(machine.cmd("set mute").strip().lower(),
                       ("1", "true", "on", "yes"))
         self.assertIn(machine.cmd("debug breaked").strip().lower(),
                       ("0", "false", "off", "no"))
 
         running = json.loads(
-            self.call_tool("msx_cpu_snapshot")[0]["text"])
+            self.call_tool("msx_local_cpu_snapshot")[0]["text"])
         self.assertEqual(running["backend"], "openmsx")
         self.assertEqual(
             running["capture"]["source"], "openmsx-debugger")
@@ -144,7 +166,7 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
 
         machine.cmd("debug break")
         paused = json.loads(
-            self.call_tool("msx_cpu_snapshot")[0]["text"])
+            self.call_tool("msx_local_cpu_snapshot")[0]["text"])
         self.assertTrue(paused["capture"]["was_already_breaked"])
         self.assertIn(machine.cmd("debug breaked").strip().lower(),
                       ("1", "true", "on", "yes"))
@@ -190,8 +212,8 @@ mailbox: dw 0
         self.assertIn("cpu-snapshot-v1", status["features"])
 
         cpu_snapshot = json.loads(
-            self.call_tool("msx_cpu_snapshot")[0]["text"])
-        self.assertEqual(cpu_snapshot["backend"], "real")
+            self.call_tool("msx_agent_cpu_snapshot")[0]["text"])
+        self.assertEqual(cpu_snapshot["backend"], "agent")
         self.assertEqual(
             cpu_snapshot["capture"]["source"],
             "bios-h-timi-hook-entry")
@@ -204,7 +226,7 @@ mailbox: dw 0
         self.assertEqual(self.status()["state"], "running")
 
         mapping = self.tool_result(
-            "msx_slot_select", page=0, slot_id=0)
+            "msx_agent_slot_select", page=0, slot_id=0)
         self.assertTrue(mapping.get("isError"))
         self.assertIn(
             "unavailable in resident mode", mapping["content"][0]["text"])
@@ -229,7 +251,8 @@ mailbox: dw 0
         self.assertGreater(second, first)
 
         # Exercise the bounded S lease while the fixture is actively running.
-        running_screenshot = self.call_tool("msx_screenshot", atomic=True)
+        running_screenshot = self.call_tool(
+            "msx_agent_screenshot", atomic=True)
         self.assertTrue(base64.b64decode(
             running_screenshot[1]["data"]).startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual(self.status()["state"], "running")
@@ -238,7 +261,7 @@ mailbox: dw 0
             self.read_memory("ram", 0x010B, 2), "little")
         self.assertGreater(after_snapshot, second)
 
-        pause = self.tool_result("msx_pause")
+        pause = self.tool_result("msx_agent_pause")
         self.assertTrue(pause.get("isError"))
         self.assertIn(
             "persistent manual pause is disabled",
@@ -246,11 +269,11 @@ mailbox: dw 0
         # Use a mailbox the fixture never writes. Replacing the live counter
         # itself would race with an instruction interrupted between its load
         # and store, which is a property of the test program, not the agent.
-        self.call_tool("msx_memory_write", space="ram", address=0x010D,
+        self.call_tool("msx_agent_memory_write", space="ram", address=0x010D,
                        data_hex="3412", verify=True)
         self.assertEqual(self.read_memory("ram", 0x010D, 2), b"\x34\x12")
 
-        screenshot = self.call_tool("msx_screenshot", atomic=True)
+        screenshot = self.call_tool("msx_agent_screenshot", atomic=True)
         self.assertIn("ASM agent/TCP", screenshot[0]["text"])
         self.assertTrue(base64.b64decode(screenshot[1]["data"]).startswith(
             b"\x89PNG\r\n\x1a\n"))
@@ -279,7 +302,7 @@ mailbox: dw 0
             print(self.machine_diagnostics(machine), file=sys.stderr)
             raise
 
-        stop = self.tool_result("msx_stop")
+        stop = self.tool_result("msx_agent_stop")
         self.assertTrue(stop.get("isError"))
         self.assertIn("unsafe in resident mode", stop["content"][0]["text"])
         self.assertEqual(self.status()["state"], "running")
@@ -294,14 +317,14 @@ mailbox: dw 0
         # ends deliberately leaves no active host protocol session whose bytes
         # could be mistaken for evidence that the resident survived. From this
         # point onward the lifecycle is exercised only through MSX-DOS.
-        real = msx_mcp_server.SESSION.msx
+        real = msx_mcp_server.SESSION.require("agent")
         self.assertIsNotNone(real)
         try:
             machine.cmd("unplug msx-rs232")
         finally:
             real.close()
-        msx_mcp_server.SESSION.msx = None
-        msx_mcp_server.SESSION.profile = None
+        msx_mcp_server.SESSION._agent_msx = None
+        msx_mcp_server.SESSION.agent_id = None
         machine.cmd("set throttle off")
 
         machine.type_line("CLS")
@@ -345,7 +368,17 @@ mailbox: dw 0
 
     def test_resident_types_and_runs_basic_only_through_agent_tcp(self):
         machine = self.start_bench(mode="resident")
+        local_before = json.loads(self.call_tool(
+            "msx_local_status")[0]["text"])
         status = self.status()
+        local_after = json.loads(self.call_tool(
+            "msx_local_status")[0]["text"])
+        self.assertEqual(local_before["target"], "local")
+        self.assertEqual(local_before["channel"], "openmsx-control")
+        self.assertEqual(status["target"], "agent")
+        self.assertEqual(status["channel"], "agent-protocol")
+        self.assertEqual(local_after["target_id"], local_before["target_id"])
+        self.assertEqual(local_after["bench_id"], status["bench_id"])
         self.assertEqual(status["runtime_mode"], "resident")
         self.assertIn("keybuf-input", status["features"])
         self.assertIn("keybuf-spool", status["features"])
@@ -353,7 +386,7 @@ mailbox: dw 0
         self.assertIn("file-transfer-v2", status["features"])
 
         clear_result = json.loads(self.call_tool(
-            "msx_type_line", text="CLS")[0]["text"])
+            "msx_agent_type_line", text="CLS")[0]["text"])
         self.assertFalse(clear_result["screen_capture_performed"], clear_result)
         machine.advance(0.3)
 
@@ -370,7 +403,7 @@ mailbox: dw 0
         archive_source = transfer_root / "preserved.zip"
         archive_source.write_bytes(archive_payload)
         raw_put = json.loads(self.call_tool(
-            "msx_file_put", local_path=str(archive_source),
+            "msx_agent_file_put", local_path=str(archive_source),
             msx_path="A:\\MCPRAW.ZIP", dos_prompt_confirmed=True,
             compression="auto", timeout=60
         )[0]["text"])
@@ -382,7 +415,7 @@ mailbox: dw 0
 
         archive_copy = transfer_root / "preserved-roundtrip.zip"
         raw_get = json.loads(self.call_tool(
-            "msx_file_get", msx_path="A:\\MCPRAW.ZIP",
+            "msx_agent_file_get", msx_path="A:\\MCPRAW.ZIP",
             local_path=str(archive_copy), dos_prompt_confirmed=True, timeout=60
         )[0]["text"])
         self.assertEqual(archive_copy.read_bytes(), archive_payload)
@@ -409,7 +442,7 @@ mailbox: dw 0
         compressible_source = transfer_root / "compressible.bin"
         compressible_source.write_bytes(compressible_payload)
         packbits_put = json.loads(self.call_tool(
-            "msx_file_put", local_path=str(compressible_source),
+            "msx_agent_file_put", local_path=str(compressible_source),
             msx_path="A:\\MCPPACK.BIN", dos_prompt_confirmed=True,
             compression="auto", timeout=60
         )[0]["text"])
@@ -420,7 +453,7 @@ mailbox: dw 0
 
         compressible_copy = transfer_root / "compressible-roundtrip.bin"
         packbits_get = json.loads(self.call_tool(
-            "msx_file_get", msx_path="A:\\MCPPACK.BIN",
+            "msx_agent_file_get", msx_path="A:\\MCPPACK.BIN",
             local_path=str(compressible_copy), dos_prompt_confirmed=True,
             timeout=60
         )[0]["text"])
@@ -438,7 +471,7 @@ mailbox: dw 0
         ]
         file_lines.append('200 PRINT "MCP FILE OK"')
         file_screen = self.call_tool(
-            "msx_run_basic", program="\n".join(file_lines),
+            "msx_agent_run_basic", program="\n".join(file_lines),
             clear=True, dos_prompt_confirmed=True)[0]["text"]
         file_result = json.loads(file_screen)
         self.assertTrue(file_result["run_submitted"], file_result)
@@ -454,7 +487,7 @@ mailbox: dw 0
             '10 A$="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"\n'
             '20 PRINT "MCP TYPE OK ";LEN(A$)')
         result = json.loads(self.call_tool(
-            "msx_run_basic", program=program, clear=True,
+            "msx_agent_run_basic", program=program, clear=True,
             allow_existing_basic=True, transfer="type")[0]["text"])
         self.assertFalse(result["screen_capture_performed"], result)
         machine.advance(2.5)
@@ -463,7 +496,7 @@ mailbox: dw 0
         self.assertIn("36", screen, screen)
 
         result = json.loads(self.call_tool(
-            "msx_type_lines",
+            "msx_agent_type_lines",
             lines=['PRINT "BATCH ONE"', 'PRINT "BATCH TWO"'])[0]["text"])
         self.assertFalse(result["screen_capture_performed"], result)
         screen = machine.screen_text()
@@ -471,9 +504,9 @@ mailbox: dw 0
 
         # Exercise raw msx_type followed by msx_type_line on the same resident
         # connection; no openMSX input API participates in either operation.
-        self.call_tool("msx_type", text="PRINT ")
+        self.call_tool("msx_agent_type", text="PRINT ")
         result = json.loads(self.call_tool(
-            "msx_type_line", text='"RESIDENT TYPE OK"')[0]["text"])
+            "msx_agent_type_line", text='"RESIDENT TYPE OK"')[0]["text"])
         self.assertFalse(result["screen_capture_performed"], result)
         screen = machine.screen_text()
         self.assertIn("RESIDENT TYPE OK", screen, screen)
@@ -493,7 +526,7 @@ mailbox: dw 0
         source.write_bytes(payload)
         put_started = time.monotonic()
         put_result = json.loads(self.call_tool(
-            "msx_file_put", local_path=str(source),
+            "msx_agent_file_put", local_path=str(source),
             msx_path="A:\\MCPFAST.BIN", dos_prompt_confirmed=True,
             compression="raw", timeout=60
         )[0]["text"])
@@ -508,7 +541,7 @@ mailbox: dw 0
         target = root / "fast-roundtrip.bin"
         get_started = time.monotonic()
         get_result = json.loads(self.call_tool(
-            "msx_file_get", msx_path="A:\\MCPFAST.BIN",
+            "msx_agent_file_get", msx_path="A:\\MCPFAST.BIN",
             local_path=str(target), dos_prompt_confirmed=True,
             timeout=60
         )[0]["text"])
@@ -543,7 +576,7 @@ mailbox: dw 0
         self.assertIn("cpu-snapshot-v1", status["features"])
         self.assertIn("[71]", machine.screen_text())
 
-        idle_snapshot = self.tool_result("msx_cpu_snapshot")
+        idle_snapshot = self.tool_result("msx_agent_cpu_snapshot")
         self.assertTrue(idle_snapshot.get("isError"))
         self.assertIn(
             "invalid_state", idle_snapshot["content"][0]["text"].lower())
@@ -557,7 +590,7 @@ start:  ei
         ret
 counter: dw 0
 """
-        self.call_tool("msx_asm_load", source=synchronous, address=0x8100,
+        self.call_tool("msx_agent_asm_load", source=synchronous, address=0x8100,
                        execute="call")
         self.assertEqual(
             int.from_bytes(
@@ -574,12 +607,12 @@ loop:   halt
         jr loop
 counter: dw 0
 """
-        self.call_tool("msx_asm_load", source=demo, address=0x8000,
+        self.call_tool("msx_agent_asm_load", source=demo, address=0x8000,
                        execute="run")
         machine.advance(0.3)
         self.assertEqual(self.status()["state"], "running")
         running_cpu = json.loads(
-            self.call_tool("msx_cpu_snapshot")[0]["text"])
+            self.call_tool("msx_agent_cpu_snapshot")[0]["text"])
         self.assertEqual(
             running_cpu["capture"]["source"],
             "bios-h-timi-hook-entry")
@@ -594,9 +627,9 @@ counter: dw 0
                 self.read_memory("ram", 0x800B, 2, atomic=False), "little"),
             first)
 
-        self.call_tool("msx_pause")
+        self.call_tool("msx_agent_pause")
         paused_cpu = json.loads(
-            self.call_tool("msx_cpu_snapshot")[0]["text"])
+            self.call_tool("msx_agent_cpu_snapshot")[0]["text"])
         self.assertEqual(paused_cpu["debug"]["agent_state"], "paused")
         paused = int.from_bytes(self.read_memory("ram", 0x800B, 2), "little")
         machine.advance(0.4)
@@ -606,20 +639,20 @@ counter: dw 0
 
         bulk = bytes((index * 73 + 19) & 0xFF
                      for index in range(status["max_payload"] - 2))
-        self.call_tool("msx_memory_write", space="ram", address=0x8200,
+        self.call_tool("msx_agent_memory_write", space="ram", address=0x8200,
                        data_hex=bulk.hex(), verify=True)
         self.assertEqual(self.read_memory("ram", 0x8200, len(bulk)), bulk)
-        self.call_tool("msx_memory_write", space="vram", address=0x4000,
+        self.call_tool("msx_agent_memory_write", space="vram", address=0x4000,
                        data_hex="5aa5", verify=True)
         self.assertEqual(self.read_memory("vram", 0x4000, 2), b"\x5a\xa5")
 
-        self.call_tool("msx_resume")
+        self.call_tool("msx_agent_resume")
         machine.advance(0.3)
         self.assertGreater(
             int.from_bytes(
                 self.read_memory("ram", 0x800B, 2, atomic=False), "little"),
             paused)
-        self.call_tool("msx_stop")
+        self.call_tool("msx_agent_stop")
         self.assertEqual(self.status()["state"], "monitor")
 
 

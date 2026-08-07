@@ -33,7 +33,8 @@
           "TECHNICAL.md",
           "server/mcp_runtime.py",
           "server/msx_mcp_server.py",
-          "tests/test_backend_optionality.py"
+          "tests/test_backend_optionality.py",
+          "tests/test_backend_routing.py"
         ]
       },
       "tags": [
@@ -53,7 +54,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "64374e7a3e1f1632bb1730743753715a81c1c942ceb84fceae6a645b36f4a293",
+      "sha256": "045c9cab09a3a011eef50f70c8821a709b7223620bb7e24082720d07f2bb1939",
       "external_references": []
     },
     {
@@ -75,6 +76,7 @@
           "server/mcp_runtime.py",
           "server/msx_mcp_server.py",
           "tests/test_backend_optionality.py",
+          "tests/test_backend_routing.py",
           "tests/test_openmsx_launcher.py"
         ]
       },
@@ -94,7 +96,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "ae6f113a53ca70aa34f7f191712d7aba2bde461c434baa333ff316c74468bb43",
+      "sha256": "8a68dbffe72906ba122b080479c22f52f1b70062918eb17e13bea4d8148f4a69",
       "external_references": [
         {
           "url": "https://github.com/mefroio/msx-ai.git",
@@ -121,6 +123,7 @@
           "server/msx_mcp_server.py",
           "server/msx_real.py",
           "tests/test_backend_optionality.py",
+          "tests/test_backend_routing.py",
           "tests/test_mcp_cpu_snapshot.py"
         ]
       },
@@ -141,7 +144,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "e825966e6f128657e83f9dab6120fc374fe618c94e0417ed124370f2ad162ace",
+      "sha256": "11ac46c85877eec9543a42d4f10a057ff53b0f596e40e9202837202ee0036d98",
       "external_references": []
     },
     {
@@ -180,7 +183,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "622f731f9d37f0ba6c4ce25c6f48e0dfb9515ab5d76dd86b8743799929d894a1",
+      "sha256": "733cf429ed6bd240fbfaec66471ae7ca303df19aaa3edbdb04ae489e65cb8bff",
       "external_references": []
     },
     {
@@ -221,7 +224,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "1b49e9085b2bd6acf2bc78d1728d329bbc47d78b79248dbbfed6a8539e3844e5",
+      "sha256": "55082b256e9f6fbc8ea8ce4eecf27befc80f45ca373acb9c7e8f5542f931ebf5",
       "external_references": []
     },
     {

@@ -20,8 +20,8 @@ openMSX, TCP/IP, and BaDCaT are all optional at the project level. A
 physical-only installation does not need an openMSX executable, emulator ROMs,
 disk images, BaDCaT hardware, a BaDCaT SDK, or BaDCaT firmware. The MCP server
 does not probe or start an
-emulator implicitly: select `msx_agent_listen` or `msx_agent_connect` for a
-physical target, and select `msx_boot`, `msx_attach`, or `msx_tcp_bench_start`
+emulator implicitly: use `msx_agent_listen` or `msx_agent_connect` for a
+physical target, and use `msx_local_boot`, `msx_local_attach`, or `msx_tcp_bench_start`
 only when the optional emulator backend is wanted.
 
 ## Project authorship
@@ -68,10 +68,11 @@ server/msx_mcp_server.py (synchronous tool/backend core)
 | Agent-path simulation in openMSX | Required | Required | Required between RS232-Net and the host |
 | Both capabilities in one installation | Available | Available | Used only when the agent backend is selected |
 
-Backend selection is explicit. One MCP server session controls one active
-target at a time, but the same installation can switch between direct openMSX,
-an openMSX-hosted agent simulation, and a physical agent without changing the
-core server or installing a product-specific edition.
+Channel routing is explicit and fixed by tool name. One MCP server can retain a
+local openMSX channel and an agent channel simultaneously. Calls can alternate
+between `msx_local_*` and `msx_agent_*` without changing any active-backend
+state. A paired bench binds both identities to one emulator with a shared
+`bench_id`; independent local and physical channels may represent two machines.
 
 ## Current capabilities
 
@@ -91,7 +92,7 @@ core server or installing a product-specific edition.
 - RAM, VRAM, direct I/O-port access, pause/resume, and host-rendered
   screenshots through the physical agent.
 - Credit-controlled BIOS keyboard input through the resident agent, including
-  255-byte batching for `msx_type_lines` and credited, whole-file-CRC-checked
+  255-byte batching for `msx_agent_type_lines` and credited, whole-file-CRC-checked
   ASCII or tokenized `.BAS` transfer for larger programs.
 - Streaming, resumable binary `PUT` and `GET` between the host and MSX-DOS,
   with 32-bit sizes and offsets, end-to-end CRC-32, restart recovery, and
@@ -279,14 +280,13 @@ through the configuration above, then select exactly one physical TCP role:
   local-only);
 - call `msx_agent_connect` when the adapter listens as a TCP server.
 
-After the TCP handshake, backend-neutral tools operate through the resident
-agent. With no selected backend, they fail with an instruction to connect a
-physical target or explicitly boot the optional emulator; they never start
-openMSX automatically.
+After the TCP handshake, `msx_agent_*` tools operate only through the resident
+agent. They never fall back to openMSX. `msx_local_*` tools independently
+require a local emulator channel and never start one automatically.
 
 ## Optional openMSX workflows
 
-`msx_boot` starts an isolated headless emulator by default. Every headless
+`msx_local_boot` starts an isolated headless emulator by default. Every headless
 process is muted at openMSX's host mixer for its complete lifetime. This does
 not change PSG, SCC, OPLL, MSX I/O ports, emulated timing, or sound routines
 executed inside the MSX. Startup fails closed if the host mute cannot be
@@ -299,10 +299,10 @@ shared instance and attach to it:
 ./open-msx.command basic
 ~~~~
 
-Then call `msx_attach`. Attaching does not change the existing instance's
+Then call `msx_local_attach`. Attaching does not change the existing instance's
 power, throttle, renderer, or audio settings. With exactly one live control
 socket, no selector is needed. If several are live, attachment fails before
-sending a command and reports their paths; call `msx_attach` again with the
+sending a command and reports their paths; call `msx_local_attach` again with the
 chosen exact `socket_path`. It never selects the newest instance implicitly.
 On Windows, the published `socket.<pid>` path is a descriptor containing an
 openMSX loopback TCP port in the official 9938--9958 range; the adapter validates
@@ -322,8 +322,10 @@ Available profiles are:
 `msx_tcp_bench_start` starts one isolated openMSX process, imports the complete
 canonical seven-file suite under `A:\MSXAI`, configures `MSXAI_HOME` and
 `PATH`, selects the 8251 driver, and connects it to the MCP server through
-RS232-Net/TCP. All physical-agent operations then use the TCP protocol; they do
-not use openMSX debugger memory APIs.
+RS232-Net/TCP. It publishes two fixed routes to the same process:
+`msx_agent_*` uses the TCP protocol and never debugger APIs, while
+`msx_local_*` uses the openMSX control channel and never the agent protocol.
+Calls can alternate between them without a selection operation.
 
 Its file-transfer recovery journals live inside the same disposable bench
 directory. Integration runs therefore cannot pollute the persistent
@@ -332,6 +334,14 @@ directory. Integration runs therefore cannot pollute the persistent
 The isolated bench also loads the generic four-way slot expander before its
 Sunrise/Nextor and RS-232 cartridges.
 
+`msx_tcp_bench_status` reports both channel identities and their shared
+`bench_id`. A failed or disconnected agent channel does not prevent
+`msx_local_screen`, `msx_local_screenshot`, or other explicit local diagnostics
+from inspecting the existing emulator. `msx_agent_disconnect` closes only the
+protocol channel. Because the emulator owns both halves of a paired bench,
+local shutdown and lifecycle-changing reset/power/quit commands are refused;
+`msx_tcp_bench_shutdown` closes agent, emulator, and temporary state together.
+
 For an interactive resident test, call it with:
 
 ~~~~json
@@ -339,10 +349,11 @@ For an interactive resident test, call it with:
 ~~~~
 
 The MSX displays the installation banner and returns to the DOS prompt. Run a
-DOS program or game in the visible window, then use `msx_status` and the
-atomic `msx_memory_read`, `msx_memory_write`, and `msx_screenshot` operations.
+DOS program or game in the visible window, then use `msx_agent_status` and the
+atomic `msx_agent_memory_read`, `msx_agent_memory_write`, and
+`msx_agent_screenshot` operations.
 Each operation acquires a bounded snapshot lease and resumes the program
-immediately. Persistent `msx_pause`/`msx_resume` is intentionally unavailable
+immediately. Persistent `msx_agent_pause`/`msx_agent_resume` is intentionally unavailable
 in the safe resident profile.
 
 For direct ASM upload and on-screen command tracing:
@@ -397,7 +408,7 @@ Optional IPv4 endpoint overrides are available for local testing:
 MSX_AI_MCP_IPV4=127.0.0.1 MSX_AI_MCP_PORT=6603 ./open-msx-mcp.command
 ~~~~
 
-Then use `msx_asm_load` with `execute="call"` or `execute="run"`.
+Then use `msx_agent_asm_load` with `execute="call"` or `execute="run"`.
 `debug=true` is intentionally rejected in resident mode.
 
 Headless test-bench instances are host-muted; visible ones retain normal sound.
@@ -534,7 +545,7 @@ framed protocols, transport ABI, and driver implementation details.
 | On-screen `DEBUG` trace | No | Optional |
 
 The resident reports execution state `running` while DOS or an application is
-active. The safe profile disables persistent manual `msx_pause`; atomic memory
+active. The safe profile disables persistent manual `msx_agent_pause`; atomic memory
 and screenshot operations use the bounded `S` lease and resume the saved CPU
 context immediately after acquisition. `stop` remains rejected because
 discarding the interrupted DOS/application context would be unsafe.
@@ -590,8 +601,8 @@ selected MSX byte driver
 ~~~~
 
 Use `msx_agent_listen` when the adapter is a TCP client. Use
-`msx_agent_connect` when the adapter exposes a TCP server. The older
-`msx_real_listen` name remains as a compatibility alias. `msx_status`
+`msx_agent_connect` when the adapter exposes a TCP server. Ambiguous historical
+aliases are not published. `msx_agent_status`
 reports `network_transport`, `network_role`, `agent_transport`, and
 `agent_transport_id` separately.
 
@@ -692,7 +703,7 @@ end-of-stream operation, not an inference from a short block or disconnect.
 The detailed state and payload layouts are in
 [`agent/README.md`](agent/README.md) and `server/msx_transfer.py`.
 
-`msx_key` uses that operation for ESC, Return, Tab, Select, and Space. STOP and
+`msx_agent_key` uses that operation for ESC, Return, Tab, Select, and Space. STOP and
 Ctrl+STOP use an idempotent one-byte RAM write to the documented BIOS `INTFLG`
 work-area variable (`FC9Bh`, values `04h` and `03h` respectively). On the real
 backend, Ctrl+C is a convenience alias for the Ctrl+STOP break event.
@@ -733,7 +744,7 @@ The first 20 register bytes are copied from the agent's own frame before any
 protocol work. They describe the register state visible when BIOS and MemMan
 invoke the `H.TIMI` callback. BIOS has already entered its interrupt handler,
 and MemMan owns an internal dispatcher stack; neither layout is a portable MSX
-hook ABI. Consequently, `msx_cpu_snapshot` returns application `PC`, `SP`,
+hook ABI. Consequently, `msx_agent_cpu_snapshot` returns application `PC`, `SP`,
 `I/R`, `IFF`, and interrupt mode as unavailable on the physical-agent backend.
 Service SP, callback return, service-time `I/R`, and current service `IFF2` are
 kept under explicitly named debug metadata and are never presented as
@@ -764,7 +775,7 @@ writes on that attachment: the host does not retry the request and does not send
 incompatible game. If a snapshot lease had been accepted, its agent-side
 countdown is the authoritative recovery path and auto-resumes the MSX. A fresh
 connection is required before issuing more commands. Persistent manual
-`msx_pause` is rejected for this profile.
+`msx_agent_pause` is rejected for this profile.
 
 The raw `N` exchange makes that decision possible before the first v3 frame. A
 legacy resident that rejects `N` or cannot advertise both `timi-poll-safe` and
@@ -783,7 +794,8 @@ unchanged.
 
 ## Screenshots from VRAM
 
-`msx_screenshot` captures VRAM and VDP/BIOS state, renders the image on the
+`msx_agent_screenshot` captures VRAM and VDP/BIOS state through the agent,
+renders the image on the
 host, and returns a PNG MCP image content block. It does not require a visible
 openMSX renderer. On a running resident target, `atomic=true` requires both
 `snapshot-lease` and `timi-poll-safe`. The initial status request is bounded;
@@ -831,7 +843,8 @@ interlaced-field timing are not reconstructed.
 
 ## Loading applications
 
-`msx_app_load` uses one parser and validation path for both backends. It
+`msx_local_app_load` and `msx_agent_app_load` use one parser and validation
+path with fixed routing. It
 recognizes:
 
 - `.com`: loaded at `0x0100`.
@@ -857,15 +870,15 @@ Execution constraints depend on the runtime:
 
 ## Batched BASIC input and file transfer
 
-`msx_type_lines` accepts an array of logical lines, appends Return to each one,
+`msx_agent_type_lines` accepts an array of logical lines, appends Return to each one,
 and waits for the target to consume the batch. On a current physical resident,
 the host fills the negotiated keyboard spool in large packets and uses its
 returned credits. On older residents it streams into available BIOS ring slots
 while retaining the same Return barrier. Real-agent input tools return a
 structured delivery acknowledgement and do not read VRAM automatically; use
-`msx_screen` explicitly when a text capture is actually required.
+`msx_agent_screen` explicitly when a text capture is actually required.
 
-`msx_run_basic` uses one batched input operation for short listings. When a
+`msx_agent_run_basic` uses one batched input operation for short listings. When a
 real target is confirmed at an MSX-DOS prompt with
 `dos_prompt_confirmed=true` and the normalized ASCII listing is at least 512
 bytes, `transfer="auto"` instead:
@@ -882,7 +895,7 @@ a resident that advertises `file-transfer-v2`; `auto` falls back to typing
 otherwise. Reusing a BASIC prompt requires the mutually exclusive
 `allow_existing_basic=true` confirmation. The host never infers either state
 from an automatic screen read. `dos_drive` (or `drive` for
-`msx_run_basic_file`) selects the temporary target drive and defaults to `A`.
+`msx_agent_run_basic_file`) selects the temporary target drive and defaults to `A`.
 The BASIC tool retains a conservative 16 KiB input policy, but protocol X itself
 uses 32-bit sizes and is not limited to 16 KiB. `format="auto"` preserves
 tokenized files beginning with `0xFF` and normalizes other files as ASCII. No
@@ -901,24 +914,29 @@ normally from DOS.
 
 | Group | Tools |
 |---|---|
-| Session | `msx_boot`, `msx_attach`, `msx_tcp_bench_start`, `msx_agent_listen`, `msx_agent_connect`, `msx_status`, `msx_shutdown` |
-| Debug | `msx_cpu_snapshot` |
-| Execution | `msx_asm_load`, `msx_app_load`, `msx_pause`, `msx_resume`, `msx_stop` |
-| Memory/video | `msx_memory_read`, `msx_memory_write`, `msx_screen`, `msx_screenshot` |
-| Hardware | `msx_io_read`, `msx_io_write`, `msx_slot_select`, `msx_mapper_select` |
-| Input | `msx_type`, `msx_type_line`, `msx_type_lines`, `msx_run_basic`, `msx_run_basic_file`, and `msx_key` |
-| Files | `msx_file_put`, `msx_file_get` |
-| openMSX/DOS | `msx_dos_asm_run`, `msx_disk_put_text`, `msx_reset`, `msx_cmd` |
+| Inventory | `msx_targets_status` |
+| Local lifecycle | `msx_local_boot`, `msx_local_attach`, `msx_local_status`, `msx_local_shutdown` |
+| Agent lifecycle | `msx_agent_listen`, `msx_agent_connect`, `msx_agent_status`, `msx_agent_disconnect` |
+| Paired bench | `msx_tcp_bench_start`, `msx_tcp_bench_status`, `msx_tcp_bench_shutdown` |
+| Local debug/execution | `msx_local_cpu_snapshot`, `msx_local_asm_load`, `msx_local_app_load` |
+| Agent debug/execution | `msx_agent_cpu_snapshot`, `msx_agent_asm_load`, `msx_agent_app_load`, `msx_agent_pause`, `msx_agent_resume`, `msx_agent_stop` |
+| Local memory/video | `msx_local_memory_read`, `msx_local_memory_write`, `msx_local_screen`, `msx_local_screenshot` |
+| Agent memory/video | `msx_agent_memory_read`, `msx_agent_memory_write`, `msx_agent_screen`, `msx_agent_screenshot` |
+| Agent hardware | `msx_agent_io_read`, `msx_agent_io_write`, `msx_agent_slot_select`, `msx_agent_mapper_select` |
+| Local input | `msx_local_type`, `msx_local_type_line`, `msx_local_type_lines`, `msx_local_run_basic`, `msx_local_key` |
+| Agent input | `msx_agent_type`, `msx_agent_type_line`, `msx_agent_type_lines`, `msx_agent_run_basic`, `msx_agent_run_basic_file`, `msx_agent_key` |
+| Agent files | `msx_agent_file_put`, `msx_agent_file_get` |
+| Local openMSX/DOS | `msx_local_dos_asm_run`, `msx_local_disk_put_text`, `msx_local_reset`, `msx_local_cmd` |
 | Documentation | `msx_docs_search` |
 
 Resident keyboard injection feeds the standard BIOS ring and therefore works
 with DOS, BASIC, and software that calls BIOS character input. Games that read
 the keyboard matrix directly do not observe those synthetic bytes. STOP and
-Ctrl+STOP are delivered through the BIOS `INTFLG`; the real backend maps
+Ctrl+STOP are delivered through the BIOS `INTFLG`; the agent backend maps
 Ctrl+C to the same break event for MCP client convenience. Physical reset, raw
 matrix emulation, and openMSX console commands remain openMSX-only. Physical
 operations use the agent byte stream rather than openMSX APIs. On a physical
-target, `msx_run_basic` enters BASIC only after the caller sets
+target, `msx_agent_run_basic` enters BASIC only after the caller sets
 `dos_prompt_confirmed=true`. Reusing an already-visible BASIC prompt requires
 the mutually exclusive `allow_existing_basic=true` opt-in. These confirmations
 prevent a tool from typing over a running application without first reading
@@ -1106,8 +1124,8 @@ in `third_party/memman/NOTICE`.
 
 ## Resumable file transfer v2
 
-`msx_file_put` uploads an arbitrary binary host file to MSX-DOS, and
-`msx_file_get` downloads an MSX-DOS file to the host. Both stream blocks instead
+`msx_agent_file_put` uploads an arbitrary binary host file to MSX-DOS, and
+`msx_agent_file_get` downloads an MSX-DOS file to the host. Both stream blocks instead
 of buffering the complete file in MSX memory. The initial call requires
 `dos_prompt_confirmed=true`, set only after the caller has externally confirmed
 an MSX-DOS prompt, so the host can start `MSXAIXF /PUT <id>` or
@@ -1265,7 +1283,7 @@ space, MSX-DOS/filesystem, and available target media.
 
 Compression is asymmetric and capability-negotiated in protocol version 1:
 
-- `msx_file_put(compression="auto")` may create a deterministic standard
+- `msx_agent_file_put(compression="auto")` may create a deterministic standard
   PackBits stream only when the target advertises `PACKBITS_DECODE` and
   compression saves at least
   the larger of 256 bytes or three percent of the source;
@@ -1275,7 +1293,7 @@ Compression is asymmetric and capability-negotiated in protocol version 1:
   encoding, while `compression="packbits"` is an explicit override and
   requires the negotiated decoder; textual BASIC normalization, when selected
   by the `.BAS` target, occurs before either compression policy;
-- `msx_file_get` always transfers raw bytes because the current MSX component
+- `msx_agent_file_get` always transfers raw bytes because the current MSX component
   provides a PackBits decoder, not a PackBits encoder.
 
 For a PackBits PUT, the compressed wire stream has its own size and CRC-32. After

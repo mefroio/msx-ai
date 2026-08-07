@@ -77,7 +77,9 @@ expensive capture unless the caller explicitly allows it.
 
 ## Before changing a target
 
-1. Call `msx_status` and verify backend, runtime mode, transport, and features.
+1. Call `msx_local_status` or `msx_agent_status` for the intended channel and
+   verify identity, runtime mode, transport, and features. In a paired bench,
+   use `msx_tcp_bench_status` to verify the shared `bench_id`.
 2. Confirm that the requested range excludes protected or unrelated state.
 3. Prefer an atomic operation for a running resident target.
 4. Keep a recoverable copy of files and application data.

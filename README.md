@@ -69,18 +69,36 @@ msx-ai-mcp --transport http --host 127.0.0.1 --port 8000
 The HTTP endpoint is `http://127.0.0.1:8000/mcp`. It is intentionally restricted
 to unauthenticated IPv4 loopback. STDIO remains the recommended default.
 
-## Choose a backend
+## Choose an explicit channel
+
+MSX-AI has no mutable “active backend.” `msx_local_*` tools always use the
+openMSX control API, and `msx_agent_*` tools always use the ASM-agent protocol.
+Both channels may remain connected, and calls may alternate between them in
+any order without changing the route of a later call. `msx_targets_status`
+lists the independent channel identities but never selects one.
+
+For configurations made from an earlier checkout, migrate deliberately:
+
+| Earlier name | Explicit replacement |
+|---|---|
+| `msx_status` | `msx_local_status`, `msx_agent_status`, or inventory-only `msx_targets_status` |
+| `msx_shutdown` | `msx_local_shutdown`, `msx_agent_disconnect`, or `msx_tcp_bench_shutdown` |
+| `msx_real_listen` | `msx_agent_listen` |
+| Other `msx_<operation>` names | Choose `msx_local_<operation>` or `msx_agent_<operation>` for the intended channel |
+
+Ambiguous names are intentionally not published and never route according to
+the most recently connected target.
 
 ### Direct openMSX
 
 Use this path for fast emulator automation and exact debugger snapshots. It
 does not require TCP or the MSX-side agent.
 
-1. Call `msx_boot` with `profile="basic"` and optionally `window=true`.
-2. Call `msx_status`; confirm `backend` is `openmsx`.
-3. Call `msx_screen`, or use `msx_run_basic` for a first visible result.
+1. Call `msx_local_boot` with `profile="basic"` and optionally `window=true`.
+2. Call `msx_local_status`; confirm `backend` is `openmsx`.
+3. Call `msx_local_screen`, or use `msx_local_run_basic` for a visible result.
 
-Use `msx_attach` instead when openMSX is already running. MSX-AI then shares
+Use `msx_local_attach` instead when openMSX is already running. MSX-AI then shares
 that instance without changing its power, throttle, or audio state. If several
 live openMSX sockets exist, the call refuses to guess: repeat it with one of the
 exact `socket_path` values reported by the error. On Windows, openMSX publishes
@@ -100,11 +118,15 @@ agent and isolated bench locally. A pipx-installed host can use it when
    local test ROMs and MSX-DOS/Nextor image.
 2. Call `msx_tcp_bench_start` with `mode="resident"`; add `window=true` for a
    visible emulator.
-3. Call `msx_status` and verify the negotiated agent features.
+3. Call `msx_tcp_bench_status` and verify both explicitly identified channels.
+4. Use `msx_agent_*` to validate the physical protocol path and `msx_local_*`
+   to inspect the same emulated machine through openMSX control APIs.
 
 Use `mode="monitor"` for direct call, run, stop, slot, and mapper experiments.
-The bench uses one isolated openMSX process and reaches the agent through TCP,
-not through debugger shortcuts.
+The bench uses exactly one isolated openMSX process. Its `local` and `agent`
+channels carry the same `bench_id`, so callers can alternate between them
+without spawning, attaching, or selecting another emulator. A stalled agent
+does not prevent `msx_local_screenshot` from diagnosing the existing machine.
 
 ### Physical MSX
 
@@ -118,7 +140,7 @@ Use this path when actual MSX hardware behavior is the subject of the session.
    machine's specific LAN IPv4 address. The safe default `127.0.0.1` accepts
    only local simulation. If the adapter accepts an incoming connection, call
    `msx_agent_connect` with its IPv4 address.
-4. Call `msx_status` before any mutation and verify runtime, transport, and
+4. Call `msx_agent_status` before any mutation and verify runtime, transport, and
    feature negotiation.
 
 The agent does not configure Wi-Fi, issue modem AT commands, or depend on a
@@ -131,9 +153,9 @@ With a visible direct-openMSX BASIC session, these MCP calls draw a simple
 test card and return a PNG without proprietary game media:
 
 ```text
-msx_boot(profile="basic", window=true)
-msx_run_basic(program="10 SCREEN 2\n20 COLOR 15,4,4\n30 CIRCLE(128,96),50,15\n40 LINE(40,40)-(216,152),8,B\n50 GOTO 50")
-msx_screenshot()
+msx_local_boot(profile="basic", window=true)
+msx_local_run_basic(program="10 SCREEN 2\n20 COLOR 15,4,4\n30 CIRCLE(128,96),50,15\n40 LINE(40,40)-(216,152),8,B\n50 GOTO 50")
+msx_local_screenshot()
 ```
 
 For an already installed physical agent, begin read-only and verify the
@@ -141,12 +163,12 @@ selected path before doing anything mutable:
 
 ```text
 msx_agent_listen(host="192.168.1.20", port=6603)
-msx_status()
-msx_cpu_snapshot()
+msx_agent_status()
+msx_agent_cpu_snapshot()
 ```
 
 The status result is structured; a resident agent reports, for example,
-`{"backend":"real","state":"running","runtime_mode":"resident",...}` before
+`{"target":"agent","backend":"agent","state":"running","runtime_mode":"resident",...}` before
 the snapshot call. An idle foreground monitor cannot provide a CPU snapshot;
 run a payload there first. The capability matrix below defines the two capture
 semantics.
@@ -175,8 +197,8 @@ MSX-AI Python server
 
 The MCP interface, target protocol, network link, and MSX UART driver are
 separate layers. A user can run only direct openMSX, only a physical target, or
-both workflows at different times without installing every optional backend.
-One MCP server process owns at most one active target session.
+both channels simultaneously without installing every optional backend. Tool
+names fix the route; connection order never changes it.
 
 ## Capability matrix
 
@@ -229,6 +251,8 @@ current and supported older MCP protocol revisions. It provides:
 - Cooperative MCP progress and safe cancellation for PUT/GET transfers.
 - Documentation resources under `msx-ai://docs/`.
 - The read-only `msx_docs_search` tool.
+- Explicit `msx_local_*`, `msx_agent_*`, and paired `msx_tcp_bench_*` families;
+  ambiguous generic operational names are not published.
 - `start_msx_session` and `diagnose_msx_connection` prompts.
 
 Start with `msx-ai://docs/index` when a client supports resources, or call:
@@ -247,6 +271,10 @@ msx_docs_search(query="resident screenshot safety")
 - Resident RAM page 1 is reserved while servicing requests. Page 3 contains
   live BIOS, DOS, stack, hook, and system state; arbitrary writes can crash the
   machine.
+- A paired bench exposes two control channels to one machine, not two machines.
+  Local reset, power, quit, and local shutdown are refused while the paired
+  bench exists, even after agent disconnect; use `msx_tcp_bench_shutdown` for
+  the combined lifecycle.
 - Resident input feeds the BIOS keyboard ring. Games that scan the physical
   keyboard matrix directly will not observe it.
 - Screenshots reconstruct standard SCREEN 0-8 and 10-12 from readable state.

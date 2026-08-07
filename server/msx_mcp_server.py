@@ -7,14 +7,16 @@ openMSX through its control channel or a physical MSX through the resident Z80
 monitor and TCP/serial transport. Models can upload Z80 builds, inspect or
 patch RAM/VRAM, control execution and render screenshots from captured VRAM.
 
-openMSX is an optional backend selected only by emulator-specific tools. A
-physical session uses RealMSX directly and requires neither an openMSX
-executable nor emulator ROMs. Emulator sessions use the project-local
-OPENMSX_HOME and never touch the user's normal setup.
+openMSX is an optional local channel selected only by ``msx_local_*`` tools.
+The independent ``msx_agent_*`` channel uses RealMSX and requires neither an
+openMSX executable nor emulator ROMs. Both may coexist; a simulated bench binds
+them to the same machine without creating a mutable "active backend". Emulator
+sessions use the isolated OPENMSX_HOME and never touch the user's normal setup.
 """
 import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re, time
 import ipaddress, math
 import secrets
+from contextvars import ContextVar
 
 import base64
 if __package__:
@@ -192,21 +194,114 @@ def _basic_prompt_visible(screen):
     return bool(rows and rows[-1].lower() == "ok")
 
 # --------------------------------------------------------------------------
-# Explicitly selected backend (one emulator or physical session at a time)
+# Independent, explicitly routed local and agent channels
 # --------------------------------------------------------------------------
 class BackendNotSelectedError(RuntimeError):
-    """Raised when a backend-neutral tool is called before target selection."""
+    """Raised when an explicit channel has no connected target."""
+
+
+class BackendAmbiguousError(RuntimeError):
+    """Raised when a legacy tool could address more than one live target."""
+
+
+_TOOL_TARGET = ContextVar("msx_ai_tool_target", default=None)
 
 
 class Session:
     def __init__(self):
-        self.msx = None
-        self.profile = None
+        # Local openMSX control and the physical-agent protocol are independent
+        # channels.  A simulated TCP bench intentionally publishes both, each
+        # pointing at the same emulated machine through a different interface.
+        self._local_msx = None
+        self._local_profile = None
+        self._agent_msx = None
+        self.local_id = None
+        self.agent_id = None
+        self.bench_id = None
+        # Compatibility storage for tests/integrators that still assign the
+        # historical ``msx``/``profile`` attributes directly.
+        self._legacy_msx = None
+        self._legacy_profile = None
         self.bench_machine = None
         self.bench_runtime = None
 
+    def _fallback_for(self, target):
+        if self._legacy_msx is None:
+            return None, None
+        is_agent = self._legacy_profile == "real"
+        if (target == "agent") == is_agent:
+            return self._legacy_msx, self._legacy_profile
+        return None, None
+
+    def backend(self, target):
+        if target == "local":
+            if self._local_msx is not None:
+                return self._local_msx, self._local_profile
+            return self._fallback_for("local")
+        if target == "agent":
+            if self._agent_msx is not None:
+                return self._agent_msx, "real"
+            return self._fallback_for("agent")
+        raise ValueError("target must be 'local' or 'agent'")
+
+    def connected_targets(self):
+        targets = []
+        for target in ("local", "agent"):
+            backend, _profile = self.backend(target)
+            if backend is not None:
+                targets.append(target)
+        return tuple(targets)
+
+    def _resolve(self, target=None):
+        target = target or _TOOL_TARGET.get()
+        if target is not None:
+            backend, profile = self.backend(target)
+            if backend is None:
+                action = ("msx_local_boot or msx_local_attach" if target == "local"
+                          else "msx_agent_listen or msx_agent_connect")
+                raise BackendNotSelectedError(
+                    f"no {target} target is connected; use {action}")
+            return backend, profile, target
+        targets = self.connected_targets()
+        if not targets:
+            raise BackendNotSelectedError(
+                "no MSX target is connected; use msx_local_boot or "
+                "msx_local_attach for openMSX, or msx_agent_listen or "
+                "msx_agent_connect for the ASM agent")
+        if len(targets) != 1:
+            raise BackendAmbiguousError(
+                "both local openMSX and TCP agent targets are connected; use "
+                "an explicit msx_local_* or msx_agent_* tool")
+        backend, profile = self.backend(targets[0])
+        return backend, profile, targets[0]
+
+    @property
+    def msx(self):
+        try:
+            return self._resolve()[0]
+        except BackendNotSelectedError:
+            return None
+
+    @msx.setter
+    def msx(self, value):
+        self._legacy_msx = value
+
+    @property
+    def profile(self):
+        try:
+            return self._resolve()[1]
+        except BackendNotSelectedError:
+            return None
+
+    @profile.setter
+    def profile(self, value):
+        self._legacy_profile = value
+
     def boot(self, profile="basic", boot_seconds=6, window=False):
-        self.shutdown()
+        if self.backend("local")[0] is not None:
+            raise OpenMSXError(
+                "a local openMSX target is already connected; close it "
+                "explicitly with msx_local_shutdown first")
         machine = None
         if profile == "dos":
             if not DOS_HDD.exists():
@@ -243,13 +338,17 @@ class Session:
             # running after a failed renderer, power, or boot command.
             machine.close()
             raise
-        self.msx = machine
-        self.profile = profile
+        self._local_msx = machine
+        self._local_profile = profile
+        self.local_id = "local-" + secrets.token_hex(6)
         return screen
 
     def attach(self, socket_path=None):
         """Connect to the user's already-running openMSX window (shared instance)."""
-        self.shutdown()
+        if self.backend("local")[0] is not None:
+            raise OpenMSXError(
+                "a local openMSX target is already connected; detach or close "
+                "it explicitly before attaching another")
         machine = OpenMSX()
         try:
             machine.attach(socket_path)
@@ -259,42 +358,60 @@ class Session:
         except Exception:
             machine.close()
             raise
-        self.msx = machine
-        self.profile = "attach"
+        self._local_msx = machine
+        self._local_profile = "attach"
+        self.local_id = "local-" + secrets.token_hex(6)
         return screen
 
     def listen_agent(self, host="127.0.0.1", port=6603, timeout=60,
                      cancelled=None):
         """Wait for an ASM agent or transparent adapter to connect over TCP."""
-        self.shutdown()
+        if self.backend("agent")[0] is not None:
+            raise OpenMSXError(
+                "an ASM-agent target is already connected; disconnect it "
+                "explicitly with msx_agent_disconnect first")
+        if self.bench_machine is not None or self.bench_runtime is not None:
+            raise OpenMSXError(
+                "the hybrid TCP bench still owns the local machine; close "
+                "that bench explicitly before listening for another agent")
         real = RealMSX(host=host, port=int(port)).listen()
         try:
             peer = real.accept(timeout=float(timeout), cancelled=cancelled)
         except Exception:
             real.close()
             raise
-        self.msx = real
-        self.profile = "real"
+        self._agent_msx = real
+        self.agent_id = "agent-" + secrets.token_hex(6)
         return peer
 
     def connect_agent(self, host, port=6603, timeout=60):
         """Connect to an ASM agent or transparent adapter over TCP."""
-        self.shutdown()
+        if self.backend("agent")[0] is not None:
+            raise OpenMSXError(
+                "an ASM-agent target is already connected; disconnect it "
+                "explicitly with msx_agent_disconnect first")
+        if self.bench_machine is not None or self.bench_runtime is not None:
+            raise OpenMSXError(
+                "the hybrid TCP bench still owns the local machine; close "
+                "that bench explicitly before connecting another agent")
         real = RealMSX(host=host, port=int(port))
         try:
             peer = real.connect(timeout=float(timeout))
         except Exception:
             real.close()
             raise
-        self.msx = real
-        self.profile = "real"
+        self._agent_msx = real
+        self.agent_id = "agent-" + secrets.token_hex(6)
         return peer
 
     def start_tcp_bench(self, host="127.0.0.1", port=0, timeout=60,
                         window=False, mode="resident", debug=False,
                         preload_files=(), cancelled=None):
         """Start one isolated openMSX as a physical-agent TCP simulation."""
-        self.shutdown()
+        if self.connected_targets():
+            raise OpenMSXError(
+                "the hybrid TCP bench requires empty local and agent slots; "
+                "close existing targets explicitly first")
         if mode not in ("resident", "monitor"):
             raise ValueError("mode must be 'resident' or 'monitor'")
         if not isinstance(debug, bool):
@@ -449,8 +566,12 @@ class Session:
             if window:
                 machine.cmd("set renderer SDLGL-PP")
 
-            self.msx = real
-            self.profile = "real"
+            self._agent_msx = real
+            self._local_msx = machine
+            self._local_profile = "bench"
+            self.bench_id = "bench-" + secrets.token_hex(6)
+            self.local_id = self.bench_id + ":local"
+            self.agent_id = self.bench_id + ":agent"
             self.bench_machine = machine
             self.bench_runtime = runtime
             return peer
@@ -465,34 +586,74 @@ class Session:
     # Backward-compatible internal name used by the original MCP tool.
     listen_real = listen_agent
 
-    def require(self):
-        if self.msx is None:
-            raise BackendNotSelectedError(
-                "no active MSX backend; use msx_agent_listen or "
-                "msx_agent_connect for physical hardware, or msx_boot for the "
-                "optional openMSX emulator")
-        return self.msx
+    def require(self, target=None):
+        return self._resolve(target)[0]
 
-    def shutdown(self):
-        if self.msx is not None:
-            if (self.profile == "real" and
-                    not getattr(self.msx, "write_quarantined", False)):
+    def shutdown_local(self):
+        local, _profile = self.backend("local")
+        if local is None:
+            return False
+        if local is self.bench_machine:
+            raise OpenMSXError(
+                "the local target belongs to the hybrid TCP bench; use "
+                "msx_tcp_bench_shutdown to close both bench channels")
+        try:
+            local.close()
+        finally:
+            self._local_msx = None
+            self._local_profile = None
+            self.local_id = None
+            if self._legacy_msx is local:
+                self._legacy_msx = None
+                self._legacy_profile = None
+        return True
+
+    def disconnect_agent(self):
+        agent, _profile = self.backend("agent")
+        if agent is None:
+            return False
+        if not getattr(agent, "write_quarantined", False):
+            try:
+                if agent.status()["state"] == "paused":
+                    agent.resume()
+            except Exception:
+                pass
+        try:
+            agent.close()
+        finally:
+            self._agent_msx = None
+            self.agent_id = None
+            if self._legacy_msx is agent:
+                self._legacy_msx = None
+                self._legacy_profile = None
+        return True
+
+    def shutdown_bench(self):
+        if self.bench_machine is None and self.bench_runtime is None:
+            return False
+        agent = self._agent_msx
+        if agent is not None:
+            if not getattr(agent, "write_quarantined", False):
                 try:
-                    if self.msx.status()["state"] == "paused":
-                        self.msx.resume()
+                    if agent.status()["state"] == "paused":
+                        agent.resume()
                 except Exception:
                     pass
             try:
-                self.msx.close()
+                agent.close()
             except Exception:
                 pass
-            self.msx = None
-            self.profile = None
+            self._agent_msx = None
+            self.agent_id = None
         if self.bench_machine is not None:
             try:
                 self.bench_machine.close()
             except Exception:
                 pass
+            if self._local_msx is self.bench_machine:
+                self._local_msx = None
+                self._local_profile = None
+                self.local_id = None
             self.bench_machine = None
         if self.bench_runtime is not None:
             try:
@@ -500,6 +661,31 @@ class Session:
             except Exception:
                 pass
             self.bench_runtime = None
+        self.bench_id = None
+        return True
+
+    def shutdown_all(self):
+        if self.bench_machine is not None or self.bench_runtime is not None:
+            self.shutdown_bench()
+        else:
+            self.disconnect_agent()
+            self.shutdown_local()
+        # Direct-assignment compatibility state may not be represented above.
+        legacy = self._legacy_msx
+        if legacy is not None:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+        self._legacy_msx = None
+        self._legacy_profile = None
+        self.local_id = None
+        self.agent_id = None
+        self.bench_id = None
+
+    # Historical internal name.  Server teardown still means every channel;
+    # public tools use explicit local/agent/bench lifecycle methods below.
+    shutdown = shutdown_all
 
 
 SESSION = Session()
@@ -522,7 +708,7 @@ def t_boot(profile="basic", window=False):
 
 def t_attach(socket_path=None):
     scr = SESSION.attach(socket_path)
-    selected = SESSION.require().socket_path
+    selected = SESSION.require("local").socket_path
     return (f"[attached to openMSX socket={selected} — shared instance]\n" +
             scr)
 
@@ -605,21 +791,30 @@ def t_tcp_bench_start(host="127.0.0.1", port=0, timeout=60, window=False,
         host=host, port=port, timeout=timeout, window=window,
         mode=mode, debug=debug,
         cancelled=current_cancellation_callback())
-    return t_status()
+    return t_tcp_bench_status()
 
 
 def t_screen():
     return _screen()
 
 
-def t_status():
-    if SESSION.msx is None:
-        return {"backend": "none", "state": "disconnected"}
-    m = SESSION.msx
-    if SESSION.profile == "real":
+def _status_for(target):
+    m, profile = SESSION.backend(target)
+    if m is None:
+        return {"target": target, "backend": (
+            "openmsx" if target == "local" else "agent"),
+            "channel": ("openmsx-control" if target == "local"
+                        else "agent-protocol"),
+            "target_id": None, "bench_id": SESSION.bench_id,
+            "state": "disconnected"}
+    if target == "agent":
         state = m.status()
         state.update({
-            "backend": "real",
+            "target": "agent",
+            "backend": "agent",
+            "channel": "agent-protocol",
+            "target_id": SESSION.agent_id,
+            "bench_id": SESSION.bench_id,
             # Socket endpoints are tuples in Python but arrays on the MCP JSON
             # boundary. Normalize them before output-schema validation.
             "peer": list(m.peer) if isinstance(m.peer, tuple) else m.peer,
@@ -651,21 +846,109 @@ def t_status():
             "vram_banks": getattr(m, "vram_banks", None),
         })
         return state
-    status = {"backend": "openmsx", "profile": SESSION.profile,
+    status = {"target": "local", "backend": "openmsx",
+              "channel": "openmsx-control",
+              "target_id": SESSION.local_id,
+              "bench_id": SESSION.bench_id,
+              "state": "connected", "profile": profile,
               "screen_mode": m.screen_mode()}
     if getattr(m, "attached", False):
         status["control_socket"] = getattr(m, "socket_path", None)
     return status
 
 
+def _identity_for(target):
+    """Describe one channel without issuing target I/O."""
+    m, profile = SESSION.backend(target)
+    connected = m is not None
+    identity = {
+        "target": target,
+        "backend": "openmsx" if target == "local" else "agent",
+        "channel": "openmsx-control" if target == "local"
+        else "agent-protocol",
+        "target_id": (SESSION.local_id if target == "local"
+                      else SESSION.agent_id),
+        "bench_id": SESSION.bench_id,
+        "state": "connected" if connected else "disconnected",
+    }
+    if connected and target == "local":
+        identity["profile"] = profile
+    if connected and target == "agent":
+        identity.update({
+            "peer": (list(m.peer) if isinstance(getattr(m, "peer", None), tuple)
+                     else getattr(m, "peer", None)),
+            "local_endpoint": (
+                list(m.local_endpoint)
+                if isinstance(getattr(m, "local_endpoint", None), tuple)
+                else getattr(m, "local_endpoint", None)),
+            "runtime_mode": getattr(m, "runtime_mode", None),
+            "agent_transport": getattr(m, "agent_transport", None),
+        })
+    return identity
+
+
+def t_status():
+    target = _TOOL_TARGET.get()
+    if target is not None:
+        return _status_for(target)
+    targets = SESSION.connected_targets()
+    if SESSION.bench_machine is not None:
+        local_connected = SESSION.backend("local")[0] is not None
+        agent_connected = SESSION.backend("agent")[0] is not None
+        return {
+            "backend": "hybrid-bench",
+            "state": ("connected" if local_connected and agent_connected
+                      else "degraded"),
+            "bench_id": SESSION.bench_id,
+            "targets": {
+                "local": _identity_for("local"),
+                "agent": _identity_for("agent"),
+            },
+        }
+    if not targets:
+        return {"backend": "none", "state": "disconnected"}
+    if len(targets) == 1:
+        return _identity_for(targets[0])
+    return {
+        "backend": "multiple",
+        "state": "connected",
+        "bench_id": SESSION.bench_id,
+        "targets": {target: _identity_for(target) for target in targets},
+    }
+
+
+def t_tcp_bench_status():
+    if SESSION.bench_machine is None:
+        return {"backend": "hybrid-bench", "bench_id": None,
+                "state": "disconnected", "targets": {}}
+    local_connected = SESSION.backend("local")[0] is not None
+    agent_connected = SESSION.backend("agent")[0] is not None
+    return {
+        "backend": "hybrid-bench",
+        "bench_id": SESSION.bench_id,
+        "state": "connected" if local_connected and agent_connected
+        else "degraded",
+        "targets": {
+            "local": (_status_for("local") if local_connected
+                      else _identity_for("local")),
+            "agent": (_status_for("agent") if agent_connected
+                      else _identity_for("agent")),
+        },
+    }
+
+
 def t_cpu_snapshot():
-    """Capture CPU debug state through the selected backend contract."""
-    return SESSION.require().cpu_snapshot()
+    """Capture CPU debug state through the fixed public tool route."""
+    backend, _profile, target = SESSION._resolve()
+    snapshot = dict(backend.cpu_snapshot())
+    snapshot["backend"] = "agent" if target == "agent" else "openmsx"
+    return snapshot
 
 
 def _require_real():
     if SESSION.profile != "real":
-        raise OpenMSXError("this operation requires an active real ASM-agent session")
+        raise OpenMSXError(
+            "this operation requires a connected ASM-agent session")
     return SESSION.require()
 
 
@@ -838,7 +1121,7 @@ class _OpenMSXApplicationBackend:
 
 
 def t_app_load(path, format=None, execute=None, verify=False):
-    """Load a manifest, COM, BLOAD BIN or flat ROM through the active backend."""
+    """Load a manifest, COM, BLOAD BIN or flat ROM through the fixed route."""
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         raise ValueError("path must be a non-empty filesystem path")
     if format is not None and not isinstance(format, str):
@@ -859,7 +1142,7 @@ def t_app_load(path, format=None, execute=None, verify=False):
     result = dict(load_application(
         backend, source, format=format, execute=execute, verify=verify,
         stop_before_load=real))
-    result["backend"] = "real" if real else "openmsx"
+    result["backend"] = "agent" if real else "openmsx"
     return result
 
 
@@ -968,7 +1251,7 @@ def t_type_line(text):
     consumed = m.type_line(text)
     if SESSION.profile == "real":
         return {
-            "backend": "real",
+            "backend": "agent",
             "bytes_consumed": consumed,
             "input": "line",
             "screen_capture_performed": False,
@@ -986,7 +1269,7 @@ def t_type_lines(lines):
     consumed = m.type_lines(lines)
     if SESSION.profile == "real":
         return {
-            "backend": "real",
+            "backend": "agent",
             "bytes_consumed": consumed,
             "input": "lines",
             "lines": len(lines),
@@ -1000,7 +1283,7 @@ def t_type(text):
     consumed = m.type(text)
     if SESSION.profile == "real":
         return {
-            "backend": "real",
+            "backend": "agent",
             "bytes_consumed": consumed,
             "input": "text",
             "screen_capture_performed": False,
@@ -1015,7 +1298,7 @@ def t_key(key):
         m.press(key)
         time.sleep(0.1)
         return {
-            "backend": "real",
+            "backend": "agent",
             "input": "key",
             "key": key,
             "screen_capture_performed": False,
@@ -1086,7 +1369,7 @@ def _run_real_basic_file(m, data, drive):
     # before execution without risking a second line being lost as type-ahead.
     m.type_line(f'KILL"{filename}":RUN')
     return {
-        "backend": "real",
+        "backend": "agent",
         "bytes_transferred": len(data),
         "delivery": "file-transfer-v2",
         "operation": "run-basic",
@@ -1134,7 +1417,7 @@ def t_run_basic_file(path, dos_prompt_confirmed, format="auto", drive="A"):
         raise TypeError("dos_prompt_confirmed must be a boolean")
     if not dos_prompt_confirmed:
         raise OpenMSXError(
-            "msx_run_basic_file requires dos_prompt_confirmed=true; confirm "
+            "msx_agent_run_basic_file requires dos_prompt_confirmed=true; confirm "
             "the MSX-DOS prompt externally before starting the worker")
     if SESSION.profile != "real":
         raise OpenMSXError(
@@ -1163,7 +1446,8 @@ def _require_file_transfer_backend(operation):
     method = getattr(m, operation, None)
     if not callable(method):
         raise OpenMSXError(
-            "the active backend does not implement resumable DOS file transfer")
+            "the connected ASM-agent backend does not implement resumable "
+            "DOS file transfer")
     if (SESSION.profile == "real" and
             not m.feature_bits & FEATURE_FILE_TRANSFER):
         raise OpenMSXError(
@@ -1183,7 +1467,7 @@ def _finish_file_transfer_tool(result):
 
 def t_file_put(local_path, msx_path, dos_prompt_confirmed,
                compression="auto", resume=True, timeout=600.0):
-    """Upload one arbitrary binary file through the active backend."""
+    """Upload one arbitrary binary file through the connected ASM agent."""
     if compression not in ("auto", "raw", "packbits"):
         raise ValueError("compression must be 'auto', 'raw', or 'packbits'")
     if not isinstance(resume, bool):
@@ -1214,7 +1498,7 @@ def t_file_put(local_path, msx_path, dos_prompt_confirmed,
 
 def t_file_get(msx_path, local_path, dos_prompt_confirmed,
                resume=True, timeout=600.0):
-    """Download one arbitrary binary file through the active backend."""
+    """Download one arbitrary binary file through the connected ASM agent."""
     if not isinstance(resume, bool):
         raise TypeError("resume must be a boolean")
     if not isinstance(dos_prompt_confirmed, bool):
@@ -1305,7 +1589,7 @@ def t_run_basic(program, clear=True, allow_existing_basic=False,
     consumed = m.type_lines(lines + ["RUN"])
     if real:
         return {
-            "backend": "real",
+            "backend": "agent",
             "bytes_consumed": consumed,
             "delivery": "keyboard-spool",
             "lines": len(lines),
@@ -1320,6 +1604,10 @@ def t_run_basic(program, clear=True, allow_existing_basic=False,
 def t_reset():
     if SESSION.profile == "real":
         raise OpenMSXError("physical reset is not implemented by the resident agent")
+    if SESSION.bench_machine is SESSION.require():
+        raise OpenMSXError(
+            "local reset is refused while the paired TCP bench is active; "
+            "use msx_tcp_bench_shutdown and start a new bench")
     m = SESSION.require()
     m.cmd("reset")
     m.advance(6)
@@ -1330,6 +1618,10 @@ def t_cmd(tcl):
     """Escape hatch: run a raw openMSX Tcl console command (peek/poke, debug…)."""
     if SESSION.profile == "real":
         raise OpenMSXError("raw Tcl commands are only available on openMSX")
+    if SESSION.bench_machine is SESSION.require():
+        raise OpenMSXError(
+            "raw Tcl is refused for a paired TCP bench because it could alter "
+            "or close the shared machine; use typed msx_local_* diagnostics")
     return SESSION.require().cmd(tcl)
 
 
@@ -1410,7 +1702,9 @@ def t_dos_asm_run(source, name="A.COM", run=True):
     if SESSION.profile == "real":
         raise OpenMSXError("MSX-DOS disk import is only available on openMSX")
     if SESSION.profile != "dos":
-        SESSION.boot("dos")
+        raise OpenMSXError(
+            "msx_local_dos_asm_run requires an existing local 'dos' profile; "
+            "start it explicitly with msx_local_boot(profile='dos')")
     m = SESSION.require()
     text = source
     if "org" not in source.lower():
@@ -1439,7 +1733,10 @@ def t_disk_put_text(name, content):
     if SESSION.profile == "real":
         raise OpenMSXError("host disk-image import is only available on openMSX")
     if SESSION.profile != "disk":
-        SESSION.boot("disk")
+        raise OpenMSXError(
+            "msx_local_disk_put_text requires an existing local 'disk' "
+            "profile; start it explicitly with "
+            "msx_local_boot(profile='disk')")
     m = SESSION.require()
     ensure_directory(DISKS)
     disk = DISKS / "work.dsk"
@@ -1456,9 +1753,36 @@ def t_disk_put_text(name, content):
 
 
 def t_shutdown():
-    backend = "real agent connection" if SESSION.profile == "real" else "emulator"
-    SESSION.shutdown()
-    return f"[{backend} stopped]"
+    target = _TOOL_TARGET.get()
+    if target == "local":
+        local = SESSION.backend("local")[0]
+        attached = bool(local is not None and getattr(local, "attached", False))
+        stopped = SESSION.shutdown_local()
+        if not stopped:
+            return "[local openMSX not connected]"
+        return ("[local openMSX detached]" if attached
+                else "[local openMSX stopped]")
+    if target == "agent":
+        stopped = SESSION.disconnect_agent()
+        return "[TCP agent disconnected]" if stopped else "[TCP agent not connected]"
+    targets = SESSION.connected_targets()
+    if len(targets) > 1:
+        raise BackendAmbiguousError(
+            "msx_shutdown is ambiguous with two connected targets; use "
+            "msx_local_shutdown, msx_agent_disconnect, or "
+            "msx_tcp_bench_shutdown")
+    if targets == ("local",):
+        SESSION.shutdown_local()
+        return "[local openMSX stopped]"
+    if targets == ("agent",):
+        SESSION.disconnect_agent()
+        return "[TCP agent disconnected]"
+    return "[no target connected]"
+
+
+def t_tcp_bench_shutdown():
+    stopped = SESSION.shutdown_bench()
+    return "[hybrid TCP bench stopped]" if stopped else "[hybrid TCP bench not running]"
 
 
 # --------------------------------------------------------------------------
@@ -1510,8 +1834,9 @@ TOOLS = {
     "msx_real_listen": (t_real_listen,
         "Compatibility alias for msx_agent_listen. Listen for a physical MSX "
         "running the ASM agent to connect over TCP. "
-        "After it connects, msx_screen and msx_screenshot read RAM/VRAM only "
-        "through the agent protocol, without using openMSX control APIs.",
+        "After it connects, msx_agent_screen and msx_agent_screenshot read "
+        "RAM/VRAM only through the agent protocol, without using openMSX "
+        "control APIs.",
         _s({"host": {"type": "string", "default": "127.0.0.1"},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535,
                      "default": 6603},
@@ -1550,9 +1875,11 @@ TOOLS = {
         "IPv4 loopback host. A headless "
         "bench is host-muted; window=true enables its visible renderer with "
         "normal sound after the TCP handshake. It remains alive until "
-        "msx_shutdown. Supported memory, "
-        "hardware, execution, application, and screenshot operations use the "
-        "TCP agent path, not openMSX debugger APIs. mode='resident' returns to "
+        "msx_tcp_bench_shutdown. The bench publishes two explicitly named "
+        "channels for the same single machine: msx_local_* uses only openMSX "
+        "control APIs, while msx_agent_* uses only TCP and the ASM agent. "
+        "Call either family in any order; no active-backend switch exists. "
+        "mode='resident' returns to "
         "DOS and supports bounded atomic inspect/patch/screenshot operations "
         "on cooperative DOS-launched software; persistent pause is disabled. "
         "Direct call/run/stop and slot/mapper selection require "
@@ -1568,7 +1895,7 @@ TOOLS = {
                      "default": "resident"},
             "debug": {"type": "boolean", "default": False}})),
     "msx_screen": (t_screen,
-        "Return the current MSX text screen (decoded from VRAM, headless).",
+        "Return the current MSX text screen through the tool's fixed channel.",
         _s({})),
     "msx_status": (t_status,
         "Return the active backend and state. A physical-agent session reports "
@@ -1577,7 +1904,7 @@ TOOLS = {
         _s({})),
     "msx_cpu_snapshot": (t_cpu_snapshot,
         "Capture Z80 registers and useful debug context without changing the "
-        "selected backend. openMSX briefly stops at an exact instruction "
+        "fixed route. openMSX briefly stops at an exact instruction "
         "boundary and returns PC/SP, code bytes, and stack words while "
         "preserving its prior run/break state. A physical agent returns the "
         "versioned BIOS H.TIMI callback-entry register frame; it explicitly "
@@ -1595,12 +1922,12 @@ TOOLS = {
         "to its upload monitor. Resident mode rejects this operation because it "
         "would discard the interrupted DOS/application context.", _s({})),
     "msx_io_read": (t_io_read,
-        "Real ASM-agent only: read one byte directly from an MSX hardware I/O "
+        "ASM-agent only: read one byte directly from an MSX hardware I/O "
         "port. Port and returned value are decimal integers in the JSON result.",
         _s({"port": {"type": "integer", "minimum": 0, "maximum": 255}},
            ["port"])),
     "msx_io_write": (t_io_write,
-        "Real ASM-agent only: write one byte directly to an MSX hardware I/O "
+        "ASM-agent only: write one byte directly to an MSX hardware I/O "
         "port. Optional verify reads the port back; leave it false for "
         "write-only or side-effectful devices.",
         _s({"port": {"type": "integer", "minimum": 0, "maximum": 255},
@@ -1608,21 +1935,21 @@ TOOLS = {
             "verify": {"type": "boolean", "default": False}},
            ["port", "value"])),
     "msx_slot_select": (t_slot_select,
-        "Real ASM-agent only: map an encoded primary/expanded slot ID into CPU "
+        "ASM-agent only: map an encoded primary/expanded slot ID into CPU "
         "page 0 or page 1. Available only in foreground-monitor mode; MemMan "
         "resident hooks cannot make a persistent, safe slot mapping.",
         _s({"page": {"type": "integer", "minimum": 0, "maximum": 1},
             "slot_id": {"type": "integer", "minimum": 0, "maximum": 255}},
            ["page", "slot_id"])),
     "msx_mapper_select": (t_mapper_select,
-        "Real ASM-agent only: select a memory-mapper segment for CPU page 0 "
+        "ASM-agent only: select a memory-mapper segment for CPU page 0 "
         "or page 1. Available only in foreground-monitor mode because remapping "
         "an interrupted resident program is unsafe.",
         _s({"page": {"type": "integer", "minimum": 0, "maximum": 1},
             "segment": {"type": "integer", "minimum": 0, "maximum": 255}},
            ["page", "segment"])),
     "msx_memory_read": (t_memory_read,
-        "Read RAM or VRAM through the selected backend; returns hex. On a real "
+        "Read RAM or VRAM through the tool's fixed channel; returns hex. On an "
         "agent, atomic=true (default) uses the bounded snapshot lease and "
         "resumes immediately after the read. Older agents require atomic=false. "
         "MemMan resident mode reserves RAM page 1 (0x4000-0x7FFF) "
@@ -1633,7 +1960,7 @@ TOOLS = {
             "atomic": {"type": "boolean", "default": True}},
            ["space", "address", "length"])),
     "msx_memory_write": (t_memory_write,
-        "Write hexadecimal bytes to RAM or VRAM through the selected backend. "
+        "Write hexadecimal bytes to RAM or VRAM through the fixed channel. "
         "Set verify=true to read back and compare. On a real agent, "
         "atomic=true (default) uses the bounded snapshot lease for the complete "
         "write and then resumes. Older agents require atomic=false. "
@@ -1670,7 +1997,7 @@ TOOLS = {
         "ASCII bytes atomically through the BIOS keyboard ring; software that "
         "reads the hardware key matrix directly will not observe them. A real "
         "target returns a delivery acknowledgement without implicitly reading "
-        "VRAM; call msx_screen explicitly when a capture is wanted.",
+        "VRAM; call the corresponding explicit screen tool when wanted.",
         _s({"text": {"type": "string"}}, ["text"])),
     "msx_type_lines": (t_type_lines,
         "Type multiple logical lines in one operation, adding RETURN after "
@@ -1778,7 +2105,7 @@ TOOLS = {
     "msx_reset": (t_reset,
         "OpenMSX only: reset the MSX and return the boot screen.", _s({})),
     "msx_app_load": (t_app_load,
-        "Load an application through the active backend using the shared, "
+        "Load an application through the tool's fixed channel using the shared, "
         "interface-independent loader. Detects msx-ai-app-v1 manifests, COM, "
         "BLOAD BIN and flat 16/32 KiB ROM files by extension/header. Relative "
         "paths are resolved from MSX_AI_USER_ROOT, or the server's current "
@@ -1806,14 +2133,14 @@ TOOLS = {
            ["source"])),
     "msx_dos_asm_run": (t_dos_asm_run,
         "OpenMSX only: assemble a Z80 .COM (org 0x100 default), import it "
-        "onto the Nextor hard disk and run it at the A:\\> prompt. Boots the 'dos' "
-        "profile automatically. Returns the DOS output.",
+        "onto the Nextor hard disk and run it at the A:\\> prompt. Requires "
+        "an existing local 'dos' profile. Returns the DOS output.",
         _s({"source": {"type": "string"},
             "name": {"type": "string", "default": "A.COM"},
             "run": {"type": "boolean", "default": True}}, ["source"])),
     "msx_disk_put_text": (t_disk_put_text,
         "OpenMSX only: write a text file into drive A's disk image so BASIC "
-        "can LOAD/RUN it. Switches to the disk profile if needed.",
+        "can LOAD/RUN it. Requires an existing local 'disk' profile.",
         _s({"name": {"type": "string"}, "content": {"type": "string"}},
            ["name", "content"])),
     "msx_cmd": (t_cmd,
@@ -1824,6 +2151,243 @@ TOOLS = {
         "Close the active emulator or real-agent connection. A paused real "
         "application is resumed before disconnecting.", _s({})),
 }
+
+_CANONICAL_TOOL_NAMES = tuple(TOOLS)
+
+
+def _targeted_handler(handler, target):
+    """Bind one public tool permanently to one backend family."""
+    def routed(**arguments):
+        token = _TOOL_TARGET.set(target)
+        try:
+            return handler(**arguments)
+        finally:
+            _TOOL_TARGET.reset(token)
+    routed.__name__ = f"{handler.__name__}_{target}"
+    return routed
+
+
+# Explicit public API.  The canonical handlers stay shared so parsing and
+# behavior cannot drift, but routing is fixed by tool name and cannot be
+# changed by arguments or by whichever backend connected most recently.
+LOCAL_TOOL_ALIASES = {
+    "msx_local_boot": "msx_boot",
+    "msx_local_attach": "msx_attach",
+    "msx_local_status": "msx_status",
+    "msx_local_screen": "msx_screen",
+    "msx_local_cpu_snapshot": "msx_cpu_snapshot",
+    "msx_local_memory_read": "msx_memory_read",
+    "msx_local_memory_write": "msx_memory_write",
+    "msx_local_screenshot": "msx_screenshot",
+    "msx_local_type_line": "msx_type_line",
+    "msx_local_type_lines": "msx_type_lines",
+    "msx_local_type": "msx_type",
+    "msx_local_key": "msx_key",
+    "msx_local_run_basic": "msx_run_basic",
+    "msx_local_reset": "msx_reset",
+    "msx_local_app_load": "msx_app_load",
+    "msx_local_asm_load": "msx_asm_load",
+    "msx_local_dos_asm_run": "msx_dos_asm_run",
+    "msx_local_disk_put_text": "msx_disk_put_text",
+    "msx_local_cmd": "msx_cmd",
+    "msx_local_shutdown": "msx_shutdown",
+}
+
+AGENT_TOOL_ALIASES = {
+    "msx_agent_status": "msx_status",
+    "msx_agent_screen": "msx_screen",
+    "msx_agent_cpu_snapshot": "msx_cpu_snapshot",
+    "msx_agent_pause": "msx_pause",
+    "msx_agent_resume": "msx_resume",
+    "msx_agent_stop": "msx_stop",
+    "msx_agent_io_read": "msx_io_read",
+    "msx_agent_io_write": "msx_io_write",
+    "msx_agent_slot_select": "msx_slot_select",
+    "msx_agent_mapper_select": "msx_mapper_select",
+    "msx_agent_memory_read": "msx_memory_read",
+    "msx_agent_memory_write": "msx_memory_write",
+    "msx_agent_screenshot": "msx_screenshot",
+    "msx_agent_type_line": "msx_type_line",
+    "msx_agent_type_lines": "msx_type_lines",
+    "msx_agent_type": "msx_type",
+    "msx_agent_key": "msx_key",
+    "msx_agent_run_basic": "msx_run_basic",
+    "msx_agent_run_basic_file": "msx_run_basic_file",
+    "msx_agent_file_put": "msx_file_put",
+    "msx_agent_file_get": "msx_file_get",
+    "msx_agent_app_load": "msx_app_load",
+    "msx_agent_asm_load": "msx_asm_load",
+    "msx_agent_disconnect": "msx_shutdown",
+}
+
+
+def _schema_without(schema, *properties):
+    excluded = set(properties)
+    return {
+        **schema,
+        "properties": {
+            name: value for name, value in schema["properties"].items()
+            if name not in excluded
+        },
+        "required": [
+            name for name in schema.get("required", []) if name not in excluded
+        ],
+    }
+
+
+LOCAL_SCHEMA_OVERRIDES = {
+    "msx_local_memory_read": _schema_without(
+        TOOLS["msx_memory_read"][2], "atomic"),
+    "msx_local_memory_write": _schema_without(
+        TOOLS["msx_memory_write"][2], "atomic"),
+    "msx_local_screenshot": _schema_without(
+        TOOLS["msx_screenshot"][2], "atomic", "allow_slow"),
+    "msx_local_run_basic": _schema_without(
+        TOOLS["msx_run_basic"][2], "transfer", "dos_prompt_confirmed",
+        "dos_drive", "allow_existing_basic"),
+}
+
+EXPLICIT_DESCRIPTIONS = {
+    "msx_local_status": (
+        "Return only the local openMSX control-channel state and identity. "
+        "This never contacts an ASM agent."),
+    "msx_agent_status": (
+        "Return only the ASM-agent protocol state, negotiated capabilities, "
+        "transport, and identity. This never calls an openMSX API."),
+    "msx_local_cpu_snapshot": (
+        "Capture an exact Z80 instruction-boundary snapshot through the local "
+        "openMSX debugger while preserving its previous run/break state."),
+    "msx_agent_cpu_snapshot": (
+        "Capture the cooperative Z80 H.TIMI callback-entry frame only through "
+        "the ASM-agent protocol; unavailable when that hook is not serviced. "
+        "It does not claim an exact application PC or SP."),
+    "msx_local_memory_read": (
+        "Read RAM or VRAM only through the local openMSX debugger and return "
+        "hexadecimal bytes."),
+    "msx_agent_memory_read": (
+        "Read RAM or VRAM only through the ASM agent. atomic=true uses a "
+        "bounded resident snapshot lease when supported."),
+    "msx_local_memory_write": (
+        "Write RAM or VRAM only through the local openMSX debugger; verify=true "
+        "performs a local read-back comparison."),
+    "msx_agent_memory_write": (
+        "Write RAM or VRAM only through the ASM agent. atomic=true uses a "
+        "bounded resident snapshot lease when supported."),
+    "msx_local_screenshot": (
+        "Capture and render the screen only through the local openMSX control "
+        "API. This remains available for bench diagnosis when the TCP agent "
+        "is stalled or disconnected."),
+    "msx_agent_screenshot": (
+        "Capture VRAM only through the ASM-agent protocol and render it "
+        "host-side. This validates the same path used by physical hardware "
+        "and never reads through openMSX control APIs."),
+    "msx_local_type_line": (
+        "Type one line plus Return through the local openMSX input API and "
+        "return the resulting text screen."),
+    "msx_local_type_lines": (
+        "Type several lines through the local openMSX input API and return "
+        "the resulting text screen."),
+    "msx_local_type": (
+        "Type text without an implicit Return through the local openMSX input "
+        "API and return the resulting text screen."),
+    "msx_local_key": (
+        "Send one named key through the local openMSX input API and return "
+        "the resulting text screen."),
+    "msx_agent_type_line": (
+        "Send one line through the ASM agent's credited BIOS keyboard spool; "
+        "returns an acknowledgement without capturing VRAM."),
+    "msx_agent_type_lines": (
+        "Send several lines through the ASM agent's credited BIOS keyboard "
+        "spool; returns one acknowledgement without capturing VRAM."),
+    "msx_agent_type": (
+        "Send text without implicit Return through the ASM agent's BIOS "
+        "keyboard spool; returns an acknowledgement without a screen read."),
+    "msx_agent_key": (
+        "Send a supported named key or break event only through the ASM agent; "
+        "returns an acknowledgement without a screen read."),
+    "msx_local_run_basic": (
+        "Enter and run a BASIC listing through local openMSX input. This tool "
+        "does not use the ASM-agent file-transfer path."),
+    "msx_agent_run_basic": (
+        "Enter and run a BASIC listing only through the ASM agent, using the "
+        "keyboard spool or confirmed MSX-DOS file delivery as requested."),
+    "msx_local_app_load": (
+        "Load a validated application only through local openMSX debugger "
+        "memory operations, with optional verification and execution."),
+    "msx_agent_app_load": (
+        "Load a validated application only through ASM-agent memory and "
+        "execution operations, subject to its negotiated runtime limits."),
+    "msx_local_asm_load": (
+        "Assemble Z80 source and load it only through local openMSX debugger "
+        "memory operations, with optional call or run."),
+    "msx_agent_asm_load": (
+        "Assemble Z80 source and load it only through ASM-agent memory "
+        "operations; call/run require foreground-monitor mode."),
+    "msx_local_shutdown": (
+        "Close an owned standalone openMSX process or detach from an external "
+        "one without quitting it. A bench-owned machine must be closed with "
+        "msx_tcp_bench_shutdown."),
+    "msx_agent_disconnect": (
+        "Disconnect only the ASM-agent protocol channel, leaving any local "
+        "openMSX diagnostic channel and bench process alive."),
+}
+
+for public_name, canonical_name in LOCAL_TOOL_ALIASES.items():
+    handler, description, schema = TOOLS[canonical_name]
+    TOOLS[public_name] = (
+        _targeted_handler(handler, "local"),
+        EXPLICIT_DESCRIPTIONS.get(
+            public_name,
+            "Local openMSX control API only; this tool never uses the TCP "
+            "agent. " + description),
+        LOCAL_SCHEMA_OVERRIDES.get(public_name, schema),
+    )
+
+for public_name, canonical_name in AGENT_TOOL_ALIASES.items():
+    handler, description, schema = TOOLS[canonical_name]
+    TOOLS[public_name] = (
+        _targeted_handler(handler, "agent"),
+        EXPLICIT_DESCRIPTIONS.get(
+            public_name,
+            "ASM-agent protocol only; this tool never uses openMSX debugger "
+            "or control APIs. " + description),
+        schema,
+    )
+
+TOOLS.update({
+    "msx_targets_status": (
+        t_status,
+        "Inventory the independently connected local openMSX and ASM-agent "
+        "channels. This tool reports identities only and never selects a "
+        "backend for another operation.",
+        _s({}),
+    ),
+    "msx_tcp_bench_status": (
+        t_tcp_bench_status,
+        "Return both explicitly identified channels of the hybrid test bench: "
+        "local openMSX control and the TCP ASM-agent protocol.",
+        _s({}),
+    ),
+    "msx_tcp_bench_shutdown": (
+        t_tcp_bench_shutdown,
+        "Close the hybrid bench atomically, including its TCP agent channel, "
+        "single owned openMSX process, and disposable runtime directory.",
+        _s({}),
+    ),
+})
+
+# The project is still pre-release, so ambiguous operational names are not
+# advertised.  Keeping the shared Python handlers above avoids duplicated
+# implementations; clients see only fixed-route local/agent names.
+_EXPLICIT_CORE_TOOLS = {
+    "msx_docs_search",
+    "msx_agent_listen",
+    "msx_agent_connect",
+    "msx_tcp_bench_start",
+}
+for _legacy_name in _CANONICAL_TOOL_NAMES:
+    if _legacy_name not in _EXPLICIT_CORE_TOOLS:
+        TOOLS.pop(_legacy_name, None)
 
 # --------------------------------------------------------------------------
 # MCP (JSON-RPC 2.0 over newline-delimited stdio)

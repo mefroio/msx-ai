@@ -23,9 +23,12 @@ TCP/IPv4 path.
   through RS232-Net and TCP. Agent operations do not fall back to openMSX
   debugger memory access.
 
-One MCP server session owns at most one active target. Backend selection is
-explicit: starting the server alone never starts openMSX or connects to
-hardware.
+One MCP server may retain an independent local openMSX channel and ASM-agent
+channel. Tool names fix routing: `msx_local_*` never uses TCP, and
+`msx_agent_*` never uses openMSX control APIs. Calls may alternate without a
+selection step. A simulated bench pairs both channels to one emulator under a
+shared `bench_id`; starting the server alone still never starts openMSX or
+connects to hardware.
 
 The installed `msx-ai-mcp` entry uses the official Python MCP SDK. STDIO is the
 default and unauthenticated Streamable HTTP is available only on IPv4 loopback.

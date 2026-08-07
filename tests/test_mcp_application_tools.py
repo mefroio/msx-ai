@@ -122,7 +122,7 @@ class MCPApplicationToolsTest(unittest.TestCase):
         self.assertEqual(self.backend.ram[0x100:0x102], b"\x00\xC9")
         self.assertEqual(self.backend.calls, [("call", 0x100)])
         self.assertEqual(self.backend.stops, 1)
-        self.assertEqual(result["backend"], "real")
+        self.assertEqual(result["backend"], "agent")
         self.assertEqual(result["format"], "com")
         self.assertEqual(result["bytes_loaded"], 2)
         self.assertTrue(result["segments"][0]["verified"])
@@ -214,7 +214,7 @@ class MCPApplicationToolsTest(unittest.TestCase):
                     msx_mcp_server, "current_cancellation_callback",
                     return_value=cancelled):
             with mock.patch.object(
-                    msx_mcp_server, "t_status", return_value="status"):
+                    msx_mcp_server, "t_tcp_bench_status", return_value="status"):
                 self.assertEqual(msx_mcp_server.t_tcp_bench_start(), "status")
         start.assert_called_once_with(
             host="127.0.0.1", port=0, timeout=60.0, window=False,
@@ -469,18 +469,19 @@ class MCPApplicationToolsTest(unittest.TestCase):
         self.assertEqual(self.backend.typed, [])
 
     def test_tools_are_published_with_required_fields_and_ranges(self):
-        for name in ("msx_app_load", "msx_io_read", "msx_io_write",
-                     "msx_slot_select", "msx_mapper_select",
+        for name in ("msx_agent_app_load", "msx_agent_io_read",
+                     "msx_agent_io_write", "msx_agent_slot_select",
+                     "msx_agent_mapper_select",
                      "msx_agent_listen", "msx_agent_connect",
-                     "msx_type_lines", "msx_run_basic_file",
-                     "msx_file_put", "msx_file_get"):
+                     "msx_agent_type_lines", "msx_agent_run_basic_file",
+                     "msx_agent_file_put", "msx_agent_file_get"):
             self.assertIn(name, msx_mcp_server.TOOLS)
-        app_schema = msx_mcp_server.TOOLS["msx_app_load"][2]
+        app_schema = msx_mcp_server.TOOLS["msx_agent_app_load"][2]
         self.assertEqual(app_schema["required"], ["path"])
         self.assertEqual(
-            msx_mcp_server.TOOLS["msx_slot_select"][2]["properties"]["page"]["maximum"],
+            msx_mcp_server.TOOLS["msx_agent_slot_select"][2]["properties"]["page"]["maximum"],
             1)
-        for name in ("msx_file_put", "msx_file_get"):
+        for name in ("msx_agent_file_put", "msx_agent_file_get"):
             schema = msx_mcp_server.TOOLS[name][2]
             self.assertIn("dos_prompt_confirmed", schema["required"])
             self.assertEqual(
@@ -573,12 +574,12 @@ class MCPApplicationToolsTest(unittest.TestCase):
             path.write_bytes(b"\xC9")
             response = msx_mcp_server.handle({
                 "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-                "params": {"name": "msx_app_load", "arguments": {
+                "params": {"name": "msx_agent_app_load", "arguments": {
                     "path": str(path), "execute": "none"}},
             })
         self.assertNotIn("isError", response["result"])
         result = json.loads(response["result"]["content"][0]["text"])
-        self.assertEqual(result["backend"], "real")
+        self.assertEqual(result["backend"], "agent")
 
 
 if __name__ == "__main__":

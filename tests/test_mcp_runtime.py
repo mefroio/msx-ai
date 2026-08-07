@@ -62,7 +62,7 @@ class MCPRuntimeTest(unittest.TestCase):
                 context, types.CallToolRequestParams(
                     name=name, arguments=arguments))
 
-        status = self.run_async(lambda: invoke("msx_status", {}))
+        status = self.run_async(lambda: invoke("msx_targets_status", {}))
         self.assertFalse(status.is_error)
         self.assertEqual(status.structured_content["state"], "disconnected")
         search = self.run_async(lambda: invoke(
@@ -78,7 +78,7 @@ class MCPRuntimeTest(unittest.TestCase):
         async def invoke():
             return await mcp_runtime._call_tool(
                 context, types.CallToolRequestParams(
-                    name="msx_memory_read",
+                    name="msx_local_memory_read",
                     arguments={"space": "rom", "address": 0, "length": 1}))
 
         result = self.run_async(invoke)
@@ -91,7 +91,7 @@ class MCPRuntimeTest(unittest.TestCase):
         async def invoke():
             return await mcp_runtime._call_tool(
                 context, types.CallToolRequestParams(
-                    name="msx_status", arguments={"unexpected": True}))
+                    name="msx_targets_status", arguments={"unexpected": True}))
 
         result = self.run_async(invoke)
         self.assertTrue(result.is_error)
@@ -99,7 +99,7 @@ class MCPRuntimeTest(unittest.TestCase):
                       result.content[0].text)
 
     def test_screenshot_content_has_image_and_structured_metadata(self):
-        result = mcp_runtime.normalize_tool_result("msx_screenshot", [
+        result = mcp_runtime.normalize_tool_result("msx_local_screenshot", [
             {"type": "text", "text": "[SCREEN 2]"},
             {"type": "image", "data": "AA==", "mimeType": "image/png"},
         ])
@@ -111,7 +111,8 @@ class MCPRuntimeTest(unittest.TestCase):
         })
 
     def test_json_shaped_plain_text_does_not_change_result_type(self):
-        for tool in ("msx_cmd", "msx_type_line", "msx_run_basic"):
+        for tool in ("msx_local_cmd", "msx_local_type_line",
+                     "msx_local_run_basic"):
             for raw in ("123", '{"a": 1}'):
                 with self.subTest(tool=tool, raw=raw):
                     result = mcp_runtime.normalize_tool_result(tool, raw)
@@ -119,23 +120,23 @@ class MCPRuntimeTest(unittest.TestCase):
 
     def test_native_dict_preserves_structured_dual_backend_result(self):
         raw = {
-            "backend": "real",
+            "backend": "agent",
             "bytes_consumed": 4,
             "input": "line",
             "screen_capture_performed": False,
         }
-        result = mcp_runtime.normalize_tool_result("msx_type_line", raw)
+        result = mcp_runtime.normalize_tool_result("msx_agent_type_line", raw)
         self.assertEqual(result.structured_content, raw)
 
     def test_bench_status_dict_matches_its_declared_object_schema(self):
         result = mcp_runtime.normalize_tool_result(
             "msx_tcp_bench_start",
-            {"backend": "none", "state": "disconnected"})
-        self.assertEqual(result.structured_content["backend"], "none")
+            {"backend": "hybrid-bench", "bench_id": None,
+             "state": "disconnected", "targets": {}})
+        self.assertEqual(result.structured_content["state"], "disconnected")
 
     def test_real_status_normalizes_socket_endpoints_before_schema_validation(self):
-        previous = (mcp_runtime.core.SESSION.msx,
-                    mcp_runtime.core.SESSION.profile)
+        previous = mcp_runtime.core.SESSION
         backend = SimpleNamespace(
             status=lambda: {"state": "monitor", "state_code": 0,
                             "protocol": 3},
@@ -148,17 +149,58 @@ class MCPRuntimeTest(unittest.TestCase):
             runtime_mode_id=1, feature_bits=0, vdp_generation=2,
             vram_size=131072, vram_banks=8)
         try:
-            mcp_runtime.core.SESSION.msx = backend
-            mcp_runtime.core.SESSION.profile = "real"
-            raw = mcp_runtime.core.t_status()
-            result = mcp_runtime.normalize_tool_result("msx_status", raw)
+            session = mcp_runtime.core.Session()
+            session._agent_msx = backend
+            session.agent_id = "agent-test"
+            mcp_runtime.core.SESSION = session
+            raw = mcp_runtime.core.TOOLS["msx_agent_status"][0]()
+            result = mcp_runtime.normalize_tool_result("msx_agent_status", raw)
         finally:
-            (mcp_runtime.core.SESSION.msx,
-             mcp_runtime.core.SESSION.profile) = previous
+            mcp_runtime.core.SESSION = previous
 
         self.assertEqual(result.structured_content["peer"], ["192.0.2.20", 6603])
         self.assertEqual(result.structured_content["local_endpoint"],
                          ["192.0.2.10", 41000])
+
+    def test_local_diagnostic_remains_live_while_agent_channel_is_blocked(self):
+        async def exercise():
+            state = mcp_runtime.RuntimeState(anyio.Lock())
+            agent_entered = anyio.Event()
+            release_agent = anyio.Event()
+            local_entered = anyio.Event()
+            second_agent_entered = anyio.Event()
+
+            async def stalled_agent():
+                async with mcp_runtime._tool_lock_scope(
+                        state, "msx_agent_status"):
+                    agent_entered.set()
+                    await release_agent.wait()
+
+            async def local_diagnostic():
+                await agent_entered.wait()
+                async with mcp_runtime._tool_lock_scope(
+                        state, "msx_local_screenshot"):
+                    local_entered.set()
+
+            async def second_agent():
+                await agent_entered.wait()
+                async with mcp_runtime._tool_lock_scope(
+                        state, "msx_agent_screen"):
+                    second_agent_entered.set()
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(stalled_agent)
+                group.start_soon(local_diagnostic)
+                group.start_soon(second_agent)
+                with anyio.fail_after(0.5):
+                    await local_entered.wait()
+                await anyio.sleep(0.03)
+                self.assertFalse(second_agent_entered.is_set())
+                release_agent.set()
+                with anyio.fail_after(0.5):
+                    await second_agent_entered.wait()
+
+        self.run_async(exercise)
 
     def test_resources_are_exact_hash_checked_corpus_entries(self):
         async def invoke():

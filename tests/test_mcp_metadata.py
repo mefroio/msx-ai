@@ -59,7 +59,7 @@ class MCPMetadataTest(unittest.TestCase):
         self.assertLessEqual(expected, mcp_metadata.DESTRUCTIVE_TOOLS)
 
     def test_io_reads_are_state_changing_and_not_idempotent(self):
-        hints = mcp_metadata.hints_for("msx_io_read")
+        hints = mcp_metadata.hints_for("msx_agent_io_read")
         self.assertFalse(hints.read_only)
         self.assertTrue(hints.destructive)
         self.assertFalse(hints.idempotent)
@@ -77,58 +77,80 @@ class MCPMetadataTest(unittest.TestCase):
 
     def test_specific_output_schemas_are_valid_draft_2020_12_schemas(self):
         for name in (
-                "msx_status", "msx_cpu_snapshot", "msx_file_put",
-                "msx_file_get", "msx_app_load",
-                "msx_type_line", "msx_type_lines", "msx_type", "msx_key",
-                "msx_run_basic", "msx_run_basic_file"):
+                "msx_targets_status", "msx_local_cpu_snapshot",
+                "msx_agent_cpu_snapshot", "msx_agent_file_put",
+                "msx_agent_file_get", "msx_local_app_load",
+                "msx_agent_type_line", "msx_agent_type_lines",
+                "msx_agent_type", "msx_agent_key",
+                "msx_agent_run_basic", "msx_agent_run_basic_file"):
             with self.subTest(tool=name):
                 schema = mcp_metadata.output_schema_for(name)
                 jsonschema.Draft202012Validator.check_schema(schema)
                 self.assertIsNot(schema, mcp_metadata.OBJECT_OUTPUT_SCHEMA)
 
-    def test_status_schema_distinguishes_disconnected_openmsx_and_real(self):
-        examples = [
-            {"backend": "none", "state": "disconnected"},
-            {
-                "backend": "openmsx", "profile": "attach", "screen_mode": 5,
-                "control_socket": "/tmp/openmsx-user/socket.1234",
-            },
-            {
-                "backend": "real",
-                "state": "running",
-                "state_code": 1,
-                "protocol": 3,
-                "peer": ["127.0.0.1", 6603],
-                "capabilities": ["ram-read", "ram-write"],
-                "resident_base": 0xC000,
-                "transport": "uart-16c550",
-                "agent_transport": "uart-16c550",
-                "agent_transport_id": 1,
-                "network_transport": "tcp",
-                "network_role": "client",
-                "local_endpoint": ["127.0.0.1", 6603],
-                "simulation": "openmsx-rs232-net",
-                "max_payload": 16384,
-                "control_level": 2,
-                "debug": False,
-                "runtime_mode": "resident",
-                "runtime_mode_id": 0,
-                "features": ["file-transfer-v2"],
-                "feature_bits": 1,
-                "vdp_generation": 2,
-                "vram_size": 131072,
-                "vram_banks": 8,
-            },
-        ]
-        schema = mcp_metadata.output_schema_for("msx_status")
-        for example in examples:
+    def test_status_schema_distinguishes_local_agent_and_hybrid_channels(self):
+        local_identity = {
+            "backend": "openmsx", "target": "local",
+            "channel": "openmsx-control", "target_id": "local-1",
+            "bench_id": "bench-123", "state": "connected",
+            "profile": "bench",
+        }
+        agent_identity = {
+            "backend": "agent", "target": "agent",
+            "channel": "agent-protocol", "target_id": "agent-1",
+            "bench_id": "bench-123", "state": "connected",
+            "peer": ["127.0.0.1", 6603],
+            "local_endpoint": ["127.0.0.1", 41000],
+            "runtime_mode": "resident", "agent_transport": "uart-8251",
+        }
+        targets_schema = mcp_metadata.output_schema_for("msx_targets_status")
+        for example in (
+                {"backend": "none", "state": "disconnected"},
+                local_identity,
+                agent_identity,
+                {"backend": "hybrid-bench", "bench_id": "bench-123",
+                 "state": "connected",
+                 "targets": {"local": local_identity,
+                             "agent": agent_identity}}):
             with self.subTest(backend=example["backend"]):
-                jsonschema.validate(example, schema)
+                jsonschema.validate(example, targets_schema)
+
+        local_status = dict(
+            local_identity, screen_mode=5,
+            control_socket="/tmp/openmsx-user/socket.1234")
+        agent_status = dict(
+            agent_identity, state="running", state_code=1, protocol=3,
+            capabilities=["ram-read", "ram-write"], resident_base=0xC000,
+            transport="uart-16c550", agent_transport_id=1,
+            network_transport="tcp", network_role="client",
+            simulation="openmsx-rs232-net", max_payload=16384,
+            control_level=2, debug=False, runtime_mode_id=0,
+            features=["file-transfer-v2"], feature_bits=1,
+            vdp_generation=2, vram_size=131072, vram_banks=8)
+        jsonschema.validate(
+            local_status, mcp_metadata.output_schema_for("msx_local_status"))
+        jsonschema.validate(
+            agent_status, mcp_metadata.output_schema_for("msx_agent_status"))
+        jsonschema.validate({
+            "backend": "hybrid-bench", "bench_id": "bench-123",
+            "state": "connected",
+            "targets": {"local": local_status, "agent": agent_status},
+        }, mcp_metadata.output_schema_for("msx_tcp_bench_status"))
+        disconnected_agent = {
+            "backend": "agent", "target": "agent",
+            "channel": "agent-protocol", "target_id": None,
+            "bench_id": "bench-123", "state": "disconnected",
+        }
+        jsonschema.validate({
+            "backend": "hybrid-bench", "bench_id": "bench-123",
+            "state": "degraded",
+            "targets": {"local": local_status,
+                        "agent": disconnected_agent},
+        }, mcp_metadata.output_schema_for("msx_tcp_bench_status"))
         with self.assertRaises(jsonschema.ValidationError):
-            jsonschema.validate(
-                {"backend": "openmsx", "profile": "attach", "screen_mode": "5"},
-                schema,
-            )
+            jsonschema.validate(agent_status,
+                                mcp_metadata.output_schema_for(
+                                    "msx_local_status"))
 
     def test_cpu_snapshot_schema_models_both_capture_contracts(self):
         openmsx = {
@@ -156,9 +178,9 @@ class MCPMetadataTest(unittest.TestCase):
             },
             "limitations": [],
         }
-        real = {
+        agent = {
             "schema": "msx-ai-cpu-snapshot-v1",
-            "backend": "real",
+            "backend": "agent",
             "capture": {
                 "source": "bios-h-timi-hook-entry",
                 "context_version": 1,
@@ -192,13 +214,18 @@ class MCPMetadataTest(unittest.TestCase):
             },
             "limitations": ["Cooperative H.TIMI boundary."],
         }
-        schema = mcp_metadata.output_schema_for("msx_cpu_snapshot")
-        jsonschema.validate(openmsx, schema)
-        jsonschema.validate(real, schema)
+        local_schema = mcp_metadata.output_schema_for("msx_local_cpu_snapshot")
+        agent_schema = mcp_metadata.output_schema_for("msx_agent_cpu_snapshot")
+        jsonschema.validate(openmsx, local_schema)
+        jsonschema.validate(agent, agent_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(openmsx, agent_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(agent, local_schema)
         invalid = dict(openmsx)
         invalid["capture"] = dict(openmsx["capture"], source="bios-h-timi-hook-entry")
         with self.assertRaises(jsonschema.ValidationError):
-            jsonschema.validate(invalid, schema)
+            jsonschema.validate(invalid, local_schema)
 
     def test_file_transfer_schemas_require_identity_crc_and_completion(self):
         common = {
@@ -222,16 +249,18 @@ class MCPMetadataTest(unittest.TestCase):
                    compression_reason="smaller wire payload")
         get = dict(common, direction="get", encoding="raw")
         get["source"], get["target"] = "A:\\PAYLOAD.BIN", "/tmp/PAYLOAD.BIN"
-        jsonschema.validate(put, mcp_metadata.output_schema_for("msx_file_put"))
-        jsonschema.validate(get, mcp_metadata.output_schema_for("msx_file_get"))
+        jsonschema.validate(
+            put, mcp_metadata.output_schema_for("msx_agent_file_put"))
+        jsonschema.validate(
+            get, mcp_metadata.output_schema_for("msx_agent_file_get"))
         invalid = dict(put, final_crc32="NOT-A-CRC")
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(
-                invalid, mcp_metadata.output_schema_for("msx_file_put"))
+                invalid, mcp_metadata.output_schema_for("msx_agent_file_put"))
 
     def test_application_example_has_a_concrete_shape(self):
         application = {
-            "backend": "real",
+            "backend": "agent",
             "name": "demo.com",
             "format": "com",
             "origin": "/tmp/demo.com",
@@ -248,48 +277,79 @@ class MCPMetadataTest(unittest.TestCase):
             "required_capabilities": ["write:ram", "execute:call"],
         }
         jsonschema.validate(
-            application, mcp_metadata.output_schema_for("msx_app_load"))
+            application, mcp_metadata.output_schema_for("msx_agent_app_load"))
+        local_application = dict(application, backend="openmsx")
+        jsonschema.validate(
+            local_application, mcp_metadata.output_schema_for(
+                "msx_local_app_load"))
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(
+                local_application,
+                mcp_metadata.output_schema_for("msx_agent_app_load"))
         mapper_only = dict(
             application, format="msx-ai-app-v1", segments=[], bytes_loaded=0,
             mapper={"page": 1, "segment": 2})
         jsonschema.validate(
-            mapper_only, mcp_metadata.output_schema_for("msx_app_load"))
+            mapper_only, mcp_metadata.output_schema_for("msx_agent_app_load"))
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(
                 dict(application, bytes_loaded=-1),
-                mcp_metadata.output_schema_for("msx_app_load"),
+                mcp_metadata.output_schema_for("msx_agent_app_load"),
             )
 
-    def test_dual_input_schema_accepts_screen_text_or_structured_agent_ack(self):
-        schema = mcp_metadata.output_schema_for("msx_type_lines")
-        jsonschema.validate({"result": "Ok\n"}, schema)
-        jsonschema.validate({
-            "backend": "real",
+    def test_input_schemas_are_fixed_to_local_text_or_agent_ack(self):
+        local_schema = mcp_metadata.output_schema_for("msx_local_type_lines")
+        agent_schema = mcp_metadata.output_schema_for("msx_agent_type_lines")
+        jsonschema.validate({"result": "Ok\n"}, local_schema)
+        acknowledgement = {
+            "backend": "agent",
             "bytes_consumed": 24,
             "input": "lines",
             "lines": 2,
             "screen_capture_performed": False,
-        }, schema)
+        }
+        jsonschema.validate(acknowledgement, agent_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate({"result": "Ok\n"}, agent_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(acknowledgement, local_schema)
         jsonschema.validate({
-            "backend": "real",
+            "backend": "agent",
             "input": "key",
             "key": "CTRL+STOP",
             "screen_capture_performed": False,
-        }, mcp_metadata.output_schema_for("msx_key"))
+        }, mcp_metadata.output_schema_for("msx_agent_key"))
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate({
-                "backend": "real",
+                "backend": "agent",
                 "input": "key",
                 "key": "CTRL+STOP",
                 "screen_capture_performed": False,
-            }, schema)
+            }, agent_schema)
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate({
-                "backend": "real",
+                "backend": "agent",
                 "bytes_consumed": 24,
                 "input": "lines",
                 "screen_capture_performed": True,
-            }, schema)
+            }, agent_schema)
+
+        local_basic_schema = mcp_metadata.output_schema_for(
+            "msx_local_run_basic")
+        agent_basic_schema = mcp_metadata.output_schema_for(
+            "msx_agent_run_basic")
+        basic_ack = {
+            "backend": "agent", "bytes_consumed": 32,
+            "delivery": "keyboard-spool", "lines": 3,
+            "operation": "run-basic", "run_submitted": True,
+            "screen_capture_performed": False,
+        }
+        jsonschema.validate({"result": "Ok\n"}, local_basic_schema)
+        jsonschema.validate(basic_ack, agent_basic_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate({"result": "Ok\n"}, agent_basic_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(basic_ack, local_basic_schema)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
+import asyncio
 import pathlib
 import tempfile
 import sys
 import tarfile
+import types
 import unittest
 from unittest import mock
 
@@ -103,6 +105,35 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
         environment = run.call_args_list[0].kwargs["env"]
         self.assertEqual(environment["HOME"], environment["USERPROFILE"])
         self.assertEqual(environment["MSX_RUN_INTEGRATION"], "0")
+
+    def test_runtime_smoke_uses_unambiguous_target_inventory(self):
+        client = mock.MagicMock()
+        client.protocol_version = "test"
+        client.__aenter__ = mock.AsyncMock(return_value=client)
+        client.__aexit__ = mock.AsyncMock(return_value=False)
+        explicit_tools = [
+            types.SimpleNamespace(name=name)
+            for name in sorted(release_check._RUNTIME_REQUIRED_TOOLS)
+        ]
+        explicit_tools.extend(
+            types.SimpleNamespace(name=f"extra_{index}")
+            for index in range(35 - len(explicit_tools)))
+        client.list_tools = mock.AsyncMock(return_value=types.SimpleNamespace(
+            tools=explicit_tools))
+        client.call_tool = mock.AsyncMock(return_value=types.SimpleNamespace(
+            is_error=False,
+            structured_content={"backend": "none", "state": "disconnected"}))
+        client.list_resources = mock.AsyncMock(return_value=types.SimpleNamespace(
+            resources=[types.SimpleNamespace(uri="docs://msx-ai/index")] * 8))
+        client.read_resource = mock.AsyncMock(return_value=types.SimpleNamespace(
+            contents=[types.SimpleNamespace(text="MSX-AI documentation")]))
+        client.list_prompts = mock.AsyncMock(return_value=types.SimpleNamespace(
+            prompts=[object(), object()]))
+
+        protocol = asyncio.run(release_check._mcp_assertions(client, "test")())
+
+        self.assertEqual(protocol, "test")
+        client.call_tool.assert_awaited_once_with("msx_targets_status", {})
 
     def test_runtime_smoke_cli_is_explicit_and_bypasses_release_build(self):
         with (mock.patch.object(

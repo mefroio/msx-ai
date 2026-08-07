@@ -78,7 +78,9 @@ class BackendOptionalityTest(unittest.TestCase):
         tools = {tool["name"] for tool in replies[1]["result"]["tools"]}
         self.assertIn("msx_agent_listen", tools)
         self.assertIn("msx_agent_connect", tools)
-        self.assertIn("msx_file_put", tools)
+        self.assertIn("msx_agent_file_put", tools)
+        self.assertIn("msx_local_boot", tools)
+        self.assertNotIn("msx_file_put", tools)
         self.assertFalse(missing_openmsx.exists())
 
     def test_unselected_backend_never_autostarts_openmsx(self):
@@ -87,7 +89,7 @@ class BackendOptionalityTest(unittest.TestCase):
               mock.patch.object(msx_client.shutil, "which") as which):
             with self.assertRaisesRegex(
                     msx_mcp_server.BackendNotSelectedError,
-                    "msx_agent_listen.*msx_agent_connect.*msx_boot"):
+                    "msx_local_boot.*msx_local_attach.*msx_agent_listen"):
                 session.require()
         openmsx.assert_not_called()
         which.assert_not_called()

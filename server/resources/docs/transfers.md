@@ -1,6 +1,6 @@
 # Resumable MSX-DOS file transfer
 
-`msx_file_put` and `msx_file_get` transfer arbitrary files through a current
+`msx_agent_file_put` and `msx_agent_file_get` transfer arbitrary files through a current
 resident agent and the matching `MSXAIXF.COM` transient helper. Direct openMSX
 and foreground-monitor sessions do not provide this data plane.
 

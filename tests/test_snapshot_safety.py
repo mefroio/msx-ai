@@ -643,7 +643,7 @@ class ScreenshotFlowTest(unittest.TestCase):
         self.assertEqual(events, [
             ("lease", True), "resumed", ("lease", True), "resumed"])
         self.assertEqual(result[1]["type"], "image")
-        schema = msx_mcp_server.TOOLS["msx_screenshot"][2]
+        schema = msx_mcp_server.TOOLS["msx_agent_screenshot"][2]
         self.assertFalse(schema["properties"]["allow_slow"]["default"])
 
 

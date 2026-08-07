@@ -1,15 +1,17 @@
 """Standards-based MCP runtime for the synchronous MSX-AI tool core.
 
 The official Python SDK supplies dual-era protocol handling, STDIO and
-Streamable HTTP.  Target operations remain serialized and run outside the
-event loop; file transfers receive cooperative progress and cancellation hooks.
+Streamable HTTP. Mutating target operations remain serialized and run outside
+the event loop; explicit local diagnostics can stay responsive while an agent
+request stalls. File transfers receive cooperative progress and cancellation
+hooks.
 """
 
 from __future__ import annotations
 
 import argparse
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import queue
 import sys
@@ -45,10 +47,13 @@ SERVER_DESCRIPTION = (
     "Python MCP server."
 )
 SERVER_INSTRUCTIONS = (
-    "Select exactly one target backend before using target tools. Use "
-    "msx_boot or msx_attach for direct openMSX control, msx_tcp_bench_start "
-    "for the simulated physical-agent path, and msx_agent_listen or "
-    "msx_agent_connect for physical hardware. Read msx-ai://docs/index or "
+    "Tool names select the channel explicitly: msx_local_* always uses the "
+    "openMSX control API, while msx_agent_* always uses the ASM-agent "
+    "protocol. Both channels may coexist and can be alternated without "
+    "changing global selection state. Use msx_local_boot or msx_local_attach "
+    "for direct openMSX control, msx_tcp_bench_start for a paired simulation, "
+    "and msx_agent_listen or msx_agent_connect for physical hardware. Read "
+    "msx-ai://docs/index or "
     "call msx_docs_search when backend or safety requirements are unclear."
 )
 PUBLIC_CACHE_MS = 300_000
@@ -58,6 +63,51 @@ _WORKER_POLL_SECONDS = 0.02
 @dataclass
 class RuntimeState:
     target_lock: anyio.Lock
+    local_lock: anyio.Lock = field(default_factory=anyio.Lock)
+    agent_lock: anyio.Lock = field(default_factory=anyio.Lock)
+
+
+_LOCAL_DIAGNOSTIC_TOOLS = frozenset({
+    "msx_local_status",
+    "msx_local_screen",
+    "msx_local_screenshot",
+})
+_NO_TARGET_IO_TOOLS = frozenset({"msx_docs_search", "msx_targets_status"})
+_BENCH_LIFECYCLE_TOOLS = frozenset({
+    "msx_tcp_bench_start",
+    "msx_tcp_bench_status",
+    "msx_tcp_bench_shutdown",
+})
+
+
+@asynccontextmanager
+async def _tool_lock_scope(state: RuntimeState, name: str):
+    """Serialize per channel while keeping safe local diagnostics responsive."""
+    if name in _NO_TARGET_IO_TOOLS:
+        yield
+        return
+    if name in _LOCAL_DIAGNOSTIC_TOOLS:
+        async with state.local_lock:
+            yield
+        return
+    if name in _BENCH_LIFECYCLE_TOOLS:
+        async with state.target_lock:
+            async with state.local_lock:
+                async with state.agent_lock:
+                    yield
+        return
+    if name.startswith("msx_local_"):
+        async with state.target_lock:
+            async with state.local_lock:
+                yield
+        return
+    if name.startswith("msx_agent_"):
+        async with state.target_lock:
+            async with state.agent_lock:
+                yield
+        return
+    async with state.target_lock:
+        yield
 
 
 @asynccontextmanager
@@ -66,12 +116,14 @@ async def _lifespan(_server: Server):
     try:
         yield state
     finally:
-        # Shutdown is intentionally serialized with all normal target calls by
-        # the server lifespan.  A transport close cannot leave openMSX or a
-        # physical-agent socket owned by an exited MCP process.
+        # Shutdown waits for both channels and every mutating operation. A
+        # transport close cannot leave openMSX or a physical-agent socket
+        # owned by an exited MCP process.
         with anyio.CancelScope(shield=True):
             async with state.target_lock:
-                await anyio.to_thread.run_sync(core.SESSION.shutdown)
+                async with state.local_lock:
+                    async with state.agent_lock:
+                        await anyio.to_thread.run_sync(core.SESSION.shutdown)
 
 
 def _tool_models() -> list[types.Tool]:
@@ -111,7 +163,7 @@ def normalize_tool_result(name: str, raw: Any) -> types.CallToolResult:
     """Convert legacy string/content returns into MCP structured output."""
     if isinstance(raw, list):
         content = [_content_block(block) for block in raw]
-        if name == "msx_screenshot":
+        if mcp_metadata.canonical_tool_name(name) == "msx_screenshot":
             summary = next((block.text for block in content
                             if isinstance(block, types.TextContent)),
                            "MSX screenshot")
@@ -233,11 +285,8 @@ async def _call_tool(ctx: ServerRequestContext,
         location = f" at {path}" if path else ""
         return _tool_error(f"invalid arguments{location}: {exc.message}")
     try:
-        if params.name == "msx_docs_search":
+        async with _tool_lock_scope(ctx.lifespan_context, params.name):
             raw = await _run_sync_handler(ctx, entry[0], arguments)
-        else:
-            async with ctx.lifespan_context.target_lock:
-                raw = await _run_sync_handler(ctx, entry[0], arguments)
         return normalize_tool_result(params.name, raw)
     except anyio.get_cancelled_exc_class():
         raise
@@ -346,21 +395,24 @@ async def _get_prompt(_ctx, params: types.GetPromptRequestParams):
         visible = visible_value.lower() in {"1", "true", "yes", "on"}
         if backend == "openmsx-direct":
             action = (
-                f"Call msx_boot with profile='basic' and window={str(visible).lower()}, "
-                "then call msx_status and perform one read-only msx_screen check.")
+                f"Call msx_local_boot with profile='basic' and "
+                f"window={str(visible).lower()}, then call msx_local_status "
+                "and perform one read-only msx_local_screen check.")
         elif backend == "agent-simulated":
             action = (
                 f"Call msx_tcp_bench_start with mode='{mode}' and "
-                f"window={str(visible).lower()}, then verify msx_status. Keep only "
-                "one openMSX process alive.")
+                f"window={str(visible).lower()}, then verify both channels with "
+                "msx_tcp_bench_status. Use msx_local_* for local inspection and "
+                "msx_agent_* for protocol validation. Keep only one openMSX "
+                "process alive.")
         else:
             action = (
                 "Ask whether the adapter is a TCP client or server. Use "
                 "msx_agent_listen for a client adapter, or msx_agent_connect for "
-                "a server adapter. After handshake, call msx_status before any "
+                "a server adapter. After handshake, call msx_agent_status before any "
                 "mutating tool. Do not assume BaDCaT-specific setup.")
         text = (
-            "Start an MSX-AI session using the selected backend. " + action +
+            "Start an MSX-AI session using explicit channel tools. " + action +
             " Read msx-ai://docs/backends and msx-ai://docs/safety when a "
             "capability or resident/monitor restriction is uncertain.")
         description = "Backend-aware startup plan"
@@ -382,10 +434,12 @@ async def _get_prompt(_ctx, params: types.GetPromptRequestParams):
                 message="symptom must be a string")
         text = (
             f"Diagnose the {backend} connection. Reported symptom: {symptom}. "
-            "Begin with msx_status. If no backend is selected, inspect the "
-            "startup method and endpoint without launching another emulator. "
-            "Use msx_screen or msx_cpu_snapshot only when the reported runtime "
-            "supports that cooperative operation. Do not issue reset, raw Tcl, "
+            "Begin with msx_targets_status, then use msx_local_status or "
+            "msx_agent_status for the intended channel. If neither channel is "
+            "connected, inspect the startup method and endpoint without "
+            "launching another emulator. Use the corresponding local or agent "
+            "screen/CPU tool only when its runtime supports that operation. Do "
+            "not issue reset, raw Tcl, "
             "memory writes, or transport restarts until the evidence is summarized. "
             "Consult msx-ai://docs/safety and msx-ai://docs/backends.")
         description = "Read-only connection diagnosis plan"

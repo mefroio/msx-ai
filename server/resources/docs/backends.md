@@ -1,19 +1,28 @@
 # Backends and runtime modes
 
-Backend selection changes both the available tools and the meaning of a CPU
-snapshot. The simulated and physical agent paths deliberately share the same
-protocol behavior; simulation is not permission to bypass that protocol with
-openMSX debugger operations.
+MSX-AI does not maintain an implicit active backend. Tool names fix the route:
+`msx_local_*` uses only the openMSX control API, and `msx_agent_*` uses only the
+ASM-agent protocol. The channels can coexist and calls can alternate in any
+order. The simulated and physical agent paths deliberately share the same
+protocol behavior; a local diagnostic call is explicit and never masquerades
+as evidence from the agent path.
+
+Earlier checkout configurations must replace `msx_status` with the explicit
+local/agent status or `msx_targets_status`, replace `msx_shutdown` with the
+matching channel or bench lifecycle tool, and replace `msx_real_listen` with
+`msx_agent_listen`. For every other historical `msx_<operation>` name, choose
+the intended `msx_local_<operation>` or `msx_agent_<operation>` form. The
+server does not publish ambiguous compatibility aliases.
 
 ## Capability matrix
 
 | Capability | Direct openMSX | Simulated agent | Physical agent |
 |---|---|---|---|
-| Start or attach target | `msx_boot`, `msx_attach` | `msx_tcp_bench_start` | `msx_agent_listen`, `msx_agent_connect` |
+| Start or attach target | `msx_local_boot`, `msx_local_attach` | `msx_tcp_bench_start` | `msx_agent_listen`, `msx_agent_connect` |
 | Text screen and PNG screenshot | Yes | Yes | Yes |
 | BASIC and BIOS text input | Yes | Resident | Resident |
 | CPU snapshot | Exact debugger boundary | Cooperative callback context | Cooperative callback context |
-| Typed RAM and VRAM read/write | Agent tools not used | Resident or monitor, with restrictions | Resident or monitor, with restrictions |
+| Typed RAM and VRAM read/write | Yes, through `msx_local_*` | Resident or monitor, with restrictions | Resident or monitor, with restrictions |
 | Application loader | Yes | Yes, mode restrictions apply | Yes, mode restrictions apply |
 | Resumable MSX-DOS PUT/GET | No | Current resident | Current resident |
 | Direct I/O-port access | Use expert openMSX console facilities | Agent | Agent |
@@ -45,6 +54,17 @@ resident BIOS keyboard injection, and is not the MSX-DOS file-transfer mode.
 Use direct openMSX for fast emulator automation and exact debugger snapshots.
 Use the simulated agent to test the real protocol and resident restrictions in
 a repeatable emulator environment. Use the physical agent when behavior on
-actual MSX hardware is the subject of the session. Call `msx_status` after
-every selection or reconnect rather than inferring the backend from a previous
-operation.
+actual MSX hardware is the subject of the session. Call `msx_local_status` or
+`msx_agent_status` for the intended channel after connecting. In a simulated
+bench, `msx_tcp_bench_status` reports both identities and their shared
+`bench_id`. Connection order and previous operations never alter routing.
+
+## Paired bench
+
+The TCP bench owns exactly one openMSX process and exposes it through two
+independent channels. `msx_agent_*` validates what a future physical MSX sees;
+`msx_local_*` provides direct emulator diagnostics, including screenshots when
+the agent is stalled. `msx_agent_disconnect` leaves the local diagnostic
+channel alive. `msx_local_shutdown` is refused for a bench-owned process;
+`msx_tcp_bench_shutdown` closes the agent, emulator, and temporary runtime as
+one explicit lifecycle operation.
