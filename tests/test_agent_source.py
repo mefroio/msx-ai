@@ -280,6 +280,61 @@ class ResidentAgentSourceTests(unittest.TestCase):
             nested_timi,
             r"(?s)pop af.*ex af,af'.*xor a.*ex af,af'.*ret")
 
+    def test_foreground_idle_hooks_leave_uart_with_monitor_loop(self):
+        hooks = self.source.split(
+            "; ------------------------------------------------------------ BIOS hooks", 1
+        )[1].split("; DEBUG is deliberately", 1)[0]
+        foreground = hooks.split("else\nresident_keyi_hook:", 1)[1]
+        keyi = foreground.split("resident_timi_hook:", 1)[0]
+        timi = foreground.split("resident_timi_hook:", 1)[1].split(
+            "resident_hook_saved_af:", 1)[0]
+        for entry in (keyi, timi):
+            self.assertIn("ld a,(runtime_mode)", entry)
+            self.assertIn("cp RUNTIME_MONITOR", entry)
+            self.assertIn("ld a,(run_state)", entry)
+            self.assertIn("or a", entry)
+        self.assertIn("and TRANSPORT_FLAG_KEYI_EXCLUSIVE", keyi)
+        self.assertIn("jp old_keyi", keyi)
+        self.assertIn("jp old_timi", timi)
+
+    def test_monitor_call_restores_interrupt_invariant(self):
+        raw_call = self.source.split("cmd_call:", 1)[1].split(
+            "cmd_run:", 1)[0]
+        framed_call = self.source.split("frame_call_allowed:", 1)[1].split(
+            "frame_cmd_run:", 1)[0]
+        self.assertLess(raw_call.index("call jump_hl"), raw_call.index("di"))
+        self.assertLess(raw_call.index("di"), raw_call.index("ld a,'K'"))
+        self.assertLess(
+            framed_call.index("call jump_hl"), framed_call.index("di"))
+        self.assertLess(
+            framed_call.index("di"), framed_call.index("jp frame_reply_ok"))
+
+    def test_ctrl_stop_exits_foreground_monitor_safely(self):
+        main = self.source.split("main_loop:", 1)[1].split(
+            "; MODE is the BIOS-owned", 1)[0]
+        self.assertRegex(
+            main,
+            r"(?s)call transport_rx_ready.*"
+            r"jr nz,main_loop_receive.*call monitor_ctrl_stop_pressed.*"
+            r"jp c,monitor_exit_to_dos.*jr main_loop")
+        key_scan = self.source.split(
+            "monitor_ctrl_stop_pressed:", 1)[1].split(
+            "; MODE is the BIOS-owned", 1)[0]
+        self.assertRegex(
+            key_scan,
+            r"(?s)push ix.*push iy.*ld ix,BREAKX.*"
+            r"ld iy,\(EXPTBL - 1\).*call CALSLT.*pop iy.*pop ix.*ret")
+        self.assertNotIn("call BREAKX", key_scan)
+        uninstall = self.source.split("cmd_uninstall:", 1)[1].split(
+            "error_busy:", 1)[0]
+        exit_path = uninstall.split("monitor_exit_to_dos:", 1)[1]
+        self.assertIn("ld hl,old_keyi", exit_path)
+        self.assertIn("ld hl,old_timi", exit_path)
+        self.assertIn("ld hl,(old_bdos)", exit_path)
+        self.assertIn("call transport_restore", exit_path)
+        self.assertIn("jp 0005h", exit_path)
+        self.assertIn("Press CTRL+STOP to cancel", self.source)
+
     def test_hook_serial_waits_use_an_explicit_bounded_budget(self):
         budget = re.search(
             r"(?m)^HOOK_IO_BUDGET:\s+equ\s+0([0-9A-Fa-f]+)h\s*$",

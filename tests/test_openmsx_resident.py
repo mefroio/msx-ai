@@ -548,6 +548,23 @@ mailbox: dw 0
         self.assertIn(
             "invalid_state", idle_snapshot["content"][0]["text"].lower())
 
+        synchronous = """org 08100h
+start:  ei
+        halt
+        ld hl,(counter)
+        inc hl
+        ld (counter),hl
+        ret
+counter: dw 0
+"""
+        self.call_tool("msx_asm_load", source=synchronous, address=0x8100,
+                       execute="call")
+        self.assertEqual(
+            int.from_bytes(
+                self.read_memory("ram", 0x810A, 2, atomic=False), "little"),
+            1)
+        self.assertEqual(self.status()["state"], "monitor")
+
         demo = """org 08000h
 start:  ei
 loop:   halt

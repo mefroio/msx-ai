@@ -56,6 +56,8 @@ H_TIMI:         equ 0FD9Fh
 MSXVER:         equ 0002Dh
 RDSLT:          equ 0000Ch
 WRSLT:          equ 00014h
+CALSLT:         equ 0001Ch
+BREAKX:         equ 000B7h
 EXTBIO:         equ 0FFCAh
 EXPTBL:         equ 0FCC1h
 RAMAD0:         equ 0F341h
@@ -388,7 +390,8 @@ transport_16c550_banner:
 resident_mode_banner:
     db "Mode: MemMan resident agent (default)",13,10,"$"
 monitor_mode_banner:
-    db "Mode: foreground monitor",13,10,"$"
+    db "Mode: foreground monitor",13,10
+    db "Press CTRL+STOP to cancel",13,10,"$"
 uninstall_mode_banner:
     db "Action: uninstall resident agent",13,10,"$"
 debug_on_banner:
@@ -949,8 +952,34 @@ if MSXAI_TSR_BUILD
     call xfer_reset
 endif
 main_loop:
+if MSXAI_TSR_BUILD
+else
+    call transport_rx_ready
+    or a
+    jr nz,main_loop_receive
+    call monitor_ctrl_stop_pressed
+    jp c,monitor_exit_to_dos
+    jr main_loop
+main_loop_receive:
+endif
     call receive_dispatch
     jr main_loop
+
+if MSXAI_TSR_BUILD
+else
+; MSX-DOS maps RAM over the ordinary BIOS entry addresses. Invoke Main-ROM
+; BREAKX through the preserved interslot CALSLT vector; its carry result is
+; valid even while maskable interrupts are disabled.
+monitor_ctrl_stop_pressed:
+    push ix
+    push iy
+    ld ix,BREAKX
+    ld iy,(EXPTBL - 1)
+    call CALSLT
+    pop iy
+    pop ix
+    ret
+endif
 
 ; MODE is the BIOS-owned capacity descriptor documented by the MSX2 Technical
 ; Handbook.  Do not infer capacity from the VDP/machine generation: a V9938 may
@@ -1137,6 +1166,26 @@ memman_hook_continue:
 else
 resident_keyi_hook:
     push af
+    ; The foreground monitor owns the UART while it is idle or servicing a
+    ; synchronous CALL. A BIOS routine invoked by CALL may enable interrupts;
+    ; parsing a retry here would re-enter the protocol before the first result
+    ; is cached. Keep suppressing an exclusive predecessor, but leave the frame
+    ; pending for the foreground loop.
+    ld a,(runtime_mode)
+    cp RUNTIME_MONITOR
+    jr nz,foreground_keyi_dispatch
+    ld a,(run_state)
+    or a
+    jr nz,foreground_keyi_dispatch
+    ld a,(active_transport_flags)
+    and TRANSPORT_FLAG_KEYI_EXCLUSIVE
+    jr z,foreground_keyi_chain
+    pop af
+    ret
+foreground_keyi_chain:
+    pop af
+    jp old_keyi
+foreground_keyi_dispatch:
     ld a,(in_hook)
     or a
     jr nz,nested_keyi_return
@@ -1154,6 +1203,17 @@ nested_keyi_chain:
     jp old_keyi
 resident_timi_hook:
     push af
+    ; H.TIMI follows the same ownership rule. It resumes UART dispatch after
+    ; asynchronous RUN marks run_state nonzero, preserving pause and control.
+    ld a,(runtime_mode)
+    cp RUNTIME_MONITOR
+    jr nz,foreground_timi_dispatch
+    ld a,(run_state)
+    or a
+    jr nz,foreground_timi_dispatch
+    pop af
+    jp old_timi
+foreground_timi_dispatch:
     ld a,(in_hook)
     or a
     jr nz,nested_timi_chain
@@ -1616,6 +1676,7 @@ cmd_call:
     or a
     jp nz,error_busy           ; never execute arbitrary code inside an ISR
     call jump_hl
+    di                         ; called code must not leak EI into the monitor
     ld a,'K'
     jp ser_put
 
@@ -1848,6 +1909,7 @@ else
     jr nz,error_ownership
     ld a,'K'
     call ser_put
+monitor_exit_to_dos:
     di
     ld hl,old_keyi
     ld de,H_KEYI
@@ -4459,6 +4521,7 @@ frame_call_state:
 frame_call_allowed:
     ld hl,(frame_request_buffer)
     call jump_hl
+    di                         ; restore the foreground monitor's IRQ invariant
     jp frame_reply_ok
 
 frame_cmd_run:
