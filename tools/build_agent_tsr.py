@@ -32,7 +32,7 @@ TSR_NAME = "MSXAI MCP1"
 # Keep all synthetic link origins low enough that the largest supported TSR
 # still fits in page 1.  They only need to be distinct to cross-check inferred
 # relocations; high origins unnecessarily reduced the builder's size ceiling.
-BUILD_ORIGINS = (0x4024, 0x49B5, 0x5346)
+BUILD_ORIGINS = (0x4024, 0x44B5, 0x4946)
 H_KEYI = 0xFD9A
 H_TIMI = 0xFD9F
 TRANSPORT_TEMPLATE = 0xFE

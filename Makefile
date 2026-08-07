@@ -5,6 +5,7 @@ AGENT_TSR_SRC := agent/msx_agent_tsr.asm
 AGENT_CORE := agent/msx_agent_core.asm
 AGENT_LOADER := agent/msx_memman_loader.asm
 AGENT_XFER_SRC := agent/msx_xfer.asm
+AGENT_XFER_ENGINE := agent/msx_xfer_engine.inc
 AGENT_XFER_PROTOCOL := agent/msx_xfer_protocol.inc
 AGENT_TRANSPORTS := agent/transports/msx_transport_8251.inc \
 	agent/transports/msx_transport_16c550.inc
@@ -24,6 +25,9 @@ AGENT_SUITE := $(AGENT_COM) $(AGENT_XFER_COM) \
 # Bench MSX-DOS exposes a TPA from 0100h through 9898h (38,808 bytes).
 # Keep 2 KiB free above each transient COM for its stack and DOS call headroom.
 MSX_DOS_BENCH_COM_MAX := 36760
+# MSXAIXF borrows 4000h-7FFFh as uninitialized accumulator RAM. Since COM
+# images load at 0100h, the helper file itself must end no later than 3FFFh.
+MSX_XFER_PAGE0_COM_MAX := 16128
 
 .PHONY: agent agent-prerequisites agent-tsr memman-assets test test-integration
 
@@ -56,10 +60,10 @@ $(AGENT_COM): $(AGENT_SRC) $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) 
 	$(Z80ASM) $< -o $@
 	$(PYTHON) tools/check_msx_com_size.py $@ $(MSX_DOS_BENCH_COM_MAX)
 
-$(AGENT_XFER_COM): $(AGENT_XFER_SRC) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL)
+$(AGENT_XFER_COM): $(AGENT_XFER_SRC) $(AGENT_XFER_ENGINE) $(AGENT_XFER_PROTOCOL)
 	mkdir -p $(dir $@)
 	$(Z80ASM) $< -o $@
-	$(PYTHON) tools/check_msx_com_size.py $@ $(MSX_DOS_BENCH_COM_MAX)
+	$(PYTHON) tools/check_msx_com_size.py $@ $(MSX_XFER_PAGE0_COM_MAX)
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v

@@ -388,6 +388,7 @@ class MCPApplicationToolsTest(unittest.TestCase):
             self.assertEqual(
                 schema["properties"]["dos_prompt_confirmed"]["type"],
                 "boolean")
+            self.assertNotIn("data_plane", schema["properties"])
 
     def test_generic_file_tools_delegate_without_loading_binary_payloads(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -419,6 +420,27 @@ class MCPApplicationToolsTest(unittest.TestCase):
         self.assertEqual(self.backend.transfers[1], (
             "get", "B:\\REMOTE.BIN", destination.resolve(strict=False),
             {"resume": False, "existing_only": False, "timeout": 90}))
+
+    def test_generic_file_tools_expose_only_the_fast_data_plane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "payload.bin"
+            source.write_bytes(b"fast transfer")
+            destination = root / "download.bin"
+
+            msx_mcp_server.t_file_put(
+                str(source), "A:\\FAST.BIN", dos_prompt_confirmed=True)
+            msx_mcp_server.t_file_get(
+                "A:\\FAST.BIN", str(destination),
+                dos_prompt_confirmed=True)
+
+        self.assertNotIn("fast", self.backend.transfers[0][3])
+        self.assertNotIn("fast", self.backend.transfers[1][3])
+
+        with self.assertRaises(TypeError):
+            msx_mcp_server.t_file_get(
+                "A:\\FAST.BIN", "unused.bin", dos_prompt_confirmed=True,
+                data_plane="legacy")
 
     def test_generic_file_tools_require_explicit_dos_confirmation_to_launch(self):
         self.backend.screen = "GAME OVER\nPRESS FIRE"

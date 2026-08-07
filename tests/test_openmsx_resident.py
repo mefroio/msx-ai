@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -476,6 +477,60 @@ mailbox: dw 0
         self.assertFalse(result["screen_capture_performed"], result)
         screen = machine.screen_text()
         self.assertIn("RESIDENT TYPE OK", screen, screen)
+        self.assertEqual(self.status()["state"], "running")
+
+    def test_resident_fast_file_transfer_roundtrip(self):
+        machine = self.start_bench(mode="resident")
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        root = pathlib.Path(fixture.name)
+
+        # Several deliberately full near-2 KiB frames validate both pump
+        # directions. Force RAW so PackBits cannot hide the actual wire load.
+        payload = bytes((index * 73 + 19) & 0xFF
+                        for index in range(6113))
+        source = root / "fast-source.bin"
+        source.write_bytes(payload)
+        put_started = time.monotonic()
+        put_result = json.loads(self.call_tool(
+            "msx_file_put", local_path=str(source),
+            msx_path="A:\\MCPFAST.BIN", dos_prompt_confirmed=True,
+            compression="raw", timeout=60
+        )[0]["text"])
+        put_seconds = time.monotonic() - put_started
+        self.assertEqual(put_result["data_plane"], "fast-v1", put_result)
+        self.assertEqual(put_result["wire_bytes"], len(payload), put_result)
+        self.assertEqual(
+            put_result["completion"], "protocol-x-terminal-verified",
+            put_result)
+        put_screen = machine.screen_text()
+
+        target = root / "fast-roundtrip.bin"
+        get_started = time.monotonic()
+        get_result = json.loads(self.call_tool(
+            "msx_file_get", msx_path="A:\\MCPFAST.BIN",
+            local_path=str(target), dos_prompt_confirmed=True,
+            timeout=60
+        )[0]["text"])
+        get_seconds = time.monotonic() - get_started
+        self.assertEqual(get_result["data_plane"], "fast-v1", get_result)
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(
+            get_result["completion"], "protocol-x-terminal-verified",
+            get_result)
+        get_screen = machine.screen_text()
+        print(
+            f"\nfast-v1 focused timing: PUT {put_seconds:.3f}s "
+            f"({len(payload) / put_seconds:.1f} B/s), "
+            f"GET {get_seconds:.3f}s "
+            f"({len(payload) / get_seconds:.1f} B/s)\n"
+            f"Measured stream: PUT {put_result['stream_rate_bps']} B/s "
+            f"in {put_result['stream_seconds']}s; "
+            f"GET {get_result['stream_rate_bps']} B/s "
+            f"in {get_result['stream_seconds']}s\n"
+            f"PUT screen:\n{put_screen}\nGET screen:\n{get_screen}",
+            flush=True)
+
         self.assertEqual(self.status()["state"], "running")
 
     def test_foreground_monitor_runs_code_and_debug_is_visible(self):

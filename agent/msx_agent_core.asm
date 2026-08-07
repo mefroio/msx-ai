@@ -72,7 +72,8 @@ KEYBUF_END:     equ 0FC18h      ; exclusive end of the 40-byte ring
 KEYBUF_SIZE:    equ 40
 PROTO_VERSION:  equ 2
 FRAMED_VERSION: equ 3
-FRAMED_MAX:     equ 0140h      ; 320-byte payload, safe under Nextor TPA
+FRAMED_SAFE_MAX: equ 0140h     ; public hook-safe v3 ceiling
+FRAMED_MAX:      equ 0800h     ; private parser/buffer ceiling for fast-v1
 CAPABILITIES:   equ 0FFh       ; core + framed v3 + hardware/mapping
 CAPABILITY_RUN: equ 008h
 CAPABILITY_MAPPING: equ 080h
@@ -94,6 +95,7 @@ KEYBUF_SPOOL_FLAG_ACTIVE: equ 2
 KEYBUF_SPOOL_FLAG_AUTHORIZED: equ 4
 TSR_TALK_CONFIG: equ 0A5h
 include 'agent/msx_xfer_protocol.inc'
+XFER_INLINE_GET_CAPACITY: equ FRAMED_SAFE_MAX - 8
 ; The hook stack has no recursion, no local frame buffers and never calls user
 ; code. A static high-water audit stays below 64 bytes; 224 bytes leaves more
 ; than three times that headroom while keeping the universal build below BDOS.
@@ -111,6 +113,7 @@ TRANSPORT_FLAG_FRAME_WAKE_ACK: equ 4
 ; lease counts complete ceilings, guaranteeing prompt recovery if the peer
 ; disappears while still allowing active 19,200-baud traffic to flow.
 HOOK_IO_BUDGET: equ 01000h
+FAST_PUMP_IO_BUDGET: equ 0FFFFh
 
 FRAME_REQUEST:    equ 1
 FRAME_RESPONSE:   equ 2
@@ -836,11 +839,10 @@ keybuf_spool_buffer:
 keybuf_spool_buffer_end:
 
 ; Protocol X/v1 keeps the staged descriptor resident while MSXAIXF.COM is
-; launched transiently to perform DOS calls. The wire-facing hook owns only
-; this bounded mailbox. PUT credit returns after an exact BDOS WRITE; durable
-; progress advances separately, only after a batched DOS ENSURE and explicit
-; commit. GET data remains pinned until the host acknowledges both its next
-; offset and rolling CRC-32.
+; launched transiently to perform DOS calls. Bulk bytes remain in the helper's
+; validated page-zero workspace. PUT accepted progress is bounded by the 16 KiB
+; helper accumulator; durable progress advances only after DOS ENSURE and an
+; explicit commit. GET durability advances at sparse host-fsync checkpoints.
 if MSXAI_TSR_BUILD
 xfer_descriptor:
     ds XFER_DESC_SIZE,0
@@ -856,13 +858,35 @@ xfer_close_requested:
     db 0
 xfer_foreground_ready:
     db 0
+xfer_fast_armed:
+    db 0
+xfer_fast_pump_active:
+    db 0
+xfer_fast_pump_sp:
+    dw 0
+xfer_fast_page0_buffer:
+    ; Fast bulk bytes stay in MSXAIXF.COM's transient page-zero workspace.
+    ; The resident retains only this validated pointer.
+    dw 0
+xfer_fast_page0_frame:
+    dw 0
+xfer_fast_get_commit_after_send:
+    db 0
+xfer_fast_get_rewind_pending:
+    db 0
+xfer_fast_rate_hint:
+    dw 0
+xfer_fast_get_sent_offset:
+    ds 4,0
+frame_external_request:
+    db 0
+frame_external_response:
+    db 0
 xfer_get_ack_pending:
     db 0
 xfer_buffer_length:
     dw 0
 xfer_buffer_offset:
-    ds 4,0
-xfer_buffer_crc:
     ds 4,0
 xfer_accepted:
     ds 4,0
@@ -876,8 +900,6 @@ xfer_last_accepted:
     dw 0
 xfer_math32:
     ds 4,0
-xfer_buffer:
-    ds XFER_GET_CAPACITY,0
 endif
 
 resident_initialize:
@@ -1059,6 +1081,15 @@ hook_chain_ready:
     and TRANSPORT_FLAG_TIMI_ONLY
     jr nz,hook_done             ; TIMI-only drivers never dispatch from H.KEYI
 hook_poll_transport:
+    ; A foreground TsrCall may be inside the same parser right now. Keep both
+    ; BIOS hooks out of the UART until that one-frame pump returns; the normal
+    ; chain still runs and remains the liveness fallback between pump calls.
+    ld a,(xfer_fast_armed)
+    or a
+    jr nz,hook_done
+    ld a,(xfer_fast_pump_active)
+    or a
+    jr nz,hook_done
     call transport_rx_ready
     or a
     jr z,hook_done
@@ -1786,9 +1817,9 @@ cmd_frame_enable:
     call ser_put
     ld a,FRAMED_VERSION
     call ser_put
-    ld a,FRAMED_MAX & 0FFh
+    ld a,FRAMED_SAFE_MAX & 0FFh
     call ser_put
-    ld a,FRAMED_MAX >> 8
+    ld a,FRAMED_SAFE_MAX >> 8
     call ser_put
     ld a,1
     ld (framed_mode),a
@@ -1943,6 +1974,17 @@ frame_rebootstrap:
     ; probability in independent byte noise is 1/2^64.
     xor a
     ld (framed_mode),a
+if MSXAI_TSR_BUILD
+    ; Re-enable hook-driven raw negotiation immediately. The foreground helper
+    ; and descriptor remain alive; a recovered host can validate the same
+    ; transfer ID and issue FAST_BEGIN again without losing resume state.
+    ld (xfer_fast_armed),a
+    ; A response that timed out or belonged to the old stream can never commit
+    ; a fast GET block after rebootstrap. FAST_BEGIN will explicitly rewind the
+    ; live DOS helper to the last durable checkpoint when required.
+    ld (xfer_fast_get_commit_after_send),a
+    ld (frame_external_response),a
+endif
     ld (last_response_valid),a
     ld (last_request_valid),a
     ld (frame_reconnect_count),a
@@ -1952,6 +1994,12 @@ frame_rebootstrap:
     jp cmd_hello
 
 frame_magic_found:
+if MSXAI_TSR_BUILD
+    xor a
+    ld (frame_external_request),a
+    ld (frame_external_response),a
+    ld (xfer_fast_get_commit_after_send),a
+endif
     call frame_crc_reset
     ld a,'M'
     call frame_crc_update
@@ -1998,16 +2046,49 @@ frame_request_status_ok:
     ; byte length would wedge the foreground monitor. Reject immediately; the
     ; next invocation scans the remaining stream for a fresh magic marker.
     ld de,(frame_length)
+    ld hl,FRAMED_SAFE_MAX
+    or a
+    sbc hl,de
+    jr nc,frame_payload_store
+if MSXAI_TSR_BUILD
+    ; Payloads above the public 320-byte limit are private to an explicitly
+    ; armed fast-v1 transfer.  They may never run from H.TIMI/H.KEYI or expose
+    ; the larger resident buffer to ordinary MCP commands.
+    ld a,(frame_opcode)
+    cp 'X'
+    jr nz,frame_payload_range
+    ld a,(xfer_fast_pump_active)
+    or a
+    jr z,frame_payload_range
+    ld a,(xfer_fast_armed)
+    or a
+    jr z,frame_payload_range
+    ld a,(xfer_descriptor + XFER_DESC_FLAGS)
+    and XFER_FLAG_FAST_PUMP
+    jr z,frame_payload_range
     ld hl,FRAMED_MAX
     or a
     sbc hl,de
     jr nc,frame_payload_store
+endif
+frame_payload_range:
     ld a,FRAME_RANGE
     jp frame_reply_error_uncached
 
 frame_payload_store:
     ld bc,(frame_length)
     ld hl,frame_request_buffer
+if MSXAI_TSR_BUILD
+    push hl
+    ld hl,FRAMED_SAFE_MAX
+    or a
+    sbc hl,bc
+    pop hl
+    jr nc,frame_payload_store_loop
+    ld hl,(xfer_fast_page0_frame)
+    ld a,1
+    ld (frame_external_request),a
+endif
 frame_payload_store_loop:
     ld a,b
     or c
@@ -2033,6 +2114,25 @@ frame_payload_complete:
     jp frame_reply_error_uncached
 
 frame_crc_valid:
+if MSXAI_TSR_BUILD
+    ; Large pump requests were received into the helper's page-zero frame
+    ; workspace. Copy only the fixed PUT_DATA control prefix into the resident
+    ; parser area; the bulk bytes remain external until the handler accepts
+    ; them into the helper's separate mailbox.
+    ld a,(frame_external_request)
+    or a
+    jr z,frame_crc_request_ready
+    ld hl,(xfer_fast_page0_frame)
+    ld de,frame_request_buffer
+    ld bc,21
+    ldir
+    ld a,(frame_request_buffer)
+    cp XFER_CMD_PUT_DATA
+    jr z,frame_crc_request_ready
+    ld a,FRAME_BAD_ARG
+    jp frame_reply_error_uncached
+frame_crc_request_ready:
+endif
     ld a,(frame_parse_status)
     or a
     jp nz,frame_reply_error_uncached
@@ -2116,6 +2216,18 @@ frame_duplicate_conflict:
     jp frame_reply_error_uncached
 
 frame_dispatch:
+if MSXAI_TSR_BUILD
+    ; The foreground transfer pump services only protocol-X requests. Ordinary
+    ; MCP operations remain available through the hook path between pump calls
+    ; instead of running on the DOS worker's call stack.
+    ld a,(xfer_fast_pump_active)
+    or a
+    jr z,frame_dispatch_normal
+    ld a,(frame_opcode)
+    cp 'X'
+    jp nz,frame_reply_bad_state
+frame_dispatch_normal:
+endif
     ld a,(frame_opcode)
     call debug_trace_command
     cp '?'
@@ -2257,6 +2369,12 @@ frame_emit_no_error_flag:
     call frame_send_crc_byte
     ld bc,(frame_response_length)
     ld hl,frame_response_buffer
+if MSXAI_TSR_BUILD
+    ld a,(frame_external_response)
+    or a
+    jr z,frame_emit_payload_loop
+    ld hl,(xfer_fast_page0_frame)
+endif
 frame_emit_payload_loop:
     ld a,b
     or c
@@ -2271,7 +2389,21 @@ frame_emit_crc:
     ld a,l
     call ser_put
     ld a,h
-    jp ser_put
+    call ser_put
+if MSXAI_TSR_BUILD
+    ; In redesigned fast-v1, successfully emitting the complete GET response
+    ; is the delivery boundary. The reliable ordered stream makes a second
+    ; application GET_ACK redundant. A transport timeout jumps away before
+    ; this point and therefore leaves the block pinned.
+    ld a,(xfer_fast_get_commit_after_send)
+    or a
+    ret z
+    xor a
+    ld (xfer_fast_get_commit_after_send),a
+    jp xfer_fast_get_commit_sent
+else
+    ret
+endif
 
 frame_crc_reset:
     ld hl,0FFFFh
@@ -2371,9 +2503,9 @@ frame_cmd_hello:
     ld a,(active_transport_id)
     ld (hl),a
     inc hl
-    ld (hl),FRAMED_MAX & 0FFh
+    ld (hl),FRAMED_SAFE_MAX & 0FFh
     inc hl
-    ld (hl),FRAMED_MAX >> 8
+    ld (hl),FRAMED_SAFE_MAX >> 8
     inc hl
     ld a,(active_transport_control_level)
     ld (hl),a
@@ -2773,6 +2905,25 @@ xfer_reset:
     ld (xfer_pending),a
     ld (xfer_close_requested),a
     ld (xfer_foreground_ready),a
+    ld (xfer_fast_armed),a
+    ld (xfer_fast_pump_active),a
+    ld (xfer_fast_pump_sp),a
+    ld (xfer_fast_pump_sp + 1),a
+    ld (xfer_fast_page0_buffer),a
+    ld (xfer_fast_page0_buffer + 1),a
+    ld (xfer_fast_page0_frame),a
+    ld (xfer_fast_page0_frame + 1),a
+    ld (xfer_fast_get_commit_after_send),a
+    ld (xfer_fast_get_rewind_pending),a
+    ld (xfer_fast_rate_hint),a
+    ld (xfer_fast_rate_hint + 1),a
+    ld hl,xfer_fast_get_sent_offset
+    ld de,xfer_fast_get_sent_offset + 1
+    ld bc,4 - 1
+    ld (hl),a
+    ldir
+    ld (frame_external_request),a
+    ld (frame_external_response),a
     ld (xfer_get_ack_pending),a
     ld (xfer_buffer_length),a
     ld (xfer_buffer_length + 1),a
@@ -2783,7 +2934,7 @@ xfer_reset:
     ldir
     ld hl,xfer_buffer_offset
     ld de,xfer_buffer_offset + 1
-    ld bc,4 + 4 + 4 + 4 + 4 - 1
+    ld bc,4 + 4 + 4 + 4 + 2 + 2 + 4 - 1
     ld (hl),a
     ldir
     ret
@@ -3073,7 +3224,11 @@ frame_cmd_file_transfer:
     jp nz,frame_reply_bad_state
     ld a,(in_hook)
     or a
+    jr nz,frame_xfer_command_context_ok
+    ld a,(xfer_fast_pump_active)
+    or a
     jp z,frame_reply_bad_state
+frame_xfer_command_context_ok:
     ld a,(run_state)
     cp 1
     jp nz,frame_reply_bad_state
@@ -3098,10 +3253,93 @@ frame_cmd_file_transfer:
     jp z,frame_xfer_close
     cp XFER_CMD_CANCEL
     jp z,frame_xfer_cancel
+    cp XFER_CMD_FAST_CAPS
+    jp z,frame_xfer_fast_caps
+    cp XFER_CMD_FAST_BEGIN
+    jp z,frame_xfer_fast_begin
     jp frame_reply_bad_arg
 
+; Retain the proven fast-v1 negotiation vector as the sole transfer data plane.
+frame_xfer_fast_caps:
+    ld de,1
+    call frame_require_length
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_response_buffer
+    ld (hl),XFER_FAST_VERSION
+    inc hl
+    ld (hl),XFER_FAST_CAPABILITIES
+    inc hl
+    ld de,XFER_FAST_PUT_CAPACITY
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld de,XFER_FAST_GET_CAPACITY
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    ld hl,6
+    jp frame_xfer_reply_length_ok
+
+; FAST_BEGIN is sent only after type_line has finished launching MSXAIXF and
+; the helper has published READY. This prevents the foreground pump from
+; consuming the keyboard-spool barrier that launched the helper itself.
+frame_xfer_fast_begin:
+    call xfer_require_id_request
+    jp c,frame_reply_bad_arg
+    ld a,(xfer_descriptor + XFER_DESC_FLAGS)
+    and XFER_FLAG_FAST_PUMP
+    jp z,frame_reply_bad_state
+    ld a,(xfer_foreground_ready)
+    or a
+    jp z,frame_reply_bad_state
+    ld a,(xfer_state)
+    cp XFER_STATE_READY
+    jr z,frame_xfer_fast_begin_ready
+    cp XFER_STATE_TRANSFERRING
+    jp nz,frame_reply_bad_state
+frame_xfer_fast_begin_ready:
+    ; Repeating FAST_BEGIN on the same live stream is idempotent. After a raw
+    ; reconnect, frame_rebootstrap clears xfer_fast_armed; a fast GET may then
+    ; have TCP-delivered/offered bytes beyond its last host-fsync checkpoint.
+    ; Discard that transient window and ask the foreground helper to seek its
+    ; already-open source handle back to the durable boundary before pumping.
+    ld a,(xfer_fast_armed)
+    or a
+    jr nz,frame_xfer_fast_begin_arm
+    ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
+    cp XFER_DIRECTION_GET
+    jr nz,frame_xfer_fast_begin_arm
+    ld a,(xfer_state)
+    cp XFER_STATE_TRANSFERRING
+    jr nz,frame_xfer_fast_begin_arm
+    ld hl,xfer_accepted
+    ld de,xfer_durable
+    call xfer_compare_four
+    jr z,frame_xfer_fast_begin_arm
+    xor a
+    ld (xfer_pending),a
+    ld (xfer_buffer_length),a
+    ld (xfer_buffer_length + 1),a
+    ld (xfer_get_ack_pending),a
+    ld (xfer_fast_get_commit_after_send),a
+    ld a,1
+    ld (xfer_fast_get_rewind_pending),a
+    ld hl,xfer_durable
+    ld de,xfer_accepted
+    ld bc,4
+    ldir
+    ld hl,xfer_durable
+    ld de,xfer_fast_get_sent_offset
+    ld bc,4
+    ldir
+frame_xfer_fast_begin_arm:
+    ld a,1
+    ld (xfer_fast_armed),a
+    jp frame_xfer_reply_state
+
 ; CAPS response: version:u8, caps:u32le, max_put:u16, max_get:u16,
-; max_path:u16. Compression bits are intentionally absent in version 1.
+; max_path:u16. The chunk fields now describe the sole fast-v1 data plane.
 frame_xfer_caps:
     ld de,1
     call frame_require_length
@@ -3118,12 +3356,12 @@ frame_xfer_caps:
     inc hl
     ld (hl),a
     inc hl
-    ld de,XFER_PUT_CAPACITY
+    ld de,XFER_FAST_PUT_CAPACITY
     ld (hl),e
     inc hl
     ld (hl),d
     inc hl
-    ld de,XFER_GET_CAPACITY
+    ld de,XFER_FAST_GET_CAPACITY
     ld (hl),e
     inc hl
     ld (hl),d
@@ -3176,6 +3414,11 @@ frame_xfer_open_encoding_ok:
     ld a,(frame_request_buffer + 4)
     and 0FFh - XFER_FLAGS_SUPPORTED
     jp nz,frame_reply_bad_arg
+    ; FAST_PUMP is retained as a mandatory wire discriminator. An obsolete host
+    ; that omits it must never enter the fast-only resident/helper state machine.
+    ld a,(frame_request_buffer + 4)
+    and XFER_FLAG_FAST_PUMP
+    jp z,frame_reply_unsupported
     ld a,(frame_request_buffer + 4)
     and XFER_FLAG_RESUME
     jr nz,frame_xfer_open_resume_flag_ok
@@ -3384,7 +3627,7 @@ frame_xfer_status:
     ld hl,51
     jp frame_xfer_reply_length_ok
 
-; PUT_DATA request: sub, id[16], offset:u32, data[0..298]. Response:
+; PUT_DATA request: sub, id[16], offset:u32, data[0..2026]. Response:
 ; accepted:u16, accepted_end:u32, durable_end:u32, credit:u16, state, error.
 frame_xfer_put_data:
     ld hl,(frame_length)
@@ -3392,7 +3635,10 @@ frame_xfer_put_data:
     or a
     sbc hl,de
     jp c,frame_reply_bad_arg
-    ld de,XFER_PUT_CAPACITY
+    ld a,(xfer_fast_pump_active)
+    or a
+    jp z,frame_reply_bad_state
+    ld de,XFER_FAST_PUT_CAPACITY
     push hl
     or a
     sbc hl,de
@@ -3428,13 +3674,13 @@ frame_xfer_put_state_ok:
     ld hl,(xfer_request_count)
     ld a,h
     or l
-    jr z,frame_xfer_put_reply
+    jp z,frame_xfer_put_reply
     ld a,(xfer_pending)
     or a
-    jr nz,frame_xfer_put_reply
+    jp nz,frame_xfer_put_reply
     ld a,(xfer_foreground_ready)
     or a
-    jr z,frame_xfer_put_reply
+    jp z,frame_xfer_put_reply
 
     ; remaining = wire_size - accepted, rejecting both underflow and crossing.
     call xfer_remaining
@@ -3450,9 +3696,28 @@ frame_xfer_put_state_ok:
     sbc hl,de
     jp c,frame_reply_range
 frame_xfer_put_fits:
+    ; A nonconforming fast client may ignore advertised credit. Enforce the
+    ; transient helper's 16 KiB accepted-minus-durable window before mutating
+    ; accepted state, so the foreground accumulator can never overflow after
+    ; the resident has already acknowledged a block.
+    call xfer_fast_put_window_remaining
+    jp c,frame_reply_range
+    ld de,(xfer_request_count)
+    or a
+    sbc hl,de
+    jp c,frame_reply_range
     ld bc,(xfer_request_count)
     ld hl,frame_request_buffer + 21
-    ld de,xfer_buffer
+    ld de,(xfer_fast_page0_buffer)
+    ld a,(frame_external_request)
+    or a
+    jr z,frame_xfer_put_copy
+    push bc
+    ld hl,(xfer_fast_page0_frame)
+    ld bc,21
+    add hl,bc
+    pop bc
+frame_xfer_put_copy:
     ldir
     ld hl,(xfer_request_count)
     ld (xfer_buffer_length),hl
@@ -3498,8 +3763,9 @@ frame_xfer_put_reply:
     ld hl,14
     jp frame_xfer_reply_length_ok
 
-; GET_READ request: sub, id, offset:u32, max:u16. A published block is pinned
-; until GET_ACK; a zero-length reply means foreground has not published yet.
+; GET_READ request: sub, id, offset:u32, max:u16. The published block is released
+; only after the complete framed response is emitted; a zero-length reply means
+; foreground has not published yet.
 frame_xfer_get_read:
     ld de,23
     call frame_require_length
@@ -3514,7 +3780,10 @@ frame_xfer_get_read:
     ld a,h
     or l
     jp z,frame_reply_bad_arg
-    ld de,XFER_GET_CAPACITY
+    ld a,(xfer_fast_pump_active)
+    or a
+    jp z,frame_reply_bad_state
+    ld de,XFER_FAST_GET_CAPACITY
     push hl
     or a
     sbc hl,de
@@ -3562,18 +3831,76 @@ frame_xfer_get_length_ready:
     ld a,b
     or c
     jr z,frame_xfer_get_copy_done
-    ld hl,xfer_buffer
+    ; Small final blocks still fit the resident's 320-byte public response
+    ; area. Full blocks use the helper's adjacent 2 KiB frame workspace.
+    ld hl,(frame_response_buffer + 4)
+    ld de,XFER_INLINE_GET_CAPACITY
+    or a
+    sbc hl,de
+    jr c,frame_xfer_get_fast_small
+    jr z,frame_xfer_get_fast_small
+    push bc
+    ld hl,frame_response_buffer
+    ld de,(xfer_fast_page0_frame)
+    ld bc,8
+    ldir
+    pop bc
+    push de
+    ld hl,(xfer_fast_page0_buffer)
+    ld de,6
+    add hl,de
+    pop de
+    ld a,1
+    ld (frame_external_response),a
+    ; DE already points eight bytes into the external frame after the header
+    ; copy above.
+    ldir
+    jr frame_xfer_get_copy_done
+frame_xfer_get_fast_small:
+    ld hl,(xfer_fast_page0_buffer)
+    ld de,6
+    add hl,de
+    jr frame_xfer_get_resident_copy
+frame_xfer_get_resident_copy:
     ld de,frame_response_buffer + 8
     ldir
 frame_xfer_get_copy_done:
+    ; Defer the state transition until frame_emit_crc has successfully
+    ; transmitted the header, payload, and framing CRC.
+    ld a,(xfer_pending)
+    or a
+    jr z,frame_xfer_get_no_auto_commit
+    ld a,1
+    ld (xfer_fast_get_commit_after_send),a
+frame_xfer_get_no_auto_commit:
     ld hl,(frame_response_buffer + 4)
     ld de,8
     add hl,de
     jp frame_xfer_reply_length_ok
 
-; GET_ACK request: sub, id, next_offset:u32, prefix_crc32:u32. The CRC binds
-; the ACK to the exact pinned bytes, so a stale/lost acknowledgement cannot
-; release a different block.
+; Complete the fast GET state transition only after the response is on the
+; stream. The foreground helper observes xfer_get_ack_pending and immediately
+; reuses its transient RAM buffer for the next DOS read.
+xfer_fast_get_commit_sent:
+    ld a,(xfer_pending)
+    or a
+    ret z
+    ld hl,xfer_accepted
+    ld de,xfer_fast_get_sent_offset
+    ld bc,4
+    ldir
+    xor a
+    ld (xfer_pending),a
+    ld (xfer_buffer_length),a
+    ld (xfer_buffer_length + 1),a
+    ld a,1
+    ld (xfer_get_ack_pending),a
+    ld a,XFER_STATE_TRANSFERRING
+    ld (xfer_state),a
+    ret
+
+; GET_ACK request: sub, id, next_offset:u32, prefix_crc32:u32. This is a sparse
+; durable checkpoint bound to the most recently emitted stream boundary.
 frame_xfer_get_ack:
     ld de,25
     call frame_require_length
@@ -3584,44 +3911,27 @@ frame_xfer_get_ack:
     ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
     cp XFER_DIRECTION_GET
     jp nz,frame_reply_bad_state
-    ld a,(xfer_pending)
-    or a
-    jp z,frame_reply_bad_state
-    ld hl,xfer_buffer_offset
-    ld de,xfer_math32
-    ld bc,4
-    ldir
-    ld hl,(xfer_buffer_length)
-    call xfer_add_math32
+    ; GET_ACK is a sparse durability checkpoint, not per-block flow control. It
+    ; may arrive while the helper already has the next block pinned.
+    ; Bind it to the most recent completely emitted response and leave that
+    ; newer pending block untouched.
     ld hl,frame_request_buffer + 17
-    ld de,xfer_math32
+    ld de,xfer_fast_get_sent_offset
     call xfer_compare_four
     jp nz,frame_reply_bad_arg
-    ld hl,frame_request_buffer + 21
-    ld de,xfer_buffer_crc
-    call xfer_compare_four
-    jp nz,frame_reply_bad_arg
-    ld hl,xfer_math32
+    ld hl,xfer_fast_get_sent_offset
     ld de,xfer_durable
     ld bc,4
     ldir
-    ld hl,xfer_math32
-    ld de,xfer_accepted
-    ld bc,4
-    ldir
-    ld hl,xfer_buffer_crc
+    ; The host CRC is a sparse durable-prefix checkpoint. The MSX has already
+    ; scanned the complete source CRC before READY, and the host must match it
+    ; again at EOF; trusting the intermediate prefix avoids a second Z80 CRC
+    ; pass while remaining fail-closed at final publication and on resume.
+    ld hl,frame_request_buffer + 21
     ld de,xfer_prefix_crc
     ld bc,4
     ldir
-    xor a
-    ld (xfer_pending),a
-    ld a,1
-    ld (xfer_get_ack_pending),a
-    xor a
-    ld (xfer_buffer_length),a
-    ld (xfer_buffer_length + 1),a
-    ld a,XFER_STATE_TRANSFERRING
-    ld (xfer_state),a
+frame_xfer_get_ack_reply:
     ld hl,xfer_durable
     ld de,frame_response_buffer
     ld bc,4
@@ -3635,8 +3945,20 @@ frame_xfer_get_ack:
     jp frame_xfer_reply_length_ok
 
 frame_xfer_close:
-    call xfer_require_id_request
-    jp c,frame_reply_bad_arg
+    ; CLOSE appends the host's measured stream average. It costs no extra
+    ; transaction and lets the foreground helper render a truthful final B/s
+    ; value even though TsrCall keeps BIOS JIFFY interrupts masked.
+    ld hl,(frame_length)
+    ld de,19
+    or a
+    sbc hl,de
+    jp nz,frame_reply_bad_arg
+    ld hl,frame_request_buffer + 1
+    call xfer_id_matches
+    jp nz,frame_reply_bad_arg
+    ld hl,(frame_request_buffer + 17)
+    ld (xfer_fast_rate_hint),hl
+frame_xfer_close_request_ok:
     ld a,(xfer_state)
     cp XFER_STATE_COMPLETE
     jr z,frame_xfer_reply_state
@@ -3681,6 +4003,7 @@ frame_xfer_cancel:
     xor a
     ld (xfer_pending),a
     ld (xfer_close_requested),a
+    ld (xfer_fast_armed),a
     ld a,XFER_STATUS_RESUMABLE
     ld (xfer_result_flags),a
     jr frame_xfer_reply_state
@@ -3776,11 +4099,21 @@ xfer_credit:
 xfer_credit_state_ok:
     call xfer_remaining
     ret c
+    call xfer_fast_put_window_remaining
+    ret c
+    ld de,XFER_FAST_PUT_CAPACITY
+    push hl
+    or a
+    sbc hl,de
+    pop hl
+    jr c,xfer_credit_capacity_ready
+    jr z,xfer_credit_capacity_ready
+    ex de,hl
+xfer_credit_capacity_ready:
     ld a,(xfer_math32 + 2)
     ld c,a
     ld a,(xfer_math32 + 3)
     or c
-    ld hl,XFER_PUT_CAPACITY
     ret nz
     ld de,(xfer_math32)
     push hl
@@ -3792,7 +4125,31 @@ xfer_credit_state_ok:
     ex de,hl
     ret
 
-; Add the 16-bit HL value to accepted or xfer_math32 respectively.
+; Return HL = 16 KiB - (accepted - durable). Carry means corrupt or excessive
+; progress. The helper owns the actual RAM; this resident calculation limits
+; both advertised credit and PUT_DATA requests from third-party clients.
+xfer_fast_put_window_remaining:
+    ld hl,(xfer_accepted)
+    ld de,(xfer_durable)
+    or a
+    sbc hl,de
+    push hl
+    ld hl,(xfer_accepted + 2)
+    ld de,(xfer_durable + 2)
+    sbc hl,de
+    ld a,h
+    or l
+    pop de
+    jr nz,xfer_fast_put_window_bad
+    ld hl,XFER_FAST_ACCUMULATOR_CAPACITY
+    or a
+    sbc hl,de
+    ret
+xfer_fast_put_window_bad:
+    scf
+    ret
+
+; Add the 16-bit HL value to accepted.
 xfer_add_accepted:
     ld de,(xfer_accepted)
     add hl,de
@@ -3801,16 +4158,6 @@ xfer_add_accepted:
     ld de,0
     adc hl,de
     ld (xfer_accepted + 2),hl
-    ret
-
-xfer_add_math32:
-    ld de,(xfer_math32)
-    add hl,de
-    ld (xfer_math32),hl
-    ld hl,(xfer_math32 + 2)
-    ld de,0
-    adc hl,de
-    ld (xfer_math32 + 2),hl
     ret
 endif
 
@@ -3821,7 +4168,7 @@ frame_cmd_ram_read:
     ld hl,(frame_request_buffer)
     ld de,(frame_request_buffer + 2)
     push hl
-    ld hl,FRAMED_MAX
+    ld hl,FRAMED_SAFE_MAX
     or a
     sbc hl,de
     pop hl
@@ -4017,7 +4364,7 @@ frame_cmd_vram_read:
     jp nz,frame_reply_range
     ld de,(frame_request_buffer + 3)
     push hl
-    ld hl,FRAMED_MAX
+    ld hl,FRAMED_SAFE_MAX
     or a
     sbc hl,de
     pop hl
@@ -4459,6 +4806,11 @@ include 'agent/transports/msx_transport_16c550.inc'
 ; abandons the frame and restores the interrupted application context.
 ser_put:
     push af
+if MSXAI_TSR_BUILD
+    ld a,(xfer_fast_pump_active)
+    or a
+    jr nz,ser_put_pump_wait_start
+endif
     ld a,(in_hook)
     or a
     jr z,ser_put_wait
@@ -4477,6 +4829,24 @@ ser_put_hook_ready:
     pop bc
     pop af
     jp transport_write
+if MSXAI_TSR_BUILD
+ser_put_pump_wait_start:
+    push bc
+    ld bc,FAST_PUMP_IO_BUDGET
+ser_put_pump_wait:
+    call transport_tx_ready
+    or a
+    jr nz,ser_put_pump_ready
+    dec bc
+    ld a,b
+    or c
+    jr nz,ser_put_pump_wait
+    jp xfer_fast_pump_timeout
+ser_put_pump_ready:
+    pop bc
+    pop af
+    jp transport_write
+endif
 ser_put_wait:
     call transport_tx_ready
     or a
@@ -4485,6 +4855,11 @@ ser_put_wait:
     jp transport_write
 
 ser_get:
+if MSXAI_TSR_BUILD
+    ld a,(xfer_fast_pump_active)
+    or a
+    jr nz,ser_get_pump_wait_start
+endif
     ld a,(in_hook)
     or a
     jr z,ser_get_wait
@@ -4502,6 +4877,23 @@ ser_get_hook_wait:
 ser_get_hook_ready:
     pop bc
     jp transport_read
+if MSXAI_TSR_BUILD
+ser_get_pump_wait_start:
+    push bc
+    ld bc,FAST_PUMP_IO_BUDGET
+ser_get_pump_wait:
+    call transport_rx_ready
+    or a
+    jr nz,ser_get_pump_ready
+    dec bc
+    ld a,b
+    or c
+    jr nz,ser_get_pump_wait
+    jp xfer_fast_pump_timeout
+ser_get_pump_ready:
+    pop bc
+    jp transport_read
+endif
 ser_get_wait:
     call transport_rx_ready
     or a
@@ -4551,13 +4943,33 @@ hook_timeout_state_done:
     ld (snapshot_lease_reload),a
     jp hook_done
 
-; Request and response deliberately share the negotiated work area. This keeps
-; both the page-1 TSR and the foreground monitor compact. Responses up through
-; the fixed CPU-context record (including every state-changing command) are
-; cached separately; bulk RAM/VRAM reads are side-effect free and may be
-; recomputed on retry.
+if MSXAI_TSR_BUILD
+; A foreground pump owns a different stack from a BIOS hook.  A partial or
+; lost frame is abandoned at its own saved TsrCall boundary; the helper then
+; loops and can receive an idempotent retry or reconnect marker safely.
+xfer_fast_pump_timeout:
+    ld sp,(xfer_fast_pump_sp)
+    xor a
+    ; Never let a later unrelated response commit a GET block whose original
+    ; response stopped part-way through transmission.
+    ld (xfer_fast_get_commit_after_send),a
+    ld (frame_external_request),a
+    ld (frame_external_response),a
+    ld (xfer_fast_pump_active),a
+    ld (xfer_fast_pump_sp),a
+    ld (xfer_fast_pump_sp + 1),a
+    ld (frame_reconnect_count),a
+    ret
+endif
+
+; Public request and response payloads share this 320-byte resident work area.
+; A foreground fast pump temporarily uses MSXAIXF.COM's validated page-zero
+; frame workspace for larger PUT input or GET output. Responses up through the
+; fixed CPU-context record (including every state-changing command) are cached
+; separately; bulk RAM/VRAM reads are side-effect free and may be recomputed on
+; retry.
 frame_request_buffer:
-    ds FRAMED_MAX,0
+    ds FRAMED_SAFE_MAX,0
 frame_response_buffer: equ frame_request_buffer
 last_response_small:
     ds FRAME_CACHE_MAX,0
@@ -4592,6 +5004,8 @@ tsr_talk:
     jp z,tsr_talk_xfer_postprocess
     cp TSR_TALK_XFER_PUT_RELEASE
     jp z,tsr_talk_xfer_put_release
+    cp TSR_TALK_XFER_PUMP
+    jp z,tsr_talk_xfer_pump
     jp tsr_talk_unsupported
 
 tsr_talk_config:
@@ -4647,6 +5061,60 @@ tsr_talk_page0_bad_pop:
     pop hl
 tsr_talk_page0_bad:
     scf
+    ret
+
+; Service at most one complete protocol-X frame on the foreground helper's
+; stack.  The host's wake ACK holds the rest of the frame until this routine
+; consumes the leading 'M', so DOS disk work cannot overflow a FIFO-less 8251.
+tsr_talk_xfer_pump:
+    ld a,(xfer_fast_armed)
+    or a
+    jr z,tsr_talk_xfer_pump_idle
+    ld a,(xfer_descriptor + XFER_DESC_FLAGS)
+    and XFER_FLAG_FAST_PUMP
+    jr z,tsr_talk_xfer_pump_idle
+    ld a,(xfer_foreground_ready)
+    or a
+    jr z,tsr_talk_xfer_pump_idle
+    ld a,(xfer_fast_pump_active)
+    or a
+    jp nz,tsr_talk_unsupported
+    ; HL is MSXAIXF.COM's transient page-zero workspace. Keep bulk bytes there
+    ; instead of reserving a second fast mailbox inside the MemMan segment.
+    push hl
+    ld bc,XFER_FAST_PAGE0_CAPACITY
+    call tsr_talk_page0_range
+    pop hl
+    jp c,tsr_talk_unsupported
+    ld a,(xfer_pending)
+    or a
+    jr z,tsr_talk_xfer_pump_store_buffer
+    ld de,(xfer_fast_page0_buffer)
+    push hl
+    or a
+    sbc hl,de
+    pop hl
+    jp nz,tsr_talk_unsupported
+tsr_talk_xfer_pump_store_buffer:
+    ld (xfer_fast_page0_buffer),hl
+    ld de,XFER_FAST_WORK_CAPACITY
+    add hl,de
+    ld (xfer_fast_page0_frame),hl
+    ld (xfer_fast_pump_sp),sp
+    ld a,1
+    ld (xfer_fast_pump_active),a
+    call transport_rx_ready
+    or a
+    jr z,tsr_talk_xfer_pump_done
+    call frame_receive
+tsr_talk_xfer_pump_done:
+    xor a
+    ld (xfer_fast_pump_active),a
+    ld (xfer_fast_pump_sp),a
+    ld (xfer_fast_pump_sp + 1),a
+    ret
+tsr_talk_xfer_pump_idle:
+    xor a
     ret
 
 ; CLAIM input HL points to a page-zero descriptor whose first 16 bytes contain
@@ -4755,12 +5223,15 @@ tsr_talk_xfer_ready_bad:
     ld (xfer_error),a
     ld a,XFER_STATE_FAILED
     ld (xfer_state),a
+    xor a
+    ld (xfer_fast_armed),a
     ld a,XFER_STATUS_RESUMABLE
     ld (xfer_result_flags),a
     jp tsr_talk_unsupported
 
 ; PUT_POLL input HL=page-zero destination. It returns A=1/HL=length when a
-; block is available but deliberately retains pending ownership until COMMIT;
+; block is available but deliberately retains pending ownership until RELEASE
+; or COMMIT;
 ; A=2 means CLOSE was requested, A=0 means wait, FFh means terminal failure.
 tsr_talk_xfer_put_poll:
     ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
@@ -4775,6 +5246,7 @@ tsr_talk_xfer_put_poll:
     or a
     jr z,tsr_talk_xfer_put_poll_data
     ld hl,0
+    ld de,(xfer_fast_rate_hint)
     ld a,2
     ret
 tsr_talk_xfer_put_poll_data:
@@ -4786,8 +5258,13 @@ tsr_talk_xfer_put_poll_data:
     call tsr_talk_page0_range
     pop de
     jp c,tsr_talk_unsupported
-    ld hl,xfer_buffer
-    ldir
+    ; The pump already copied the accepted block into this exact foreground
+    ; buffer. Returning it in place avoids a redundant 2 KiB LDIR.
+    ld hl,(xfer_fast_page0_buffer)
+    or a
+    sbc hl,de
+    jp nz,tsr_talk_unsupported
+tsr_talk_xfer_put_poll_ready:
     ld hl,(xfer_buffer_length)
     ld a,1
     ret
@@ -4797,8 +5274,9 @@ tsr_talk_xfer_wait:
     ret
 
 ; PUT_RELEASE input HL is the exact current block length. It releases mailbox
-; credit after WRITE without claiming that DOS has made those bytes durable.
-; A later PUT_COMMIT covers every released write since the previous ENSURE.
+; credit after the helper copied those bytes into its 16 KiB accumulator,
+; without claiming DOS durability. A later PUT_COMMIT covers the complete
+; accumulator window after its single WRITE and ENSURE.
 tsr_talk_xfer_put_release:
     ld a,(xfer_pending)
     or a
@@ -4881,7 +5359,7 @@ tsr_talk_xfer_get_publish:
     or c
     jp z,tsr_talk_unsupported
     push hl
-    ld hl,XFER_GET_CAPACITY
+    ld hl,XFER_FAST_GET_CAPACITY
     or a
     sbc hl,bc
     pop hl
@@ -4896,8 +5374,15 @@ tsr_talk_xfer_get_publish:
     call tsr_talk_page0_range
     pop bc
     jp c,tsr_talk_unsupported
+    ; Pin the helper-owned page-zero block while the pump emits this response.
+    ; MSXAIXF does not reuse the buffer until the complete frame has left the
+    ; resident and GET_POLL releases the foreground loop.
+    ld (xfer_fast_page0_buffer),hl
+tsr_talk_xfer_get_publish_buffer_ready:
     push hl
-    ld hl,xfer_durable
+    ; Streaming may have several TCP-delivered blocks after the latest host
+    ; durability checkpoint. Continue from the sent/accepted boundary.
+    ld hl,xfer_accepted
     ld de,xfer_buffer_offset
     ld bc,4
     ldir
@@ -4907,20 +5392,14 @@ tsr_talk_xfer_get_publish:
     ld b,(hl)
     inc hl
     ld (xfer_buffer_length),bc
-    push bc
-    ld de,xfer_buffer_crc
-    ld bc,4
-    ldir
-    pop bc
-    ld de,xfer_buffer
-    ldir
-    ld hl,xfer_durable
-    ld de,xfer_accepted
-    ld bc,4
-    ldir
+    ; The helper retains four rolling-CRC bytes in this internal header for ABI
+    ; stability. Fast-v1 checkpoints carry the authoritative host prefix CRC,
+    ; so the resident need not duplicate these bytes.
+    ld de,4
+    add hl,de
+tsr_talk_xfer_get_publish_accepted_ready:
     ld hl,(xfer_buffer_length)
     call xfer_add_accepted
-    ; xfer_add_accepted used xfer_accepted as intended after the durable copy.
     ld hl,(xfer_descriptor + XFER_DESC_WIRE_SIZE)
     ld de,(xfer_accepted)
     or a
@@ -4936,8 +5415,9 @@ tsr_talk_xfer_get_publish:
     xor a
     ret
 
-; Foreground waits here after publishing GET data. A=1 acknowledges that the
-; host released the block; A=2 signals CLOSE at EOF; FFh is cancel/failure.
+; Foreground waits here after publishing GET data. A=1 releases the block,
+; A=2 signals CLOSE at EOF, A=3 requests a fast reconnect seek to the durable
+; offset copied to caller page-zero HL, and FFh is cancel/failure.
 tsr_talk_xfer_get_poll:
     ld a,(xfer_descriptor + XFER_DESC_DIRECTION)
     cp XFER_DIRECTION_GET
@@ -4947,6 +5427,23 @@ tsr_talk_xfer_get_poll:
     jp z,tsr_talk_unsupported
     cp XFER_STATE_CANCELLED
     jp z,tsr_talk_unsupported
+    ld a,(xfer_fast_get_rewind_pending)
+    or a
+    jr z,tsr_talk_xfer_get_poll_ack_pending
+    push hl
+    ld bc,4
+    call tsr_talk_page0_range
+    pop hl
+    jp c,tsr_talk_unsupported
+    ex de,hl
+    ld hl,xfer_durable
+    ld bc,4
+    ldir
+    xor a
+    ld (xfer_fast_get_rewind_pending),a
+    ld a,3
+    ret
+tsr_talk_xfer_get_poll_ack_pending:
     ld a,(xfer_get_ack_pending)
     or a
     jr z,tsr_talk_xfer_get_poll_close
@@ -4958,6 +5455,7 @@ tsr_talk_xfer_get_poll_close:
     ld a,(xfer_close_requested)
     or a
     jr z,tsr_talk_xfer_get_poll_ack
+    ld de,(xfer_fast_rate_hint)
     ld a,2
     ret
 tsr_talk_xfer_get_poll_ack:
@@ -4988,6 +5486,8 @@ tsr_talk_xfer_postprocess:
     jp nz,tsr_talk_unsupported
     ld a,XFER_STATE_POSTPROCESS
     ld (xfer_state),a
+    xor a
+    ld (xfer_fast_armed),a
     ld a,XFER_STATUS_ACTIVE | XFER_STATUS_RESUMABLE | XFER_STATUS_WIRE_VERIFIED
     ld (xfer_result_flags),a
     xor a
@@ -5020,12 +5520,14 @@ tsr_talk_xfer_finish:
     xor a
     ld (xfer_error),a
     ld (xfer_foreground_ready),a
+    ld (xfer_fast_armed),a
     ld a,XFER_STATUS_RESUMABLE | XFER_STATUS_WIRE_VERIFIED | XFER_STATUS_FINAL_VERIFIED | XFER_STATUS_PUBLISHED
     ld (xfer_result_flags),a
     xor a
     ret
 tsr_talk_xfer_finish_cancelled:
     xor a
+    ld (xfer_fast_armed),a
     ret
 tsr_talk_xfer_finish_failed:
     ld a,h
@@ -5039,6 +5541,7 @@ tsr_talk_xfer_finish_error_ready:
     xor a
     ld (xfer_pending),a
     ld (xfer_foreground_ready),a
+    ld (xfer_fast_armed),a
     ld a,XFER_STATUS_RESUMABLE
     ld (xfer_result_flags),a
     xor a

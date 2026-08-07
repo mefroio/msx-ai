@@ -21,6 +21,7 @@ from msx_transfer import (  # noqa: E402
     TransferDirection,
     TransferEncoding,
     TransferError,
+    TransferFastCapability,
     TransferJournal,
     TransferJournalError,
     TransferOpenFlag,
@@ -39,6 +40,8 @@ from msx_transfer import (  # noqa: E402
     encode_close,
     encode_get_ack,
     encode_get_read,
+    encode_fast_begin,
+    encode_fast_capabilities_request,
     encode_open,
     encode_put_data,
     encode_status,
@@ -49,6 +52,7 @@ from msx_transfer import (  # noqa: E402
     parse_close_reply,
     parse_get_ack_reply,
     parse_get_read_reply,
+    parse_fast_capabilities_reply,
     parse_open_reply,
     parse_put_data_reply,
     parse_status_reply,
@@ -106,13 +110,14 @@ class TransferOpenWireTest(unittest.TestCase):
         self.assertEqual(FEATURE_FILE_TRANSFER_V2, 0x80)
         self.assertEqual(TRANSFER_OPCODE, ord("X"))
         self.assertEqual(
-            [int(value) for value in TransferSubcommand], list(range(8)))
+            [int(value) for value in TransferSubcommand], list(range(10)))
         self.assertEqual(TransferDirection.PUT, 0)
         self.assertEqual(TransferDirection.GET, 1)
         self.assertEqual(TransferEncoding.RAW, 0)
         self.assertEqual(TransferEncoding.PACKBITS, 1)
         self.assertEqual(TransferOpenFlag.RESUME, 0x01)
         self.assertEqual(TransferOpenFlag.RECEIPTLESS_REPLAY, 0x02)
+        self.assertEqual(TransferOpenFlag.FAST_PUMP, 0x04)
         self.assertEqual(int(
             TransferCapability.RAW | TransferCapability.PUT |
             TransferCapability.GET | TransferCapability.RESUME |
@@ -128,7 +133,7 @@ class TransferOpenWireTest(unittest.TestCase):
 
         self.assertEqual(len(payload), 58)
         self.assertEqual(payload.hex(),
-            "0101000101000102030405060708090a0b0c0d0e0f"
+            "0101000105000102030405060708090a0b0c0d0e0f"
             "04030201d4c3b2a1443322118877665520100000efbeadde"
             "0b00413a5c47414d452e42494e")
         self.assertEqual(decode_open(payload), descriptor)
@@ -178,8 +183,21 @@ class TransferOpenWireTest(unittest.TestCase):
 
     def test_resume_flag_is_preserved_even_at_offset_zero(self):
         descriptor = put_descriptor(resume=True)
-        self.assertEqual(encode_open(descriptor)[4], TransferOpenFlag.RESUME)
+        self.assertEqual(
+            encode_open(descriptor)[4],
+            TransferOpenFlag.RESUME | TransferOpenFlag.FAST_PUMP)
         self.assertTrue(decode_open(encode_open(descriptor)).resume)
+
+    def test_fast_open_flag_is_mandatory_and_not_selectable(self):
+        descriptor = put_descriptor()
+        payload = encode_open(descriptor)
+
+        self.assertEqual(payload[4], TransferOpenFlag.FAST_PUMP)
+        self.assertEqual(decode_open(payload), descriptor)
+        missing = bytearray(payload)
+        missing[4] &= ~TransferOpenFlag.FAST_PUMP
+        with self.assertRaisesRegex(TransferPayloadError, "required fast-v1"):
+            decode_open(missing)
 
     def test_receiptless_replay_requires_an_exact_complete_put_boundary(self):
         descriptor = put_descriptor(
@@ -190,7 +208,8 @@ class TransferOpenWireTest(unittest.TestCase):
         self.assertEqual(
             payload[4],
             TransferOpenFlag.RESUME |
-            TransferOpenFlag.RECEIPTLESS_REPLAY)
+            TransferOpenFlag.RECEIPTLESS_REPLAY |
+            TransferOpenFlag.FAST_PUMP)
         self.assertEqual(decode_open(payload), descriptor)
 
         with self.assertRaisesRegex(TransferError, "complete CRC-matched PUT"):
@@ -215,6 +234,26 @@ class TransferReplyAndRequestTest(unittest.TestCase):
             parse_capabilities_reply(payload + b"\x00")
         with self.assertRaisesRegex(TransferPayloadError, "unknown bits"):
             parse_capabilities_reply(struct.pack("<BIHHH", 1, 0x80, 1, 1, 1))
+
+    def test_fast_capabilities_and_begin_have_fixed_isolated_vectors(self):
+        payload = struct.pack("<BBHH", 1, 3, 2026, 2040)
+        result = parse_fast_capabilities_reply(payload)
+
+        self.assertEqual(result.version, 1)
+        self.assertEqual(
+            result.capabilities,
+            TransferFastCapability.PUMP | TransferFastCapability.STREAM)
+        self.assertEqual(
+            (result.max_put_chunk, result.max_get_chunk), (2026, 2040))
+        self.assertEqual(encode_fast_capabilities_request(), b"\x08")
+        self.assertEqual(encode_fast_begin(TRANSFER_ID), b"\x09" + TRANSFER_ID)
+
+        with self.assertRaises(TransferPayloadError):
+            parse_fast_capabilities_reply(payload + b"\x00")
+        with self.assertRaisesRegex(TransferPayloadError, "unknown bits"):
+            parse_fast_capabilities_reply(struct.pack("<BBHH", 1, 4, 1, 1))
+        with self.assertRaisesRegex(TransferPayloadError, "zero-byte"):
+            parse_fast_capabilities_reply(struct.pack("<BBHH", 1, 3, 0, 1))
 
     def test_open_and_terminal_replies_are_exact_state_error_pairs(self):
         opened = parse_open_reply(bytes((TransferState.READY,
@@ -242,7 +281,9 @@ class TransferReplyAndRequestTest(unittest.TestCase):
             encode_get_ack(TRANSFER_ID, 0x10, 0xAABBCCDD),
             b"\x05" + TRANSFER_ID +
             b"\x10\x00\x00\x00\xdd\xcc\xbb\xaa")
-        self.assertEqual(encode_close(TRANSFER_ID), b"\x06" + TRANSFER_ID)
+        self.assertEqual(
+            encode_close(TRANSFER_ID, rate_bps=1559),
+            b"\x06" + TRANSFER_ID + b"\x17\x06")
         self.assertEqual(encode_cancel(TRANSFER_ID), b"\x07" + TRANSFER_ID)
 
     def test_put_get_and_ack_replies_are_strict(self):
@@ -499,6 +540,50 @@ class TransferJournalTest(unittest.TestCase):
                     confirmed_offset=0, prefix_crc32=0,
                     caller_binding="/resolved/local/file.bin")
 
+    def test_single_data_plane_journal_v4_omits_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TransferJournal(directory)
+            descriptor = put_descriptor()
+            path = journal.save(
+                descriptor, confirmed_offset=400,
+                prefix_crc32=0xABCDEF01,
+                caller_binding="/resolved/local/file.bin")
+
+            document = json.loads(path.read_text())
+            self.assertEqual(document["version"], 4)
+            self.assertNotIn("data_plane", document)
+            resumed = journal.load(
+                descriptor,
+                caller_binding="/resolved/local/file.bin").resumed_descriptor()
+            self.assertEqual(resumed.resume_offset, 400)
+
+    def test_version_three_fast_journal_migrates_but_legacy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TransferJournal(directory)
+            descriptor = put_descriptor()
+            path = journal.save(
+                descriptor, confirmed_offset=400,
+                prefix_crc32=0xABCDEF01)
+            document = json.loads(path.read_text())
+            document["version"] = 3
+            document["data_plane"] = "fast-v1"
+            path.write_text(json.dumps(document))
+
+            record = journal.load(descriptor)
+            self.assertEqual(record.confirmed_offset, 400)
+            journal.save(
+                record.descriptor, confirmed_offset=record.confirmed_offset,
+                prefix_crc32=record.prefix_crc32)
+            migrated = json.loads(path.read_text())
+            self.assertEqual(migrated["version"], 4)
+            self.assertNotIn("data_plane", migrated)
+
+            document["data_plane"] = "legacy"
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(
+                    TransferJournalError, "removed legacy"):
+                journal.load(descriptor)
+
     def test_close_intent_is_durable_monotonic_and_authorizes_replay(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = TransferJournal(directory)
@@ -518,7 +603,8 @@ class TransferJournalTest(unittest.TestCase):
             self.assertEqual(
                 encode_open(resumed)[4],
                 TransferOpenFlag.RESUME |
-                TransferOpenFlag.RECEIPTLESS_REPLAY)
+                TransferOpenFlag.RECEIPTLESS_REPLAY |
+                TransferOpenFlag.FAST_PUMP)
             with self.assertRaisesRegex(
                     TransferJournalError, "clear.*close intent"):
                 journal.save(
@@ -541,7 +627,9 @@ class TransferJournalTest(unittest.TestCase):
             self.assertTrue(resumed.resume)
             self.assertFalse(record.close_intent)
             self.assertFalse(resumed.receiptless_replay)
-            self.assertEqual(encode_open(resumed)[4], TransferOpenFlag.RESUME)
+            self.assertEqual(
+                encode_open(resumed)[4],
+                TransferOpenFlag.RESUME | TransferOpenFlag.FAST_PUMP)
 
     def test_close_intent_rejects_partial_or_non_put_boundaries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -558,24 +646,27 @@ class TransferJournalTest(unittest.TestCase):
                     confirmed_offset=1000,
                     prefix_crc32=0x11223344, close_intent=True)
 
-    def test_version_one_journal_loads_without_terminal_authority(self):
+    def test_version_one_and_two_legacy_journals_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = TransferJournal(directory)
             descriptor = put_descriptor()
             path = journal.save(
                 descriptor, confirmed_offset=descriptor.wire_size,
                 prefix_crc32=descriptor.wire_crc32)
-            document = json.loads(path.read_text())
-            document["version"] = 1
-            del document["close_intent"]
-            path.write_text(json.dumps(document))
+            current = json.loads(path.read_text())
+            for version in (1, 2):
+                with self.subTest(version=version):
+                    document = dict(current)
+                    document["version"] = version
+                    if version == 1:
+                        del document["close_intent"]
+                    path.write_text(json.dumps(document))
+                    with self.assertRaisesRegex(
+                            TransferJournalError, "removed legacy"):
+                        journal.load(descriptor)
 
-            record = journal.load(descriptor)
-            self.assertFalse(record.close_intent)
-            self.assertFalse(record.resumed_descriptor().receiptless_replay)
-
-            document["version"] = True
-            path.write_text(json.dumps(document))
+            current["version"] = True
+            path.write_text(json.dumps(current))
             with self.assertRaisesRegex(
                     TransferJournalError, "unsupported journal version"):
                 journal.load(descriptor)
@@ -593,6 +684,74 @@ class TransferJournalTest(unittest.TestCase):
             self.assertEqual(found.descriptor.transfer_id, b"a" * 16)
             self.assertIsNone(journal.find_matching(
                 expected, caller_binding="/not-the-source.bin"))
+
+    def test_discovery_skips_only_provably_unrelated_legacy_journals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TransferJournal(directory)
+            caller = "/local/source.bin"
+            matching = put_descriptor(transfer_id=b"m" * 16)
+            journal.save(
+                matching, confirmed_offset=500, prefix_crc32=0x12345678,
+                caller_binding=caller)
+
+            other_path = put_descriptor(
+                transfer_id=b"p" * 16, path="A:\\OTHER.BIN")
+            other_path_file = journal.save(
+                other_path, confirmed_offset=0, prefix_crc32=0,
+                caller_binding=caller)
+            other_path_document = json.loads(other_path_file.read_text())
+            other_path_document["version"] = 2
+            other_path_file.write_text(json.dumps(other_path_document))
+
+            other_caller = put_descriptor(transfer_id=b"c" * 16)
+            other_caller_file = journal.save(
+                other_caller, confirmed_offset=0, prefix_crc32=0,
+                caller_binding="/local/other-source.bin")
+            other_caller_document = json.loads(other_caller_file.read_text())
+            other_caller_document["version"] = 3
+            other_caller_document["data_plane"] = "legacy"
+            other_caller_file.write_text(json.dumps(other_caller_document))
+
+            expected = put_descriptor(transfer_id=b"n" * 16)
+            found = journal.find_matching(
+                expected, caller_binding=caller)
+
+            self.assertEqual(found.descriptor.transfer_id, b"m" * 16)
+
+    def test_discovery_rejects_legacy_journal_that_may_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TransferJournal(directory)
+            saved = put_descriptor(transfer_id=b"l" * 16)
+            path = journal.save(
+                saved, confirmed_offset=0, prefix_crc32=0,
+                caller_binding="/local/source.bin")
+            document = json.loads(path.read_text())
+            document["version"] = 2
+            path.write_text(json.dumps(document))
+
+            with self.assertRaisesRegex(
+                    TransferJournalError, "removed legacy"):
+                journal.find_matching(
+                    put_descriptor(transfer_id=b"e" * 16),
+                    caller_binding="/local/source.bin")
+            with self.assertRaisesRegex(
+                    TransferJournalError, "removed legacy"):
+                journal.load(saved, caller_binding="/local/source.bin")
+
+    def test_discovery_does_not_swallow_generic_corruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TransferJournal(directory)
+            unrelated = put_descriptor(
+                transfer_id=b"u" * 16, path="A:\\OTHER.BIN")
+            path = journal.save(
+                unrelated, confirmed_offset=0, prefix_crc32=0)
+            document = json.loads(path.read_text())
+            document["wire_crc32"] = "not-a-crc"
+            path.write_text(json.dumps(document))
+
+            with self.assertRaises(TransferJournalError):
+                journal.find_matching(
+                    put_descriptor(transfer_id=b"e" * 16))
 
     def test_get_discovery_treats_zero_metadata_as_unknown(self):
         with tempfile.TemporaryDirectory() as directory:

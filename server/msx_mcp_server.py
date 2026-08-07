@@ -1517,7 +1517,13 @@ TOOLS = {
         "CRLF plus 0x1A before hashing; tokenized BASIC remains byte-exact. "
         "compression='auto' keeps ZIP and other already-compressed files "
         "unchanged and uses PackBits only when it saves space and the target "
-        "advertises a decoder. Set dos_prompt_confirmed=true only after "
+        "advertises a decoder. The fast-v1 foreground helper pump carries up "
+        "to 2026 sequential data bytes per frame, with no extra "
+        "STATUS round trip per block. Whole-file CRC, sparse durable state, "
+        "resume, and publication checks remain mandatory. It requires the "
+        "current agent. Results include "
+        "host-measured stream bytes, seconds, and B/s. Set "
+        "dos_prompt_confirmed=true only after "
         "externally confirming the DOS prompt. False permits active resume "
         "recovery only. The tool performs no automatic VRAM read.",
         _s({"local_path": {"type": "string", "minLength": 1},
@@ -1532,9 +1538,14 @@ TOOLS = {
            ["local_path", "msx_path", "dos_prompt_confirmed"])),
     "msx_file_get": (t_file_get,
         "Download an arbitrary MSX-DOS file using file-transfer-v2. Streams "
-        "raw bytes with 32-bit offsets, CRC-32, explicit block ACKs, durable "
-        "resume, and atomic no-overwrite publication on the host. GET remains "
-        "raw until an independently negotiated MSX encoder is available. The "
+        "raw bytes with 32-bit offsets, CRC-32, durable resume, and atomic "
+        "no-overwrite publication on the host. GET remains "
+        "raw until an independently negotiated MSX encoder is available. "
+        "The fast-v1 foreground helper pump carries up to 2040 data bytes per "
+        "frame, replacing per-block GET ACKs with sparse durable checkpoints. "
+        "Whole-file CRC, resume, and publication checks remain mandatory. It "
+        "requires the current agent. Results "
+        "include host-measured stream bytes, seconds, and B/s. The "
         "MSX must be externally confirmed at a DOS prompt with "
         "dos_prompt_confirmed=true; false permits active resume recovery only. "
         "The tool performs no automatic VRAM read.",

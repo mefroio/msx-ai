@@ -4,6 +4,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOADER = ROOT / "agent" / "msx_memman_loader.asm"
+XFER_ENGINE = ROOT / "agent" / "msx_xfer_engine.inc"
 MAKEFILE = ROOT / "Makefile"
 
 
@@ -11,12 +12,14 @@ class MemManLoaderSourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = LOADER.read_text(encoding="utf-8")
+        cls.xfer = XFER_ENGINE.read_text(encoding="utf-8")
 
     def test_loader_is_integrated_into_the_canonical_suite_build(self):
         makefile = MAKEFILE.read_text(encoding="utf-8")
         core = (ROOT / "agent" / "msx_agent_core.asm").read_text(
             encoding="utf-8")
         self.assertIn("msx_memman_loader", makefile)
+        self.assertIn("msx_xfer_engine", makefile)
         self.assertIn("include 'agent/msx_memman_loader.asm'", core)
         self.assertIn("work/agent/MSXAI.COM", makefile)
 
@@ -192,18 +195,19 @@ class MemManLoaderSourceTests(unittest.TestCase):
                 "TSR_TALK_UPLOAD_BEGIN", "TSR_TALK_UPLOAD_POLL",
                 "TSR_TALK_UPLOAD_END", "FILE_UPLOAD_TIMEOUT_TICKS",
                 "loader_put_tsr_call:", "loader_put_crc_update:"):
-            self.assertNotIn(obsolete, core + self.source)
+            self.assertNotIn(obsolete, core + self.source + self.xfer)
         self.assertNotIn("MSXAI /PUT", core)
 
-        self.assertIn("loader_xfer_put_file:", self.source)
-        self.assertIn("loader_xfer_get_file:", self.source)
-        self.assertIn("TSR_TALK_XFER_PUT_POLL", self.source)
-        self.assertIn("TSR_TALK_XFER_GET_PUBLISH", self.source)
+        self.assertNotIn("loader_xfer_put_file:", self.source)
+        self.assertIn("loader_xfer_put_file:", self.xfer)
+        self.assertIn("loader_xfer_get_file:", self.xfer)
+        self.assertIn("TSR_TALK_XFER_PUT_POLL", self.xfer)
+        self.assertIn("TSR_TALK_XFER_GET_PUBLISH", self.xfer)
         self.assertIn("MSXAIXF.COM", helper)
         self.assertIn('db "/PUT",0', helper)
         self.assertIn('db "/GET",0', helper)
         self.assertIn("loader_xfer_buffer:", helper)
-        self.assertNotIn("loader_put_buffer", helper + self.source)
+        self.assertNotIn("loader_put_buffer", helper + self.source + self.xfer)
 
 
 if __name__ == "__main__":

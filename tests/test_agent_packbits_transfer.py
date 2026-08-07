@@ -6,9 +6,10 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MAKEFILE = (ROOT / "Makefile").read_text(encoding="utf-8")
 CORE = (ROOT / "agent" / "msx_agent_core.asm").read_text(encoding="utf-8")
-LOADER = (ROOT / "agent" / "msx_memman_loader.asm").read_text(
-    encoding="utf-8")
 HELPER = (ROOT / "agent" / "msx_xfer.asm").read_text(encoding="utf-8")
+ENGINE = (ROOT / "agent" / "msx_xfer_engine.inc").read_text(
+    encoding="utf-8")
+XFER = HELPER + "\n" + ENGINE
 PROTOCOL = (ROOT / "agent" / "msx_xfer_protocol.inc").read_text(
     encoding="utf-8")
 REAL = (ROOT / "server" / "msx_real.py").read_text(encoding="utf-8")
@@ -19,10 +20,15 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertIn("AGENT_XFER_COM := work/agent/MSXAIXF.COM", MAKEFILE)
         self.assertRegex(MAKEFILE, r"(?m)^agent: .*\$\(AGENT_XFER_COM\)")
         self.assertIn("MSX_DOS_BENCH_COM_MAX := 36760", MAKEFILE)
+        self.assertIn("MSX_XFER_PAGE0_COM_MAX := 16128", MAKEFILE)
+        xfer_rule = MAKEFILE.split(
+            "$(AGENT_XFER_COM): $(AGENT_XFER_SRC)", 1)[1].split(
+            "\ntest:", 1)[0]
+        self.assertIn("$(MSX_XFER_PAGE0_COM_MAX)", xfer_rule)
         self.assertEqual(
             MAKEFILE.count("tools/check_msx_com_size.py $@ "), 2)
         self.assertIn("Usage: MSXAIXF /PUT|/GET", HELPER)
-        self.assertIn("include 'agent/msx_memman_loader.asm'", HELPER)
+        self.assertIn("include 'agent/msx_xfer_engine.inc'", HELPER)
 
     def test_transfer_helper_initializes_memman_inichk_control_code(self):
         discovery = HELPER.split("memman_find_agent:", 1)[1].split(
@@ -32,7 +38,7 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
             r"(?s)^\s*xor a\s+.*ld d,'M'\s+ld e,30\s+call EXTBIO")
 
     def test_zero_length_transfers_never_enter_z80_block_copy(self):
-        path_copy = LOADER.split("loader_xfer_build_one_path:", 1)[1].split(
+        path_copy = XFER.split("loader_xfer_build_one_path:", 1)[1].split(
             "loader_xfer_build_prefix_done:", 1)[0]
         self.assertRegex(
             path_copy,
@@ -44,8 +50,13 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertRegex(
             get_copy,
             r"(?s)ld bc,\(frame_response_buffer \+ 4\)\s+"
-            r"ld a,b\s+or c\s+jr z,frame_xfer_get_copy_done\s+"
-            r"ld hl,xfer_buffer\s+ld de,frame_response_buffer \+ 8\s+ldir")
+            r"ld a,b\s+or c\s+jr z,frame_xfer_get_copy_done")
+        self.assertNotIn("ld hl,xfer_buffer", get_copy)
+        self.assertIn("ld hl,(xfer_fast_page0_buffer)", get_copy)
+        self.assertRegex(
+            get_copy,
+            r"(?s)frame_xfer_get_resident_copy:\s+"
+            r"ld de,frame_response_buffer \+ 8\s+ldir")
 
     def test_tsr_finish_returns_success_after_publishing_result_flags(self):
         finish = CORE.split("tsr_talk_xfer_finish:", 1)[1].split(
@@ -89,7 +100,7 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertIn("MSXAIXF /GET", REAL)
 
     def test_decoder_rejects_reserved_and_noncanonical_controls(self):
-        decoder = LOADER.split("loader_xfer_packbits_loop:", 1)[1].split(
+        decoder = XFER.split("loader_xfer_packbits_loop:", 1)[1].split(
             "loader_xfer_packbits_complete:", 1)[0]
         self.assertIn("cp 080h", decoder)
         self.assertIn("reserved no-op is non-canonical", decoder)
@@ -98,9 +109,9 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertIn("call loader_xfer_packbits_final_fits", decoder)
 
     def test_decoder_verifies_exact_wire_and_final_streams(self):
-        loop = LOADER.split("loader_xfer_packbits_loop:", 1)[1].split(
+        loop = XFER.split("loader_xfer_packbits_loop:", 1)[1].split(
             "loader_xfer_packbits_complete:", 1)[0]
-        complete = LOADER.split("loader_xfer_packbits_complete:", 1)[1].split(
+        complete = XFER.split("loader_xfer_packbits_complete:", 1)[1].split(
             "loader_xfer_packbits_create_error:", 1)[0]
         self.assertIn("call loader_xfer_position_equals_wire", loop)
         self.assertIn("call loader_xfer_packbits_read_exact", loop)
@@ -111,85 +122,79 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertIn("call loader_xfer_publish_output", complete)
 
     def test_failure_deletes_only_create_new_owned_output(self):
-        cleanup = LOADER.split("loader_xfer_delete_owned_output:", 1)[1].split(
+        cleanup = XFER.split("loader_xfer_delete_owned_output:", 1)[1].split(
             "loader_xfer_mark_progress:", 1)[0]
         self.assertIn("loader_xfer_output_owned", cleanup)
         self.assertIn("loader_xfer_output_path", cleanup)
         self.assertNotIn("loader_xfer_temp_path", cleanup)
         self.assertNotIn("loader_xfer_meta_path", cleanup)
 
-    def test_put_release_and_batched_commit_separate_write_from_durability(self):
+    def test_put_release_and_fast_window_commit_separate_acceptance_from_durability(self):
         release = CORE.split("tsr_talk_xfer_put_release:", 1)[1].split(
             "tsr_talk_xfer_put_commit:", 1)[0]
         commit = CORE.split("tsr_talk_xfer_put_commit:", 1)[1].split(
             "tsr_talk_xfer_get_publish:", 1)[0]
-        ensure = LOADER.split("loader_xfer_put_ensure:", 1)[1].split(
-            "loader_xfer_put_finalize:", 1)[0]
+        flush = XFER.split("loader_xfer_put_fast_flush:", 1)[1].split(
+            "loader_xfer_put_close:", 1)[0]
 
         self.assertIn("TSR_TALK_XFER_PUT_RELEASE: equ 0B1h", PROTOCOL)
         self.assertIn("ld (xfer_pending),a", release)
         self.assertIn("ld (xfer_buffer_length),a", release)
         self.assertNotIn("xfer_durable", release)
         self.assertNotIn("xfer_prefix_crc", release)
-        self.assertLess(ensure.index("DOS_ENSURE"),
-                        ensure.index("TSR_TALK_XFER_PUT_COMMIT"))
-        self.assertEqual(LOADER.count("TSR_TALK_XFER_PUT_COMMIT"), 1)
-        put_loop = LOADER.split("loader_xfer_put_loop:", 1)[1].split(
-            "loader_xfer_put_ensure:", 1)[0]
-        after_position = put_loop.split(
-            "call loader_xfer_add_position", 1)[1]
-        self.assertLess(
-            after_position.index("ld hl,(loader_xfer_block_length)"),
-            after_position.index("ld de,(loader_xfer_unflushed)"),
+        self.assertLess(flush.index("DOS_ENSURE"),
+                        flush.index("TSR_TALK_XFER_PUT_COMMIT"))
+        self.assertEqual(XFER.count("TSR_TALK_XFER_PUT_COMMIT"), 1)
+        self.assertIn("XFER_FAST_ACCUMULATOR_HIGH_WATER", XFER)
+        self.assertIn(
+            "XFER_FAST_ACCUMULATOR_CAPACITY - XFER_FAST_PUT_CAPACITY",
+            XFER,
         )
+        for obsolete in (
+                "loader_xfer_put_ensure:", "loader_xfer_unflushed",
+                "XFER_ENSURE_BATCH_BYTES", "XFER_PUT_CAPACITY:"):
+            self.assertNotIn(obsolete, XFER + PROTOCOL)
         self.assertRegex(
             commit,
             r"(?s)xfer_accepted.*xfer_durable.*xfer_math32.*"
             r"ld hl,xfer_accepted\s+ld de,xfer_durable\s+ld bc,4\s+ldir")
 
-        threshold = int(re.search(
-            r"XFER_ENSURE_BATCH_BYTES:\s+equ\s+(\d+)", LOADER).group(1))
-        capacity = int(re.search(
-            r"XFER_PUT_CAPACITY:\s+equ\s+(\d+)", PROTOCOL).group(1))
-        self.assertLessEqual(threshold + capacity - 1, 0xFFFF)
-
-    def test_foreground_progress_updates_after_every_confirmed_block(self):
-        put_before_ensure = LOADER.split(
-            "loader_xfer_put_loop:", 1)[1].split(
-            "loader_xfer_put_ensure:", 1)[0]
-        put_ensure = LOADER.split(
-            "loader_xfer_put_ensure:", 1)[1].split(
-            "loader_xfer_put_finalize:", 1)[0]
-        get_ack = LOADER.split(
+    def test_foreground_progress_updates_after_every_confirmed_fast_window(self):
+        put_accumulate = XFER.split(
+            "loader_xfer_put_fast_accumulate:", 1)[1].split(
+            "loader_xfer_put_fast_flush:", 1)[0]
+        put_flush = XFER.split(
+            "loader_xfer_put_fast_flush:", 1)[1].split(
+            "loader_xfer_put_close:", 1)[0]
+        get_ack = XFER.split(
             "loader_xfer_get_acked:", 1)[1].split(
             "loader_xfer_get_wait_close:", 1)[0]
 
         self.assertLess(
-            put_before_ensure.index("TSR_TALK_XFER_PUT_RELEASE"),
-            put_before_ensure.index("call loader_xfer_progress_after_block"))
-        self.assertLess(put_ensure.index("DOS_ENSURE"),
-                        put_ensure.index("TSR_TALK_XFER_PUT_COMMIT"))
+            put_accumulate.index("TSR_TALK_XFER_PUT_RELEASE"),
+            put_accumulate.index("call loader_xfer_mark_progress"))
+        self.assertNotIn(
+            "call loader_xfer_progress_after_block", put_accumulate)
+        self.assertLess(put_flush.index("DOS_ENSURE"),
+                        put_flush.index("TSR_TALK_XFER_PUT_COMMIT"))
         self.assertLess(
-            put_ensure.index("TSR_TALK_XFER_PUT_COMMIT"),
-            put_ensure.index("call loader_xfer_progress_after_block"))
-        self.assertRegex(
-            get_ack,
-            r"(?s)call loader_xfer_add_position\s+"
-            r"call loader_xfer_progress_after_block\s+"
-            r"call loader_xfer_mark_progress")
+            put_flush.index("TSR_TALK_XFER_PUT_COMMIT"),
+            put_flush.index("call loader_xfer_progress_after_block"))
+        self.assertIn("call loader_xfer_progress_after_block", get_ack)
+        self.assertIn("call loader_xfer_mark_progress", get_ack)
         self.assertEqual(
-            LOADER.count("call loader_xfer_progress_after_block"), 3)
+            XFER.count("call loader_xfer_progress_after_block"), 2)
 
     def test_progress_display_is_fixed_width_and_uses_32_bit_thresholds(self):
-        progress = LOADER.split(
+        progress = XFER.split(
             "loader_xfer_progress_begin:", 1)[1].split(
             "loader_xfer_mark_progress:", 1)[0]
-        message = LOADER.split(
+        message = XFER.split(
             "loader_xfer_progress_message:", 1)[1].split(
             "loader_xfer_expected_direction:", 1)[0]
 
-        self.assertIn("XFER_PROGRESS_BAR_WIDTH: equ 18", LOADER)
-        self.assertIn("XFER_PROGRESS_DIVISOR:   equ 100", LOADER)
+        self.assertIn("XFER_PROGRESS_BAR_WIDTH: equ 18", XFER)
+        self.assertIn("XFER_PROGRESS_DIVISOR:   equ 100", XFER)
         self.assertIn("loader_xfer_progress_step + 2", progress)
         self.assertIn("loader_xfer_progress_next + 3", progress)
         self.assertIn("loader_xfer_position + 3", progress)
@@ -209,14 +214,14 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertEqual(rendered_width, 35)
 
     def test_rate_uses_confirmed_bytes_jiffies_and_pal_ntsc_frequency(self):
-        rate = LOADER.split(
+        rate = XFER.split(
             "loader_xfer_progress_after_block:", 1)[1].split(
             "loader_xfer_progress_reached_next:", 1)[0]
-        begin = LOADER.split(
+        begin = XFER.split(
             "loader_xfer_progress_begin:", 1)[1].split(
             "loader_xfer_progress_after_block:", 1)[0]
 
-        self.assertIn("RG9SAV:                  equ 0FFE8h", LOADER)
+        self.assertIn("RG9SAV:                  equ 0FFE8h", XFER)
         self.assertIn("bit 1,a", begin)
         self.assertIn("ld a,50", begin)
         self.assertIn("ld a,60", begin)
@@ -224,7 +229,24 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertIn("loader_xfer_progress_pending", rate)
         self.assertIn("loader_xfer_progress_last_jiffy", rate)
         self.assertIn("loader_xfer_progress_divide_u16", rate)
+        self.assertLess(
+            rate.index("call loader_xfer_progress_divide_u16"),
+            rate.index("loader_xfer_progress_rate_multiply"))
+        self.assertIn("loader_xfer_progress_rate_fraction_loop", rate)
         self.assertIn("ld hl,0FFFFh", rate)
+        self.assertIn("loader_xfer_progress_rate_sample", rate)
+        self.assertIn("ld a,(loader_xfer_progress_hz)", rate)
+        self.assertLess(
+            rate.index("loader_xfer_progress_rate_sample:"),
+            rate.index("ld hl,(loader_xfer_progress_current_jiffy)"))
+
+        # The old multiply-first 16-bit formula overflowed for a 2040-byte
+        # block. Quotient/remainder decomposition remains exact.
+        block, ticks, hz = 2040, 64, 60
+        quotient, remainder = divmod(block, ticks)
+        self.assertEqual(
+            quotient * hz + (remainder * hz) // ticks,
+            (block * hz) // ticks)
 
     def test_progress_integer_algorithms_cover_protocol_boundaries(self):
         def divide_u16(dividend, divisor):
@@ -239,7 +261,7 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
                     quotient += 1
             return quotient, remainder
 
-        for dividend in (0, 1, 59, 60, 298, 17880, 65535):
+        for dividend in (0, 1, 59, 60, 2026, 2040, 16384, 65535):
             for divisor in (1, 2, 3, 10, 50, 60, 65535):
                 self.assertEqual(
                     divide_u16(dividend, divisor), divmod(dividend, divisor))
@@ -273,17 +295,17 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
                  for percent in range(1, 101)])
 
     def test_transaction_phases_recover_owned_output_and_completed_rename(self):
-        metadata = LOADER.split("loader_xfer_create_metadata:", 1)[1].split(
+        metadata = XFER.split("loader_xfer_create_metadata:", 1)[1].split(
             "loader_xfer_compare_bytes:", 1)[0]
-        phases = LOADER.split("loader_xfer_set_phase:", 1)[1].split(
+        phases = XFER.split("loader_xfer_set_phase:", 1)[1].split(
             "; Decode a complete standard PackBits", 1)[0]
-        packbits = LOADER.split(
+        packbits = XFER.split(
             "loader_xfer_put_packbits_finalize:", 1)[1].split(
             "loader_xfer_packbits_loop:", 1)[0]
-        publish = LOADER.split("loader_xfer_publish_selected:", 1)[1].split(
+        publish = XFER.split("loader_xfer_publish_selected:", 1)[1].split(
             "loader_xfer_scan_exact:", 1)[0]
 
-        self.assertIn('db "MXAI2MT2"', LOADER)
+        self.assertIn('db "MXAI2MT2"', XFER)
         self.assertIn("XFER_META_PHASE_INV", metadata)
         self.assertIn("DOS_ENSURE", metadata)
         self.assertLess(phases.index("write_exact"), phases.index("DOS_ENSURE"))
@@ -307,12 +329,12 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertIn("XFER_DESC_FINAL_CRC", publish)
 
     def test_lost_terminal_reply_uses_full_journal_and_exact_target_replay(self):
-        raw_success = LOADER.split("call loader_xfer_publish_temp", 1)[1].split(
+        raw_success = XFER.split("call loader_xfer_publish_temp", 1)[1].split(
             "loader_xfer_get_file:", 1)[0]
-        packed_success = LOADER.split(
+        packed_success = XFER.split(
             "loader_xfer_packbits_complete:", 1)[1].split(
             "loader_xfer_packbits_create_error:", 1)[0]
-        replay = LOADER.split(
+        replay = XFER.split(
             "loader_xfer_prepare_receiptless_published:", 1)[1].split(
             "loader_xfer_prepare_metadata_error:", 1)[0]
         self.assertIn("ld de,loader_xfer_meta_path", raw_success)
@@ -326,9 +348,9 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertNotIn("DOS_DELETE", replay)
 
     def test_terminal_success_follows_cleanup_and_final_console_output(self):
-        success_exit = LOADER.split("loader_xfer_success_exit:", 1)[1].split(
+        success_exit = XFER.split("loader_xfer_success_exit:", 1)[1].split(
             "loader_xfer_timeout_error:", 1)[0]
-        self.assertEqual(LOADER.count("call loader_xfer_finish_success"), 1)
+        self.assertEqual(XFER.count("call loader_xfer_finish_success"), 1)
         self.assertLess(
             success_exit.index("call loader_xfer_print"),
             success_exit.index("call loader_xfer_finish_success"))
@@ -336,18 +358,18 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
             success_exit.index("call loader_xfer_finish_success"),
             success_exit.index("ld c,0"))
 
-        raw_put = LOADER.split("loader_xfer_put_finalize:", 1)[1].split(
+        raw_put = XFER.split("loader_xfer_put_finalize:", 1)[1].split(
             "loader_xfer_get_file:", 1)[0]
-        get = LOADER.split("loader_xfer_get_finalize:", 1)[1].split(
+        get = XFER.split("loader_xfer_get_finalize:", 1)[1].split(
             "loader_xfer_wait:", 1)[0]
-        packed = LOADER.split("loader_xfer_packbits_complete:", 1)[1].split(
+        packed = XFER.split("loader_xfer_packbits_complete:", 1)[1].split(
             "loader_xfer_packbits_create_error:", 1)[0]
         for path in (raw_put, get, packed):
             self.assertIn("jp loader_xfer_success_exit", path)
             self.assertNotIn("call loader_xfer_finish_success", path)
 
     def test_missing_sidecar_replays_an_empty_completed_put(self):
-        prepare = LOADER.split("loader_xfer_prepare_put:", 1)[1].split(
+        prepare = XFER.split("loader_xfer_prepare_put:", 1)[1].split(
             "loader_xfer_prepare_new:", 1)[0]
         self.assertIn("XFER_FLAG_RECEIPTLESS_REPLAY", prepare)
         self.assertIn("loader_xfer_requested_resume_equals_wire", prepare)
@@ -382,7 +404,7 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
         self.assertIn("frame_request_buffer + 25", validation)
 
     def test_main_agent_contains_no_embedded_external_decompressor(self):
-        combined = (CORE + LOADER).lower()
+        combined = (CORE + XFER).lower()
         self.assertNotIn("incbin 'work/agent/vendor/gunzip", combined)
         self.assertNotIn("gunzip_high", combined)
 

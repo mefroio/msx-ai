@@ -228,8 +228,12 @@ class ResidentAgentSourceTests(unittest.TestCase):
 
         storage = self.source.split("xfer_descriptor:", 1)[1].split(
             "resident_initialize:", 1)[0]
-        self.assertRegex(
-            storage, r"(?m)^xfer_buffer:\s*\n\s*ds XFER_GET_CAPACITY,0$")
+        self.assertIn("xfer_fast_page0_buffer:", storage)
+        self.assertIn("xfer_fast_page0_frame:", storage)
+        self.assertNotRegex(storage, r"(?m)^xfer_buffer:")
+        self.assertNotRegex(storage, r"(?m)^xfer_buffer_crc:")
+        self.assertNotIn("XFER_GET_CAPACITY", self.source)
+        self.assertNotIn("XFER_PUT_CAPACITY", self.source)
         self.assertNotIn("equ upload_buffer", storage)
 
         talk = self.source.split("tsr_talk:", 1)[1].split(
@@ -237,7 +241,7 @@ class ResidentAgentSourceTests(unittest.TestCase):
         for action in (
                 "TSR_TALK_XFER_CLAIM", "TSR_TALK_XFER_READY",
                 "TSR_TALK_XFER_PUT_POLL", "TSR_TALK_XFER_GET_PUBLISH",
-                "TSR_TALK_XFER_FINISH"):
+                "TSR_TALK_XFER_FINISH", "TSR_TALK_XFER_PUMP"):
             self.assertIn(action, talk)
         for obsolete in (
                 "TSR_TALK_UPLOAD_BEGIN", "TSR_TALK_UPLOAD_POLL",

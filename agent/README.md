@@ -3,8 +3,8 @@
 The MSX-DOS side of the physical-target backend is a compact seven-file suite:
 
 - `MSXAI.COM` is the command-line lifecycle front end and foreground monitor;
-- `MSXAIXF.COM` is the transient protocol-X PUT/GET worker and bounded
-  PackBits decoder;
+- `MSXAIXF.COM` is the transient protocol-X PUT/GET worker, 16 KiB fast-I/O
+  accumulator, and bounded PackBits decoder;
 - `MCP8251.TSR` and `MCP16550.TSR` are fixed-driver resident images selected
   by `/DRIVER` on first installation; and
 - `MEMMAN.COM`, `TL.COM`, and `TK.COM` provide the external MemMan lifecycle.
@@ -12,6 +12,11 @@ The MSX-DOS side of the physical-target backend is a compact seven-file suite:
 Runtime command-line options select the driver and operating mode. Splitting
 the suite keeps unrelated transient utilities out of the main executable and
 does not make their file sizes cumulative in MSX RAM.
+
+In the source tree, `msx_xfer.asm` owns the transient transfer executable and
+compiles `msx_xfer_engine.inc`, which contains its PUT/GET, resume, progress,
+CRC, and PackBits routines. `msx_memman_loader.asm` contains only the resident
+installation and removal lifecycle; it has no file-transfer engine code.
 
 The external contract is a full-duplex byte stream. TCP roles, MCP tools,
 application parsing, and screenshot rendering live on the host and are not
@@ -173,6 +178,39 @@ UART framing and bounded mailbox copies but never calls BDOS. This separation
 is independent of the selected 8251 or 16C550 byte-stream transport and keeps
 interrupted DOS, games, and BIOS hooks out of the filesystem path.
 
+File PUT and GET use `fast-v1` as their sole active data path. Negotiation is
+mandatory: the host requires `FAST_CAPABILITIES`, marks OPEN with flag bit
+`0x04`, launches `MSXAIXF.COM`, and sends `FAST_BEGIN` only after the helper
+reports READY. The resident agent and transient helper must come from the same
+current suite. Any missing capability, rejected begin, or mismatched suite
+causes the transfer to fail closed before file data is transferred; there is no
+slower data-plane fallback.
+
+The helper uses `TSR_TALK_XFER_PUMP` to service one complete opcode-X frame
+between DOS calls, outside `H.TIMI`, with up to 2,026 PUT data bytes or 2,040
+GET data bytes. Hooks leave the UART untouched while the pump is armed, so the
+frame-wake ACK holds the host at its leading byte during disk work. This is
+physical receive credit, not another transfer-level ACK. The pump has its own
+bounded I/O timeout and saved stack. Reconnect clears pump ownership while
+preserving the validated descriptor and durable resume state for an explicit
+re-arm.
+
+Existing version-3 host journals already marked `fast-v1` are migrated and can
+resume after validation. Journals created for the retired legacy transfer data
+plane, and legacy transfers that were active during an upgrade, cannot resume
+with the current build. They are rejected rather than reinterpreted through an
+incompatible framing and credit model. During automatic discovery, a retired
+journal is ignored only when its fully validated binding proves that it belongs
+to another transfer; a possibly matching retired journal remains a hard error.
+
+The larger parser window is private to an armed opcode-X pump. Bootstrap and
+HELLO still advertise 320 bytes, ordinary commands remain capped at that
+hook-safe limit, and the host raises its v3 ceiling only around one fast bulk
+frame before restoring it. Transfer negotiation requires both `PUMP` (`0x01`)
+and `STREAM` (`0x02`) capability bits. It reuses the existing MCP frame CRC-16
+and sequence de-duplication but adds no per-block checksum; the whole-file
+CRC-32 remains the end-to-end integrity check.
+
 The host BASIC file mode uses this same path: it materializes the ASCII or
 tokenized `.BAS` bytes temporarily, stages a raw protocol-X PUT, launches
 `MSXAIXF.COM`, and requires the final CRC-32 and publication checks before
@@ -187,14 +225,16 @@ DOS termination instruction in the transient process. Host PUT/GET and BASIC
 file workflows use that protocol witness instead of hidden pre/post screen
 captures. A 32-hex transfer ID naturally wraps on a 40-column DOS screen.
 
-PUT uses a one-block mailbox with separate accepted and durable boundaries. The
-hook may accept at most 298 bytes at once. After an exact MSX-DOS 2 `WRITE`, the
-foreground worker releases that mailbox without claiming durability, allowing
-the next block to arrive. It runs `ENSURE` at an 8 KiB batch boundary and for
-the final block; only then does a cumulative commit advance the host-visible
-durable offset and CRC-32. The host bounds the accepted-minus-durable window to
-16 KiB, so a stalled or nonconforming target cannot grow host memory without
-limit.
+PUT keeps separate accepted and durable boundaries. The foreground pump accepts
+up to 2,026 data bytes per physical frame and copies consecutive frames into a
+16 KiB accumulator in transient CPU page 1. At its high-water threshold
+(normally about 14--16 KiB) or at end of file, `MSXAIXF.COM` updates the rolling
+CRC-32 over that contiguous window, performs one exact DOS `WRITE`, runs one
+`ENSURE`, and publishes one cumulative durable commit. The ordinary PUT reply
+is the only application credit; the host sends no separate STATUS request per
+frame. The resident advertises the available window as PUT credit and rejects
+requests that would make accepted-minus-durable exceed 16 KiB, so a stalled or
+nonconforming host cannot overflow the helper's accumulator.
 
 A same-directory partial named `xxxxxxxx.PRT` is created from 32 ID bits with
 `CREATE_NEW`. Its `xxxxxxxx.MTD` sidecar contains an immutable full 128-bit
@@ -203,11 +243,15 @@ binding plus a small complemented transaction phase. The phase is itself
 claimed. Publication first refuses an existing target, then uses DOS2 `RENAME`
 in the same directory. It never truncates or replaces a user file.
 
-GET opens the requested source read-only, discovers its 32-bit length and
-CRC-32 in the foreground, and publishes blocks of at most 312 bytes. Each block
-is pinned in resident memory until the host acknowledges its exact next offset
-and rolling prefix CRC. A lost acknowledgement therefore cannot release or
-silently skip a different block.
+GET opens the requested source read-only and discovers its 32-bit length and
+whole-file CRC-32 in the foreground. It performs one DOS `READ` of up to 16 KiB
+into the transient accumulator, then slices that window into framed responses
+containing at most 2,040 data bytes. Each frame is released only after its
+complete response has left the agent, and the next slice streams without an
+application ACK. The host flushes and fsyncs its partial and sends `GET_ACK` at
+64 KiB checkpoints and EOF. After reconnect, `FAST_BEGIN` rewinds the still-open
+DOS handle to that durable checkpoint, so an unacknowledged tail is replayed
+rather than skipped.
 
 Both directions support zero-byte files and lengths above 64 KiB; actual media,
 filesystem, and MSX-DOS limits still apply. CLOSE is the explicit end-of-stream
@@ -215,22 +259,23 @@ signal and is replay-safe while verification is running and after completion.
 A one-minute NTSC/72-second PAL no-progress deadline closes foreground handles
 without deleting a valid PUT partial. On resume, the sidecar binding and phase
 are revalidated, the actual partial length and CRC are scanned, and the host
-must confirm the returned prefix before sending more bytes. This recovers both
-a disk `WRITE` that survived before its next batched `ENSURE` and an `ENSURE`
-whose resident commit reply was lost. The implementation does not write a
-per-block disk journal: actual partial bytes, CRC reconciliation, and the few
-publication phases are the recovery authority.
+must confirm the returned prefix before sending more bytes. This recovers an
+`ENSURE`d accumulator window whose cumulative commit reply was lost. The
+implementation does not write a per-block disk journal: actual partial bytes,
+CRC reconciliation, and the few publication phases are the recovery authority.
 
 The foreground worker renders `[##################] 100% 11520 B/s` as one
 fixed-width, 35-column, carriage-returned status line. This fits Brazilian
 machines whose DOS console exposes 37 columns without touching the auto-wrap
-column. PUT updates after every exact
-`DOS_WRITE` is released or committed, and GET updates after each host ACK.
-Percentage uses the complete 32-bit wire position and size, including a resumed
-starting offset. Rate uses confirmed bytes per BIOS-jiffy interval and follows
-the saved VDP PAL/NTSC setting. The display code is compiled only into
-`MSXAIXF.COM`; it adds no resident TSR memory and disappears when DOS terminates
-the helper.
+column. PUT updates after accumulator windows are written and committed; GET
+updates as 16 KiB read windows are emitted. Percentage uses the complete 32-bit
+wire position and size, including a resumed starting offset. Intermediate rates
+use intervals of at least one BIOS second and follow the saved VDP PAL/NTSC
+setting. At CLOSE, the host appends its monotonic whole-stream B/s measurement,
+which the helper renders as the final 100% rate before its OK line. The host
+result returns the same interval as `stream_bytes`, `stream_seconds`, and
+`stream_rate_bps`. The display code is compiled only into `MSXAIXF.COM`; it adds
+no resident TSR memory and disappears when DOS terminates the helper.
 
 Protocol version 1 advertises RAW plus PUT-side `PACKBITS_DECODE`; GET remains
 RAW. The host uses deterministic standard PackBits only after capability
@@ -250,7 +295,8 @@ MSX backend, not to any MCP-specific interface.
 
 For a PackBits PUT, the verified `.PRT` is never published directly.
 `MSXAIXF.COM` reserves a distinct same-directory `.OUT` with `CREATE_NEW`, then
-decodes the complete wire stream incrementally with its fixed 318-byte buffer.
+decodes the complete wire stream incrementally with its fixed 2,046-byte
+transient buffer.
 It rejects reserved control `80h`, the non-canonical two-byte run `FFh`,
 truncated packets, trailing input, and output beyond the declared final size.
 It independently verifies exact 32-bit final length and CRC-32 before renaming
@@ -390,13 +436,14 @@ runs `TL.COM`, which loads only the selected TSR into mapper-managed resident
 memory. The unselected TSR, `TK.COM`, and `MSXAIXF.COM` remain disk files.
 
 `MSXAIXF.COM` is loaded later as an ordinary foreground transient only for a
-protocol-X PUT or GET. Its fixed buffer also performs PackBits decoding, and
-DOS reclaims its TPA when it exits. Uninstall similarly stages and overlays
-external `TK.COM` for one action. During a lifecycle handoff the front end and
-one staged external overlay briefly share the TPA; the other suite components
-do not. The requirement is therefore that active pair plus guarded stack and
-overlay headroom, never the sum of all seven file sizes. Only MemMan and the
-selected agent TSR remain allocated after installation.
+protocol-X PUT or GET. Its transient workspace provides PackBits decoding and
+the fast data plane's 16 KiB accumulator; DOS reclaims the complete TPA when it
+exits. Uninstall similarly stages and overlays external `TK.COM` for one
+action. During a lifecycle handoff the front end and one staged external
+overlay briefly share the TPA; the other suite components do not. The
+requirement is therefore that active pair plus guarded stack and overlay
+headroom, never the sum of all seven file sizes. Only MemMan and the selected
+agent TSR remain allocated after installation.
 
 MemMan relocates the TSR within a managed segment. When a hook or talk entry is
 running, that segment is mapped into CPU page 1. The agent must execute there,
@@ -479,9 +526,16 @@ CRC covers the full header and payload. Sequence numbers are monotonic modulo
 prevent state-changing commands from executing twice. Bulk RAM/VRAM reads may
 be recomputed because they are side-effect free.
 
-The current negotiated payload limit is 320 bytes. Request and response storage
-share one buffer to keep the resident compact. A split lookup-table
-implementation accelerates CRC processing.
+The public negotiated payload limit is 320 bytes, and the resident request and
+response area remains 320 bytes. File-transfer payloads above that limit are
+accepted only for an armed `fast-v1` opcode-X pump, using `MSXAIXF.COM`'s
+separate transient 2,048-byte page-zero frame workspace and adjacent 2,046-byte
+mailbox. PUT and GET also use a 16 KiB accumulator at `4000h`--`7FFFh`; none of
+these areas expands resident BSS. The helper refuses to start unless the DOS
+TPA top and entry stack pointer both provide at least `8800h`, leaving 2 KiB of
+guarded stack headroom above the accumulator. The build separately guarantees
+that the COM image ends before `4000h`. A split lookup-table implementation
+accelerates CRC processing.
 
 The v3 HELLO appends an optional feature byte after the runtime-mode byte. Bit
 0 advertises `keybuf-input`; bit 1 advertises the foreground-debug-only
@@ -523,8 +577,13 @@ lengths are `BAD_ARG`, and a request outside an active `H.TIMI` callback is
 
 Opcode `X` carries file-transfer subprotocol version 1. Its subcommands are
 `CAPS=0`, `OPEN=1`, `STATUS=2`, `PUT_DATA=3`, `GET_READ=4`, `GET_ACK=5`,
-`CLOSE=6`, and `CANCEL=7`. Every stateful request after OPEN includes the
-16-byte transfer ID. OPEN uses this fixed prefix before its ASCII path:
+`CLOSE=6`, `CANCEL=7`, `FAST_CAPABILITIES=8`, and `FAST_BEGIN=9`.
+`FAST_CAPABILITIES` is deliberately separate, preserving the base CAPS reply
+byte-for-byte. Capability bit `0x01` identifies the foreground pump and bit
+`0x02` identifies the sequential-stream revision. Both capabilities and a
+successful `FAST_BEGIN` are required for every transfer. Every stateful request
+after OPEN includes the 16-byte transfer ID. OPEN uses this fixed prefix before
+its ASCII path:
 
 ~~~~text
 sub:u8, version:u8, direction:u8, encoding:u8, flags:u8, id[16],
@@ -535,15 +594,18 @@ resume_offset:u32, resume_prefix_crc32:u32, path_length:u16, path[]
 All integers are little-endian. OPEN flag bit 0 requests resume. Bit 1
 authorizes receiptless terminal replay and is accepted only together with bit 0
 for a PUT whose requested offset and prefix CRC exactly equal its complete wire
-size and CRC. PUT data is `sub | id | offset:u32 | data`; its response separates
+size and CRC. Bit 2 is required and selects the negotiated pump. PUT data is
+`sub | id | offset:u32 | data`; its response separates
 the accepted block length and accepted end from the
 batched, `ENSURE`-backed durable end and next credit. GET_READ returns
 `offset:u32 | length:u16 | state:u8 | error:u8 | data`; GET_ACK binds the
-next offset to the rolling prefix CRC-32. STATUS returns state, direction,
-encoding, error, result flags, ID, all four integrity fields, durable and
-accepted offsets, prefix CRC, and PUT credit. Result flag bits mean active,
-resumable, wire verified, final verified, and published. Numeric state/error
-values and the complete host parser are defined in `server/msx_transfer.py`.
+next durable offset to the rolling prefix CRC-32 and is sent at 64 KiB and EOF
+checkpoints. CLOSE is `sub | id | rate_bps:u16`, with the rate measured by the
+host over the data-stream interval. STATUS returns state, direction, encoding,
+error, result flags, ID, all four integrity fields, durable and accepted
+offsets, prefix CRC, and PUT credit. Result flag bits mean active, resumable,
+wire verified, final verified, and published. Numeric state/error values and
+the complete host parser are defined in `server/msx_transfer.py`.
 
 Opcode `S` accepts exactly one non-zero lease byte while the resident is
 servicing a running program from a hook. After acknowledging it, the agent

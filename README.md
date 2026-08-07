@@ -36,9 +36,13 @@ BaDCaT-specific commands or depend on one network-adapter product.
   the openMSX debugger, or a versioned BIOS `H.TIMI` callback context through
   the physical agent.
 - Host-rendered SCREEN 0-8 and SCREEN 10-12 captures from VRAM.
-- Resumable binary PUT and GET with 32-bit sizes, CRC-32, explicit block
-  acknowledgement, and collision-safe publication.
-- On-MSX transfer percentage, progress bar, and confirmed bytes per second.
+- Resumable binary PUT and GET with 32-bit sizes, end-to-end CRC-32, durable
+  restart checkpoints, and collision-safe publication.
+- The `fast-v1` PUT/GET data path groups near-2 KiB wire frames into transient
+  16 KiB disk-I/O windows, with no extra STATUS round trip per PUT frame and
+  sparse durable GET checkpoints.
+- On-MSX transfer percentage, progress bar, and host-measured final bytes per
+  second, also returned to the MCP client as structured stream metrics.
 - Lightweight PackBits transport compression when it reduces the wire size;
   already-compressed files remain byte-exact.
 
@@ -110,6 +114,9 @@ not distributed by this repository.
   screenshots remain experimental.
 - Failed file transfers retain verified recovery state and never publish an
   incomplete target as a successful file.
+- File transfer requires a matched current resident and `MSXAIXF.COM`. Existing
+  version-3 `fast-v1` journals migrate, but sessions and journals from the
+  retired legacy transfer path cannot resume with the current suite.
 
 Physical BaDCaT SMD validation and performance measurements remain pending.
 The generic 16C550 driver is not a BaDCaT-specific build.

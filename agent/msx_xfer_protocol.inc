@@ -11,6 +11,7 @@ TSR_TALK_XFER_GET_POLL: equ 0AEh
 TSR_TALK_XFER_FINISH: equ 0AFh
 TSR_TALK_XFER_POSTPROCESS: equ 0B0h
 TSR_TALK_XFER_PUT_RELEASE: equ 0B1h
+TSR_TALK_XFER_PUMP: equ 0B2h
 
 XFER_VERSION: equ 1
 XFER_CMD_CAPS: equ 0
@@ -21,6 +22,19 @@ XFER_CMD_GET_READ: equ 4
 XFER_CMD_GET_ACK: equ 5
 XFER_CMD_CLOSE: equ 6
 XFER_CMD_CANCEL: equ 7
+; Keep the proven fast-v1 negotiation opcodes byte-exact. Fast-v1 is the only
+; active file-transfer data plane; FAST_PUMP remains an OPEN discriminator so
+; obsolete clients fail closed instead of entering an incompatible state path.
+XFER_CMD_FAST_CAPS: equ 8
+XFER_CMD_FAST_BEGIN: equ 9
+XFER_FAST_VERSION: equ 1
+XFER_FAST_CAP_PUMP: equ 1
+; Redesigned fast-v1 treats the successful framed response as the TCP-stream
+; delivery boundary. PUT therefore streams the next block without a STATUS
+; round-trip, while GET releases a transmitted block without a separate
+; application GET_ACK. The final CRC-32 still covers the complete file.
+XFER_FAST_CAP_STREAM: equ 2
+XFER_FAST_CAPABILITIES: equ XFER_FAST_CAP_PUMP | XFER_FAST_CAP_STREAM
 XFER_DIRECTION_PUT: equ 0
 XFER_DIRECTION_GET: equ 1
 XFER_ENCODING_RAW: equ 0
@@ -29,7 +43,8 @@ XFER_FLAG_RESUME: equ 1
 ; Host journaled a complete durable boundary before CLOSE. This is the only
 ; authorization to validate a final target after the helper removed its MTD.
 XFER_FLAG_RECEIPTLESS_REPLAY: equ 2
-XFER_FLAGS_SUPPORTED: equ XFER_FLAG_RESUME | XFER_FLAG_RECEIPTLESS_REPLAY
+XFER_FLAG_FAST_PUMP: equ 4
+XFER_FLAGS_SUPPORTED: equ XFER_FLAG_RESUME | XFER_FLAG_RECEIPTLESS_REPLAY | XFER_FLAG_FAST_PUMP
 XFER_CAP_RAW: equ 1
 XFER_CAP_PUT: equ 2
 XFER_CAP_GET: equ 4
@@ -39,8 +54,18 @@ XFER_CAP_PACKBITS_DECODE: equ 32
 XFER_CAP_PACKBITS_ENCODE: equ 64
 XFER_CAPABILITIES: equ XFER_CAP_RAW | XFER_CAP_PUT | XFER_CAP_GET | XFER_CAP_RESUME | XFER_CAP_CRC32 | XFER_CAP_PACKBITS_DECODE
 XFER_PATH_MAX: equ 63
-XFER_PUT_CAPACITY: equ 298
-XFER_GET_CAPACITY: equ 312
+; Fast-v1 uses the largest payloads that fit a 2048-byte framed-v3 message.
+XFER_FAST_PUT_CAPACITY: equ 2026
+XFER_FAST_GET_CAPACITY: equ 2040
+; The fast mailbox lives in the foreground helper's page-zero work area:
+; length:u16 + prefix_crc32:u32 + the largest GET block.
+XFER_FAST_WORK_CAPACITY: equ XFER_FAST_GET_CAPACITY + 6
+; A second, adjacent helper workspace holds the complete pump-only v3 payload.
+XFER_FAST_FRAME_CAPACITY: equ 2048
+XFER_FAST_PAGE0_CAPACITY: equ XFER_FAST_WORK_CAPACITY + XFER_FAST_FRAME_CAPACITY
+; Shared fast-v1 durability window. The transient helper owns the RAM; the
+; resident uses this value only to constrain accepted-minus-durable credit.
+XFER_FAST_ACCUMULATOR_CAPACITY: equ 16384
 XFER_STATE_IDLE: equ 0
 XFER_STATE_STAGED: equ 1
 XFER_STATE_OPENING: equ 2

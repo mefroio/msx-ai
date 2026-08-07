@@ -12,7 +12,8 @@ OPEN request payload (protocol version 1)::
     u8   version          01h
     u8   direction        00h PUT, 01h GET
     u8   encoding         00h raw, 01h PackBits
-    u8   flags            bit 0 resume, bit 1 receiptless terminal replay
+    u8   flags            bit 0 resume, bit 1 receiptless terminal replay,
+                          bit 2 required foreground stream pump
     u8   transfer_id[16]  opaque 128-bit identifier
     u32  wire_size
     u32  wire_crc32
@@ -33,6 +34,13 @@ Receiptless replay is deliberately narrower than ordinary resume. The host may
 set bit 1 only after it has fsync'd a journal at the complete durable PUT
 boundary before CLOSE. This distinguishes a lost terminal reply from a journal
 created before OPEN, including the otherwise ambiguous zero-byte case.
+
+The ``fast-v1`` stream pump is the only file-transfer data plane. It is
+negotiated with separate ``FAST_CAPABILITIES`` and ``FAST_BEGIN`` subcommands,
+reuses the outer frame CRC-16 rather than adding a transfer-block checksum,
+sends PUT without a separate STATUS poll, and checkpoints GET durability only
+at 64 KiB or EOF. Transfer identity, whole-file CRC-32, resume, compression,
+and publication semantics remain unchanged.
 """
 from __future__ import annotations
 
@@ -72,6 +80,8 @@ class TransferSubcommand(IntEnum):
     GET_ACK = 0x05
     CLOSE = 0x06
     CANCEL = 0x07
+    FAST_CAPABILITIES = 0x08
+    FAST_BEGIN = 0x09
 
 
 class TransferDirection(IntEnum):
@@ -96,10 +106,18 @@ class TransferCapability(IntFlag):
     PACKBITS_ENCODE = 0x00000040
 
 
+class TransferFastCapability(IntFlag):
+    """Foreground stream-pump facilities negotiated separately from CAPS."""
+
+    PUMP = 0x01
+    STREAM = 0x02
+
+
 class TransferOpenFlag(IntFlag):
     NONE = 0x00
     RESUME = 0x01
     RECEIPTLESS_REPLAY = 0x02
+    FAST_PUMP = 0x04
 
 
 class TransferState(IntEnum):
@@ -151,6 +169,14 @@ class TransferBindingError(TransferError):
 
 class TransferJournalError(TransferError):
     """A local resume journal is corrupt, unsafe, or inconsistent."""
+
+
+class TransferJournalLegacyError(TransferJournalError):
+    """A valid journal uses a retired data protocol."""
+
+    def __init__(self, message: str, record):
+        super().__init__(message)
+        self.record = record
 
 
 def _u32(name: str, value: int) -> int:
@@ -263,7 +289,6 @@ class TransferDescriptor:
                 resume_offset != wire_size or resume_crc != wire_crc32):
             raise TransferError(
                 "receiptless_replay requires a complete CRC-matched PUT resume")
-
         object.__setattr__(self, "direction", direction)
         object.__setattr__(self, "encoding", encoding)
         object.__setattr__(self, "transfer_id", transfer_id)
@@ -295,6 +320,7 @@ class TransferDescriptor:
 
 _OPEN_HEADER = struct.Struct("<BBBBB16sIIIIIIH")
 _CAPABILITIES_REPLY = struct.Struct("<BIHHH")
+_FAST_CAPABILITIES_REPLY = struct.Struct("<BBHH")
 _OPEN_REPLY = struct.Struct("<BB")
 _STATUS_REPLY = struct.Struct("<BBBBB16sIIIIIIIH")
 _PUT_DATA_REPLY = struct.Struct("<HIIHBB")
@@ -302,6 +328,7 @@ _GET_READ_HEADER = struct.Struct("<IHBB")
 _GET_ACK_REPLY = struct.Struct("<IBB")
 _TERMINAL_REPLY = struct.Struct("<BB")
 _ID_REQUEST = struct.Struct("<B16s")
+_FAST_CLOSE_REQUEST = struct.Struct("<B16sH")
 _GET_READ_REQUEST = struct.Struct("<B16sIH")
 _GET_ACK_REQUEST = struct.Struct("<B16sII")
 _PUT_DATA_REQUEST = struct.Struct("<B16sI")
@@ -314,13 +341,19 @@ def encode_capabilities_request() -> bytes:
 encode_caps_request = encode_capabilities_request
 
 
+def encode_fast_capabilities_request() -> bytes:
+    """Probe the required fast-v1 stream-pump capabilities."""
+
+    return bytes((TransferSubcommand.FAST_CAPABILITIES,))
+
+
 def encode_open(descriptor: TransferDescriptor) -> bytes:
     """Encode the canonical OPEN payload documented at module level."""
 
     if not isinstance(descriptor, TransferDescriptor):
         raise TransferError("descriptor must be a TransferDescriptor")
     path = _path_bytes(descriptor.path)
-    flags = TransferOpenFlag.NONE
+    flags = TransferOpenFlag.FAST_PUMP
     if descriptor.resume:
         flags |= TransferOpenFlag.RESUME
     if descriptor.receiptless_replay:
@@ -360,10 +393,14 @@ def decode_open(payload: bytes | bytearray | memoryview) -> TransferDescriptor:
             f"unsupported transfer version {version}; expected "
             f"{TRANSFER_PROTOCOL_VERSION}")
     supported_flags = int(
-        TransferOpenFlag.RESUME | TransferOpenFlag.RECEIPTLESS_REPLAY)
+        TransferOpenFlag.RESUME | TransferOpenFlag.RECEIPTLESS_REPLAY |
+        TransferOpenFlag.FAST_PUMP)
     if flags & ~supported_flags:
         raise TransferPayloadError(
             f"OPEN contains unknown flag bits: 0x{flags:02X}")
+    if not flags & TransferOpenFlag.FAST_PUMP:
+        raise TransferPayloadError(
+            "OPEN does not select the required fast-v1 stream pump")
     expected = _OPEN_HEADER.size + path_length
     if len(payload) != expected:
         raise TransferPayloadError(
@@ -400,6 +437,14 @@ class TransferCapabilitiesReply:
     max_put_chunk: int
     max_get_chunk: int
     max_path: int
+
+
+@dataclass(frozen=True)
+class TransferFastCapabilitiesReply:
+    version: int
+    capabilities: TransferFastCapability
+    max_put_chunk: int
+    max_get_chunk: int
 
 
 @dataclass(frozen=True)
@@ -541,6 +586,38 @@ def parse_capabilities_reply(payload: bytes | bytearray | memoryview
 parse_caps_reply = parse_capabilities_reply
 
 
+def parse_fast_capabilities_reply(payload: bytes | bytearray | memoryview
+                                  ) -> TransferFastCapabilitiesReply:
+    """Parse the required fast-v1 stream-pump capability response."""
+
+    payload = _payload(payload, _FAST_CAPABILITIES_REPLY.size,
+                       "FAST_CAPABILITIES")
+    version, capability_bits, put_chunk, get_chunk = (
+        _FAST_CAPABILITIES_REPLY.unpack(payload))
+    if version != 1:
+        raise TransferPayloadError(
+            f"unsupported fast transfer version {version}; expected 1")
+    known = int(
+        TransferFastCapability.PUMP | TransferFastCapability.STREAM)
+    if capability_bits & ~known:
+        raise TransferPayloadError(
+            f"FAST_CAPABILITIES contains unknown bits 0x{capability_bits:02X}")
+    capabilities = TransferFastCapability(capability_bits)
+    if capabilities & TransferFastCapability.PUMP and (
+            put_chunk == 0 or get_chunk == 0):
+        raise TransferPayloadError(
+            "FAST_CAPABILITIES advertises a zero-byte chunk")
+    return TransferFastCapabilitiesReply(
+        version, capabilities, put_chunk, get_chunk)
+
+
+def encode_fast_begin(transfer_id: bytes) -> bytes:
+    """Arm fast pumping only after the DOS helper has reached READY."""
+
+    return _ID_REQUEST.pack(
+        TransferSubcommand.FAST_BEGIN, _transfer_id(transfer_id))
+
+
 def parse_open_reply(payload: bytes | bytearray | memoryview) -> TransferOpenReply:
     payload = _payload(payload, _OPEN_REPLY.size, "OPEN")
     state, error = _OPEN_REPLY.unpack(payload)
@@ -650,9 +727,10 @@ def parse_status_reply(payload: bytes | bytearray | memoryview, *,
         credit)
 
 
-def encode_close(transfer_id: bytes) -> bytes:
-    return _ID_REQUEST.pack(
-        TransferSubcommand.CLOSE, _transfer_id(transfer_id))
+def encode_close(transfer_id: bytes, *, rate_bps: int) -> bytes:
+    return _FAST_CLOSE_REQUEST.pack(
+        TransferSubcommand.CLOSE, _transfer_id(transfer_id),
+        _u16("rate_bps", rate_bps))
 
 
 def encode_cancel(transfer_id: bytes) -> bytes:
@@ -1162,13 +1240,15 @@ class TransferJournalRecord:
 class TransferJournal:
     """Atomic host-side resume metadata stored below a caller-owned directory."""
 
-    _VERSION = 2
+    _VERSION = 4
     _V1_KEYS = frozenset({
         "version", "transfer_id", "direction", "encoding", "wire_size",
         "wire_crc32", "final_size", "final_crc32", "path",
         "confirmed_offset", "prefix_crc32", "caller_binding",
     })
-    _KEYS = _V1_KEYS | {"close_intent"}
+    _V2_KEYS = _V1_KEYS | {"close_intent"}
+    _V3_KEYS = _V2_KEYS | {"data_plane"}
+    _KEYS = _V2_KEYS
 
     def __init__(self, state_directory: str | os.PathLike[str]):
         self.state_directory = Path(state_directory)
@@ -1343,9 +1423,29 @@ class TransferJournal:
         version = document.get("version")
         if isinstance(version, bool) or not isinstance(version, int):
             raise TransferJournalError("unsupported journal version")
+        legacy_protocol = False
         if version == 1:
             expected_keys = self._V1_KEYS
             close_intent = False
+            legacy_protocol = True
+        elif version == 2:
+            expected_keys = self._V2_KEYS
+            close_intent = document.get("close_intent")
+            if not isinstance(close_intent, bool):
+                raise TransferJournalError(
+                    "journal close_intent must be a boolean")
+            legacy_protocol = True
+        elif version == 3:
+            expected_keys = self._V3_KEYS
+            if set(document) != expected_keys:
+                raise TransferJournalError(
+                    "journal fields do not match version 3 schema")
+            if document.get("data_plane") != "fast-v1":
+                legacy_protocol = True
+            close_intent = document.get("close_intent")
+            if not isinstance(close_intent, bool):
+                raise TransferJournalError(
+                    "journal close_intent must be a boolean")
         elif version == self._VERSION:
             expected_keys = self._KEYS
             close_intent = document.get("close_intent")
@@ -1417,6 +1517,10 @@ class TransferJournal:
                 record.prefix_crc32 != saved.wire_crc32):
             raise TransferJournalError(
                 "journal close_intent lacks a complete PUT boundary")
+        if legacy_protocol:
+            raise TransferJournalLegacyError(
+                "journal belongs to the removed legacy transfer protocol",
+                record)
         return record
 
     def load(self, expected: TransferDescriptor, *,
@@ -1491,7 +1595,15 @@ class TransferJournal:
                         f"journal scan exceeds the {max_entries}-entry limit")
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                record = self._load_path(Path(entry.path))
+                try:
+                    record = self._load_path(Path(entry.path))
+                except TransferJournalLegacyError as exc:
+                    if (self._matches_without_id(
+                            exc.record.descriptor, expected) and
+                            (caller_binding is None or
+                             exc.record.caller_binding == caller_binding)):
+                        raise
+                    continue
                 if not self._matches_without_id(record.descriptor, expected):
                     continue
                 if (caller_binding is not None and

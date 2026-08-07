@@ -9,7 +9,12 @@ import zlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "server"))
 
 import msx_real  # noqa: E402
-from msx_real import RealMSX, RealMSXError, RealMSXProtocolError  # noqa: E402
+from msx_real import (  # noqa: E402
+    RealMSX,
+    RealMSXError,
+    RealMSXProtocolError,
+    RealMSXTimeoutError,
+)
 from msx_transfer import (  # noqa: E402
     TransferAckReply,
     TransferCapabilitiesReply,
@@ -19,6 +24,8 @@ from msx_transfer import (  # noqa: E402
     TransferDirection,
     TransferEncoding,
     TransferError,
+    TransferFastCapabilitiesReply,
+    TransferFastCapability,
     TransferJournal,
     TransferOpenReply,
     TransferProgressReply,
@@ -60,22 +67,38 @@ class ScriptedTransferMSX(RealMSX):
             (TransferCapability.RAW | TransferCapability.PUT |
              TransferCapability.GET | TransferCapability.RESUME |
              TransferCapability.CRC32),
-            298, 312, 63)
+            2026, 2040, 63)
+        self.fast_caps = TransferFastCapabilitiesReply(
+            1,
+            TransferFastCapability.PUMP | TransferFastCapability.STREAM,
+            2026, 2040)
         self.descriptor = None
         self.transfer_state = TransferState.IDLE
         self.put_bytes = bytearray(initial_put)
         self.get_source = bytes(get_source)
         self.get_durable = 0
-        self.get_offer = None
+        self.get_sent = 0
         self.close_requested = False
         self.typed_commands = []
         self.closed_ids = []
+        self.close_rate_hints = []
         self.open_calls = 0
         self.put_blocks = 0
         self.get_blocks = 0
 
     def file_transfer_capabilities(self, *, refresh=False):
         return self.caps
+
+    def _require_file_transfer_fast_pump(self):
+        return self.fast_caps
+
+    def file_transfer_fast_begin(self, transfer_id):
+        self.assert_id(transfer_id)
+        self._fast_transfer_id = bytes(transfer_id)
+        if self.descriptor.direction is TransferDirection.GET:
+            self.get_sent = self.get_durable
+        return TransferOpenReply(
+            self.transfer_state, TransferRemoteError.NONE)
 
     def file_transfer_open(self, descriptor):
         self.open_calls += 1
@@ -89,6 +112,7 @@ class ScriptedTransferMSX(RealMSX):
                     TransferState.FAILED, TransferRemoteError.BINDING)
         else:
             self.get_durable = descriptor.resume_offset
+            self.get_sent = self.get_durable
             expected_prefix = (
                 zlib.crc32(self.get_source[:self.get_durable]) & 0xFFFFFFFF)
             if descriptor.resume_prefix_crc32 != expected_prefix:
@@ -131,7 +155,8 @@ class ScriptedTransferMSX(RealMSX):
                          TransferReplyFlag.RESUMABLE)
                 credit = min(self.caps.max_put_chunk, wire_size - durable)
         else:
-            durable = accepted = self.get_durable
+            durable = self.get_durable
+            accepted = self.get_sent
             prefix = zlib.crc32(
                 self.get_source[:self.get_durable]) & 0xFFFFFFFF
             if durable == wire_size and self.close_requested:
@@ -166,17 +191,10 @@ class ScriptedTransferMSX(RealMSX):
 
     def file_transfer_get_read(self, transfer_id, offset, maximum):
         self.assert_id(transfer_id)
-        if self.get_offer is not None:
-            offered_offset, offered = self.get_offer
-            if offset != offered_offset:
-                raise AssertionError("host skipped a pinned GET block")
-            return TransferDataReply(
-                offered_offset, offered, TransferState.TRANSFERRING,
-                TransferRemoteError.NONE)
-        if offset != self.get_durable:
+        if offset != self.get_sent:
             raise AssertionError("host GET offset diverged")
         data = self.get_source[offset:offset + maximum]
-        self.get_offer = (offset, data)
+        self.get_sent += len(data)
         self.get_blocks += 1
         return TransferDataReply(
             offset, data, TransferState.TRANSFERRING,
@@ -184,21 +202,20 @@ class ScriptedTransferMSX(RealMSX):
 
     def file_transfer_get_ack(self, transfer_id, next_offset, prefix_crc32):
         self.assert_id(transfer_id)
-        offered_offset, data = self.get_offer
-        if next_offset != offered_offset + len(data):
+        if next_offset != self.get_sent:
             raise AssertionError("host acknowledged the wrong GET boundary")
         expected = zlib.crc32(self.get_source[:next_offset]) & 0xFFFFFFFF
         if prefix_crc32 != expected:
             raise AssertionError("host acknowledged the wrong GET CRC")
         self.get_durable = next_offset
-        self.get_offer = None
         state = TransferState.TRANSFERRING
         return TransferAckReply(
             next_offset, state, TransferRemoteError.NONE)
 
-    def file_transfer_close(self, transfer_id):
+    def file_transfer_close(self, transfer_id, *, rate_bps=None):
         self.assert_id(transfer_id)
         self.closed_ids.append(bytes(transfer_id))
+        self.close_rate_hints.append(rate_bps)
         self.close_requested = True
         return TransferTerminalReply(
             TransferState.VERIFYING, TransferRemoteError.NONE)
@@ -270,10 +287,96 @@ class BatchedPutTransferMSX(ScriptedTransferMSX):
             TransferState.TRANSFERRING, TransferRemoteError.NONE)
 
 
+class FastStreamTransferMSX(ScriptedTransferMSX):
+    """Redesigned fast-v1 double: sequential PUT and ACK-free GET."""
+
+    def __init__(self, *, get_source=b""):
+        super().__init__(get_source=get_source)
+        self.status_calls = 0
+        self.get_ack_calls = 0
+
+    def file_transfer_status(self, transfer_id):
+        self.status_calls += 1
+        return super().file_transfer_status(transfer_id)
+
+    def file_transfer_put_data(self, transfer_id, offset, data):
+        self.assert_id(transfer_id)
+        if offset != len(self.put_bytes):
+            raise AssertionError("host fast PUT offset diverged")
+        self.put_bytes += data
+        self.put_blocks += 1
+        end = len(self.put_bytes)
+        return TransferProgressReply(
+            len(data), end, end, 0,
+            TransferState.TRANSFERRING, TransferRemoteError.NONE)
+
+    def file_transfer_get_read(self, transfer_id, offset, maximum):
+        self.assert_id(transfer_id)
+        if offset != self.get_sent:
+            raise AssertionError("host fast GET offset diverged")
+        data = self.get_source[offset:offset + maximum]
+        self.get_sent += len(data)
+        self.get_blocks += 1
+        return TransferDataReply(
+            offset, data, TransferState.TRANSFERRING,
+            TransferRemoteError.NONE)
+
+    def file_transfer_get_ack(self, transfer_id, next_offset, prefix_crc32):
+        self.get_ack_calls += 1
+        self.assert_id(transfer_id)
+        if next_offset != self.get_sent:
+            raise AssertionError("fast-v1 checkpoint used the wrong offset")
+        expected = zlib.crc32(self.get_source[:next_offset]) & 0xFFFFFFFF
+        if prefix_crc32 != expected:
+            raise AssertionError("fast-v1 checkpoint used the wrong CRC")
+        self.get_durable = next_offset
+        return TransferAckReply(
+            next_offset, TransferState.TRANSFERRING,
+            TransferRemoteError.NONE)
+
+
 class RealMSXStreamingTransferTest(unittest.TestCase):
+    def test_fast_stream_removes_per_block_status_and_get_ack(self):
+        payload = bytes(range(251)) * 37
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "fast-source.bin"
+            destination = root / "fast-return.bin"
+            source.write_bytes(payload)
+
+            put_target = FastStreamTransferMSX()
+            put_result = put_target.put_file(
+                source, "A:\\FAST.BIN", compression="raw",
+                state_directory=root / "put-state")
+
+            get_target = FastStreamTransferMSX(get_source=payload)
+            get_result = get_target.get_file(
+                "A:\\FAST.BIN", destination,
+                state_directory=root / "get-state")
+            returned = destination.read_bytes()
+
+        self.assertEqual(bytes(put_target.put_bytes), payload)
+        self.assertGreater(put_target.put_blocks, 1)
+        self.assertLess(put_target.status_calls, put_target.put_blocks)
+        self.assertEqual(returned, payload)
+        self.assertGreater(get_target.get_blocks, 1)
+        self.assertEqual(get_target.get_ack_calls, 1)
+        self.assertLess(get_target.get_ack_calls, get_target.get_blocks)
+        self.assertLess(get_target.status_calls, get_target.get_blocks)
+        self.assertEqual(put_result["data_plane"], "fast-v1")
+        self.assertEqual(get_result["data_plane"], "fast-v1")
+        self.assertEqual(put_result["stream_bytes"], len(payload))
+        self.assertEqual(get_result["stream_bytes"], len(payload))
+        self.assertGreaterEqual(put_result["stream_seconds"], 0)
+        self.assertGreaterEqual(get_result["stream_seconds"], 0)
+        self.assertGreaterEqual(put_result["stream_rate_bps"], 0)
+        self.assertGreaterEqual(get_result["stream_rate_bps"], 0)
+        self.assertIsInstance(put_target.close_rate_hints[-1], int)
+        self.assertIsInstance(get_target.close_rate_hints[-1], int)
+
     def test_put_fsyncs_close_intent_before_sending_close(self):
         class LoseCloseReply(ScriptedTransferMSX):
-            def file_transfer_close(self, transfer_id):
+            def file_transfer_close(self, transfer_id, *, rate_bps=None):
                 self.assert_id(transfer_id)
                 raise RealMSXError("simulated lost CLOSE request")
 
@@ -346,7 +449,7 @@ class RealMSXStreamingTransferTest(unittest.TestCase):
         self.assertGreater(target.maximum_gap, target.caps.max_put_chunk)
         self.assertLessEqual(
             target.maximum_gap,
-            target.sync_threshold + target.caps.max_put_chunk - 1,
+            target.sync_threshold + target.fast_caps.max_put_chunk - 1,
         )
         self.assertEqual(result["wire_bytes"], len(payload))
 
@@ -354,17 +457,18 @@ class RealMSXStreamingTransferTest(unittest.TestCase):
         payload = bytes(range(241)) * 50
 
         class FailBeforeEnsure(BatchedPutTransferMSX):
-            def file_transfer_status(self, transfer_id):
+            def file_transfer_put_data(self, transfer_id, offset, data):
                 if self.put_blocks >= 5 and self.put_durable == 0:
                     raise RealMSXError("simulated link loss before ENSURE")
-                return super().file_transfer_status(transfer_id)
+                return super().file_transfer_put_data(
+                    transfer_id, offset, data)
 
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             source = root / "interrupted.bin"
             source.write_bytes(payload)
             state = root / "state"
-            target = FailBeforeEnsure()
+            target = FailBeforeEnsure(sync_threshold=0xFFFF)
 
             with self.assertRaisesRegex(RealMSXError, "before ENSURE"):
                 target.put_file(
@@ -404,6 +508,50 @@ class RealMSXStreamingTransferTest(unittest.TestCase):
                 target.put_file(
                     source, descriptor.path, compression="raw",
                     state_directory=state)
+
+    def test_put_full_window_status_poll_honors_progress_timeout(self):
+        payload = bytes(range(251)) * 100
+
+        class StalledFullWindow(BatchedPutTransferMSX):
+            def __init__(self):
+                super().__init__(sync_threshold=0xFFFF)
+                self.status_polls = 0
+
+            def file_transfer_status(self, transfer_id):
+                self.status_polls += 1
+                if self.status_polls > 32:
+                    raise AssertionError(
+                        "full-window STATUS polling ignored its deadline")
+                return super().file_transfer_status(transfer_id)
+
+        class AdvancingClock:
+            def __init__(self):
+                self.now = 0.0
+
+            def __call__(self):
+                self.now += 0.25
+                return self.now
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "stalled.bin"
+            source.write_bytes(payload)
+            target = StalledFullWindow()
+
+            with (mock.patch(
+                    "msx_real.time.monotonic", side_effect=AdvancingClock()),
+                  mock.patch("msx_real.time.sleep")):
+                with self.assertRaisesRegex(
+                        RealMSXTimeoutError,
+                        "timeout waiting for durable MSX PUT progress"):
+                    target.put_file(
+                        source, "A:\\STALLED.BIN", compression="raw",
+                        state_directory=root / "state", timeout=0.5)
+
+        self.assertEqual(
+            target.maximum_gap,
+            msx_real.FILE_TRANSFER_MAX_UNCOMMITTED)
+        self.assertLess(target.status_polls, 32)
 
     def test_put_resume_discovers_random_id_and_revalidates_prefix(self):
         payload = b"resumable-" * 1000
@@ -659,7 +807,7 @@ class RealMSXStreamingTransferTest(unittest.TestCase):
             target.descriptor = descriptor.with_resume(
                 len(committed), zlib.crc32(committed) & 0xFFFFFFFF)
             target.get_durable = len(committed)
-            target.get_offer = (len(committed), offered)
+            target.get_sent = len(committed) + len(offered)
 
             result = target.get_file(
                 descriptor.path, destination,
