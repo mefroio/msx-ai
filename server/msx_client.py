@@ -38,6 +38,11 @@ _REPLY = re.compile(r'<reply result="(ok|nok)">(.*?)</reply>', re.S)
 _TCL_TRUE = frozenset(("1", "true", "on", "yes"))
 
 
+def _uses_unix_control():
+    """Whether openMSX publishes a Unix-domain control endpoint here."""
+    return hasattr(socket, "AF_UNIX")
+
+
 def list_sockets():
     """Candidate openMSX control endpoints, newest first.
 
@@ -48,7 +53,7 @@ def list_sockets():
     bases = [os.environ.get(v) for v in ("TMPDIR", "TMP", "TEMP")]
     bases += [tempfile.gettempdir()]
     socks = []
-    if hasattr(socket, "AF_UNIX"):
+    if _uses_unix_control():
         user = os.environ.get("USER", "")
         bases += ["/tmp"]
         for base in bases:
@@ -74,7 +79,7 @@ def list_sockets():
 
 def _open_control_endpoint(path):
     """Connect to one published openMSX control endpoint."""
-    if hasattr(socket, "AF_UNIX"):
+    if _uses_unix_control():
         control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             control.connect(path)

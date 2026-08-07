@@ -263,10 +263,10 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             endpoint = pathlib.Path(directory) / "socket.123"
             endpoint.write_text("9947\n", encoding="ascii")
-            with (mock.patch.object(msx_client.socket, "AF_UNIX", create=True),
+            with (mock.patch.object(msx_client, "_uses_unix_control",
+                                    return_value=False),
                   mock.patch.object(msx_client.socket, "socket",
                                     return_value=control)):
-                del msx_client.socket.AF_UNIX
                 self.assertIs(msx_client._open_control_endpoint(endpoint), control)
         self.assertEqual(control.connected_path, ("127.0.0.1", 9947))
 
@@ -274,8 +274,8 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             endpoint = pathlib.Path(directory) / "socket.123"
             endpoint.write_text("8080\n", encoding="ascii")
-            with mock.patch.object(msx_client.socket, "AF_UNIX", create=True):
-                del msx_client.socket.AF_UNIX
+            with mock.patch.object(msx_client, "_uses_unix_control",
+                                   return_value=False):
                 with self.assertRaisesRegex(OpenMSXError, "outside 9938..9958"):
                     msx_client._open_control_endpoint(endpoint)
 
