@@ -1,10 +1,14 @@
 {
   "schema_version": 1,
   "project": "MSX-AI",
-  "license": "MIT",
-  "corpus_license": "MIT",
-  "project_license": "MIT",
+  "license": "GPL-3.0-or-later",
+  "corpus_license": "GPL-3.0-or-later",
+  "project_license": "GPL-3.0-or-later",
   "authored_by": "MSX-AI project",
+  "creator": {
+    "name": "Rodrigo Galhardi M. Garcia",
+    "role": "Project creator and originator of the MCP-to-real-MSX integration concept"
+  },
   "provenance": {
     "origin": "project-authored",
     "repository_url": "https://github.com/mefroio/msx-ai",
@@ -19,7 +23,7 @@
       "path": "overview.md",
       "title": "MSX-AI overview",
       "summary": "Purpose, architecture paths, capabilities, and navigation for the MSX-AI documentation corpus.",
-      "license": "MIT",
+      "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
       "provenance": {
@@ -49,7 +53,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "eec3caac50dbf57899ed948dfeeb2ac4b21969933448b5f3b5be67c28f4a2186",
+      "sha256": "64374e7a3e1f1632bb1730743753715a81c1c942ceb84fceae6a645b36f4a293",
       "external_references": []
     },
     {
@@ -57,7 +61,7 @@
       "path": "getting-started.md",
       "title": "Getting started",
       "summary": "Host installation and minimal successful workflows for direct, simulated-agent, and physical-agent targets.",
-      "license": "MIT",
+      "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
       "provenance": {
@@ -105,7 +109,7 @@
       "path": "backends.md",
       "title": "Backends and runtime modes",
       "summary": "Capability matrix and selection guidance for direct openMSX, simulated agents, physical agents, residents, and monitors.",
-      "license": "MIT",
+      "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
       "provenance": {
@@ -145,7 +149,7 @@
       "path": "safety.md",
       "title": "Safety and operational limits",
       "summary": "Fail-closed behavior, cooperative-control boundaries, memory hazards, input limits, and screenshot constraints.",
-      "license": "MIT",
+      "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
       "provenance": {
@@ -184,7 +188,7 @@
       "path": "transfers.md",
       "title": "Resumable MSX-DOS file transfer",
       "summary": "Requirements, integrity model, fast data plane, encodings, publication rules, and recovery behavior for PUT and GET.",
-      "license": "MIT",
+      "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
       "provenance": {
@@ -225,7 +229,7 @@
       "path": "development.md",
       "title": "Development and validation",
       "summary": "Deterministic tests, integration tests, agent builds, deployable artifacts, release hygiene, and documentation provenance.",
-      "license": "MIT",
+      "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
       "provenance": {
@@ -263,7 +267,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "ddc41c8df99a131a2ef291b7ab23559a97c9cd01a75841eb1ee833b587a20ee5",
+      "sha256": "bbd6f93a63354bb11a64d72713870ba71b1d08a9c7f8ea73c2c865a353db148d",
       "external_references": []
     }
   ]

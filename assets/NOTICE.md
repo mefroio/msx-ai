@@ -17,6 +17,7 @@ SHA-256:
 237217a89ae9acc00976015c4f4a0e53d70421499b764cef39207f757444c549  msx-ai-robot.png
 ```
 
-The original mascot artwork is distributed under the project MIT License.
+The original mascot artwork is distributed under GPL-3.0-or-later with the
+rest of the project-authored MSX-AI material.
 `MSX` is used nominatively; any associated word marks belong to their
 respective owners.

@@ -125,6 +125,7 @@ _WHEEL_LICENSE_FILES = {
 }
 _SDIST_REQUIRED_FILES = {
     ".mcp.json",
+    "AUTHORS.md",
     "LICENSE",
     "MANIFEST.in",
     "Makefile",
@@ -725,6 +726,7 @@ def _compatibility_manifest(
             ", ".join(missing))
     return {
         "schema_version": 1,
+        "creator": "Rodrigo Galhardi M. Garcia",
         "host": _project_version(source),
         "agent": _AGENT_VERSION,
         "wire": _WIRE_VERSION,

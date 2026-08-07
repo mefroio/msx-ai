@@ -5,6 +5,13 @@ auditable host implementation written in Python. Code that runs on the MSX is
 provided as Z80 assembly source and reproducibly built MSX-DOS programs. The
 project does not require an opaque host executable.
 
+## Project origin
+
+MSX-AI was conceived and created by **Rodrigo Galhardi M. Garcia**, originator
+of the project's central concept: connect MCP not only to an emulator, but to a
+real MSX through an agent executing on the target over a transport-independent
+TCP/IPv4 path.
+
 ## Three target paths
 
 - **Direct openMSX** controls an emulator through its control API. It does not

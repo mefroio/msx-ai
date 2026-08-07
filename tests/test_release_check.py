@@ -241,7 +241,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
         server = source / "server"
         agent.mkdir(parents=True)
         server.mkdir()
-        (source / "LICENSE").write_bytes(b"project MIT license\n")
+        (source / "LICENSE").write_bytes(b"project GPL license\n")
         memman = source / "third_party" / "memman"
         memman.mkdir(parents=True)
         (memman / "NOTICE").write_bytes(b"MemMan Public Domain notice\n")
@@ -280,6 +280,8 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 manifest = release_check.json.loads(
                     archive.read("COMPATIBILITY.json"))
                 self.assertEqual(manifest["host"], "0.6.0")
+                self.assertEqual(
+                    manifest["creator"], "Rodrigo Galhardi M. Garcia")
                 self.assertEqual(manifest["agent"], "2.0")
                 self.assertEqual(manifest["wire"], "v3")
                 self.assertEqual(manifest["transfer"], "fast-v1")
@@ -287,7 +289,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     manifest["toolchain"]["id"], "bas-wijnen-z80asm")
                 self.assertEqual(manifest["toolchain"]["version"], "1.8")
                 self.assertEqual(
-                    archive.read("LICENSE"), b"project MIT license\n")
+                    archive.read("LICENSE"), b"project GPL license\n")
                 self.assertEqual(
                     archive.read("MEMMAN-NOTICE.txt"),
                     b"MemMan Public Domain notice\n")

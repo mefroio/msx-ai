@@ -24,6 +24,15 @@ emulator implicitly: select `msx_agent_listen` or `msx_agent_connect` for a
 physical target, and select `msx_boot`, `msx_attach`, or `msx_tcp_bench_start`
 only when the optional emulator backend is wanted.
 
+## Project authorship
+
+MSX-AI was conceived and created by **Rodrigo Galhardi M. Garcia**, who
+originated the project's central concept of connecting MCP to both emulated MSX
+systems and real MSX hardware through an agent executing on the target. The
+transport-independent separation between MCP, TCP/IPv4, the MSX-side agent,
+UART drivers, emulator simulation, and physical adapters is part of that
+project direction. The complete attribution statement is in `AUTHORS.md`.
+
 ~~~~text
 AI client / MCP (STDIO or local Streamable HTTP)
        |
@@ -258,7 +267,7 @@ when required by the threat model.
 The installed openMSX XML/settings templates are a separate configuration
 resource set containing adapted GPL-2.0 material. Their notice and complete
 license are under `third_party/openmsx`; the Python host, Z80 agent, and
-project-authored documentation remain MIT-licensed.
+project-authored documentation are GPL-3.0-or-later.
 
 ## Physical-only workflow
 
@@ -937,7 +946,8 @@ contract succeeds. Clients that did not supply a progress token incur only the
 small callback/queue checks.
 
 The bundled resources are `msx-ai://docs/index`, one URI per compact Markdown
-document, and `msx-ai://docs/manifest`. The manifest records MIT licensing,
+document, and `msx-ai://docs/manifest`. The manifest records
+GPL-3.0-or-later licensing,
 project-authored provenance, internal evidence paths, review date, and SHA-256
 for every document; reads verify the digest. `msx_docs_search` uses a
 deterministic weighted lexical index rather than embeddings or external
@@ -952,7 +962,7 @@ release frontend:
 ~~~~sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e . 'build>=1'
+python -m pip install -e . 'build>=1' 'setuptools>=77'
 ~~~~
 
 Run the deterministic suite with that interpreter:
@@ -1044,7 +1054,7 @@ server/mcp_runtime.py     official-SDK MCP transports and structured adapter
 server/mcp_metadata.py    output schemas and explicit tool behavior hints
 server/msx_mcp_server.py  synchronous tool registry and backend adapters
 server/msx_docs.py        validated resources and deterministic lexical search
-server/resources/docs/   bundled MIT corpus and provenance manifest
+server/resources/docs/   bundled GPL-3.0-or-later corpus and provenance manifest
 server/paths.py           immutable/source/user/runtime path separation
 server/msx_protocol.py    protocol-v3 codec and incremental parser
 server/msx_v3.py          framed stream session, retries, and correlation
@@ -1268,8 +1278,9 @@ and block pacing, not the transfer semantics.
 
 ## License
 
-MSX-AI is released under the [MIT License](LICENSE). Third-party components
-retain the terms documented in their respective notices.
+MSX-AI is released under [GPL-3.0-or-later](LICENSE). Third-party components
+retain the terms documented in their respective notices; in particular, the
+separately aggregated openMSX configuration resources remain GPL-2.0-only.
 
 ## Known limitations
 

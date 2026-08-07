@@ -54,8 +54,10 @@ def load_manifest() -> dict[str, Any]:
     manifest = json.loads(raw)
     if manifest.get("schema_version") != 1:
         raise ValueError("unsupported documentation manifest schema")
-    if manifest.get("corpus_license", manifest.get("license")) != "MIT":
-        raise ValueError("documentation corpus must declare the MIT license")
+    if (manifest.get("corpus_license", manifest.get("license")) !=
+            "GPL-3.0-or-later"):
+        raise ValueError(
+            "documentation corpus must declare GPL-3.0-or-later")
     if not isinstance(manifest.get("documents"), list):
         raise ValueError("documentation manifest has no document list")
     return manifest
@@ -79,7 +81,8 @@ def load_documents() -> tuple[Document, ...]:
         declared = str(item.get("sha256", "")).lower()
         if digest != declared:
             raise ValueError(f"documentation digest mismatch: {path}")
-        if item.get("origin") != "project-authored" or item.get("license") != "MIT":
+        if (item.get("origin") != "project-authored" or
+                item.get("license") != "GPL-3.0-or-later"):
             raise ValueError(f"invalid provenance for documentation: {path}")
         documents.append(Document(
             id=identifier,

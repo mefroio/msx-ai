@@ -40,5 +40,5 @@ firmware-independent descriptions, and local settings used by the isolated
 test environment. The complete preferred form for modification is the XML,
 settings, and README source present in this repository and in the source
 distribution. The MSX-AI Python implementation, Z80 agent, and
-project-authored documentation remain under the project MIT license except
-where another bundled notice says otherwise.
+project-authored documentation are GPL-3.0-or-later except where another
+bundled notice says otherwise.

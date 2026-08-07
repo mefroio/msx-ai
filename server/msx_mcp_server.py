@@ -1476,7 +1476,7 @@ TOOLS = {
     "msx_docs_search": (t_docs_search,
         "Search the bundled MSX-AI documentation using a deterministic lexical "
         "index. Results link to exact msx-ai://docs resources and include short "
-        "snippets. The corpus is project-authored, MIT-licensed and carries "
+        "snippets. The corpus is project-authored, GPL-3.0-or-later and carries "
         "machine-readable provenance; no target connection is required.",
         _s({"query": {"type": "string", "minLength": 1},
             "backend": {"type": "string",

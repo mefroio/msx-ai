@@ -7,6 +7,11 @@
 Control emulated and physical MSX computers through one Python MCP
 server.
 
+Created by **Rodrigo Galhardi M. Garcia**, originator of the project's central
+concept: use MCP to control both emulated MSX systems and real MSX hardware
+through an agent executing on the target. See [authorship and project
+origin](https://github.com/mefroio/msx-ai/blob/main/AUTHORS.md).
+
 MSX-AI gives an MCP client a common set of tools for direct openMSX automation,
 an agent running on physical MSX hardware, or that same physical-agent path
 simulated through openMSX. Backend selection is explicit: starting the server
@@ -270,7 +275,7 @@ For an editable environment:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e . 'build>=1'
+python -m pip install -e . 'build>=1' 'setuptools>=77'
 make PYTHON=python test
 make PYTHON=python agent
 make PYTHON=python release-check
@@ -325,7 +330,7 @@ interchangeable.
 - [Documentation provenance manifest](https://github.com/mefroio/msx-ai/blob/main/server/resources/docs/manifest.json)
 
 The bundled corpus is original project documentation. Its manifest records
-MIT licensing, internal evidence paths, review date, and a SHA-256 digest for
+GPL-3.0-or-later licensing, internal evidence paths, review date, and a SHA-256 digest for
 every MCP-readable document. Third-party MemMan material is identified
 separately in `third_party/memman/NOTICE`. The small openMSX configuration
 resource set includes adapted GPL-2.0 material and is identified in
@@ -334,8 +339,12 @@ MSX-AI host, agent, or documentation.
 
 ## License
 
-MSX-AI code and project-authored documentation are released under the
-[MIT License](https://github.com/mefroio/msx-ai/blob/main/LICENSE). Bundled
-third-party or derived resources retain the licenses named in their notices.
+MSX-AI code, project-authored documentation, and original artwork are released
+under [GPL-3.0-or-later](https://github.com/mefroio/msx-ai/blob/main/LICENSE).
+Bundled third-party or derived resources retain the licenses named in their
+notices.
+Copyright (C) 2026 Rodrigo Galhardi M. Garcia. Project authorship and the origin
+of the real-MSX MCP integration are recorded in
+[`AUTHORS.md`](https://github.com/mefroio/msx-ai/blob/main/AUTHORS.md).
 The original mascot artwork and its provenance statement are described in
 [`assets/NOTICE.md`](https://github.com/mefroio/msx-ai/blob/main/assets/NOTICE.md).

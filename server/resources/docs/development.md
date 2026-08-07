@@ -11,7 +11,7 @@ Create and activate an editable environment from the repository root:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e . 'build>=1'
+python -m pip install -e . 'build>=1' 'setuptools>=77'
 ```
 
 Then run the deterministic unit suite with that interpreter:
@@ -112,8 +112,9 @@ connection.
 
 ## Documentation provenance
 
-The MCP documentation corpus is project-authored and licensed under MIT. Its
-manifest records stable identifiers, intended audience, backend scope, local
+The MCP documentation corpus is project-authored and licensed under
+GPL-3.0-or-later. Its manifest records stable identifiers, intended audience,
+backend scope, local
 evidence paths, review date, and SHA-256 for every Markdown resource. Evidence
 points to this repository's implementation, tests, or existing project
 documentation.

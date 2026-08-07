@@ -36,10 +36,18 @@ class DocumentationCorpusTests(unittest.TestCase):
     def test_corpus_metadata_is_explicit(self):
         self.assertEqual(self.manifest["schema_version"], 1)
         self.assertEqual(self.manifest["project"], "MSX-AI")
-        self.assertEqual(self.manifest["license"], "MIT")
-        self.assertEqual(self.manifest["corpus_license"], "MIT")
-        self.assertEqual(self.manifest["project_license"], "MIT")
+        self.assertEqual(self.manifest["license"], "GPL-3.0-or-later")
+        self.assertEqual(
+            self.manifest["corpus_license"], "GPL-3.0-or-later")
+        self.assertEqual(
+            self.manifest["project_license"], "GPL-3.0-or-later")
         self.assertEqual(self.manifest["authored_by"], "MSX-AI project")
+        self.assertEqual(self.manifest["creator"], {
+            "name": "Rodrigo Galhardi M. Garcia",
+            "role": (
+                "Project creator and originator of the MCP-to-real-MSX "
+                "integration concept"),
+        })
         self.assertEqual(
             self.manifest["provenance"], {
                 "origin": "project-authored",
@@ -61,7 +69,7 @@ class DocumentationCorpusTests(unittest.TestCase):
     def test_document_metadata_and_hashes(self):
         for document in self.documents:
             with self.subTest(document=document["id"]):
-                self.assertEqual(document["license"], "MIT")
+                self.assertEqual(document["license"], "GPL-3.0-or-later")
                 self.assertEqual(document["authored_by"], "MSX-AI project")
                 self.assertEqual(document["origin"], "project-authored")
                 self.assertEqual(
