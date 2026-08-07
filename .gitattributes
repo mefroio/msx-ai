@@ -1,0 +1,5 @@
+# Release manifests hash these files byte-for-byte. Keep their canonical LF
+# representation on every checkout, including Git for Windows with autocrlf.
+server/resources/docs/** text eol=lf
+server/resources/openmsx/** text eol=lf
+.openmsx-home/** text eol=lf

@@ -84,7 +84,9 @@ does not require TCP or the MSX-side agent.
 Use `msx_attach` instead when openMSX is already running. MSX-AI then shares
 that instance without changing its power, throttle, or audio state. If several
 live openMSX sockets exist, the call refuses to guess: repeat it with one of the
-exact `socket_path` values reported by the error.
+exact `socket_path` values reported by the error. On Windows, openMSX publishes
+the loopback TCP port in that descriptor file; MSX-AI discovers and connects to
+it automatically, so attaching remains available without Unix sockets.
 
 ### Simulated physical agent
 

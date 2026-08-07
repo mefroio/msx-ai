@@ -39,18 +39,27 @@ _TCL_TRUE = frozenset(("1", "true", "on", "yes"))
 
 
 def list_sockets():
-    """Candidate openMSX control sockets, newest first.
+    """Candidate openMSX control endpoints, newest first.
 
-    openMSX puts the socket in openmsx-<user>/ under the first of the env vars
-    TMPDIR, TMP, TEMP, falling back to /tmp -- so scan all of them. Stale
-    filesystem entries are filtered only when attach() attempts a connection.
+    Unix hosts publish domain sockets under openmsx-<user>. Windows publishes
+    small socket.<pid> files under openmsx-default; each file contains the
+    loopback TCP port of that instance. Stale entries are filtered by attach().
     """
-    user = os.environ.get("USER", "")
-    bases = [os.environ.get(v) for v in ("TMPDIR", "TMP", "TEMP")] + ["/tmp"]
+    bases = [os.environ.get(v) for v in ("TMPDIR", "TMP", "TEMP")]
+    bases += [tempfile.gettempdir()]
     socks = []
-    for b in bases:
-        if b:
-            socks += glob.glob(os.path.join(b, f"openmsx-{user}", "socket.*"))
+    if hasattr(socket, "AF_UNIX"):
+        user = os.environ.get("USER", "")
+        bases += ["/tmp"]
+        for base in bases:
+            if base:
+                socks += glob.glob(
+                    os.path.join(base, f"openmsx-{user}", "socket.*"))
+    else:
+        for base in bases:
+            if base:
+                socks += glob.glob(
+                    os.path.join(base, "openmsx-default", "socket.*"))
     socks = list(dict.fromkeys(socks))          # dedupe, keep order
     candidates = []
     for path in socks:
@@ -61,6 +70,35 @@ def list_sockets():
             # filter socket files that remain on disk but refuse a connection.
             continue
     return [path for _mtime, path in sorted(candidates, reverse=True)]
+
+
+def _open_control_endpoint(path):
+    """Connect to one published openMSX control endpoint."""
+    if hasattr(socket, "AF_UNIX"):
+        control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            control.connect(path)
+        except Exception:
+            control.close()
+            raise
+        return control
+
+    try:
+        raw_port = pathlib.Path(path).read_text(encoding="ascii").strip()
+        port = int(raw_port, 10)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OpenMSXError(
+            f"invalid openMSX Windows control endpoint {path}: {exc}") from exc
+    if not 9938 <= port <= 9958:
+        raise OpenMSXError(
+            f"openMSX Windows control port is outside 9938..9958: {port}")
+    control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        control.connect(("127.0.0.1", port))
+    except Exception:
+        control.close()
+        raise
+    return control
 
 
 class OpenMSXError(RuntimeError):
@@ -216,13 +254,11 @@ class OpenMSX:
         last = None
         connected = []
         for path in candidates:                 # skip stale/dead socket files
-            sk = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                sk.connect(path)
+                sk = _open_control_endpoint(path)
                 connected.append((path, sk))
-            except OSError as e:
+            except (OSError, OpenMSXError) as e:
                 last = e
-                sk.close()
         if not connected:
             raise OpenMSXError(f"could not connect to any openMSX socket ({last})")
         if sockpath is None and len(connected) > 1:

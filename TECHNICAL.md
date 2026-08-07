@@ -304,6 +304,10 @@ power, throttle, renderer, or audio settings. With exactly one live control
 socket, no selector is needed. If several are live, attachment fails before
 sending a command and reports their paths; call `msx_attach` again with the
 chosen exact `socket_path`. It never selects the newest instance implicitly.
+On Windows, the published `socket.<pid>` path is a descriptor containing an
+openMSX loopback TCP port in the official 9938--9958 range; the adapter validates
+the descriptor and connects to `127.0.0.1`. Unix hosts use the domain socket
+itself.
 
 Available profiles are:
 

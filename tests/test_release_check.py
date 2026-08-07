@@ -225,7 +225,8 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 release_check.shutil, "which", side_effect=find_tool):
             self.assertEqual(
                 release_check._resolve_build_tools(environment),
-                ("/resolved/gmake", "/resolved/z80asm"))
+                (str(pathlib.Path("/resolved/gmake").resolve()),
+                 str(pathlib.Path("/resolved/z80asm").resolve())))
         self.assertEqual(calls, [
             ("/custom/gmake", "/custom/bin"),
             ("custom-z80asm", "/custom/bin"),

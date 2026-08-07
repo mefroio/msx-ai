@@ -33,10 +33,10 @@ class ScreenshotRendererTest(unittest.TestCase):
         self.assertEqual(tuple(rgb[0:3]), (255, 255, 255))
 
     def test_png_signature(self):
-        with tempfile.NamedTemporaryFile(suffix=".png") as output:
-            write_png(output.name, 1, 1, bytes([1, 2, 3]))
-            output.seek(0)
-            self.assertEqual(output.read(8), b"\x89PNG\r\n\x1a\n")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "screenshot.png"
+            write_png(output, 1, 1, bytes([1, 2, 3]))
+            self.assertEqual(output.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
 
 if __name__ == "__main__":

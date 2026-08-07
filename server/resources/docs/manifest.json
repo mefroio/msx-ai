@@ -94,7 +94,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "01ed2adab304a0176190adcbe675d2e8c031de086bc2e7a3f9545be13a08e55e",
+      "sha256": "ae6f113a53ca70aa34f7f191712d7aba2bde461c434baa333ff316c74468bb43",
       "external_references": [
         {
           "url": "https://github.com/mefroio/msx-ai.git",

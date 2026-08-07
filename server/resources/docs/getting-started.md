@@ -65,6 +65,8 @@ Alternatively, start the repository launcher and use `msx_attach` to control
 that already-running openMSX instance without changing its power, throttle, or
 audio state. If several live control sockets are discovered, attachment fails
 safely and lists them; repeat the call with the intended exact `socket_path`.
+On Windows this path names openMSX's loopback TCP-port descriptor rather than a
+Unix socket; MSX-AI handles that distinction automatically.
 
 ## Simulated MSX agent
 

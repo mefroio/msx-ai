@@ -210,7 +210,8 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
                   return_value=["/tmp/openmsx-user/socket.1",
                                 "/tmp/openmsx-user/socket.2"]),
               mock.patch.object(
-                  msx_client.socket, "socket", side_effect=[first, second])):
+                  msx_client, "_open_control_endpoint",
+                  side_effect=[first, second])):
             with self.assertRaisesRegex(
                     OpenMSXError, "multiple running openMSX instances"):
                 machine.attach()
@@ -225,11 +226,16 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
         selected = _ControlSocket()
         machine = OpenMSX(bin="/fake/openmsx")
         requested = "/tmp/openmsx-user/socket.2"
+
+        def connect(path):
+            selected.connect(path)
+            return selected
+
         with (mock.patch.object(
                   msx_client, "list_sockets",
                   return_value=["/tmp/openmsx-user/socket.1", requested]),
               mock.patch.object(
-                  msx_client.socket, "socket", return_value=selected),
+                  msx_client, "_open_control_endpoint", side_effect=connect),
               mock.patch.object(msx_client.threading.Thread, "start"),
               mock.patch.object(msx_client.time, "sleep")):
             self.assertIs(machine.attach(requested), machine)
@@ -251,6 +257,27 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
               self.assertRaisesRegex(OpenMSXError, "not among the discovered")):
             machine.attach("/tmp/unrelated-service.sock")
         socket_factory.assert_not_called()
+
+    def test_windows_control_endpoint_uses_published_loopback_port(self):
+        control = _ControlSocket()
+        with tempfile.TemporaryDirectory() as directory:
+            endpoint = pathlib.Path(directory) / "socket.123"
+            endpoint.write_text("9947\n", encoding="ascii")
+            with (mock.patch.object(msx_client.socket, "AF_UNIX", create=True),
+                  mock.patch.object(msx_client.socket, "socket",
+                                    return_value=control)):
+                del msx_client.socket.AF_UNIX
+                self.assertIs(msx_client._open_control_endpoint(endpoint), control)
+        self.assertEqual(control.connected_path, ("127.0.0.1", 9947))
+
+    def test_windows_control_endpoint_rejects_untrusted_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            endpoint = pathlib.Path(directory) / "socket.123"
+            endpoint.write_text("8080\n", encoding="ascii")
+            with mock.patch.object(msx_client.socket, "AF_UNIX", create=True):
+                del msx_client.socket.AF_UNIX
+                with self.assertRaisesRegex(OpenMSXError, "outside 9938..9958"):
+                    msx_client._open_control_endpoint(endpoint)
 
 
 if __name__ == "__main__":
