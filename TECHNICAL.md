@@ -956,6 +956,18 @@ backend-aware prompts that recommend status/read-only evidence before mutation.
 
 ## Validation
 
+CI separates language compatibility from host portability. Ubuntu runs Python
+3.10 through 3.14, while Windows and macOS run Python 3.14. Each lane installs
+the package, runs the complete hardware-free suite, and starts the installed
+MCP entry point over both STDIO and IPv4-loopback HTTP. The protocol tests keep
+TCP framing, CRC, resume, PUT/GET, and hard-link publication enabled on every
+host; Windows therefore requires a hard-link-capable filesystem such as NTFS.
+The canonical Z80/release build remains on Ubuntu with Bas Wijnen `z80asm` 1.8.
+This matrix does not replace the serialized openMSX integration suite or the
+pending physical BaDCaT validation. Attaching to an already-running openMSX by
+Unix control socket is a POSIX-only adapter feature; spawning an explicitly
+selected emulator uses the separate stdio control path.
+
 From the repository root, create an editable environment and install the
 release frontend:
 

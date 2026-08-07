@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
@@ -602,7 +603,10 @@ class TransferJournalTest(unittest.TestCase):
                 caller_binding="/resolved/local/file.bin")
             self.assertEqual(path.parent, Path(directory))
             self.assertEqual(path.name, TRANSFER_ID.hex() + ".json")
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            # Windows protects the temporary file through ACLs and does not
+            # expose meaningful Unix permission bits through stat().
+            if os.name == "posix":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
             record = journal.load(
@@ -620,6 +624,47 @@ class TransferJournalTest(unittest.TestCase):
                     put_descriptor(path="B:\\OTHER.BIN"),
                     confirmed_offset=0, prefix_crc32=0,
                     caller_binding="/resolved/local/file.bin")
+
+    def test_atomic_roundtrip_without_posix_fchmod(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TransferJournal(directory)
+            descriptor = put_descriptor()
+            with mock.patch("msx_transfer.os.fchmod", None, create=True):
+                path = journal.save(
+                    descriptor, confirmed_offset=400,
+                    prefix_crc32=0xABCDEF01,
+                    caller_binding="C:\\resolved\\local\\file.bin")
+
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
+            record = journal.load(
+                descriptor,
+                caller_binding="C:\\resolved\\local\\file.bin")
+            self.assertEqual(record.confirmed_offset, 400)
+            self.assertEqual(record.prefix_crc32, 0xABCDEF01)
+
+    def test_no_nofollow_fallback_accepts_regular_file_and_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = TransferJournal(root)
+            descriptor = put_descriptor()
+            path = journal.save(
+                descriptor, confirmed_offset=400,
+                prefix_crc32=0xABCDEF01)
+
+            with mock.patch("msx_transfer.os.O_NOFOLLOW", 0, create=True):
+                self.assertEqual(
+                    journal.load(descriptor).confirmed_offset, 400)
+
+                external = root / "external.json"
+                external.write_bytes(path.read_bytes())
+                path.unlink()
+                try:
+                    path.symlink_to(external)
+                except (OSError, NotImplementedError):
+                    self.skipTest("symbolic links are unavailable")
+                with self.assertRaisesRegex(
+                        TransferJournalError, "symbolic link"):
+                    journal.load(descriptor)
 
     def test_single_data_plane_journal_v4_omits_selection(self):
         with tempfile.TemporaryDirectory() as directory:

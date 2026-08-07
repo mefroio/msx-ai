@@ -235,6 +235,7 @@
       "provenance": {
         "origin": "project-authored",
         "evidence": [
+          ".github/workflows/ci.yml",
           "LICENSE",
           "Makefile",
           "pyproject.toml",
@@ -244,6 +245,7 @@
           "tests/test_mcp_runtime.py",
           "tests/test_openmsx_resident.py",
           "tests/test_packaging_paths.py",
+          "tests/test_release_check.py",
           "tools/release_check.py",
           "third_party/memman/NOTICE",
           "third_party/memman/SHA256SUMS"
@@ -267,7 +269,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-07",
-      "sha256": "bbd6f93a63354bb11a64d72713870ba71b1d08a9c7f8ea73c2c865a353db148d",
+      "sha256": "42615b5adadae3c599088658a73ed79329e72ad9496246c71f3faf0be02d1970",
       "external_references": []
     }
   ]

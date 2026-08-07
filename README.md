@@ -272,6 +272,15 @@ msx_docs_search(query="resident screenshot safety")
 
 ## Development and validation
 
+The hardware-free host is continuously tested on Ubuntu, Windows, and macOS.
+Ubuntu covers Python 3.10 through 3.14; Windows and macOS run the current
+Python 3.14 lane. Every host lane installs the project, runs the complete unit
+suite, and exercises the installed MCP entry point through STDIO and IPv4
+loopback HTTP. The Ubuntu-only release gate additionally rebuilds the Z80 suite
+with the pinned assembler. These jobs validate the host and simulated TCP
+protocol path; openMSX with local ROMs and physical BaDCaT hardware remain
+separate explicit integration gates.
+
 For an editable environment:
 
 ```sh

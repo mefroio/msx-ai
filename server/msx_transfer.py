@@ -1474,7 +1474,14 @@ class TransferJournal:
             dir=self.state_directory)
         temporary = Path(temporary_name)
         try:
-            os.fchmod(descriptor_fd, 0o600)
+            # ``fchmod`` is POSIX-only.  mkstemp() still gives us an
+            # exclusively-created, non-inheritable descriptor on Windows,
+            # where access is governed by the directory/file ACL rather than
+            # Unix mode bits.  Keep enforcing owner-only mode everywhere the
+            # platform exposes that operation.
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                fchmod(descriptor_fd, 0o600)
             with os.fdopen(descriptor_fd, "wb") as handle:
                 handle.write(encoded)
                 handle.flush()
@@ -1512,9 +1519,26 @@ class TransferJournal:
 
     @staticmethod
     def _read_no_follow(path: Path) -> bytes:
+        # Windows has no O_NOFOLLOW.  Preserve the same fail-closed journal
+        # semantics there by snapshotting the directory entry, rejecting a
+        # symlink, and proving that the opened descriptor and the entry still
+        # identify the same file.  On POSIX, O_NOFOLLOW remains the stronger
+        # single-open primitive.
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        before = None
+        if not nofollow:
+            try:
+                before = os.lstat(path)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                raise TransferJournalError(
+                    f"cannot safely inspect journal {path.name}: {exc}") from exc
+            if stat.S_ISLNK(before.st_mode):
+                raise TransferJournalError(
+                    f"cannot safely open journal {path.name}: symbolic link")
         flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags |= nofollow
         try:
             descriptor_fd = os.open(path, flags)
         except FileNotFoundError:
@@ -1526,6 +1550,20 @@ class TransferJournal:
             details = os.fstat(descriptor_fd)
             if not stat.S_ISREG(details.st_mode):
                 raise TransferJournalError("journal is not a regular file")
+            if before is not None:
+                try:
+                    current = os.lstat(path)
+                except OSError as exc:
+                    raise TransferJournalError(
+                        f"journal {path.name} changed during safe open") from exc
+                before_identity = (before.st_dev, before.st_ino)
+                opened_identity = (details.st_dev, details.st_ino)
+                current_identity = (current.st_dev, current.st_ino)
+                if (not stat.S_ISREG(current.st_mode) or
+                        before_identity != opened_identity or
+                        current_identity != opened_identity):
+                    raise TransferJournalError(
+                        f"journal {path.name} changed during safe open")
             with os.fdopen(descriptor_fd, "rb") as handle:
                 descriptor_fd = -1
                 return handle.read(MAX_JOURNAL_BYTES + 1)

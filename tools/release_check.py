@@ -936,6 +936,9 @@ def _isolated_environment(base: dict[str, str], probe: Path) -> dict[str, str]:
     home.mkdir(parents=True, exist_ok=True)
     user.mkdir(parents=True, exist_ok=True)
     environment["HOME"] = str(home)
+    # pathlib uses USERPROFILE instead of HOME on Windows.  Set both so the
+    # child MCP processes have the same isolated state root on every host.
+    environment["USERPROFILE"] = str(home)
     environment["MSX_AI_USER_ROOT"] = str(user)
     environment["PYTHONNOUSERSITE"] = "1"
     environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
@@ -1138,6 +1141,40 @@ def _run_http_smoke(python: Path, entrypoint: Path, probe: Path,
         raise failure
 
 
+def _runtime_entrypoint(environment: Mapping[str, str]) -> Path:
+    executable = shutil.which(
+        "msx-ai-mcp", path=environment.get("PATH"))
+    if executable is None:
+        raise ReleaseCheckError(
+            "runtime smoke requires the installed msx-ai-mcp entry point "
+            "to be available on PATH")
+    return Path(executable).resolve()
+
+
+def run_runtime_smoke() -> int:
+    """Exercise installed MCP transports without build tools or hardware."""
+    base_environment = _release_environment()
+    entrypoint = _runtime_entrypoint(base_environment)
+    with tempfile.TemporaryDirectory(
+            prefix="msx-ai-runtime-smoke-") as directory:
+        probe = Path(directory) / "probe"
+        probe.mkdir()
+        environment = _isolated_environment(base_environment, probe)
+        checker = str(Path(__file__).resolve())
+        for mode in ("auto", "legacy"):
+            _run(
+                [sys.executable, checker, "_mcp-stdio",
+                 str(entrypoint), mode],
+                cwd=probe, env=environment, timeout=MCP_TIMEOUT,
+                capture=True)
+        _assert_no_state(probe, "STDIO MCP runtime smoke tests")
+        _run_http_smoke(
+            Path(sys.executable), entrypoint, probe, environment)
+        _assert_no_state(probe, "HTTP MCP runtime smoke test")
+    _say("PASS: installed MCP STDIO and HTTP transports validated")
+    return 0
+
+
 def _validate_installed_wheel(wheel: Path, temporary: Path,
                               base_env: dict[str, str]) -> None:
     environment_root = temporary / "clean-venv"
@@ -1311,12 +1348,24 @@ def main(argv: list[str] | None = None) -> int:
             help=(
                 "require a clean Git checkout and stage exactly committed HEAD"))
         parser.add_argument(
+            "--runtime-smoke", action="store_true",
+            help=(
+                "validate installed MCP STDIO and HTTP transports without "
+                "build tools or hardware"))
+        parser.add_argument(
             "--output-dir", type=Path,
             help=(
                 "persist validated release assets (requires --publish)"))
         options = parser.parse_args(arguments)
+        if options.runtime_smoke and options.publish:
+            parser.error("--runtime-smoke cannot be combined with --publish")
+        if options.runtime_smoke and options.output_dir is not None:
+            parser.error(
+                "--runtime-smoke cannot be combined with --output-dir")
         if options.output_dir is not None and not options.publish:
             parser.error("--output-dir requires --publish")
+        if options.runtime_smoke:
+            return run_runtime_smoke()
         output_directory = options.output_dir
         if output_directory is not None and not output_directory.is_absolute():
             output_directory = ROOT / output_directory

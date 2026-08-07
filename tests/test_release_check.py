@@ -76,7 +76,48 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             self.assertNotIn("MSX_AI_SOURCE_ROOT", environment)
             self.assertNotIn("PYTHONPATH", environment)
             self.assertEqual(environment["HOME"], str(probe / "home"))
+            self.assertEqual(environment["USERPROFILE"], str(probe / "home"))
             release_check._assert_no_state(probe, "test probe")
+
+    def test_runtime_smoke_exercises_both_stdio_eras_and_http(self):
+        entrypoint = pathlib.Path("/installed/msx-ai-mcp")
+        with (mock.patch.object(
+                  release_check, "_runtime_entrypoint",
+                  return_value=entrypoint),
+              mock.patch.object(release_check, "_run") as run,
+              mock.patch.object(
+                  release_check, "_run_http_smoke") as http,
+              mock.patch.object(release_check, "_assert_no_state") as clean):
+            self.assertEqual(release_check.run_runtime_smoke(), 0)
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(
+            [(command[-3], command[-1]) for command in commands],
+            [("_mcp-stdio", "auto"), ("_mcp-stdio", "legacy")])
+        self.assertEqual(
+            [pathlib.Path(command[-2]) for command in commands],
+            [entrypoint, entrypoint])
+        self.assertEqual(http.call_count, 1)
+        self.assertEqual(clean.call_count, 2)
+        environment = run.call_args_list[0].kwargs["env"]
+        self.assertEqual(environment["HOME"], environment["USERPROFILE"])
+        self.assertEqual(environment["MSX_RUN_INTEGRATION"], "0")
+
+    def test_runtime_smoke_cli_is_explicit_and_bypasses_release_build(self):
+        with (mock.patch.object(
+                  release_check, "run_runtime_smoke", return_value=0) as smoke,
+              mock.patch.object(release_check, "run_release_check") as release):
+            self.assertEqual(
+                release_check.main(["--runtime-smoke"]), 0)
+        smoke.assert_called_once_with()
+        release.assert_not_called()
+
+    def test_runtime_smoke_requires_installed_entrypoint(self):
+        with mock.patch.object(release_check.shutil, "which", return_value=None), \
+                self.assertRaisesRegex(
+                    release_check.ReleaseCheckError, "installed msx-ai-mcp"):
+            release_check._runtime_entrypoint({"PATH": "/missing"})
 
     def test_positive_wheel_content_policy_accepts_exact_public_sets(self):
         release_check._assert_wheel_contents(list(self.wheel_members()))

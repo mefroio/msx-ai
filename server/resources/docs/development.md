@@ -6,6 +6,14 @@ area and are not source artifacts.
 
 ## Python validation
 
+GitHub Actions uses seven explicit hardware-free lanes: Ubuntu with Python
+3.10, 3.11, 3.12, 3.13, and 3.14, plus Windows and macOS with Python 3.14.
+Every lane installs the project, runs the complete unit suite, and exercises
+the installed MCP entry point over STDIO and IPv4-loopback HTTP. TCP framing,
+CRC, resume, PUT/GET, and hard-link behavior remain enabled across hosts rather
+than being skipped. The Ubuntu-only release gate adds the canonical Z80 build.
+These lanes do not launch openMSX or claim physical BaDCaT validation.
+
 Create and activate an editable environment from the repository root:
 
 ```sh

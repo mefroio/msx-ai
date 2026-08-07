@@ -1,3 +1,4 @@
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -16,6 +17,8 @@ class OpenMSXMCPLauncherTest(unittest.TestCase):
         cls.shortcut = SHORTCUT.read_text(encoding="utf-8")
         cls.startup = STARTUP.read_text(encoding="utf-8")
 
+    @unittest.skipIf(
+        os.name == "nt", "macOS .command launchers require POSIX semantics")
     def test_shell_launchers_are_valid(self):
         subprocess.run(
             ["bash", "-n", str(LAUNCHER), str(SHORTCUT)], check=True)
