@@ -4,6 +4,13 @@
   <img src="https://raw.githubusercontent.com/mefroio/msx-ai/main/assets/msx-ai-robot.png" alt="MSX-AI retro robot mascot" width="320">
 </p>
 
+<p align="center">
+  <a href="https://github.com/mefroio"><img alt="Built by Rodrigo Galhardi M. Garcia" src="https://img.shields.io/badge/Built%20by-Rodrigo%20Galhardi%20M.%20Garcia-blue"></a>
+  <a href="https://github.com/mefroio/msx-ai/blob/main/LICENSE"><img alt="License GPLv3 or later" src="https://img.shields.io/badge/License-GPLv3%2B-blue.svg"></a>
+  <a href="https://github.com/mefroio/msx-ai/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/mefroio/msx-ai/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/mefroio/msx-ai/blob/main/pyproject.toml"><img alt="Python 3.10 or newer" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&amp;logoColor=white"></a>
+</p>
+
 Control emulated and physical MSX computers through one Python MCP
 server.
 
