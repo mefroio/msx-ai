@@ -16,8 +16,7 @@ server.
 
 MSX-AI gives an MCP client a common set of tools for direct openMSX automation,
 an agent running on physical MSX hardware, or that same physical-agent path
-simulated through openMSX. Backend selection is explicit: starting the server
-does not launch an emulator or connect to hardware.
+simulated through openMSX.
 
 ## What you can do
 
