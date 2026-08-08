@@ -11,7 +11,7 @@
   <a href="https://github.com/mefroio/msx-ai/blob/main/pyproject.toml"><img alt="Python 3.10 or newer" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&amp;logoColor=white"></a>
 </p>
 
-Control emulated and physical MSX computers through one Python MCP
+Control emulated and/or physical MSX computers through one Python MCP
 server.
 
 MSX-AI gives an MCP client a common set of tools for direct openMSX automation,
