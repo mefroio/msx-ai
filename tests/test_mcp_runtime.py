@@ -10,6 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "server"))
 import anyio
 import mcp.types as types
 import mcp_runtime
+from _version import __version__
 from execution import current_cancellation_callback, current_progress_callback
 
 
@@ -33,7 +34,7 @@ class MCPRuntimeTest(unittest.TestCase):
     def test_server_exposes_tools_resources_prompts_and_dual_era_discovery(self):
         server = mcp_runtime.create_server()
         self.assertEqual(server.name, "msx-ai")
-        self.assertEqual(server.version, "0.6.0")
+        self.assertEqual(server.version, __version__)
         methods = set(server._request_handlers)
         self.assertLessEqual({
             "server/discover", "tools/list", "tools/call",

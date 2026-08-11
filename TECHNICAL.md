@@ -678,11 +678,11 @@ aliases are not published. `msx_agent_status`
 reports `network_transport`, `network_role`, `agent_transport`, and
 `agent_transport_id` separately.
 
-Version identifiers belong to separate compatibility layers. The Python
-distribution is version 0.6.0; the current MSX executable banner identifies
-Agent 2.0; framed transport is protocol v3; and protocol-X file transfer is
-version 1. Release artifacts group compatible builds, so none of those numbers
-should be compared as if they were one shared semantic version.
+Runtime compatibility is determined by negotiated protocol versions and
+advertised capabilities. The Python distribution version is derived from
+`server/_version.py` and names packages and release archives, but it is not
+sent to the MSX agent. Framed transport uses protocol v3, and protocol-X file
+transfer uses `fast-v1`.
 
 Host-created IPv4 TCP streams enable `TCP_NODELAY`. Both current UART drivers
 advertise the transport-independent `frame-wake-ack` feature. For each framed
@@ -1185,8 +1185,10 @@ make PYTHON=python release-assets
 The result is the source distribution, the wheel rebuilt from that source
 distribution, and `msx-ai-agent-<host-version>.zip`. The agent archive contains
 exactly the seven deployable binaries plus `LICENSE`, `MEMMAN-NOTICE.txt`,
-`SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records Host 0.6.0, Agent
-2.0, framed wire v3, transfer `fast-v1`, and the pinned assembler identity.
+`SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records the Python
+distribution version derived at build time, framed wire v3, transfer `fast-v1`,
+and the pinned assembler identity; it does not assign a separate agent release
+version.
 Publication is atomic per file, refuses overwrite, and rolls back files created
 by the attempt if a later publication fails. Repeated builds prove equivalence
 between the staged and sdist source on the same host and toolchain; this is not

@@ -47,7 +47,9 @@ class PackagingMetadataTest(unittest.TestCase):
         namespace = {}
         source = (SERVER / "_version.py").read_text(encoding="utf-8")
         exec(compile(source, str(SERVER / "_version.py"), "exec"), namespace)
-        self.assertEqual(namespace["__version__"], "0.6.0")
+        self.assertRegex(
+            namespace["__version__"],
+            r"^[0-9]+\.[0-9]+\.[0-9]+(?:[.a-zA-Z0-9+-]*)?$")
         self.assertIn(
             'version = { attr = "msx_ai._version.__version__" }',
             self.pyproject)

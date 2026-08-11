@@ -180,8 +180,8 @@ recommendation rather than opening an unauthenticated raw TCP channel.
 Use this path to validate the real resident/monitor protocol and restrictions
 without physical hardware.
 
-This workflow is source-checkout-only in version 0.6.0 because it builds the
-agent and isolated bench locally. A pipx-installed host can use it when
+This workflow is source-checkout-only because it builds the agent and isolated
+bench locally. A pipx-installed host can use it when
 `MSX_AI_SOURCE_ROOT` points to a checkout.
 
 1. In that checkout, build the agent suite with `make agent` and prepare the
@@ -442,12 +442,12 @@ The corresponding direct Windows commands are
 `python tools/release_check.py --publish --output-dir dist`.
 
 `release-assets` writes the sdist, the wheel rebuilt from it, and
-`msx-ai-agent-0.6.0.zip` under ignored `dist/`. The agent ZIP contains the
-seven matching MSX files, the project license, the MemMan notice, checksums,
-and an explicit host/agent/wire/transfer compatibility manifest. Existing
-artifacts are never overwritten. The gate proves same-host equivalence with
-the pinned assembler; it does not claim byte-identical output across unrelated
-toolchains.
+`msx-ai-agent-<version>.zip` under ignored `dist/`, with `<version>` derived
+from the Python package metadata. The agent ZIP contains the seven matching
+MSX files, the project license, the MemMan notice, checksums, and explicit
+wire-protocol, transfer-protocol, and toolchain metadata. Existing artifacts
+are never overwritten. The gate proves same-host equivalence with the pinned
+assembler; it does not claim byte-identical output across unrelated toolchains.
 
 The full agent-through-emulator end-to-end suite is deliberately separate and
 serialized. With the required ROMs and ignored MSX-DOS/Nextor image installed,
@@ -457,11 +457,10 @@ opt in with:
 make PYTHON=python test-integration
 ```
 
-Version labels describe separate layers: `0.6.0` is the Python distribution,
-the current MSX-side banner is Agent `2.0`, protocol v3 is the framed wire
-transport, and protocol-X v1 is the file-transfer contract. Release assets
-group mutually compatible host and agent builds; these numbers are not
-interchangeable.
+Runtime compatibility is determined by the negotiated wire protocol,
+capabilities, and versioned subprotocols. The Python distribution version names
+packages and release archives; there is no separate agent release version to
+compare at connection time.
 
 ## Documentation
 

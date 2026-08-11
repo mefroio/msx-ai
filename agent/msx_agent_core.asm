@@ -411,7 +411,7 @@ inconsistent_message:
 usage_message:
     db 13,10,"MSX-AI MCP Agent",13,10
     db "Provides remote MCP control of MSX hardware over TCP/IP.",13,10
-    db "Author: Rodrigo Galhardi M. Garcia - Version 2.0",13,10,13,10
+    db "Author: Rodrigo Galhardi M. Garcia",13,10,13,10
     db "Usage:",13,10
     db "  MSXAI /DRIVER:8251",13,10
     db "  MSXAI /DRIVER:16C550",13,10

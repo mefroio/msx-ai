@@ -469,7 +469,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
         (server / "_version.py").write_text(
             '__version__ = "0.6.0"\n', encoding="utf-8")
         (agent / "msx_agent_core.asm").write_text(
-            'db "Version 2.0"\nFRAMED_VERSION: equ 3\n',
+            "FRAMED_VERSION: equ 3\n",
             encoding="utf-8")
         (agent / "msx_xfer_protocol.inc").write_text(
             "; fast-v1\nXFER_FAST_VERSION: equ 1\n", encoding="utf-8")
@@ -503,7 +503,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 self.assertEqual(manifest["host"], "0.6.0")
                 self.assertEqual(
                     manifest["creator"], "Rodrigo Galhardi M. Garcia")
-                self.assertEqual(manifest["agent"], "2.0")
+                self.assertNotIn("agent", manifest)
                 self.assertEqual(manifest["wire"], "v3")
                 self.assertEqual(manifest["transfer"], "fast-v1")
                 self.assertEqual(

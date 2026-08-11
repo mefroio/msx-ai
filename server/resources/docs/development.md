@@ -111,10 +111,12 @@ On Windows, use `python tools/release_check.py --publish` for strict mode and
 This writes the sdist, the wheel rebuilt from that sdist, and a deterministic
 `msx-ai-agent-<host-version>.zip`. The ZIP contains exactly seven binaries,
 the project `LICENSE`, `MEMMAN-NOTICE.txt`, `SHA256SUMS`, and
-`COMPATIBILITY.json` recording host, Agent 2.0, wire v3, `fast-v1`, and the
-pinned assembler. Checksums cover the binaries, license, notice, and
-compatibility manifest. Existing output files are never overwritten, and a
-failed multi-file publication rolls back files created by that attempt.
+`COMPATIBILITY.json` recording the Python distribution version derived at build
+time, wire v3, transfer `fast-v1`, and the pinned assembler; it does not assign
+a separate agent release version. Checksums cover the binaries, license,
+notice, and compatibility manifest. Existing output files are never
+overwritten, and a failed multi-file publication rolls back files created by
+that attempt.
 Same-host double builds prove equivalence between the staged and sdist sources;
 they are not a claim that unrelated host toolchains produce byte-identical
 binaries.

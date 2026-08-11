@@ -12,9 +12,7 @@
   "provenance": {
     "origin": "project-authored",
     "repository_url": "https://github.com/mefroio/msx-ai",
-    "distribution_version": "0.6.0",
-    "source_distribution": "msx_ai-0.6.0.tar.gz",
-    "evidence_paths_relative_to": "source distribution root"
+    "evidence_paths_relative_to": "repository root"
   },
   "reviewed_at": "2026-08-10",
   "documents": [
@@ -296,7 +294,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "ccad182a4c7a83dcdc7a74fcae1cd615e4b8eb1e0c05c9e769b75f0a081f0be9",
+      "sha256": "23147ea141060a5ef125ce6c56abd82577cac0ffd6a26aee7ccd06791913d66f",
       "external_references": []
     }
   ]

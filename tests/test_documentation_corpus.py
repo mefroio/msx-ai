@@ -52,9 +52,7 @@ class DocumentationCorpusTests(unittest.TestCase):
             self.manifest["provenance"], {
                 "origin": "project-authored",
                 "repository_url": "https://github.com/mefroio/msx-ai",
-                "distribution_version": "0.6.0",
-                "source_distribution": "msx_ai-0.6.0.tar.gz",
-                "evidence_paths_relative_to": "source distribution root",
+                "evidence_paths_relative_to": "repository root",
             })
         self.assertEqual(self.manifest["reviewed_at"], "2026-08-10")
 

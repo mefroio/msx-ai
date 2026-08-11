@@ -176,7 +176,6 @@ _AGENT_COM_SIZE_CEILINGS = {
     "MSXAI.COM": 36_760,
     "MSXAIXF.COM": 16_128,
 }
-_AGENT_VERSION = "2.0"
 _WIRE_VERSION = "v3"
 _TRANSFER_VERSION = "fast-v1"
 _Z80ASM_TOOLCHAIN_ID = "bas-wijnen-z80asm"
@@ -735,7 +734,6 @@ def _compatibility_manifest(
     transfer = (source / "agent" / "msx_xfer_protocol.inc").read_text(
         encoding="utf-8")
     expected_markers = (
-        ("agent 2.0", 'Version 2.0"' in core),
         ("wire v3", "FRAMED_VERSION: equ 3" in core),
         ("transfer fast-v1", "XFER_FAST_VERSION: equ 1" in transfer and
          "fast-v1" in transfer),
@@ -749,7 +747,6 @@ def _compatibility_manifest(
         "schema_version": 1,
         "creator": "Rodrigo Galhardi M. Garcia",
         "host": _project_version(source),
-        "agent": _AGENT_VERSION,
         "wire": _WIRE_VERSION,
         "transfer": _TRANSFER_VERSION,
         "toolchain": {
