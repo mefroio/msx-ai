@@ -22,6 +22,7 @@ READ_ONLY_TOOLS = frozenset({
     "msx_memory_read",
     "msx_screenshot",
     "msx_docs_search",
+    "msx_doctor",
 })
 
 # Repeating these calls with the same target state and arguments is expected
@@ -68,7 +69,7 @@ DESTRUCTIVE_TOOLS = frozenset({
     "msx_shutdown",
 })
 
-LOCAL_ONLY_TOOLS = frozenset({"msx_docs_search"})
+LOCAL_ONLY_TOOLS = frozenset({"msx_docs_search", "msx_doctor"})
 
 
 TEXT_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -128,9 +129,28 @@ STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
                 "bench_id": {"type": ["string", "null"]},
                 "state": {"enum": ["connected", "disconnected"]},
                 "profile": {
-                    "enum": ["basic", "disk", "dos", "msx2plus", "attach",
-                             "bench"],
+                    "enum": ["basic", "disk", "dos", "msx2plus", "cbios",
+                             "attach", "bench"],
                 },
+                "requested_profile": {
+                    "enum": ["basic", "disk", "dos", "msx2plus", "cbios",
+                             "auto", "attach", "bench"],
+                },
+                "resolved_profile": {
+                    "enum": ["basic", "disk", "dos", "msx2plus", "cbios",
+                             "attach", "bench"],
+                },
+                "machine": {"type": ["string", "null"]},
+                "config_mode": {
+                    "type": ["string", "null"],
+                    "enum": ["isolated", "user", "overlay", None],
+                },
+                "config_home": {"type": ["string", "null"]},
+                "effective_config_home": {"type": ["string", "null"]},
+                "user_config_home": {"type": ["string", "null"]},
+                "control_transport": {"type": ["string", "null"]},
+                "executable": {"type": ["string", "null"]},
+                "platform": {"type": ["string", "null"]},
                 "screen_mode": {"type": "integer", "minimum": 0, "maximum": 255},
                 "control_socket": {"type": ["string", "null"]},
             },
@@ -270,7 +290,10 @@ LOCAL_IDENTITY_OUTPUT_SCHEMA: dict[str, Any] = {
         name: _LOCAL_STATUS_PROPERTIES[name]
         for name in (
             "backend", "target", "channel", "target_id", "bench_id", "state",
-            "profile")
+            "profile", "requested_profile", "resolved_profile", "machine",
+            "config_mode", "config_home", "effective_config_home",
+            "user_config_home",
+            "control_transport", "executable", "platform")
     },
     "required": [
         "backend", "target", "channel", "target_id", "bench_id", "state",
@@ -831,6 +854,134 @@ DOCS_OUTPUT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_LOCAL_PROFILE_NAMES = [
+    "basic", "disk", "dos", "msx2plus", "cbios", "auto",
+]
+_RESOLVED_PROFILE_NAMES = [
+    "basic", "disk", "dos", "msx2plus", "cbios",
+]
+_CONFIG_MODE_SCHEMA: dict[str, Any] = {
+    "type": "string", "enum": ["isolated", "user", "overlay"],
+}
+_DOCTOR_COMPONENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {"enum": ["machine", "extension"]},
+        "name": {"type": "string"},
+        "config_found": {"type": "boolean"},
+        "config_path": {"type": ["string", "null"]},
+        "config_candidates": {
+            "type": "array", "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "kind", "name", "config_found", "config_path", "config_candidates",
+    ],
+    "additionalProperties": False,
+}
+_DOCTOR_CANDIDATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "profile": {"enum": _RESOLVED_PROFILE_NAMES},
+        "machine": {"type": ["string", "null"]},
+        "ready": {"type": "boolean"},
+        "platform": {"type": ["string", "null"]},
+        "control_transport": {"type": ["string", "null"]},
+        "control_transport_supported": {"type": "boolean"},
+        "boot_supported": {"type": "boolean"},
+        "attach_transport": {"type": ["string", "null"]},
+        "attach_supported": {"type": "boolean"},
+        "config_mode": _CONFIG_MODE_SCHEMA,
+        "executable": {"type": ["string", "null"]},
+        "executable_found": {"type": "boolean"},
+        "home": {"type": ["string", "null"]},
+        "user_home": {"type": ["string", "null"]},
+        "home_exists": {"type": "boolean"},
+        "machine_config_found": {"type": ["boolean", "null"]},
+        "machine_config_candidates": {
+            "type": "array", "items": {"type": "string"},
+        },
+        "config_components": {
+            "type": "array", "items": _DOCTOR_COMPONENT_SCHEMA,
+        },
+        "required_roms": {
+            "type": "array", "items": {"type": "string"},
+        },
+        "missing_roms": {
+            "type": "array", "items": {"type": "string"},
+        },
+        "rom_readiness": {
+            "enum": ["ready", "unverified", "not-required"],
+        },
+        "problems": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "profile", "machine", "ready", "platform", "control_transport",
+        "control_transport_supported", "boot_supported", "attach_transport",
+        "attach_supported", "config_mode", "executable",
+        "executable_found", "home", "user_home", "home_exists",
+        "machine_config_found", "machine_config_candidates", "problems",
+    ],
+    "additionalProperties": False,
+}
+LOCAL_DOCTOR_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "platform": {"type": ["string", "null"]},
+        "executable": {"type": ["string", "null"]},
+        "executable_found": {"type": "boolean"},
+        "control_transport": {"type": ["string", "null"]},
+        "control_transport_supported": {"type": "boolean"},
+        "transport_ready": {"type": "boolean"},
+        "boot_supported": {"type": "boolean"},
+        "attach_transport": {"type": ["string", "null"]},
+        "attach_supported": {"type": "boolean"},
+        "config_mode": _CONFIG_MODE_SCHEMA,
+        "config_home": {"type": ["string", "null"]},
+        "user_config_home": {"type": ["string", "null"]},
+        "config_home_exists": {"type": "boolean"},
+        "requested_profile": {"enum": _LOCAL_PROFILE_NAMES},
+        "resolved_profile": {
+            "type": ["string", "null"],
+            "enum": [*_RESOLVED_PROFILE_NAMES, None],
+        },
+        "machine": {"type": ["string", "null"]},
+        "machine_config_found": {"type": ["boolean", "null"]},
+        "profile_ready": {"type": "boolean"},
+        "ready": {"type": "boolean"},
+        "candidates": {
+            "type": "array", "minItems": 1,
+            "items": _DOCTOR_CANDIDATE_SCHEMA,
+        },
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"enum": ["warning", "error"]},
+                    "code": {"type": "string", "minLength": 1},
+                    "message": {"type": "string", "minLength": 1},
+                    "action": {"type": "string", "minLength": 1},
+                },
+                "required": ["severity", "code", "message", "action"],
+                "additionalProperties": False,
+            },
+        },
+        "persistent_process_started": {"const": False},
+    },
+    "required": [
+        "platform", "executable", "executable_found", "control_transport",
+        "control_transport_supported", "transport_ready", "boot_supported",
+        "attach_transport",
+        "attach_supported",
+        "config_mode", "config_home", "user_config_home",
+        "config_home_exists", "requested_profile", "resolved_profile",
+        "machine", "machine_config_found", "profile_ready", "ready",
+        "candidates", "issues", "persistent_process_started",
+    ],
+    "additionalProperties": False,
+}
+
 # Existing functions returning JSON objects.  All other legacy handlers are
 # normalized into {"result": "..."} by the modern runtime.
 OBJECT_RESULT_TOOLS = frozenset({
@@ -903,6 +1054,8 @@ def _backend_specific_schema(schema: Mapping[str, Any], backend: str):
 
 def output_schema_for(name: str) -> Mapping[str, Any]:
     public_name = name
+    if public_name == "msx_local_doctor":
+        return LOCAL_DOCTOR_OUTPUT_SCHEMA
     if public_name == "msx_targets_status":
         return TARGETS_STATUS_OUTPUT_SCHEMA
     if public_name in {"msx_tcp_bench_start", "msx_tcp_bench_status"}:

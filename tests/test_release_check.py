@@ -33,6 +33,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
 
     def test_forbidden_release_content_is_detected_case_insensitively(self):
         forbidden = (
+            "project/.MCP.JSON",
             "project/work/agent/MSXAI.COM",
             "project/.openmsx-home/share/systemroms/MSX.ROM",
             "project/games/demo.DSK",
@@ -263,6 +264,152 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             ("custom-z80asm", "/custom/bin"),
         ])
 
+    def test_windows_without_make_override_selects_portable_builder(self):
+        calls = []
+
+        def find_tool(name, *, path=None):
+            calls.append((name, path))
+            return {
+                "make": "/incidental/make",
+                "z80asm": "/resolved/z80asm",
+            }.get(name)
+
+        environment = {"PATH": "/custom/bin"}
+        with mock.patch.object(
+                release_check.shutil, "which", side_effect=find_tool):
+            self.assertEqual(
+                release_check._resolve_build_tools(
+                    environment, platform="nt"),
+                (None, str(pathlib.Path("/resolved/z80asm").resolve())))
+        self.assertEqual(calls, [("z80asm", "/custom/bin")])
+
+    def test_posix_without_make_keeps_existing_failure(self):
+        with mock.patch.object(
+                release_check.shutil, "which", return_value=None), \
+                self.assertRaisesRegex(
+                    release_check.ReleaseCheckError, "MAKE='make'"):
+            release_check._resolve_build_tools(
+                {"PATH": "/custom/bin"}, platform="posix")
+
+    def test_windows_does_not_hide_invalid_explicit_make_override(self):
+        with mock.patch.object(
+                release_check.shutil, "which", return_value=None) as find, \
+                self.assertRaisesRegex(
+                    release_check.ReleaseCheckError,
+                    "MAKE='/missing/gmake'"):
+            release_check._resolve_build_tools({
+                "PATH": "/custom/bin",
+                "MAKE": "/missing/gmake",
+            }, platform="nt")
+        find.assert_called_once_with("/missing/gmake", path="/custom/bin")
+
+    def test_agent_builder_preserves_make_path_when_available(self):
+        environment = {"PATH": "/custom/bin"}
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory)
+            agent = source / "work" / "agent"
+            with (mock.patch.object(
+                      release_check, "_resolve_build_tools",
+                      return_value=("make-tool", "assembler-tool")),
+                  mock.patch.object(
+                      release_check, "_z80asm_version_line"),
+                  mock.patch.object(release_check, "_run") as run,
+                  mock.patch.object(
+                      release_check, "_build_agent_suite_portable")
+                  as portable,
+                  mock.patch.object(
+                      release_check, "_assert_agent_suite") as check):
+                self.assertEqual(
+                    release_check._build_agent_suite(source, environment),
+                    agent)
+
+        run.assert_called_once_with([
+            "make-tool", "agent", f"PYTHON={sys.executable}",
+            "Z80ASM=assembler-tool",
+        ], cwd=source, env=environment)
+        portable.assert_not_called()
+        check.assert_called_once_with(agent)
+
+    def test_windows_portable_builder_matches_make_recipe(self):
+        environment = {"PATH": "/custom/bin"}
+        assembler = "C:/Program Files/z80asm/z80asm.exe"
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory)
+            agent = source / "work" / "agent"
+            build = agent / "build"
+            tools = source / "tools"
+            with (mock.patch.object(
+                      release_check, "_resolve_build_tools",
+                      return_value=(None, assembler)),
+                  mock.patch.object(
+                      release_check, "_z80asm_version_line") as version,
+                  mock.patch.object(release_check, "_run") as run,
+                  mock.patch.object(
+                      release_check, "_assert_agent_suite") as check):
+                self.assertEqual(
+                    release_check._build_agent_suite(source, environment),
+                    agent)
+
+            expected = [
+                [
+                    sys.executable, str(tools / "materialize_memman.py"),
+                    "--source-dir", str(source / "third_party" / "memman"),
+                    "--output-dir", str(agent),
+                ],
+                [
+                    sys.executable, str(tools / "build_agent_tsr.py"),
+                    "--repository", str(source), "--assembler", assembler,
+                    "--output", str(build / "MSXAI.TSR"),
+                    "--metadata-output", str(build / "MSXAI_TSR.INC"),
+                    "--8251-output", str(agent / "MCP8251.TSR"),
+                    "--16c550-output", str(agent / "MCP16550.TSR"),
+                ],
+                [
+                    assembler, str(source / "agent" / "msx_agent.asm"),
+                    "-o", str(agent / "MSXAI.COM"),
+                ],
+                [
+                    sys.executable, str(tools / "check_msx_com_size.py"),
+                    str(agent / "MSXAI.COM"), "36760",
+                ],
+                [
+                    assembler, str(source / "agent" / "msx_xfer.asm"),
+                    "-o", str(agent / "MSXAIXF.COM"),
+                ],
+                [
+                    sys.executable, str(tools / "check_msx_com_size.py"),
+                    str(agent / "MSXAIXF.COM"), "16128",
+                ],
+            ]
+
+        self.assertEqual([call.args[0] for call in run.call_args_list], expected)
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs, {"cwd": source, "env": environment})
+        version.assert_called_once_with(assembler, environment)
+        check.assert_called_once_with(agent)
+
+    def test_make_failure_is_not_retried_with_portable_builder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory)
+            with (mock.patch.object(
+                      release_check, "_resolve_build_tools",
+                      return_value=("make-tool", "assembler-tool")),
+                  mock.patch.object(
+                      release_check, "_z80asm_version_line"),
+                  mock.patch.object(
+                      release_check, "_run",
+                      side_effect=release_check.ReleaseCheckError(
+                          "make failed")) as run,
+                  mock.patch.object(
+                      release_check, "_build_agent_suite_portable")
+                  as portable,
+                  self.assertRaisesRegex(
+                      release_check.ReleaseCheckError, "make failed")):
+                release_check._build_agent_suite(source, {})
+
+        self.assertEqual(run.call_count, 1)
+        portable.assert_not_called()
+
     def test_publish_status_requires_no_tracked_or_untracked_changes(self):
         release_check._assert_publish_status(b"")
         for status in (b" M tracked.py\x00", b"?? untracked.py\x00"):
@@ -288,6 +435,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 pathlib.Path(directory), {"PATH": "/unused"})
             self.assertEqual(
                 (source / "server/_version.py").read_bytes(), content)
+            self.assertTrue((source / ".mcp.json").is_file())
             self.assertTrue((source / "work/release-secret.dsk").is_file())
             self.assertEqual(clean.call_count, 2)
             capture.assert_called_once_with(

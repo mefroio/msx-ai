@@ -13,8 +13,7 @@ msx-ai-mcp
 ```
 
 After publication, `pipx install msx-ai` installs the same entry point from
-PyPI. A checkout whose `.mcp.json` names `msx-ai-mcp` must be installed once
-with pipx/pip before an IDE can start that command.
+PyPI.
 
 From a source checkout, an editable environment is:
 
@@ -23,8 +22,34 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
-Configure the MCP client to launch `msx-ai-mcp`. When running directly from a
-checkout without installation, the compatibility entry point is:
+The PowerShell equivalent is:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+MCP configuration is machine/client state and is not published by this
+repository. In particular, root `.mcp.json` is ignored because it commonly
+contains absolute executable paths. For Codex, add the installed STDIO server
+with:
+
+```sh
+codex mcp add msx-ai -- msx-ai-mcp
+```
+
+The equivalent portable entry belongs in `~/.codex/config.toml`, or in the
+ignored `.codex/config.toml` of a trusted checkout:
+
+```toml
+[mcp_servers.msx-ai]
+command = "msx-ai-mcp"
+```
+
+Other MCP clients should configure the same `msx-ai-mcp` command in their own
+local format. Keep any `OPENMSX_BIN` override local rather than committing an
+absolute path. When running directly from a checkout without installation, the
+compatibility entry point is:
 
 ```sh
 python3 server/msx_mcp_server.py
@@ -48,28 +73,52 @@ their routing.
 
 ## Direct openMSX
 
-Install openMSX and provide the legally obtained system ROMs required by the
-chosen machine. Call `msx_local_boot` with profile `basic`, `disk`, `dos`, or
-`msx2plus`. The default is a headless `basic` session; set `window=true` for a
-visible shared display.
+Install openMSX. `OPENMSX_BIN` may select an executable explicitly; otherwise
+MSX-AI searches `PATH`, the standard macOS app bundle, or registered/standard
+Windows installations as appropriate. Call `msx_local_doctor` before boot. It
+is read-only and reports executable presence/path, owned and attach transports,
+`control_transport_supported`, `boot_supported`, `attach_supported`,
+configuration homes, requested/resolved profile and machine, readiness, and
+structured issues whose `action` fields contain concrete recommendations.
+Candidate reports carry the transport/boot flags too, and the top-level result
+always records `persistent_process_started=false`.
 
-An installed wheel materializes only the public MSX-AI machine/extension XML
-profiles on the first emulator start. It never supplies proprietary ROMs. Set
-`MSX_AI_OPENMSX_HOME` when those ROMs and profiles already live in another
-isolated openMSX home.
+`auto` uses a validated configured BASIC machine and falls back to `cbios`.
+The ROM-free `cbios` profile uses the C-BIOS supplied with openMSX for control,
+screen, and cartridge-oriented smoke tests; it does not provide MSX BASIC or
+MSX-DOS. Profiles `basic`, `disk`, `dos`, and `msx2plus` remain available when
+their legally obtained firmware/media are installed. The default is headless;
+set `window=true` for a visible shared display. Omitting `profile` still means
+`basic` for compatibility, so request `auto` or `cbios` explicitly for a
+portable first boot.
+
+An installed wheel materializes only public MSX-AI machine/extension XML
+profiles on the first isolated emulator start. It never supplies proprietary
+ROMs. Choose `config_mode="isolated"` (the repeatable default), `"user"` (the
+user's openMSX home/file pools with disposable process settings), or
+`"overlay"` (managed MSX-AI templates plus user machine/ROM discovery).
+`MSX_AI_OPENMSX_HOME` overrides only the managed isolated home.
 
 A minimal check is:
 
-1. Call `msx_local_boot` with `profile="basic"`.
-2. Call `msx_local_status` and confirm backend `openmsx`.
-3. Call `msx_local_screen`, or send a BASIC line with `msx_local_type_line`.
+1. Call `msx_local_doctor` with `profile="auto"` and the intended
+   `config_mode`; resolve any reported issue.
+2. Call `msx_local_boot` with the same profile/mode.
+3. Call `msx_local_status` and confirm backend `openmsx`.
+4. Call `msx_local_screen`. Send BASIC only if the resolved machine actually
+   supplies MSX BASIC.
 
 Alternatively, start the repository launcher and use `msx_local_attach` to control
 that already-running openMSX instance without changing its power, throttle, or
 audio state. If several live control sockets are discovered, attachment fails
 safely and lists them; repeat the call with the intended exact `socket_path`.
-On Windows this path names openMSX's loopback TCP-port descriptor rather than a
-Unix socket; MSX-AI handles that distinction automatically.
+Linux and macOS report `control_transport="stdio"` and
+`attach_transport="unix_socket"`. Windows reports `tcp_sspi` for both
+transports: owned boot waits for its child PID's openMSX descriptor, while
+external attachment validates the selected existing descriptor. Both accept
+only loopback ports 9938 through 10001 and require SSPI Negotiate. If SSPI is
+unavailable, doctor/boot/attach reports an actionable unsupported result
+instead of using unauthenticated raw TCP.
 
 ## Simulated MSX agent
 

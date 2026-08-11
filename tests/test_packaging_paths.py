@@ -69,6 +69,8 @@ class PackagingMetadataTest(unittest.TestCase):
         self.assertNotIn("include .openmsx-home/share/settings.xml", self.manifest)
         self.assertNotIn("include open-msx.command", self.manifest)
         self.assertNotIn("include open-msx-mcp.command", self.manifest)
+        self.assertNotIn("include .mcp.json", self.manifest)
+        self.assertIn("exclude .mcp.json", self.manifest)
         self.assertIn("recursive-include third_party/memman", self.manifest)
         self.assertIn("recursive-include third_party/openmsx", self.manifest)
         self.assertIn('"third_party/openmsx/NOTICE"', self.pyproject)

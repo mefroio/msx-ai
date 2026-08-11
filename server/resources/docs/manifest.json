@@ -16,7 +16,7 @@
     "source_distribution": "msx_ai-0.6.0.tar.gz",
     "evidence_paths_relative_to": "source distribution root"
   },
-  "reviewed_at": "2026-08-07",
+  "reviewed_at": "2026-08-10",
   "documents": [
     {
       "id": "overview",
@@ -53,31 +53,35 @@
         "agent-simulated",
         "agent-physical"
       ],
-      "reviewed_at": "2026-08-07",
-      "sha256": "045c9cab09a3a011eef50f70c8821a709b7223620bb7e24082720d07f2bb1939",
+      "reviewed_at": "2026-08-10",
+      "sha256": "624cd57a2779a1493c8958330e525279a294fba59806c4ea534eaf43c6503fe7",
       "external_references": []
     },
     {
       "id": "getting-started",
       "path": "getting-started.md",
       "title": "Getting started",
-      "summary": "Host installation and minimal successful workflows for direct, simulated-agent, and physical-agent targets.",
+      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal successful workflows for direct, simulated-agent, and physical-agent targets.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
       "provenance": {
         "origin": "project-authored",
         "evidence": [
-          ".mcp.json",
+          "MANIFEST.in",
           "Makefile",
           "TECHNICAL.md",
           "agent/README.md",
           "pyproject.toml",
           "server/mcp_runtime.py",
+          "server/msx_client.py",
           "server/msx_mcp_server.py",
+          "server/windows_sspi.py",
           "tests/test_backend_optionality.py",
           "tests/test_backend_routing.py",
-          "tests/test_openmsx_launcher.py"
+          "tests/test_openmsx_cbios_integration.py",
+          "tests/test_openmsx_launcher.py",
+          "tests/test_windows_sspi.py"
         ]
       },
       "tags": [
@@ -95,8 +99,8 @@
         "agent-simulated",
         "agent-physical"
       ],
-      "reviewed_at": "2026-08-07",
-      "sha256": "8a68dbffe72906ba122b080479c22f52f1b70062918eb17e13bea4d8148f4a69",
+      "reviewed_at": "2026-08-10",
+      "sha256": "d5dcb2f85275509501aa675b22a2e57312b30da26e05e47637f6ad273be95e4f",
       "external_references": [
         {
           "url": "https://github.com/mefroio/msx-ai.git",
@@ -122,9 +126,11 @@
           "server/msx_client.py",
           "server/msx_mcp_server.py",
           "server/msx_real.py",
+          "server/windows_sspi.py",
           "tests/test_backend_optionality.py",
           "tests/test_backend_routing.py",
-          "tests/test_mcp_cpu_snapshot.py"
+          "tests/test_mcp_cpu_snapshot.py",
+          "tests/test_windows_sspi.py"
         ]
       },
       "tags": [
@@ -143,8 +149,8 @@
         "agent-simulated",
         "agent-physical"
       ],
-      "reviewed_at": "2026-08-07",
-      "sha256": "11ac46c85877eec9543a42d4f10a057ff53b0f596e40e9202837202ee0036d98",
+      "reviewed_at": "2026-08-10",
+      "sha256": "32c8e4675b0a59fa862913e46e31e7cbeeeb2d382a7499701935a771f3f510a4",
       "external_references": []
     },
     {
@@ -182,7 +188,7 @@
         "agent-simulated",
         "agent-physical"
       ],
-      "reviewed_at": "2026-08-07",
+      "reviewed_at": "2026-08-10",
       "sha256": "733cf429ed6bd240fbfaec66471ae7ca303df19aaa3edbdb04ae489e65cb8bff",
       "external_references": []
     },
@@ -223,7 +229,7 @@
         "agent-simulated",
         "agent-physical"
       ],
-      "reviewed_at": "2026-08-07",
+      "reviewed_at": "2026-08-10",
       "sha256": "55082b256e9f6fbc8ea8ce4eecf27befc80f45ca373acb9c7e8f5542f931ebf5",
       "external_references": []
     },
@@ -231,7 +237,7 @@
       "id": "development",
       "path": "development.md",
       "title": "Development and validation",
-      "summary": "Deterministic tests, integration tests, agent builds, deployable artifacts, release hygiene, and documentation provenance.",
+      "summary": "Deterministic tests, cross-platform C-BIOS integration, agent builds, deployable artifacts, release hygiene, and documentation provenance.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -246,6 +252,7 @@
           "agent/README.md",
           "tests/test_agent_source.py",
           "tests/test_mcp_runtime.py",
+          "tests/test_openmsx_cbios_integration.py",
           "tests/test_openmsx_resident.py",
           "tests/test_packaging_paths.py",
           "tests/test_release_check.py",
@@ -271,8 +278,8 @@
         "agent-simulated",
         "agent-physical"
       ],
-      "reviewed_at": "2026-08-07",
-      "sha256": "42615b5adadae3c599088658a73ed79329e72ad9496246c71f3faf0be02d1970",
+      "reviewed_at": "2026-08-10",
+      "sha256": "ccad182a4c7a83dcdc7a74fcae1cd615e4b8eb1e0c05c9e769b75f0a081f0be9",
       "external_references": []
     }
   ]

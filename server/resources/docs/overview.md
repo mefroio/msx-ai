@@ -44,6 +44,12 @@ screenshots from VRAM. The agent path additionally exposes bounded RAM and VRAM
 operations, direct I/O, and resumable MSX-DOS file transfer when the selected
 runtime mode supports them.
 
+Direct-openMSX setup is host-aware. `msx_local_doctor` resolves the executable,
+platform control transport, profile/machine, and `isolated`, `user`, or
+`overlay` configuration policy without starting a process. The ROM-free
+`cbios` profile makes control-channel validation possible on standard openMSX
+installations; it does not imply MSX BASIC or MSX-DOS.
+
 The MSX-DOS agent has two modes. The default MemMan resident returns to DOS and
 cooperatively services requests from the BIOS timer hook. It is intended for
 observing compatible DOS software while preserving its execution context. The

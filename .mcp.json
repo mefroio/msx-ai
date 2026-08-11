@@ -1,7 +1,0 @@
-{
-  "mcpServers": {
-    "msx-ai": {
-      "command": "msx-ai-mcp"
-    }
-  }
-}

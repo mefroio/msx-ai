@@ -12,7 +12,14 @@ Every lane installs the project, runs the complete unit suite, and exercises
 the installed MCP entry point over STDIO and IPv4-loopback HTTP. TCP framing,
 CRC, resume, PUT/GET, and hard-link behavior remain enabled across hosts rather
 than being skipped. The Ubuntu-only release gate adds the canonical Z80 build.
-These lanes do not launch openMSX or claim physical BaDCaT validation.
+These regular lanes do not launch openMSX or claim physical BaDCaT validation.
+
+The ROM-free `openmsx-cbios` integration test can be run explicitly on Ubuntu,
+Windows, and macOS, but the committed workflow does not currently schedule a
+real-emulator job. The smoke covers adapter preflight, C-BIOS boots through both
+adapter and public Session/profile paths, real Tcl/state exchanges, and clean
+shutdown. External Windows SSPI attachment, user firmware overlays, and
+physical hardware remain separate explicit validation scopes.
 
 Create and activate an editable environment from the repository root:
 
@@ -20,6 +27,14 @@ Create and activate an editable environment from the repository root:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e . 'build>=1' 'setuptools>=77'
+```
+
+The PowerShell equivalent is:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e . "build>=1" "setuptools>=77"
 ```
 
 Then run the deterministic unit suite with that interpreter:
@@ -32,7 +47,15 @@ The suite covers protocol framing, backend selection, snapshots, memory safety,
 application loading, screenshot rendering, transfer integrity and recovery,
 agent source invariants, and reproducible helper generation.
 
-The optional serialized integration suite is:
+The same ROM-free smoke can be run locally with a standard openMSX+C-BIOS
+installation:
+
+```sh
+MSX_RUN_OPENMSX_SMOKE=1 \
+  python -m unittest tests.test_openmsx_cbios_integration -v
+```
+
+The larger optional serialized agent-through-emulator suite is:
 
 ```sh
 make PYTHON=python test-integration
@@ -48,8 +71,17 @@ Run the complete, hardware-free release gate with:
 make PYTHON=python release-check
 ```
 
-It requires Bas Wijnen `z80asm` 1.8 on `PATH`, or explicit `MAKE` and `Z80ASM`
-executable overrides. This pre-commit gate builds a clean temporary snapshot
+This remains the Linux/macOS workflow. On Windows, the equivalent command is:
+
+```powershell
+python tools/release_check.py
+```
+
+It requires Bas Wijnen `z80asm` 1.8 on `PATH`, or an explicit `Z80ASM`
+executable override. Windows uses portable Python subprocesses by default;
+an explicit `MAKE` override opts into the existing Makefile recipe and remains
+fail-closed. Linux and macOS continue to require Make. This pre-commit gate
+builds a clean snapshot
 of the checkout's current on-disk source, including uncommitted changes while
 excluding generated and local-state directories. It runs the unit suite,
 builds and inspects the sdist and wheel, rebuilds both the wheel and seven-file
@@ -73,6 +105,9 @@ validated release files under ignored `dist/`, run:
 make PYTHON=python release-assets
 ```
 
+On Windows, use `python tools/release_check.py --publish` for strict mode and
+`python tools/release_check.py --publish --output-dir dist` to persist assets.
+
 This writes the sdist, the wheel rebuilt from that sdist, and a deterministic
 `msx-ai-agent-<host-version>.zip`. The ZIP contains exactly seven binaries,
 the project `LICENSE`, `MEMMAN-NOTICE.txt`, `SHA256SUMS`, and
@@ -85,9 +120,9 @@ they are not a claim that unrelated host toolchains produce byte-identical
 binaries.
 
 The wheel must contain only public openMSX XML/settings resources; ROMs, disks,
-persistent state, captures, and local configuration are forbidden. Neither
-release gate launches openMSX; use the explicitly optional integration suite
-for emulator validation.
+persistent state, captures, `.mcp.json`, and other local configuration are
+forbidden. Neither release gate launches openMSX; use the C-BIOS smoke or the
+explicitly optional full integration suite for emulator validation.
 
 ## Build the MSX-DOS suite
 

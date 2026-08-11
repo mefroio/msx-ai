@@ -56,7 +56,7 @@ class DocumentationCorpusTests(unittest.TestCase):
                 "source_distribution": "msx_ai-0.6.0.tar.gz",
                 "evidence_paths_relative_to": "source distribution root",
             })
-        self.assertEqual(self.manifest["reviewed_at"], "2026-08-07")
+        self.assertEqual(self.manifest["reviewed_at"], "2026-08-10")
 
     def test_manifest_covers_every_markdown_resource_once(self):
         ids = [document["id"] for document in self.documents]
@@ -74,7 +74,7 @@ class DocumentationCorpusTests(unittest.TestCase):
                 self.assertEqual(document["origin"], "project-authored")
                 self.assertEqual(
                     document["provenance"]["origin"], "project-authored")
-                self.assertEqual(document["reviewed_at"], "2026-08-07")
+                self.assertEqual(document["reviewed_at"], "2026-08-10")
                 self.assertTrue(document["title"])
                 self.assertTrue(document["summary"])
                 self.assertTrue(document["tags"])

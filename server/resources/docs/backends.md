@@ -52,6 +52,11 @@ resident BIOS keyboard injection, and is not the MSX-DOS file-transfer mode.
 ## Choosing a path
 
 Use direct openMSX for fast emulator automation and exact debugger snapshots.
+Before the first boot, call `msx_local_doctor` with the intended profile and
+configuration mode. `auto` can fall back to the ROM-free `cbios` profile for
+control-channel validation; choose a firmware-backed profile when MSX BASIC or
+MSX-DOS is required. Owned control uses stdio on Linux/macOS and an authenticated
+loopback TCP descriptor with SSPI Negotiate on Windows.
 Use the simulated agent to test the real protocol and resident restrictions in
 a repeatable emulator environment. Use the physical agent when behavior on
 actual MSX hardware is the subject of the session. Call `msx_local_status` or

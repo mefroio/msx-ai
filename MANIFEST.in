@@ -3,7 +3,7 @@ include AUTHORS.md
 include README.md
 include TECHNICAL.md
 include Makefile
-include .mcp.json
+exclude .mcp.json
 
 recursive-include agent *.asm *.inc *.md
 recursive-include assets *.png *.md

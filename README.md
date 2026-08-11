@@ -48,7 +48,29 @@ pipx install msx-ai
 msx-ai-mcp
 ```
 
-The default transport is STDIO. A typical MCP client entry is:
+The default transport is STDIO. MCP configuration belongs to the client or to
+the developer machine; this repository intentionally does not ship a root
+`.mcp.json`. Such a file commonly grows workstation-specific executable paths
+and environment values, so it is ignored and excluded from distributions.
+
+For Codex, either add the server from the CLI:
+
+```sh
+codex mcp add msx-ai -- msx-ai-mcp
+```
+
+or put this portable entry in the user-level `~/.codex/config.toml` or, for a
+trusted checkout only, the ignored project file `.codex/config.toml`:
+
+```toml
+[mcp_servers.msx-ai]
+command = "msx-ai-mcp"
+```
+
+The ChatGPT desktop app, Codex CLI, and Codex IDE extension share that Codex
+configuration, as described in the
+[official Codex MCP setup](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+Other MCP clients can use their own local equivalent, for example:
 
 ```json
 {
@@ -59,6 +81,9 @@ The default transport is STDIO. A typical MCP client entry is:
   }
 }
 ```
+
+Keep any `OPENMSX_BIN` override in the shell environment or in that local
+client configuration. Do not commit an absolute path from one workstation.
 
 Local Streamable HTTP is optional:
 
@@ -89,21 +114,65 @@ For configurations made from an earlier checkout, migrate deliberately:
 Ambiguous names are intentionally not published and never route according to
 the most recently connected target.
 
+### openMSX discovery and preflight
+
+`msx_local_doctor` is read-only and does not start an emulator. Run it before
+the first boot, especially after installing openMSX or changing profiles. It
+reports the host platform, resolved executable/presence, owned and attach
+transports/support (`control_transport_supported`, `boot_supported`, and
+`attach_supported`), configuration mode/homes, requested and resolved
+profile/machine, readiness, and structured issues. Candidate reports repeat
+the transport and boot support flags. Every issue includes an `action` field
+with the concrete recommendation.
+
+Executable discovery is host-aware:
+
+| Host | Discovery order and owned-process control |
+|---|---|
+| Linux | `OPENMSX_BIN`, then `openmsx` on `PATH`; `control_transport=stdio`, `attach_transport=unix_socket` |
+| macOS | `OPENMSX_BIN`, `PATH`, then the standard openMSX app bundle; `control_transport=stdio`, `attach_transport=unix_socket` |
+| Windows | `OPENMSX_BIN`, `PATH`, then registered/standard Program Files installs; `control_transport=tcp_sspi`, `attach_transport=tcp_sspi` |
+
+The portable `cbios` profile uses the free C-BIOS supplied with openMSX and
+does not require proprietary firmware. It is intended for control-channel,
+screen, and cartridge-oriented smoke tests; C-BIOS does not include MSX BASIC
+or MSX-DOS. `auto` first resolves a usable configured BASIC machine and
+otherwise falls back to C-BIOS. The existing `basic`, `disk`, `dos`, and
+`msx2plus` profiles remain available for installations with their required
+firmware and media. Omitting `profile` still means `basic` for compatibility;
+request `auto` or `cbios` explicitly for a portable first boot.
+
+Boot configuration is explicit:
+
+| `config_mode` | Behavior |
+|---|---|
+| `isolated` | Default; uses only MSX-AI's managed openMSX home and temporary settings |
+| `user` | Uses the user's openMSX machine/file pools without replacing the user's persistent settings |
+| `overlay` | Adds MSX-AI's managed templates while retaining user machine/ROM discovery |
+
 ### Direct openMSX
 
 Use this path for fast emulator automation and exact debugger snapshots. It
 does not require TCP or the MSX-side agent.
 
-1. Call `msx_local_boot` with `profile="basic"` and optionally `window=true`.
-2. Call `msx_local_status`; confirm `backend` is `openmsx`.
-3. Call `msx_local_screen`, or use `msx_local_run_basic` for a visible result.
+1. Call `msx_local_doctor` with `profile="auto"` and the intended
+   `config_mode`; resolve any reported issue.
+2. Call `msx_local_boot` with `profile="auto"`, optionally `window=true`, and
+   the same `config_mode`.
+3. Call `msx_local_status`; confirm `backend` is `openmsx`.
+4. Call `msx_local_screen`. Use `msx_local_run_basic` only when the doctor
+   resolved a firmware-backed profile that provides MSX BASIC.
 
 Use `msx_local_attach` instead when openMSX is already running. MSX-AI then shares
 that instance without changing its power, throttle, or audio state. If several
 live openMSX sockets exist, the call refuses to guess: repeat it with one of the
-exact `socket_path` values reported by the error. On Windows, openMSX publishes
-the loopback TCP port in that descriptor file; MSX-AI discovers and connects to
-it automatically, so attaching remains available without Unix sockets.
+exact `socket_path` values reported by the error. Linux and macOS attach through
+the published Unix-domain socket. On Windows, both owned boot and attach use
+openMSX's loopback descriptor (ports 9938 through 10001) and the official SSPI
+Negotiate exchange. An owned boot waits for the descriptor matching the child
+PID; attach additionally validates the selected existing process. If SSPI is
+unavailable, MSX-AI reports Windows control as unsupported with an actionable
+recommendation rather than opening an unauthenticated raw TCP channel.
 
 ### Simulated physical agent
 
@@ -306,8 +375,14 @@ Ubuntu covers Python 3.10 through 3.14; Windows and macOS run the current
 Python 3.14 lane. Every host lane installs the project, runs the complete unit
 suite, and exercises the installed MCP entry point through STDIO and IPv4
 loopback HTTP. The Ubuntu-only release gate additionally rebuilds the Z80 suite
-with the pinned assembler. These jobs validate the host and simulated TCP
-protocol path; openMSX with local ROMs and physical BaDCaT hardware remain
+with the pinned assembler. These regular jobs validate the host and simulated
+TCP protocol path without launching an emulator. The ROM-free C-BIOS smoke can
+be run explicitly on Ubuntu, Windows, or macOS; the committed CI does not
+currently schedule a real-emulator job. That smoke performs the same read-only
+adapter preflight used by the doctor, boots through both adapter and public
+Session/profile paths, exercises the platform control transport, reads emulator
+state, and shuts down without an orphan process. The larger
+MSX-DOS/RS232-Net suite with local media and physical BaDCaT hardware remain
 separate explicit integration gates.
 
 For an editable environment:
@@ -320,6 +395,26 @@ make PYTHON=python test
 make PYTHON=python agent
 make PYTHON=python release-check
 ```
+
+The equivalent PowerShell environment setup is:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e . "build>=1" "setuptools>=77"
+```
+
+Those Make commands remain the supported Linux/macOS workflow. On Windows,
+after activating the environment, the equivalent release gate does not require
+installing a Unix Make implementation:
+
+```powershell
+python tools/release_check.py
+```
+
+Windows uses the portable Python agent builder by default. An explicit `MAKE`
+override opts into the existing Makefile recipe and is validated, while
+Linux/macOS continue to require and use Make exactly as before.
 
 The unit and explicit integration suites together cover protocol framing,
 backend isolation, memory safety,
@@ -337,6 +432,10 @@ make PYTHON=python publish-check
 make PYTHON=python release-assets
 ```
 
+The corresponding direct Windows commands are
+`python tools/release_check.py --publish` and
+`python tools/release_check.py --publish --output-dir dist`.
+
 `release-assets` writes the sdist, the wheel rebuilt from it, and
 `msx-ai-agent-0.6.0.zip` under ignored `dist/`. The agent ZIP contains the
 seven matching MSX files, the project license, the MemMan notice, checksums,
@@ -345,8 +444,9 @@ artifacts are never overwritten. The gate proves same-host equivalence with
 the pinned assembler; it does not claim byte-identical output across unrelated
 toolchains.
 
-The emulator end-to-end suite is deliberately separate and serialized. With
-the required ROMs and ignored MSX-DOS/Nextor image installed, opt in with:
+The full agent-through-emulator end-to-end suite is deliberately separate and
+serialized. With the required ROMs and ignored MSX-DOS/Nextor image installed,
+opt in with:
 
 ```sh
 make PYTHON=python test-integration

@@ -12,6 +12,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+.mcp.json
 
 # Python caches and local environments
 __pycache__/

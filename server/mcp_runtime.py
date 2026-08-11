@@ -51,7 +51,9 @@ SERVER_INSTRUCTIONS = (
     "openMSX control API, while msx_agent_* always uses the ASM-agent "
     "protocol. Both channels may coexist and can be alternated without "
     "changing global selection state. Use msx_local_boot or msx_local_attach "
-    "for direct openMSX control, msx_tcp_bench_start for a paired simulation, "
+    "for direct openMSX control; msx_local_doctor validates executable, "
+    "transport, profile and config readiness without launching it. Use "
+    "msx_tcp_bench_start for a paired simulation, "
     "and msx_agent_listen or msx_agent_connect for physical hardware. Read "
     "msx-ai://docs/index or "
     "call msx_docs_search when backend or safety requirements are unclear."
@@ -72,7 +74,9 @@ _LOCAL_DIAGNOSTIC_TOOLS = frozenset({
     "msx_local_screen",
     "msx_local_screenshot",
 })
-_NO_TARGET_IO_TOOLS = frozenset({"msx_docs_search", "msx_targets_status"})
+_NO_TARGET_IO_TOOLS = frozenset({
+    "msx_docs_search", "msx_targets_status", "msx_local_doctor",
+})
 _BENCH_LIFECYCLE_TOOLS = frozenset({
     "msx_tcp_bench_start",
     "msx_tcp_bench_status",
@@ -394,8 +398,11 @@ async def _get_prompt(_ctx, params: types.GetPromptRequestParams):
                 message="visible must be true or false")
         visible = visible_value.lower() in {"1", "true", "yes", "on"}
         if backend == "openmsx-direct":
+            config_mode = "user" if visible else "isolated"
             action = (
-                f"Call msx_local_boot with profile='basic' and "
+                f"Call msx_local_doctor with profile='auto' and "
+                f"config_mode='{config_mode}'. If ready, call msx_local_boot "
+                f"with the resolved profile, config_mode='{config_mode}' and "
                 f"window={str(visible).lower()}, then call msx_local_status "
                 "and perform one read-only msx_local_screen check.")
         elif backend == "agent-simulated":
@@ -436,8 +443,9 @@ async def _get_prompt(_ctx, params: types.GetPromptRequestParams):
             f"Diagnose the {backend} connection. Reported symptom: {symptom}. "
             "Begin with msx_targets_status, then use msx_local_status or "
             "msx_agent_status for the intended channel. If neither channel is "
-            "connected, inspect the startup method and endpoint without "
-            "launching another emulator. Use the corresponding local or agent "
+            "connected, call msx_local_doctor for openMSX or inspect the agent "
+            "startup endpoint without launching another emulator. Use the "
+            "corresponding local or agent "
             "screen/CPU tool only when its runtime supports that operation. Do "
             "not issue reset, raw Tcl, "
             "memory writes, or transport restarts until the evidence is summarized. "

@@ -75,7 +75,7 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
         )
 
     def test_ctrl_stop_uses_a_real_keyboard_matrix_chord(self):
-        machine = OpenMSX(bin="/fake/openmsx")
+        machine = OpenMSX(bin="/fake/openmsx", platform="linux")
         machine.cmd = mock.Mock(return_value="")
 
         machine.press("ctrl+stop")
@@ -86,7 +86,7 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
 
     def test_adapter_supports_package_import_and_snapshot_transaction(self):
         packaged = importlib.import_module("server.msx_client")
-        machine = packaged.OpenMSX(bin="/fake/openmsx")
+        machine = packaged.OpenMSX(bin="/fake/openmsx", platform="linux")
 
         # The debugger snapshot is a multi-command transaction, so its lock
         # must be re-entrant when capture_openmsx_cpu calls machine.cmd().
@@ -111,10 +111,12 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             calls.append(tcl)
             if tcl == "set mute":
                 return "true"
+            if tcl == "set renderer":
+                return "none"
             return ""
 
         popen_patch, thread_patch, sleep_patch = self._start_patches(process)
-        machine = OpenMSX(bin="/fake/openmsx")
+        machine = OpenMSX(bin="/fake/openmsx", platform="linux")
         with popen_patch as popen, thread_patch, sleep_patch, \
                 mock.patch.object(machine, "cmd", side_effect=command):
             machine.start(headless=True)
@@ -124,7 +126,7 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             runtime_settings = pathlib.Path(argv[argv.index("-setting") + 1])
             self.assertTrue(runtime_settings.is_file())
             startup = argv[argv.index("-command") + 1]
-            self.assertEqual(startup, "set mute on")
+            self.assertEqual(startup, "set mute on; set renderer none")
             machine.close()
 
         self.assertNotIn("set mute off", calls)
@@ -135,7 +137,7 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
     def test_visible_spawn_does_not_change_host_mute(self):
         process = _Process()
         popen_patch, thread_patch, sleep_patch = self._start_patches(process)
-        machine = OpenMSX(bin="/fake/openmsx")
+        machine = OpenMSX(bin="/fake/openmsx", platform="linux")
         with popen_patch as popen, thread_patch, sleep_patch, \
                 mock.patch.object(machine, "cmd") as command:
             machine.start(headless=False)
@@ -147,7 +149,7 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
     def test_control_channel_failure_after_spawn_terminates_process(self):
         process = _Process()
         popen_patch, thread_patch, sleep_patch = self._start_patches(process)
-        machine = OpenMSX(bin="/fake/openmsx")
+        machine = OpenMSX(bin="/fake/openmsx", platform="linux")
         with popen_patch, thread_patch, sleep_patch, \
                 mock.patch.object(
                     machine, "_write", side_effect=BrokenPipeError("closed")):
@@ -181,7 +183,8 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
                 os.environ.pop("MSX_AI_SOURCE_ROOT", None)
                 os.environ.pop("MSX_AI_OPENMSX_HOME", None)
                 home = paths.openmsx_home()
-                machine = OpenMSX(home=home, bin="/fake/openmsx")
+                machine = OpenMSX(
+                    home=home, bin="/fake/openmsx", platform="linux")
                 with (mock.patch.object(
                           msx_client.subprocess, "Popen", side_effect=spawn) as popen,
                       mock.patch.object(msx_client.threading.Thread, "start"),
@@ -199,10 +202,12 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             calls.append(tcl)
             if tcl == "set mute":
                 return "false"
+            if tcl == "set renderer":
+                return "none"
             return ""
 
         popen_patch, thread_patch, sleep_patch = self._start_patches(process)
-        machine = OpenMSX(bin="/fake/openmsx")
+        machine = OpenMSX(bin="/fake/openmsx", platform="linux")
         with popen_patch, thread_patch, sleep_patch, \
                 mock.patch.object(machine, "cmd", side_effect=command):
             with self.assertRaisesRegex(OpenMSXError, "mandatory headless host mute"):
@@ -275,10 +280,9 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             endpoint.write_text("9947\n", encoding="ascii")
             with (mock.patch.object(msx_client, "_uses_unix_control",
                                     return_value=False),
-                  mock.patch.object(msx_client.socket, "socket",
+                  mock.patch.object(msx_client, "_connect_windows_sspi",
                                     return_value=control)):
                 self.assertIs(msx_client._open_control_endpoint(endpoint), control)
-        self.assertEqual(control.connected_path, ("127.0.0.1", 9947))
 
     def test_windows_control_endpoint_rejects_untrusted_port(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -286,7 +290,7 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             endpoint.write_text("8080\n", encoding="ascii")
             with mock.patch.object(msx_client, "_uses_unix_control",
                                    return_value=False):
-                with self.assertRaisesRegex(OpenMSXError, "outside 9938..9958"):
+                with self.assertRaisesRegex(OpenMSXError, "outside 9938..10001"):
                     msx_client._open_control_endpoint(endpoint)
 
 

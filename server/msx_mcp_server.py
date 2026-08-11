@@ -11,12 +11,15 @@ openMSX is an optional local channel selected only by ``msx_local_*`` tools.
 The independent ``msx_agent_*`` channel uses RealMSX and requires neither an
 openMSX executable nor emulator ROMs. Both may coexist; a simulated bench binds
 them to the same machine without creating a mutable "active backend". Emulator
-sessions use the isolated OPENMSX_HOME and never touch the user's normal setup.
+sessions default to an isolated OPENMSX_HOME. Explicit user mode inherits the
+normal openMSX setup, while overlay mode adds its ROM/config pools to temporary
+MSX-AI templates without writing the user's files.
 """
 import sys, os, json, tempfile, subprocess, pathlib, traceback, shutil, re, time
 import ipaddress, math
 import secrets
 from contextvars import ContextVar
+import xml.etree.ElementTree as ET
 
 import base64
 if __package__:
@@ -91,6 +94,7 @@ DOS_HDD = pathlib.Path(os.environ.get(
     "MSX_AI_DOS_HDD",
     SOURCE_WORK / "system-disks" / "msxdos.dsk")).expanduser()
 BASIC_MACHINE = os.environ.get("MSX_AI_BASIC_MACHINE", "Gradiente_Expert20")
+CBIOS_MACHINE = os.environ.get("MSX_AI_CBIOS_MACHINE", "C-BIOS_MSX2_BR")
 MSX2PLUS_MACHINE = os.environ.get(
     "MSX_AI_MSX2PLUS_MACHINE", "Sony_HB-F1XDJ_128K_Lite")
 DISK_EXTENSION = os.environ.get("MSX_AI_DISK_EXTENSION", "DDX_3.0")
@@ -117,6 +121,11 @@ REAL_BASIC_FILE_LIMIT = 0x4000
 UART_BITS_PER_BYTE = 10
 UART_SCREENSHOT_MARGIN = 1.15
 SLOW_SCREENSHOT_SECONDS = 10.0
+
+LOCAL_PROFILES = ("basic", "disk", "dos", "msx2plus", "cbios", "auto")
+OPENMSX_CONFIG_MODES = ("isolated", "user", "overlay")
+DEFAULT_OPENMSX_CONFIG_MODE = os.environ.get(
+    "MSX_AI_OPENMSX_CONFIG_MODE", "isolated")
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_VERSION = __version__
@@ -193,6 +202,82 @@ def _basic_prompt_visible(screen):
     rows = [row.strip() for row in physical_rows if row.strip()]
     return bool(rows and rows[-1].lower() == "ok")
 
+
+def _validate_local_profile(profile):
+    if not isinstance(profile, str) or profile not in LOCAL_PROFILES:
+        allowed = ", ".join(repr(item) for item in LOCAL_PROFILES)
+        raise ValueError(f"profile must be one of {allowed}")
+    return profile
+
+
+def _validate_config_mode(config_mode):
+    if config_mode is None:
+        config_mode = DEFAULT_OPENMSX_CONFIG_MODE
+    if not isinstance(config_mode, str) or config_mode not in OPENMSX_CONFIG_MODES:
+        allowed = ", ".join(repr(item) for item in OPENMSX_CONFIG_MODES)
+        raise ValueError(f"config_mode must be one of {allowed}")
+    return config_mode
+
+
+def _profile_arguments(profile, *, require_files=True):
+    """Return stable OpenMSX constructor arguments for one concrete profile."""
+    if profile == "dos":
+        if require_files and not DOS_HDD.is_file():
+            raise OpenMSXError(f"MSX-DOS image not found: {DOS_HDD}")
+        return {
+            "machine": BASIC_MACHINE,
+            "extensions": [DOS_EXTENSION],
+            "harddisk": str(DOS_HDD),
+        }
+    if profile == "disk":
+        return {"machine": BASIC_MACHINE, "extensions": [DISK_EXTENSION]}
+    if profile == "msx2plus":
+        return {"machine": MSX2PLUS_MACHINE, "extensions": []}
+    if profile == "cbios":
+        return {"machine": CBIOS_MACHINE, "extensions": []}
+    if profile == "basic":
+        return {"machine": BASIC_MACHINE, "extensions": []}
+    raise ValueError("auto must be resolved before constructing openMSX")
+
+
+def _profile_machine_name(profile):
+    if profile in {"basic", "disk", "dos", "bench"}:
+        return BASIC_MACHINE
+    if profile == "msx2plus":
+        return MSX2PLUS_MACHINE
+    if profile == "cbios":
+        return CBIOS_MACHINE
+    return None
+
+
+def _new_openmsx(*, config_mode, **arguments):
+    """Construct the adapter while remaining compatible with older installs."""
+    try:
+        return OpenMSX(config_mode=config_mode, **arguments)
+    except TypeError as exc:
+        # A source checkout can briefly pair a new MCP core with an older
+        # installed emulator adapter. Preserve the historical isolated mode,
+        # but never pretend that user/overlay policies were honored.
+        message = str(exc)
+        if "config_mode" not in message or "unexpected keyword" not in message:
+            raise
+        if config_mode != "isolated":
+            raise OpenMSXError(
+                "the installed openMSX adapter does not support "
+                f"config_mode={config_mode!r}; update msx-ai or use "
+                "config_mode='isolated'") from exc
+        machine = OpenMSX(**arguments)
+        try:
+            machine.config_mode = "isolated"
+        except Exception:
+            pass
+        return machine
+
+
+def _new_profile_machine(profile, *, config_mode):
+    return _new_openmsx(
+        config_mode=config_mode, **_profile_arguments(profile))
+
 # --------------------------------------------------------------------------
 # Independent, explicitly routed local and agent channels
 # --------------------------------------------------------------------------
@@ -214,6 +299,8 @@ class Session:
         # pointing at the same emulated machine through a different interface.
         self._local_msx = None
         self._local_profile = None
+        self._local_requested_profile = None
+        self._local_config_mode = None
         self._agent_msx = None
         self.local_id = None
         self.agent_id = None
@@ -297,49 +384,59 @@ class Session:
     def profile(self, value):
         self._legacy_profile = value
 
-    def boot(self, profile="basic", boot_seconds=6, window=False):
+    def boot(self, profile="basic", boot_seconds=6, window=False,
+             config_mode=None):
         if self.backend("local")[0] is not None:
             raise OpenMSXError(
                 "a local openMSX target is already connected; close it "
                 "explicitly with msx_local_shutdown first")
+        profile = _validate_local_profile(profile)
+        config_mode = _validate_config_mode(config_mode)
+        candidates = ("basic", "cbios") if profile == "auto" else (profile,)
+        errors = []
         machine = None
-        if profile == "dos":
-            if not DOS_HDD.exists():
-                raise OpenMSXError(f"MSX-DOS image not found: {DOS_HDD}")
-            machine = OpenMSX(machine=BASIC_MACHINE,
-                              extensions=[DOS_EXTENSION],
-                              harddisk=str(DOS_HDD))
-        elif profile == "disk":
-            machine = OpenMSX(machine=BASIC_MACHINE,
-                              extensions=[DISK_EXTENSION])
-        elif profile == "msx2plus":
-            machine = OpenMSX(machine=MSX2PLUS_MACHINE, extensions=[])
-        else:
-            machine = OpenMSX(machine=BASIC_MACHINE, extensions=[])
-        try:
-            machine.start(headless=not window)
-            machine.power_on()
-            if window:
-                # Show a real openMSX window on the user's screen (renderer none ->
-                # SDLGL-PP). Works because the MCP server runs in the GUI session.
-                # The same -control channel still drives it, so the user types in the
-                # window AND the AI operates the same shared instance.
-                machine.cmd("set renderer SDLGL-PP")
-                machine.cmd("set throttle on")   # real speed for interactive use
-            machine.advance(boot_seconds if profile != "dos" else 14)
-            if profile == "disk":
-                # DDX shows its insert-disk prompt; ESC drops into DDX-BASIC.
-                machine.press("ESC")
-                machine.advance(3)
-            screen = machine.screen_text()
-        except Exception:
-            # A partially booted emulator is still owned by this session.  Do
-            # not publish it as the active backend, and never leave its process
-            # running after a failed renderer, power, or boot command.
-            machine.close()
-            raise
+        resolved_profile = None
+        screen = None
+        for candidate in candidates:
+            machine = None
+            try:
+                machine = _new_profile_machine(
+                    candidate, config_mode=config_mode)
+                machine.start(headless=not window)
+                machine.power_on()
+                if window:
+                    # Show a real openMSX window on the user's screen (renderer
+                    # none -> SDLGL-PP). The same control channel still drives it,
+                    # so the user and the AI operate one shared instance.
+                    machine.cmd("set renderer SDLGL-PP")
+                    machine.cmd("set throttle on")
+                machine.advance(boot_seconds if candidate != "dos" else 14)
+                if candidate == "disk":
+                    # DDX shows its insert-disk prompt; ESC enters DDX-BASIC.
+                    machine.press("ESC")
+                    machine.advance(3)
+                screen = machine.screen_text()
+                resolved_profile = candidate
+                break
+            except Exception as exc:
+                # A partially booted emulator is still owned by this session.
+                # Never publish it or leave its process running after failure.
+                if machine is not None:
+                    machine.close()
+                machine = None
+                if profile != "auto":
+                    raise
+                errors.append((candidate, exc))
+        if machine is None or resolved_profile is None:
+            detail = "; ".join(
+                f"{candidate}: {error}" for candidate, error in errors)
+            raise OpenMSXError(
+                "auto profile could not boot either the configured BASIC "
+                f"machine or the C-BIOS fallback ({detail})")
         self._local_msx = machine
-        self._local_profile = profile
+        self._local_profile = resolved_profile
+        self._local_requested_profile = profile
+        self._local_config_mode = config_mode
         self.local_id = "local-" + secrets.token_hex(6)
         return screen
 
@@ -360,6 +457,10 @@ class Session:
             raise
         self._local_msx = machine
         self._local_profile = "attach"
+        self._local_requested_profile = "attach"
+        # An attached process owns its own configuration; this session neither
+        # isolates nor overlays it.
+        self._local_config_mode = "user"
         self.local_id = "local-" + secrets.token_hex(6)
         return screen
 
@@ -569,6 +670,8 @@ class Session:
             self._agent_msx = real
             self._local_msx = machine
             self._local_profile = "bench"
+            self._local_requested_profile = "bench"
+            self._local_config_mode = "isolated"
             self.bench_id = "bench-" + secrets.token_hex(6)
             self.local_id = self.bench_id + ":local"
             self.agent_id = self.bench_id + ":agent"
@@ -602,6 +705,8 @@ class Session:
         finally:
             self._local_msx = None
             self._local_profile = None
+            self._local_requested_profile = None
+            self._local_config_mode = None
             self.local_id = None
             if self._legacy_msx is local:
                 self._legacy_msx = None
@@ -653,6 +758,8 @@ class Session:
             if self._local_msx is self.bench_machine:
                 self._local_msx = None
                 self._local_profile = None
+                self._local_requested_profile = None
+                self._local_config_mode = None
                 self.local_id = None
             self.bench_machine = None
         if self.bench_runtime is not None:
@@ -679,6 +786,8 @@ class Session:
                 pass
         self._legacy_msx = None
         self._legacy_profile = None
+        self._local_requested_profile = None
+        self._local_config_mode = None
         self.local_id = None
         self.agent_id = None
         self.bench_id = None
@@ -697,13 +806,22 @@ def _screen():
     return SESSION.require().screen_text()
 
 
-def t_boot(profile="basic", window=False):
-    if profile not in ("basic", "disk", "dos", "msx2plus"):
-        raise ValueError(
-            "profile must be 'basic', 'disk', 'dos' or 'msx2plus'")
-    scr = SESSION.boot(profile, window=window)
+def t_boot(profile="basic", window=False, config_mode=None):
+    profile = _validate_local_profile(profile)
+    config_mode = _validate_config_mode(config_mode)
+    scr = SESSION.boot(profile, window=window, config_mode=config_mode)
     tag = "window" if window else "headless"
-    return f"[boot profile={profile} {tag}]\n{scr}"
+    machine, resolved = SESSION.backend("local")
+    machine_name = getattr(machine, "machine", None)
+    details = [
+        f"profile={profile}",
+        f"resolved_profile={resolved}",
+        f"config_mode={config_mode}",
+        tag,
+    ]
+    if isinstance(machine_name, (str, os.PathLike)):
+        details.append(f"machine={os.fspath(machine_name)}")
+    return f"[boot {' '.join(details)}]\n{scr}"
 
 
 def t_attach(socket_path=None):
@@ -711,6 +829,512 @@ def t_attach(socket_path=None):
     selected = SESSION.require("local").socket_path
     return (f"[attached to openMSX socket={selected} — shared instance]\n" +
             scr)
+
+
+def _path_exists(value):
+    if not isinstance(value, (str, os.PathLike)) or not os.fspath(value):
+        return False
+    try:
+        return pathlib.Path(value).expanduser().is_file()
+    except OSError:
+        return False
+
+
+def _platform_label(value):
+    value = str(value or sys.platform).lower()
+    if value.startswith("win"):
+        return "windows"
+    if value in {"darwin", "mac", "macos"}:
+        return "macos"
+    if value.startswith("linux"):
+        return "linux"
+    return value
+
+
+def _fallback_preflight(machine):
+    """Minimal read-only report for a temporarily mismatched client module."""
+    executable = _json_scalar(getattr(machine, "bin", None))
+    executable_found = _path_exists(executable)
+    if not executable_found and isinstance(executable, str):
+        executable_found = shutil.which(executable) is not None
+    home = _json_scalar(getattr(machine, "home", None))
+    platform_name = (
+        "windows" if sys.platform.startswith("win") else
+        "macos" if sys.platform == "darwin" else
+        "linux" if sys.platform.startswith("linux") else sys.platform)
+    problems = []
+    if not executable_found:
+        problems.append(
+            "openMSX executable was not found; install openMSX or set "
+            "OPENMSX_BIN to its executable")
+    problems.append(
+        "this msx-ai openMSX adapter lacks the static preflight API; update "
+        "the package before relying on machine/ROM readiness")
+    return {
+        "ready": False,
+        "platform": getattr(machine, "platform", platform_name),
+        "control_transport": getattr(
+            machine, "control_transport",
+            "tcp_sspi" if platform_name == "windows" else "stdio"),
+        "control_transport_supported": platform_name != "windows",
+        "boot_supported": platform_name != "windows",
+        "attach_transport": (
+            "tcp_sspi" if platform_name == "windows" else "unix_socket"),
+        "attach_supported": platform_name != "windows",
+        "config_mode": getattr(machine, "config_mode", "isolated"),
+        "machine": getattr(machine, "machine", None),
+        "executable": executable,
+        "executable_found": executable_found,
+        "home": home,
+        "user_home": _json_scalar(getattr(machine, "user_home", None)),
+        "home_exists": bool(home and pathlib.Path(home).is_dir()),
+        "machine_config_found": None,
+        "machine_config_candidates": [],
+        "problems": problems,
+    }
+
+
+def _share_roots(report):
+    roots = []
+    config_mode = report.get("config_mode")
+    user_home_value = report.get("user_home")
+    user_share = (pathlib.Path(user_home_value) / "share"
+                  if isinstance(user_home_value, (str, os.PathLike)) and
+                  os.fspath(user_home_value) else None)
+    for candidate in report.get("machine_config_candidates", []):
+        try:
+            path = pathlib.Path(candidate)
+        except TypeError:
+            continue
+        if path.suffix.lower() == ".xml":
+            share = path.parent.parent
+            if (config_mode == "isolated" and user_share is not None and
+                    share.resolve(strict=False) ==
+                    user_share.resolve(strict=False)):
+                continue
+            roots.append(share)
+    home_keys = (
+        ("home",) if config_mode == "isolated" else
+        ("user_home",) if config_mode == "user" else
+        ("home", "user_home"))
+    for key in home_keys:
+        value = report.get(key)
+        if isinstance(value, (str, os.PathLike)) and os.fspath(value):
+            home = pathlib.Path(value)
+            roots.extend((home / "share", home))
+    executable = report.get("executable")
+    if isinstance(executable, (str, os.PathLike)) and os.fspath(executable):
+        parent = pathlib.Path(executable).parent
+        roots.extend((parent / "share", parent.parent / "Resources" / "share"))
+    if report.get("config_mode") in {"isolated", "overlay"}:
+        roots.extend((
+            pathlib.Path(OPENMSX_HOME) / "share",
+            pathlib.Path(__file__).resolve().parent / "resources" / "openmsx" /
+            "share",
+        ))
+    result = []
+    seen = set()
+    for root in roots:
+        normalized = str(root.resolve(strict=False)).casefold()
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(root)
+    return result
+
+
+def _component_config(kind, name, report, shares):
+    directory = "machines" if kind == "machine" else "extensions"
+    candidates = [root / directory / f"{name}.xml" for root in shares]
+    seen = set()
+    normalized = []
+    for candidate in candidates:
+        path = pathlib.Path(candidate)
+        marker = str(path.resolve(strict=False)).casefold()
+        if marker not in seen:
+            seen.add(marker)
+            normalized.append(path)
+    selected = next((path for path in normalized if path.is_file()), None)
+    return {
+        "kind": kind,
+        "name": name,
+        "config_found": selected is not None,
+        "config_path": str(selected) if selected is not None else None,
+        "config_candidates": [str(path) for path in normalized],
+    }
+
+
+def _rom_requirements(config_path):
+    try:
+        root = ET.parse(config_path).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    requirements = []
+    for rom in root.findall(".//rom"):
+        filenames = [
+            (node.text or "").strip() for node in rom.findall("filename")
+            if (node.text or "").strip()
+        ]
+        sha1s = [
+            (node.text or "").strip().lower() for node in rom.findall("sha1")
+            if (node.text or "").strip()
+        ]
+        if filenames or sha1s:
+            requirements.append({"filenames": filenames, "sha1s": sha1s})
+    return requirements
+
+
+def _rom_catalog(shares):
+    catalog = []
+    seen = set()
+    for root in shares:
+        pool = root / "systemroms"
+        if not pool.is_dir():
+            continue
+        try:
+            entries = pool.rglob("*")
+            for path in entries:
+                if not path.is_file():
+                    continue
+                marker = str(path.resolve(strict=False)).casefold()
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                catalog.append((path.name.casefold(), str(path)))
+        except OSError:
+            continue
+    return catalog
+
+
+def _rom_requirement_found(requirement, catalog):
+    filenames = [item.casefold() for item in requirement["filenames"]]
+    sha1s = [item.casefold() for item in requirement["sha1s"]]
+    for basename, _path in catalog:
+        if any(
+                basename == filename or
+                basename.endswith("." + filename) or
+                basename.endswith("." + filename + ".gz")
+                for filename in filenames):
+            return True
+        if any(basename.startswith(sha1) for sha1 in sha1s):
+            return True
+    return False
+
+
+def _inspect_profile_roms(profile, report, catalog_cache=None):
+    """Conservatively inspect XML ROM references in known openMSX pools."""
+    shares = _share_roots(report)
+    arguments = _profile_arguments(profile, require_files=False)
+    components = [
+        _component_config("machine", arguments["machine"], report, shares),
+    ]
+    components.extend(
+        _component_config("extension", extension, report, shares)
+        for extension in arguments.get("extensions", []))
+    missing_configs = [
+        f"{item['kind']} config not found for {item['name']}"
+        for item in components if not item["config_found"]
+    ]
+    machine_config_found = components[0]["config_found"]
+    report["machine_config_found"] = machine_config_found
+    if machine_config_found:
+        # A managed isolated/overlay template can be present in package
+        # resources before its writable home is materialized. Static doctor
+        # checks may therefore prove availability beyond adapter.preflight().
+        report["problems"] = [
+            problem for problem in report["problems"]
+            if not ("machine config" in problem.lower() and
+                    "not found" in problem.lower())
+        ]
+    requirements = []
+    for component in components:
+        if component["config_path"] is not None:
+            requirements.extend(_rom_requirements(component["config_path"]))
+    catalog_key = tuple(str(root.resolve(strict=False)).casefold()
+                        for root in shares)
+    if catalog_cache is not None and catalog_key in catalog_cache:
+        catalog = catalog_cache[catalog_key]
+    else:
+        catalog = _rom_catalog(shares)
+        if catalog_cache is not None:
+            catalog_cache[catalog_key] = catalog
+    missing_roms = []
+    for requirement in requirements:
+        if _rom_requirement_found(requirement, catalog):
+            continue
+        label = (requirement["filenames"][0]
+                 if requirement["filenames"] else requirement["sha1s"][0])
+        missing_roms.append(label)
+    report["config_components"] = components
+    report["required_roms"] = [
+        (item["filenames"][0] if item["filenames"] else item["sha1s"][0])
+        for item in requirements
+    ]
+    report["missing_roms"] = missing_roms
+    report["rom_readiness"] = (
+        "unverified" if missing_roms else
+        "ready" if requirements else "not-required")
+    if missing_configs:
+        report["ready"] = False
+        report["problems"].extend(missing_configs)
+    if missing_roms:
+        # openMSX can also find SHA-matched files inside archives and external
+        # pools that static inspection cannot enumerate. Mark readiness as
+        # unverified, not as a definitive licensing/configuration failure.
+        report["ready"] = False
+        report["problems"].extend(
+            "ROM requirement was not found by filename or SHA-1 in the known "
+            "systemroms pools; runtime readiness remains unverified: " + name
+            for name in missing_roms)
+    blocking_problems = []
+    for problem in report["problems"]:
+        lowered = problem.lower()
+        attach_only = (
+            report.get("boot_supported") and
+            any(marker in lowered for marker in ("attach", "sspi")))
+        if not attach_only:
+            blocking_problems.append(problem)
+    report["ready"] = bool(
+        report.get("executable_found") and report.get("boot_supported") and
+        not missing_configs and not missing_roms and not blocking_problems)
+    return report
+
+
+def _preflight_candidate(profile, config_mode, *, catalog_cache=None):
+    """Inspect one concrete profile without starting or persisting openMSX."""
+    try:
+        arguments = _profile_arguments(profile, require_files=False)
+    except Exception as exc:
+        return {
+            "profile": profile,
+            "machine": _profile_machine_name(profile),
+            "ready": False,
+            "platform": None,
+            "control_transport": None,
+            "control_transport_supported": False,
+            "boot_supported": False,
+            "attach_transport": None,
+            "attach_supported": False,
+            "config_mode": config_mode,
+            "executable": None,
+            "executable_found": False,
+            "home": None,
+            "user_home": None,
+            "home_exists": False,
+            "machine_config_found": None,
+            "machine_config_candidates": [],
+            "problems": [str(exc)],
+        }
+    try:
+        machine = _new_openmsx(config_mode=config_mode, **arguments)
+        preflight = getattr(machine, "preflight", None)
+        report = preflight() if callable(preflight) else _fallback_preflight(machine)
+        if not isinstance(report, dict):
+            raise TypeError("OpenMSX.preflight() must return a dictionary")
+    except Exception as exc:
+        report = {
+            "ready": False,
+            "platform": None,
+            "control_transport": None,
+            "control_transport_supported": False,
+            "boot_supported": False,
+            "attach_transport": None,
+            "attach_supported": False,
+            "config_mode": config_mode,
+            "machine": arguments["machine"],
+            "executable": None,
+            "executable_found": False,
+            "home": None,
+            "user_home": None,
+            "home_exists": False,
+            "machine_config_found": None,
+            "machine_config_candidates": [],
+            "problems": [f"could not inspect openMSX: {exc}"],
+        }
+    problems = report.get("problems", [])
+    if isinstance(problems, str):
+        problems = [problems]
+    platform_name = _platform_label(report.get("platform"))
+    control_transport_supported = bool(report.get(
+        "control_transport_supported", platform_name != "windows"))
+    normalized = {
+        "profile": profile,
+        "machine": _json_scalar(report.get("machine", arguments["machine"])),
+        "ready": bool(report.get("ready", False)),
+        "platform": platform_name,
+        "control_transport": _json_scalar(report.get("control_transport")),
+        "control_transport_supported": bool(
+            control_transport_supported),
+        "boot_supported": bool(report.get(
+            "boot_supported", control_transport_supported)),
+        "attach_transport": _json_scalar(report.get("attach_transport")),
+        "attach_supported": bool(report.get("attach_supported", False)),
+        "config_mode": _json_scalar(report.get("config_mode", config_mode)),
+        "executable": _json_scalar(report.get("executable")),
+        "executable_found": bool(report.get("executable_found", False)),
+        "home": _json_scalar(report.get("home")),
+        "user_home": _json_scalar(report.get("user_home")),
+        "home_exists": bool(report.get("home_exists", False)),
+        "machine_config_found": report.get("machine_config_found"),
+        "machine_config_candidates": [
+            _json_scalar(item)
+            for item in report.get("machine_config_candidates", [])
+        ],
+        "problems": [str(item.get("message", item))
+                     if isinstance(item, dict) else str(item)
+                     for item in problems],
+    }
+    normalized = _inspect_profile_roms(
+        profile, normalized, catalog_cache=catalog_cache)
+    if profile == "dos" and not DOS_HDD.is_file():
+        normalized["ready"] = False
+        normalized["problems"].append(f"MSX-DOS image not found: {DOS_HDD}")
+    return normalized
+
+
+def _doctor_issue(message, *, severity="error"):
+    lowered = message.lower()
+    if "executable" in lowered or "openmsx_bin" in lowered:
+        code = "openmsx-executable-missing"
+        action = "Install openMSX or set OPENMSX_BIN to the executable path."
+    elif "preflight api" in lowered:
+        code = "adapter-preflight-unavailable"
+        action = "Update msx-ai so the local adapter can validate this setup."
+    elif "msx-dos image" in lowered or "msxdos.dsk" in lowered:
+        code = "dos-image-missing"
+        action = "Set MSX_AI_DOS_HDD to an existing licensed MSX-DOS/Nextor image."
+    elif "rom" in lowered or "firmware" in lowered:
+        extension_firmware = any(
+            item in lowered for item in ("ddx", "nextor", "sunrise"))
+        code = ("extension-rom-missing" if extension_firmware
+                else "machine-rom-missing")
+        action = (
+            "Install the freely distributable C-BIOS ROM set in an openMSX "
+            "systemroms pool."
+            if "cbios" in lowered or "c-bios" in lowered else
+            "Install the required extension firmware in an openMSX systemroms "
+            "pool; disk/DOS profile semantics cannot be replaced by C-BIOS."
+            if extension_firmware else
+            "Add the legally obtained ROM to an openMSX systemroms pool, or "
+            "use profile='cbios'/'auto'.")
+    elif "config" in lowered and "not found" in lowered:
+        is_machine = "machine" in lowered
+        code = ("machine-config-missing" if is_machine
+                else "extension-config-missing")
+        action = (
+            "Verify the selected config mode/home and machine XML, or use the "
+            "C-BIOS profile bundled with openMSX."
+            if is_machine else
+            "Install or select an openMSX extension definition available in "
+            "the chosen configuration mode.")
+    elif "sspi" in lowered or "attach" in lowered:
+        code = "windows-sspi-unavailable"
+        action = (
+            "Owned boot is available; install/configure SSPI attach support "
+            "before connecting to an existing openMSX instance."
+            if ("owned boot" in lowered and
+                any(item in lowered for item in ("available", "supported")))
+            else "Install/configure the Windows SSPI control helper before "
+            "booting or attaching to a local openMSX instance.")
+    else:
+        code = "openmsx-preflight-problem"
+        action = "Review the selected openMSX executable, machine and config home."
+    return {"severity": severity, "code": code,
+            "message": message, "action": action}
+
+
+def t_local_doctor(profile="auto", config_mode=None):
+    """Return a read-only local openMSX readiness report."""
+    profile = _validate_local_profile(profile)
+    config_mode = _validate_config_mode(config_mode)
+    candidates = ("basic", "cbios") if profile == "auto" else (profile,)
+    catalog_cache = {}
+    reports = [
+        _preflight_candidate(
+            item, config_mode, catalog_cache=catalog_cache)
+        for item in candidates
+    ]
+    selected = next((item for item in reports if item["ready"]), None)
+    if selected is None and profile != "auto":
+        selected = reports[0]
+
+    issues = []
+    if profile == "auto" and selected is not None and selected["profile"] != "basic":
+        basic_problems = reports[0]["problems"] or [
+            "the configured BASIC profile did not pass preflight"]
+        issues.append({
+            "severity": "warning",
+            "code": "auto-profile-fallback",
+            "message": (
+                "auto resolved to C-BIOS because the configured BASIC profile "
+                f"was not ready: {'; '.join(basic_problems)}"),
+            "action": (
+                "Use profile='cbios' for deterministic proprietary-ROM-free "
+                "startup, or "
+                "install the configured machine firmware to restore BASIC."),
+        })
+    problem_source = reports if selected is None else [selected]
+    for report in problem_source:
+        for problem in report["problems"]:
+            lowered = problem.lower()
+            severity = (
+                "warning" if "unverified" in lowered else
+                "warning" if (any(marker in lowered
+                                  for marker in ("attach", "sspi")) and
+                              report.get("boot_supported")) else
+                "error")
+            issues.append(_doctor_issue(problem, severity=severity))
+
+    transport_source = selected or reports[-1]
+    if (transport_source.get("platform") == "windows" and
+            (not transport_source.get("boot_supported") or
+             not transport_source.get("attach_supported"))):
+        message = (
+            "Windows local control uses the authenticated tcp_sspi endpoint; "
+            "the required SSPI helper is not available for owned boot and/or "
+            "attach in this environment")
+        if not any(item["code"] == "windows-sspi-unavailable"
+                   for item in issues):
+            issues.append(_doctor_issue(
+                message, severity=(
+                    "warning" if transport_source.get("boot_supported")
+                    else "error")))
+
+    deduplicated_issues = []
+    seen_issues = set()
+    for issue in issues:
+        marker = (issue["code"], issue["message"])
+        if marker not in seen_issues:
+            seen_issues.add(marker)
+            deduplicated_issues.append(issue)
+
+    return {
+        "platform": transport_source.get("platform"),
+        "executable": transport_source.get("executable"),
+        "executable_found": transport_source.get("executable_found", False),
+        "control_transport": transport_source.get("control_transport"),
+        "control_transport_supported": transport_source.get(
+            "control_transport_supported", False),
+        "transport_ready": bool(
+            transport_source.get("executable_found") and
+            transport_source.get("control_transport_supported")),
+        "boot_supported": transport_source.get("boot_supported", False),
+        "attach_transport": transport_source.get("attach_transport"),
+        "attach_supported": transport_source.get("attach_supported", False),
+        "config_mode": config_mode,
+        "config_home": transport_source.get("home"),
+        "user_config_home": transport_source.get("user_home"),
+        "config_home_exists": transport_source.get("home_exists", False),
+        "requested_profile": profile,
+        "resolved_profile": selected["profile"] if selected else None,
+        "machine": selected["machine"] if selected else None,
+        "machine_config_found": (
+            selected.get("machine_config_found") if selected else None),
+        "profile_ready": bool(selected and selected["ready"]),
+        "ready": bool(selected and selected["ready"]),
+        "candidates": reports,
+        "issues": deduplicated_issues,
+        "persistent_process_started": False,
+    }
 
 
 def t_real_listen(host="127.0.0.1", port=6603, timeout=60):
@@ -798,6 +1422,52 @@ def t_screen():
     return _screen()
 
 
+def _json_scalar(value):
+    """Return a JSON-safe scalar for optional adapter metadata."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    return str(value)
+
+
+def _local_runtime_metadata(machine, profile):
+    requested = SESSION._local_requested_profile or profile
+    config_mode = (SESSION._local_config_mode or
+                   getattr(machine, "config_mode", None))
+    if config_mode is None and profile != "attach":
+        config_mode = "isolated"
+    machine_name = (getattr(machine, "attached_machine", None)
+                    if profile == "attach" else
+                    getattr(machine, "machine", None))
+    if machine_name is None:
+        machine_name = _profile_machine_name(profile)
+    platform_value = getattr(machine, "platform", None)
+    metadata = {
+        "requested_profile": requested,
+        "resolved_profile": profile,
+        "machine": _json_scalar(machine_name),
+        "config_mode": _json_scalar(config_mode),
+        "config_home": _json_scalar(
+            None if profile == "attach" else getattr(machine, "home", None)),
+        "effective_config_home": _json_scalar(
+            None if profile == "attach" else
+            getattr(machine, "effective_home", None)),
+        "user_config_home": _json_scalar(
+            None if profile == "attach" else
+            getattr(machine, "user_home", None)),
+        "control_transport": _json_scalar(
+            getattr(machine, "control_transport",
+                    getattr(machine, "transport", None))),
+        "executable": _json_scalar(
+            None if profile == "attach" else getattr(machine, "bin", None)),
+        "platform": (_platform_label(platform_value)
+                     if platform_value is not None else None),
+    }
+    return {name: value for name, value in metadata.items()
+            if value is not None}
+
+
 def _status_for(target):
     m, profile = SESSION.backend(target)
     if m is None:
@@ -852,6 +1522,7 @@ def _status_for(target):
               "bench_id": SESSION.bench_id,
               "state": "connected", "profile": profile,
               "screen_mode": m.screen_mode()}
+    status.update(_local_runtime_metadata(m, profile))
     if getattr(m, "attached", False):
         status["control_socket"] = getattr(m, "socket_path", None)
     return status
@@ -873,6 +1544,7 @@ def _identity_for(target):
     }
     if connected and target == "local":
         identity["profile"] = profile
+        identity.update(_local_runtime_metadata(m, profile))
     if connected and target == "agent":
         identity.update({
             "peer": (list(m.peer) if isinstance(getattr(m, "peer", None), tuple)
@@ -1812,17 +2484,29 @@ TOOLS = {
             "limit": {"type": "integer", "minimum": 1, "maximum": 20,
                       "default": 5}}, ["query"])),
     "msx_boot": (t_boot,
-        "Boot an isolated MSX. profile='basic' starts the Gradiente Expert 2.0 "
+        "Boot a local MSX with an explicit configuration policy. "
+        "profile='basic' starts the Gradiente Expert 2.0 "
         "in BASIC; profile='disk' adds its DDX 3.0 floppy; profile='dos' boots "
         "MSX-DOS 2 (Nextor) from the Sunrise IDE hard disk; profile='msx2plus' "
-        "starts a Sony HB-F1XDJ MSX2+ with 128 KiB RAM and built-in floppy. "
-        "Set window=true to also open a "
+        "starts a Sony HB-F1XDJ MSX2+ with 128 KiB RAM and built-in floppy; "
+        "profile='cbios' uses openMSX's freely distributable C-BIOS MSX2 "
+        "machine without proprietary firmware. profile='auto' tries the "
+        "configured BASIC machine first and "
+        "falls back to C-BIOS only when that explicit adaptive profile was "
+        "requested. config_mode='isolated' preserves the reproducible project "
+        "home, 'user' uses the user's normal openMSX setup, and 'overlay' adds "
+        "MSX-AI templates without hiding user ROM pools. Set window=true to open a "
         "visible openMSX window on the user's screen (shared: the user types in it "
         "and the AI drives the same instance). Returns the boot screen.",
         _s({"profile": {"type": "string",
-                        "enum": ["basic", "disk", "dos", "msx2plus"],
+                        "enum": list(LOCAL_PROFILES),
                         "default": "basic"},
-            "window": {"type": "boolean", "default": False}})),
+            "window": {"type": "boolean", "default": False},
+            "config_mode": {
+                "type": "string", "enum": list(OPENMSX_CONFIG_MODES),
+                "default": (DEFAULT_OPENMSX_CONFIG_MODE
+                            if DEFAULT_OPENMSX_CONFIG_MODE in OPENMSX_CONFIG_MODES
+                            else "isolated")}})),
     "msx_attach": (t_attach,
         "Attach to the user's ALREADY-RUNNING openMSX window (shared instance) via "
         "its control socket, instead of spawning a headless one. Use this when the "
@@ -2356,6 +3040,22 @@ for public_name, canonical_name in AGENT_TOOL_ALIASES.items():
     )
 
 TOOLS.update({
+    "msx_local_doctor": (
+        t_local_doctor,
+        "Inspect local openMSX readiness without starting an emulator or "
+        "creating configuration files. Reports the resolved executable, "
+        "platform control/attach transports, config policy and homes, profile "
+        "resolution, machine/ROM prerequisites, and actionable problems.",
+        _s({
+            "profile": {"type": "string", "enum": list(LOCAL_PROFILES),
+                        "default": "auto"},
+            "config_mode": {
+                "type": "string", "enum": list(OPENMSX_CONFIG_MODES),
+                "default": (DEFAULT_OPENMSX_CONFIG_MODE
+                            if DEFAULT_OPENMSX_CONFIG_MODE in OPENMSX_CONFIG_MODES
+                            else "isolated")},
+        }),
+    ),
     "msx_targets_status": (
         t_status,
         "Inventory the independently connected local openMSX and ASM-agent "

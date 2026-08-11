@@ -68,6 +68,9 @@ _FORBIDDEN_SEGMENTS = {
     "systemroms",
     "work",
 }
+_FORBIDDEN_BASENAMES = {
+    ".mcp.json",
+}
 _FORBIDDEN_SUFFIXES = {
     ".dsk",
     ".fd1",
@@ -116,6 +119,7 @@ _RUNTIME_MODULES = {
     "msx_transfer.py",
     "msx_v3.py",
     "paths.py",
+    "windows_sspi.py",
 }
 _WHEEL_LICENSE_FILES = {
     "LICENSE",
@@ -124,7 +128,6 @@ _WHEEL_LICENSE_FILES = {
     "third_party/openmsx/NOTICE",
 }
 _SDIST_REQUIRED_FILES = {
-    ".mcp.json",
     "AUTHORS.md",
     "LICENSE",
     "MANIFEST.in",
@@ -242,7 +245,7 @@ def _require_dependencies(
         raise ReleaseCheckError(
             "missing release dependencies: " + ", ".join(missing) +
             ". Install the project and the build frontend in this Python "
-            "environment before running make release-check.")
+            "environment before running release validation.")
     constraints = {
         "anyio": ((4, 5), (5,)),
         "jsonschema": ((4, 20), (5,)),
@@ -264,19 +267,34 @@ def _require_dependencies(
     _z80asm_version_line(assembler, environment)
 
 
-def _resolve_build_tools(environment: Mapping[str, str]) -> tuple[str, str]:
-    """Resolve validated MAKE and Z80ASM overrides without a shell."""
+def _resolve_build_tools(
+        environment: Mapping[str, str], *, platform: str | None = None
+) -> tuple[str | None, str]:
+    """Resolve optional Windows make and the required Z80ASM executable."""
+    platform = os.name if platform is None else platform
     path = environment.get("PATH")
-    resolved: dict[str, str] = {}
-    for variable, default in (("MAKE", "make"), ("Z80ASM", "z80asm")):
-        candidate = environment.get(variable, default).strip()
-        executable = shutil.which(candidate, path=path) if candidate else None
-        if executable is None:
+    make_override = environment.get("MAKE")
+    make_candidate = "make" if make_override is None else make_override.strip()
+    make_executable = None
+    if platform != "nt" or make_override is not None:
+        make_executable = (
+            shutil.which(make_candidate, path=path) if make_candidate else None)
+        if make_executable is None:
             raise ReleaseCheckError(
-                f"release build tool {variable}={candidate!r} is not an "
+                f"release build tool MAKE={make_candidate!r} is not an "
                 "executable available through the configured PATH")
-        resolved[variable] = str(Path(executable).resolve())
-    return resolved["MAKE"], resolved["Z80ASM"]
+    make = (str(Path(make_executable).resolve())
+            if make_executable is not None else None)
+
+    assembler_candidate = environment.get("Z80ASM", "z80asm").strip()
+    assembler_executable = (
+        shutil.which(assembler_candidate, path=path)
+        if assembler_candidate else None)
+    if assembler_executable is None:
+        raise ReleaseCheckError(
+            f"release build tool Z80ASM={assembler_candidate!r} is not an "
+            "executable available through the configured PATH")
+    return make, str(Path(assembler_executable).resolve())
 
 
 def _assert_z80asm_version(output: str) -> str:
@@ -395,6 +413,7 @@ def _stage_source(destination: Path) -> Path:
 def _add_release_canaries(source: Path) -> None:
     """Add forbidden files that packaging rules must prove they exclude."""
     canaries = {
+        Path(".mcp.json"): b'{"local": "release canary"}\n',
         Path("work/release-secret.dsk"): b"release canary\n",
         Path(".openmsx-home/persistent/release-secret.rom"):
             b"release canary\n",
@@ -460,6 +479,8 @@ def _forbidden_reasons(name: str) -> list[str]:
     path = _safe_archive_path(name)
     lowered_parts = tuple(part.lower() for part in path.parts)
     reasons: list[str] = []
+    if lowered_parts[-1] in _FORBIDDEN_BASENAMES:
+        reasons.append("local client configuration")
     forbidden_segments = sorted(
         set(lowered_parts).intersection(_FORBIDDEN_SEGMENTS))
     if forbidden_segments:
@@ -909,15 +930,64 @@ def _persist_release_assets(output_directory: Path, artifacts: list[Path]) \
     return targets
 
 
+def _build_agent_suite_portable(
+        source: Path, env: dict[str, str], assembler: str,
+        agent_directory: Path) -> None:
+    """Run the Makefile agent recipe without requiring a POSIX make tool."""
+    build_directory = agent_directory / "build"
+    build_directory.mkdir(parents=True, exist_ok=True)
+    tools = source / "tools"
+    commands = (
+        [
+            sys.executable, str(tools / "materialize_memman.py"),
+            "--source-dir", str(source / "third_party" / "memman"),
+            "--output-dir", str(agent_directory),
+        ],
+        [
+            sys.executable, str(tools / "build_agent_tsr.py"),
+            "--repository", str(source), "--assembler", assembler,
+            "--output", str(build_directory / "MSXAI.TSR"),
+            "--metadata-output", str(build_directory / "MSXAI_TSR.INC"),
+            "--8251-output", str(agent_directory / "MCP8251.TSR"),
+            "--16c550-output", str(agent_directory / "MCP16550.TSR"),
+        ],
+        [
+            assembler, str(source / "agent" / "msx_agent.asm"),
+            "-o", str(agent_directory / "MSXAI.COM"),
+        ],
+        [
+            sys.executable, str(tools / "check_msx_com_size.py"),
+            str(agent_directory / "MSXAI.COM"),
+            str(_AGENT_COM_SIZE_CEILINGS["MSXAI.COM"]),
+        ],
+        [
+            assembler, str(source / "agent" / "msx_xfer.asm"),
+            "-o", str(agent_directory / "MSXAIXF.COM"),
+        ],
+        [
+            sys.executable, str(tools / "check_msx_com_size.py"),
+            str(agent_directory / "MSXAIXF.COM"),
+            str(_AGENT_COM_SIZE_CEILINGS["MSXAIXF.COM"]),
+        ],
+    )
+    for command in commands:
+        _run(command, cwd=source, env=env)
+
+
 def _build_agent_suite(source: Path, env: dict[str, str]) -> Path:
     make, assembler = _resolve_build_tools(env)
     _z80asm_version_line(assembler, env)
     _say("building the seven-file Z80 agent suite in the staged snapshot")
-    _run(
-        [make, "agent", f"PYTHON={sys.executable}",
-         f"Z80ASM={assembler}"],
-        cwd=source, env=env)
     agent_directory = source / "work" / "agent"
+    if make is None:
+        _say("using the portable Python agent builder on Windows")
+        _build_agent_suite_portable(
+            source, env, assembler, agent_directory)
+    else:
+        _run(
+            [make, "agent", f"PYTHON={sys.executable}",
+             f"Z80ASM={assembler}"],
+            cwd=source, env=env)
     _assert_agent_suite(agent_directory)
     return agent_directory
 

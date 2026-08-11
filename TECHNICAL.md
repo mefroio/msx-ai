@@ -170,6 +170,9 @@ device, not a dependency.
   emulator integration tests. Version 21.0 is the currently tested version.
 - Legally obtained MSX system ROMs are required only by openMSX machine
   configurations that use proprietary firmware.
+- C-BIOS is shipped with standard openMSX distributions and supports the
+  ROM-free `cbios` control-channel profile. It does not supply MSX BASIC or
+  MSX-DOS.
 - Bas Wijnen's `z80asm` is required to build the ASM agent suite or use tools
   that assemble uploaded Z80 source. It is not required to start the MCP server
   with an already-built agent suite.
@@ -181,33 +184,51 @@ variables:
 
 | Variable | Purpose |
 |---|---|
-| `OPENMSX_BIN` | Path to the openMSX executable |
+| `OPENMSX_BIN` | Optional explicit path to the openMSX executable |
 | `Z80ASM` | Path to the `z80asm` executable |
 | `MSX_AI_OPENMSX_HOME` | Isolated openMSX data/configuration directory |
+| `MSX_AI_OPENMSX_CONFIG_MODE` | Default boot policy: `isolated`, `user`, or `overlay` |
+| `MSX_AI_CBIOS_MACHINE` | C-BIOS machine used by the `cbios` profile |
 | `MSX_AI_DOS_HDD` | Bootable MSX-DOS/Nextor hard-disk image |
 | `MSX_AI_BASIC_MACHINE` | Machine used by the `basic`, `disk`, and `dos` profiles |
 | `MSX_AI_MSX2PLUS_MACHINE` | Machine used by the `msx2plus` profile |
 | `MSX_AI_DISK_EXTENSION` | Storage extension used by the `disk` profile |
 | `MSX_AI_DOS_EXTENSION` | Storage extension used by the `dos` profile |
 
-The repository includes machine XML definitions but not their ROM files. In a
-source checkout, place local ROMs below `.openmsx-home/share/systemroms/`. An
-installed wheel materializes public templates under
-`~/.msx-ai/openmsx-home`, so its default firmware location is
-`~/.msx-ai/openmsx-home/share/systemroms/`. Alternatively, point
-`MSX_AI_OPENMSX_HOME` at an existing isolated configuration. This command helps
-diagnose missing firmware from a source checkout (the raw openMSX executable
-reads `OPENMSX_HOME`, not the Python host's `MSX_AI_OPENMSX_HOME`):
+Executable discovery is deliberately deferred until an emulator operation.
+Linux resolves `OPENMSX_BIN` and then `openmsx` on `PATH`. macOS additionally
+checks the standard application bundle. Windows additionally inspects the
+registered and standard Program Files installations. A failure reports every
+relevant candidate instead of degrading into a control-channel timeout.
 
-~~~~sh
-OPENMSX_HOME="$PWD/.openmsx-home" "${OPENMSX_BIN:-openmsx}" \
-  -machine Gradiente_Expert20 -testconfig
-~~~~
+`msx_local_doctor` performs the complete read-only preflight. Its structured
+result includes `platform`, executable path/presence, `control_transport` and
+`attach_transport`, the `control_transport_supported`, `boot_supported`, and
+`attach_supported` flags, `config_mode` and effective/user homes,
+requested/resolved profile and machine, granular readiness flags, candidate
+reports (including their transport/boot flags), and `issues`. Each issue
+contains `severity`, `code`, `message`, and an actionable `action`;
+`persistent_process_started=false` proves that the doctor did not leave an
+emulator running. It is the supported replacement for
+manually exporting `OPENMSX_HOME` and invoking `-testconfig` with paths that
+only apply to one checkout.
 
-After an installed package has materialized its templates, use
-`OPENMSX_HOME="$HOME/.msx-ai/openmsx-home"` instead. For a custom directory,
-pass the same path to `MSX_AI_OPENMSX_HOME` when running MSX-AI and to
-`OPENMSX_HOME` when invoking openMSX directly.
+The repository includes public machine XML definitions but no proprietary ROM
+files. `msx_local_boot` accepts three configuration policies:
+
+- `isolated` is the backward-compatible default. It uses the managed MSX-AI
+  openMSX home, including `MSX_AI_OPENMSX_HOME` when explicitly set, and a
+  disposable settings file.
+- `user` leaves openMSX's user home and machine/file pools in place. MSX-AI
+  still uses disposable process settings so an automated session does not
+  rewrite persistent preferences.
+- `overlay` exposes the managed MSX-AI templates while retaining discovery of
+  the user's machine definitions and legally installed ROM file pools.
+
+Use `isolated` for repeatable headless automation and CI, `user` for an
+interactive installation already managed through openMSX, and `overlay` when
+an MSX-AI profile should reuse user-supplied firmware. The mode is per boot;
+it is not mutable global backend state.
 
 ## MCP setup
 
@@ -221,10 +242,31 @@ msx-ai-mcp
 ~~~~
 
 `pipx install msx-ai` becomes the equivalent short form after the first PyPI
-publication. Existing checkouts must install once after this migration because
-`.mcp.json` now invokes `msx-ai-mcp` rather than the direct legacy script.
+publication.
 
-The default transport is STDIO. A client configuration needs only the command:
+MCP client configuration is local operational state. The repository therefore
+ignores and excludes root `.mcp.json` files: they commonly contain absolute
+executable paths and host-specific environment values. For Codex, add the
+STDIO server with:
+
+~~~~sh
+codex mcp add msx-ai -- msx-ai-mcp
+~~~~
+
+The equivalent portable Codex entry belongs in `~/.codex/config.toml`, or in
+the ignored `.codex/config.toml` of a trusted checkout:
+
+~~~~toml
+[mcp_servers.msx-ai]
+command = "msx-ai-mcp"
+~~~~
+
+Codex CLI, the Codex IDE extension, and the ChatGPT desktop app share this
+configuration. Keep `OPENMSX_BIN` in the launching environment or the local
+client file; never publish a workstation's absolute path.
+
+The default transport is STDIO. Other clients can express the same portable
+command in their own local format:
 
 ~~~~json
 {
@@ -286,11 +328,28 @@ require a local emulator channel and never start one automatically.
 
 ## Optional openMSX workflows
 
-`msx_local_boot` starts an isolated headless emulator by default. Every headless
+Call `msx_local_doctor` before a first boot or after changing the executable,
+profile, or configuration mode. It resolves the same binary, machine, home,
+and transport that a boot would use, but never starts openMSX.
+
+`msx_local_boot` starts an `isolated` headless emulator by default; `user` and
+`overlay` select the configuration policies described above. Every headless
 process is muted at openMSX's host mixer for its complete lifetime. This does
 not change PSG, SCC, OPLL, MSX I/O ports, emulated timing, or sound routines
 executed inside the MSX. Startup fails closed if the host mute cannot be
 verified.
+
+Owned-process control is platform-specific behind one command interface.
+Linux and macOS use openMSX `-control stdio`. On Windows, MSX-AI starts socket
+control, waits for the `socket.<pid>` descriptor belonging to the child,
+validates its loopback endpoint, and completes SSPI Negotiate before accepting
+XML replies. This avoids openMSX's console-dependent pipe redirection and never
+opens an unauthenticated raw TCP channel. Process ownership remains separate
+from transport ownership: shutdown terminates a process started by MSX-AI,
+while disconnecting from an attached instance leaves the user's process alive.
+The doctor/status vocabulary is stable: POSIX reports
+`control_transport="stdio"` and `attach_transport="unix_socket"`; Windows
+reports `control_transport="tcp_sspi"` and `attach_transport="tcp_sspi"`.
 
 Visible instances are not forcibly muted. Use `window=true`, or start a
 shared instance and attach to it:
@@ -304,18 +363,28 @@ power, throttle, renderer, or audio settings. With exactly one live control
 socket, no selector is needed. If several are live, attachment fails before
 sending a command and reports their paths; call `msx_local_attach` again with the
 chosen exact `socket_path`. It never selects the newest instance implicitly.
-On Windows, the published `socket.<pid>` path is a descriptor containing an
-openMSX loopback TCP port in the official 9938--9958 range; the adapter validates
-the descriptor and connects to `127.0.0.1`. Unix hosts use the domain socket
-itself.
+Linux and macOS use the published Unix-domain socket itself. On Windows,
+openMSX 21 publishes `socket.<pid>` as a loopback descriptor in the 9938--10001
+range. Both owned boot and external attachment validate descriptor/process
+identity and perform openMSX's SSPI authentication exchange before accepting
+replies. If SSPI support is unavailable on the host or in the Python runtime,
+`msx_local_doctor` and `msx_local_attach` return a specific unsupported result
+and recommendation; they never substitute a raw unauthenticated TCP channel.
 
 Available profiles are:
 
+- `auto`: use a validated configured BASIC machine, otherwise resolve `cbios`.
+- `cbios`: a free C-BIOS machine for control/screen/cartridge smoke tests; no
+  MSX BASIC or MSX-DOS is implied.
 - `basic`: Gradiente Expert 2.0 in BASIC.
 - `disk`: the same machine with the DDX 3.0 disk extension.
 - `dos`: the same machine with Sunrise IDE/Nextor and a local hard-disk image.
 - `msx2plus`: Sony HB-F1XDJ MSX2+ configuration.
 - `mcp`: the reusable, user-owned foreground TCP test instance described below.
+
+The public `msx_local_boot` default remains `basic` for backward compatibility.
+Callers that want adaptive or guaranteed ROM-free startup must request `auto`
+or `cbios` explicitly.
 
 ### TCP agent test bench
 
@@ -985,10 +1054,17 @@ MCP entry point over both STDIO and IPv4-loopback HTTP. The protocol tests keep
 TCP framing, CRC, resume, PUT/GET, and hard-link publication enabled on every
 host; Windows therefore requires a hard-link-capable filesystem such as NTFS.
 The canonical Z80/release build remains on Ubuntu with Bas Wijnen `z80asm` 1.8.
-This matrix does not replace the serialized openMSX integration suite or the
-pending physical BaDCaT validation. Attaching to an already-running openMSX by
-Unix control socket is a POSIX-only adapter feature; spawning an explicitly
-selected emulator uses the separate stdio control path.
+These regular lanes intentionally do not launch openMSX.
+
+The `tests.test_openmsx_cbios_integration` smoke can be run explicitly on
+Ubuntu, Windows, and macOS, but the committed workflow does not currently
+schedule a real-emulator job. It runs the adapter's read-only preflight, boots
+a ROM-free C-BIOS machine through both the adapter and public Session/profile
+path, exchanges real Tcl commands, reads emulator state, then verifies clean
+shutdown for each lifecycle. This covers POSIX stdio control and the Windows
+TCP/SSPI path without proprietary ROMs or MSX-DOS media. It does not claim
+coverage for a user's firmware overlay, the serialized agent-through-RS232-Net
+suite, external Windows SSPI attachment, or physical BaDCaT validation.
 
 From the repository root, create an editable environment and install the
 release frontend:
@@ -997,6 +1073,14 @@ release frontend:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e . 'build>=1' 'setuptools>=77'
+~~~~
+
+The PowerShell equivalent is:
+
+~~~~powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e . "build>=1" "setuptools>=77"
 ~~~~
 
 Run the deterministic suite with that interpreter:
@@ -1011,6 +1095,19 @@ Bas Wijnen `z80asm` 1.8, either on `PATH` or selected with `Z80ASM`):
 ~~~~sh
 make PYTHON=python release-check
 ~~~~
+
+Linux and macOS retain that Make-based entry point. On Windows the same gate
+can be invoked directly:
+
+~~~~powershell
+python tools/release_check.py
+~~~~
+
+Windows release validation uses portable Python subprocesses by default for
+the same MemMan materialization, TSR generation, assembly, and size checks. An
+explicit `MAKE` override opts into the existing Makefile recipe. Linux and
+macOS continue to require and use Make. Bas Wijnen `z80asm` 1.8 remains
+mandatory for the Z80 release payload, and invalid overrides fail closed.
 
 Release validation additionally builds the sdist and wheel, creates the wheel
 from the sdist, installs it into a clean environment outside the checkout, runs
@@ -1049,7 +1146,15 @@ filesystem, the verified `.msxpart` file and its resume journal are preserved.
 The same hard-link requirement applies to first-run materialization of packaged
 openMSX templates under the managed state directory.
 
-Run the opt-in end-to-end suite:
+Run the ROM-free adapter direct-control smoke locally with a standard
+openMSX+C-BIOS installation:
+
+~~~~sh
+MSX_RUN_OPENMSX_SMOKE=1 \
+  python -m unittest tests.test_openmsx_cbios_integration -v
+~~~~
+
+Run the larger opt-in agent-through-emulator suite:
 
 ~~~~sh
 make PYTHON=python test-integration
@@ -1109,7 +1214,9 @@ Generated and machine-specific data are intentionally ignored:
 
 - `work/` and assembled binaries;
 - ROMs, disk images, savestates, replays, persistent CMOS/SRAM, and captures;
-- local openMSX settings, caches, editor state, logs, and temporary files.
+- local openMSX settings, caches, editor state, logs, and temporary files;
+- client configuration such as `.mcp.json` and `.codex/config.toml`, which may
+  contain workstation-specific paths or environment values.
 
 The test files are part of the project and should be published; they define the
 protocol, renderer, lifecycle, and safety contracts. The many historical COM
