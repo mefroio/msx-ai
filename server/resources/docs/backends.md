@@ -23,7 +23,7 @@ server does not publish ambiguous compatibility aliases.
 | BASIC and BIOS text input | Yes | Resident | Resident |
 | CPU snapshot | Exact debugger boundary | Cooperative callback context | Cooperative callback context |
 | Typed RAM and VRAM read/write | Yes, through `msx_local_*` | Resident or monitor, with restrictions | Resident or monitor, with restrictions |
-| Application loader | Yes | Yes, mode restrictions apply | Yes, mode restrictions apply |
+| Application loader | Direct | Resident FE-header BLOAD via verified BASIC, or restricted direct data load | Resident FE-header BLOAD via verified BASIC, or restricted direct data load |
 | Resumable MSX-DOS PUT/GET | No | Current resident | Current resident |
 | Direct I/O-port access | Use expert openMSX console facilities | Agent | Agent |
 | Call, run, stop injected code | Loader and emulator facilities | Monitor | Monitor |
@@ -42,12 +42,22 @@ Resident RAM page 1 (`0x4000` through `0x7FFF`) is unavailable because the TSR
 must occupy that CPU page while servicing a request. Page 3 is accessible but
 contains live BIOS, DOS, hook, stack, and system state.
 
+For `msx_agent_app_load`, the default `environment="auto"` selects MSX BASIC
+only for a valid FE-header BLOAD. The resident must be at a recognized DOS or
+BASIC prompt. The host enters BASIC if needed, writes the exact header-declared
+range, always verifies it by reading it back, and submits a nonzero entry through
+`DEFUSR`/`USR`. The complete payload must be in CPU pages 2/3
+(`0x8000-0xFFFF`): page 0 is Main-ROM in BASIC and page 1 is not an available
+resident/BASIC payload area. No relocation is attempted.
+
 ## Foreground monitor
 
 The monitor owns the foreground process and protects its relocated image. It
 supports direct upload, call, asynchronous run, pause, resume, stop, and page-0
 or page-1 slot and mapper selection. It does not return to DOS, does not provide
 resident BIOS keyboard injection, and is not the MSX-DOS file-transfer mode.
+Use `environment="direct"` for BLOAD or other artifacts deliberately built for
+that monitor. `msx_agent_asm_load` also remains direct and never selects BASIC.
 
 ## Choosing a path
 

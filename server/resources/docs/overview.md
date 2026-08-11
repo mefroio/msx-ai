@@ -44,6 +44,14 @@ screenshots from VRAM. The agent path additionally exposes bounded RAM and VRAM
 operations, direct I/O, and resumable MSX-DOS file transfer when the selected
 runtime mode supports them.
 
+On a resident agent, `msx_agent_app_load` automatically recognizes only valid
+seven-byte-FE-header BLOAD files. From a verified MSX-DOS or BASIC prompt it
+enters BASIC when needed, injects the exact declared RAM payload, always reads it
+back, and submits a nonzero entry through `DEFUSR`/`USR`. It performs no
+relocation and accepts only a complete payload in CPU pages 2/3
+(`0x8000-0xFFFF`). Explicit `environment="direct"` and `msx_agent_asm_load`
+preserve the foreground direct-injection workflows.
+
 Direct-openMSX setup is host-aware. `msx_local_doctor` resolves the executable,
 platform control transport, profile/machine, and `isolated`, `user`, or
 `overlay` configuration policy without starting a process. The ROM-free

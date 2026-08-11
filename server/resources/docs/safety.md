@@ -60,6 +60,22 @@ boundary and have different semantics.
 Use verification only where reads are meaningful. Some hardware registers are
 write-only or have read side effects.
 
+## Application loading
+
+Automatic `msx_agent_app_load` behavior is deliberately narrow. Only a valid
+seven-byte-FE-header BLOAD on a resident agent selects the MSX-BASIC environment,
+and only from a recognized DOS or BASIC prompt. The declared RAM payload is
+always read back completely before a nonzero entry is submitted through
+`DEFUSR`/`USR`; the caller cannot disable this verification.
+
+Verification proves the injected bytes, not compatibility of arbitrary machine
+code. The loader never relocates a BLOAD image because the FE header provides no
+relocation records. It accepts only a complete segment in CPU pages 2/3
+(`0x8000-0xFFFF`) and rejects entries outside that segment. Page 0 belongs to
+Main-ROM in BASIC, and page 1 is unavailable for this resident/BASIC path.
+`environment="direct"` and `msx_agent_asm_load` remain explicit direct-injection
+paths and retain their foreground-monitor safety limits.
+
 ## Input and display limits
 
 Resident input feeds the BIOS keyboard ring. Software that scans the physical

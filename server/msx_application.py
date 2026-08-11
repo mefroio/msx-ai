@@ -121,15 +121,22 @@ class Application:
     def required_capabilities(self) -> Tuple[str, ...]:
         """All explicit and mechanically inferred backend capabilities."""
 
-        capabilities = list(self.requirements)
-        for segment in self.segments:
-            capabilities.append(f"write:{segment.space}")
-        if self.entry.mode != "none":
-            capabilities.append(f"execute:{self.entry.mode}")
-        mapper_type = _mapper_type(self.mapper)
-        if mapper_type not in (None, "none", "flat"):
-            capabilities.append(f"mapper:{mapper_type}")
-        return tuple(dict.fromkeys(capabilities))
+        return _required_capabilities(self, self.entry)
+
+
+def _required_capabilities(
+        application: Application, entry: EntryPoint) -> Tuple[str, ...]:
+    """Infer capabilities for the effective, possibly overridden entry."""
+
+    capabilities = list(application.requirements)
+    for segment in application.segments:
+        capabilities.append(f"write:{segment.space}")
+    if entry.mode != "none":
+        capabilities.append(f"execute:{entry.mode}")
+    mapper_type = _mapper_type(application.mapper)
+    if mapper_type not in (None, "none", "flat"):
+        capabilities.append(f"mapper:{mapper_type}")
+    return tuple(dict.fromkeys(capabilities))
 
 
 Source = Union[Application, Mapping[str, Any], str, os.PathLike, bytes, bytearray]
@@ -708,7 +715,14 @@ def load_application(
 
     # Mapper rejection also occurs before any backend state is changed.
     configure_mapper = _mapper_configurator(backend, application.mapper)
+    preflight = getattr(backend, "preflight_application", None)
     prepare = getattr(backend, "prepare_application", None)
+    # A preflight is observational by contract. Run it before STOP, mapper
+    # changes, or writes so an incompatible image cannot partially mutate the
+    # target before it is rejected. Keep the older prepare hook in its original
+    # post-STOP/post-mapper position for backend compatibility.
+    if callable(preflight):
+        preflight(application)
     if stopper is not None:
         stopper()
     if configure_mapper is not None:
@@ -745,7 +759,7 @@ def load_application(
         "bytes_loaded": sum(item["length"] for item in loaded),
         "entry": {"mode": entry.mode, "address": entry.address},
         "mapper": dict(application.mapper) if application.mapper is not None else None,
-        "required_capabilities": list(application.required_capabilities),
+        "required_capabilities": list(_required_capabilities(application, entry)),
     }
 
 

@@ -682,10 +682,24 @@ APP_LOAD_OUTPUT_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "uniqueItems": True,
         },
+        "execution_environment": {"enum": ["direct", "msx-basic"]},
+        "environment_auto_selected": {"type": "boolean"},
+        "target_transition": {
+            "enum": ["none", "dos-to-basic", "already-basic"],
+        },
+        "execution_submission": {
+            "enum": [
+                "none", "agent-call", "agent-run", "openmsx-call",
+                "openmsx-run", "basic-usr",
+            ],
+        },
+        "screen_probe_performed": {"type": "boolean"},
     },
     "required": [
         "backend", "name", "format", "origin", "segments", "bytes_loaded",
-        "entry", "mapper", "required_capabilities",
+        "entry", "mapper", "required_capabilities", "execution_environment",
+        "environment_auto_selected", "target_transition",
+        "execution_submission", "screen_probe_performed",
     ],
     "additionalProperties": False,
 }
@@ -1052,6 +1066,62 @@ def _backend_specific_schema(schema: Mapping[str, Any], backend: str):
     }
 
 
+def _app_load_route_schema(backend: str):
+    """Close execution metadata over the route that actually performed it."""
+    schema = _backend_specific_schema(APP_LOAD_OUTPUT_SCHEMA, backend)
+    if backend == "openmsx":
+        route_contract = {
+            "properties": {
+                "execution_environment": {"const": "direct"},
+                "target_transition": {"const": "none"},
+                "execution_submission": {
+                    "enum": ["none", "openmsx-call", "openmsx-run"],
+                },
+                "screen_probe_performed": {"const": False},
+            },
+            "required": [
+                "execution_environment", "target_transition",
+                "execution_submission", "screen_probe_performed",
+            ],
+        }
+    else:
+        route_contract = {
+            "oneOf": [
+                {
+                    "properties": {
+                        "execution_environment": {"const": "direct"},
+                        "target_transition": {"const": "none"},
+                        "execution_submission": {
+                            "enum": ["none", "agent-call", "agent-run"],
+                        },
+                        "screen_probe_performed": {"const": False},
+                    },
+                    "required": [
+                        "execution_environment", "target_transition",
+                        "execution_submission", "screen_probe_performed",
+                    ],
+                },
+                {
+                    "properties": {
+                        "execution_environment": {"const": "msx-basic"},
+                        "target_transition": {
+                            "enum": ["dos-to-basic", "already-basic"],
+                        },
+                        "execution_submission": {
+                            "enum": ["none", "basic-usr"],
+                        },
+                        "screen_probe_performed": {"const": True},
+                    },
+                    "required": [
+                        "execution_environment", "target_transition",
+                        "execution_submission", "screen_probe_performed",
+                    ],
+                },
+            ],
+        }
+    return {**schema, "allOf": [route_contract]}
+
+
 def output_schema_for(name: str) -> Mapping[str, Any]:
     public_name = name
     if public_name == "msx_local_doctor":
@@ -1070,9 +1140,9 @@ def output_schema_for(name: str) -> Mapping[str, Any]:
     if public_name == "msx_agent_cpu_snapshot":
         return _backend_specific_schema(CPU_SNAPSHOT_OUTPUT_SCHEMA, "agent")
     if public_name == "msx_local_app_load":
-        return _backend_specific_schema(APP_LOAD_OUTPUT_SCHEMA, "openmsx")
+        return _app_load_route_schema("openmsx")
     if public_name == "msx_agent_app_load":
-        return _backend_specific_schema(APP_LOAD_OUTPUT_SCHEMA, "agent")
+        return _app_load_route_schema("agent")
     if public_name in {
             "msx_local_type_line", "msx_local_type_lines", "msx_local_type",
             "msx_local_key", "msx_local_run_basic"}:

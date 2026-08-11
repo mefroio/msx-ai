@@ -234,6 +234,29 @@ class LoaderContractTest(unittest.TestCase):
         self.assertEqual(backend.ram[0x100:0x102], b"\x00\xC9")
         self.assertEqual(backend.executed, [0x100])
         self.assertEqual(result["entry"], {"mode": "run", "address": 0x100})
+        self.assertIn("execute:run", result["required_capabilities"])
+
+    def test_execution_override_controls_effective_capabilities(self):
+        image = b"\xFE\x00\x80\x00\x80\x00\x80\xC9"
+
+        disabled = load_application(
+            FakeBackend(), image, execute="none", verify=True)
+        self.assertEqual(
+            disabled["entry"], {"mode": "none", "address": None})
+        self.assertIn("write:ram", disabled["required_capabilities"])
+        self.assertNotIn("execute:run", disabled["required_capabilities"])
+        self.assertFalse(any(
+            capability.startswith("execute:")
+            for capability in disabled["required_capabilities"]))
+
+        backend = FakeBackend()
+        called = load_application(
+            backend, image, execute="call", verify=False)
+        self.assertEqual(
+            called["entry"], {"mode": "call", "address": 0x8000})
+        self.assertEqual(backend.calls, [("call", 0x8000)])
+        self.assertIn("execute:call", called["required_capabilities"])
+        self.assertNotIn("execute:run", called["required_capabilities"])
 
     def test_missing_backend_operation_fails_before_any_write(self):
         class RamOnly:
@@ -252,6 +275,33 @@ class LoaderContractTest(unittest.TestCase):
         with self.assertRaises(BackendError):
             load_application(backend, manifest)
         self.assertEqual(backend.writes, 0)
+
+    def test_backend_preflight_runs_before_stop_or_write(self):
+        class RejectingBackend(FakeBackend):
+            def __init__(self):
+                super().__init__()
+                self.events = []
+
+            def preflight_application(self, application):
+                self.events.append("prepare")
+                raise BackendCapabilityError("incompatible target")
+
+            def stop(self):
+                self.events.append("stop")
+                super().stop()
+
+            def poke(self, address, data):
+                self.events.append("write")
+                return super().poke(address, data)
+
+        backend = RejectingBackend()
+        with self.assertRaisesRegex(BackendCapabilityError, "incompatible"):
+            load_application(
+                backend, b"\xC9", format="com", execute="none",
+                stop_before_load=True)
+        self.assertEqual(backend.events, ["prepare"])
+        self.assertEqual(backend.stops, 0)
+        self.assertEqual(backend.ram[0x100], 0)
 
     def test_declared_capabilities_are_enforced(self):
         backend = FakeBackend()

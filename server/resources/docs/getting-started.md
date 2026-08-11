@@ -156,4 +156,29 @@ After negotiation, call
 `msx_agent_status` and verify the runtime mode, transport, and feature list before
 performing writes.
 
+## Load a BLOAD through resident MSX BASIC
+
+With the agent installed in its default resident mode and the visible MSX at an
+MSX-DOS prompt or MSX BASIC `Ok` prompt, call:
+
+```text
+msx_agent_app_load(path="/host/path/GAME.BIN")
+```
+
+The default `environment="auto"` selects this flow only when the host file has a
+valid seven-byte BLOAD `0xFE` header. From DOS, the host types `BASIC` and confirms
+the `Ok` prompt. It then injects the exact header-declared RAM range through the
+agent, always reads the complete range back, and submits a nonzero entry through
+`DEFUSR0`/`USR0`. The host path is not copied onto an MSX disk and no local
+openMSX API is involved. `execute="run"` returns after submission, whereas
+`execute="call"` waits up to ten seconds for BASIC to return to `Ok`.
+
+The flow never relocates code. Its complete segment must fit in CPU pages 2/3
+(`0x8000-0xFFFF`), and its entry must lie inside that segment. Page 0 is mapped
+as Main-ROM in BASIC, while page 1 is not an available resident/BASIC payload
+area. Use `environment="basic"` to request the same checks explicitly. Use
+`environment="direct"` only for an artifact intentionally built for the
+foreground monitor; `msx_agent_asm_load` remains the separate direct
+source-assembly and RAM-injection tool.
+
 ROM images and bootable disk images are not distributed with MSX-AI.

@@ -24,6 +24,8 @@ class FakeRealMSX:
         self.transfers = []
         self.feature_bits = msx_mcp_server.FEATURE_FILE_TRANSFER
         self.screen = "MSX-DOS 2\nA:\\>"
+        self.runtime_mode = "foreground-monitor"
+        self.screen_reads = 0
 
     def stop(self):
         self.stops += 1
@@ -97,6 +99,7 @@ class FakeRealMSX:
         self.typed.append(("key", key))
 
     def screen_text(self, timeout=None):
+        self.screen_reads += 1
         return self.screen
 
 
@@ -135,6 +138,211 @@ class MCPApplicationToolsTest(unittest.TestCase):
                 str(path), format="com", execute="none")
 
         self.assertEqual(result["entry"], {"address": None, "mode": "none"})
+        self.assertEqual(self.backend.calls, [])
+
+    @staticmethod
+    def _bload(start=0xC000, payload=b"\xC9", entry=None):
+        if entry is None:
+            entry = start
+        end = start + len(payload) - 1
+        return (b"\xFE" + start.to_bytes(2, "little") +
+                end.to_bytes(2, "little") +
+                entry.to_bytes(2, "little") + payload)
+
+    def test_agent_bload_auto_enters_basic_verifies_and_uses_usr(self):
+        self.backend.runtime_mode = "resident"
+        payload = b"\x3E\x0F\xC9"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "PONG.BIN"
+            path.write_bytes(self._bload(payload=payload))
+            result = msx_mcp_server.t_app_load(str(path))
+
+        self.assertEqual(self.backend.stops, 0)
+        self.assertEqual(self.backend.ram[0xC000:0xC003], payload)
+        self.assertEqual(self.backend.typed, [
+            ("line", "BASIC"),
+            ("line", "DEFUSR0=49152:A=USR0(0)"),
+        ])
+        self.assertEqual(self.backend.screen_reads, 2)
+        self.assertTrue(result["segments"][0]["verified"])
+        self.assertEqual(result["execution_environment"], "msx-basic")
+        self.assertTrue(result["environment_auto_selected"])
+        self.assertEqual(result["target_transition"], "dos-to-basic")
+        self.assertEqual(result["execution_submission"], "basic-usr")
+        self.assertTrue(result["screen_probe_performed"])
+        self.assertIn("input:basic-usr", result["required_capabilities"])
+        self.assertNotIn("execute:run", result["required_capabilities"])
+
+    def test_agent_bload_waits_for_delayed_basic_prompt(self):
+        self.backend.runtime_mode = "resident"
+        screens = iter([
+            "MSX-DOS 2\nA:\\>",
+            "A:\\>BASIC",
+            "Microsoft MSX BASIC\nOk",
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DELAY.BIN"
+            path.write_bytes(self._bload(payload=b"\xC9"))
+            with mock.patch.object(
+                    self.backend, "screen_text",
+                    side_effect=lambda timeout=None: next(screens)):
+                result = msx_mcp_server.t_app_load(str(path))
+
+        self.assertEqual(result["target_transition"], "dos-to-basic")
+        self.assertEqual(self.backend.ram[0xC000], 0xC9)
+        self.assertEqual(self.backend.typed, [
+            ("line", "BASIC"),
+            ("line", "DEFUSR0=49152:A=USR0(0)"),
+        ])
+
+    def test_agent_bload_auto_accepts_an_existing_basic_prompt(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.screen = "Microsoft MSX BASIC version 2.1\nOk"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DEMO.BIN"
+            path.write_bytes(self._bload(entry=0))
+            result = msx_mcp_server.t_app_load(
+                str(path), execute="none", verify=False)
+
+        self.assertEqual(self.backend.typed, [])
+        self.assertEqual(result["target_transition"], "already-basic")
+        self.assertEqual(result["execution_submission"], "none")
+        self.assertTrue(result["segments"][0]["verified"])
+
+    def test_agent_bload_basic_call_waits_for_returned_prompt(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.screen = "Microsoft MSX BASIC\nOk"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "CALL.BIN"
+            path.write_bytes(self._bload(payload=b"\xC9"))
+            result = msx_mcp_server.t_app_load(
+                str(path), execute="call")
+
+        self.assertEqual(result["entry"], {
+            "mode": "call", "address": 0xC000,
+        })
+        self.assertEqual(result["execution_submission"], "basic-usr")
+        self.assertGreaterEqual(self.backend.screen_reads, 2)
+
+    def test_agent_bload_auto_rejects_foreground_before_target_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DEMO.BIN"
+            path.write_bytes(self._bload())
+            with self.assertRaisesRegex(Exception, "resident agent"):
+                msx_mcp_server.t_app_load(str(path))
+
+        self.assertEqual(self.backend.screen_reads, 0)
+        self.assertEqual(self.backend.stops, 0)
+        self.assertEqual(self.backend.typed, [])
+        self.assertEqual(self.backend.ram[0xC000], 0)
+
+    def test_agent_bload_auto_rejects_unknown_prompt_before_write(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.screen = "GAME RUNNING"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DEMO.BIN"
+            path.write_bytes(self._bload())
+            with self.assertRaisesRegex(Exception, "DOS prompt or MSX BASIC"):
+                msx_mcp_server.t_app_load(str(path))
+
+        self.assertEqual(self.backend.screen_reads, 1)
+        self.assertEqual(self.backend.typed, [])
+        self.assertEqual(self.backend.ram[0xC000], 0)
+
+    def test_agent_bload_auto_rejects_resident_page_one_before_prompt(self):
+        self.backend.runtime_mode = "resident"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "PAGE1.BIN"
+            path.write_bytes(self._bload(start=0x7000, payload=b"\xC9"))
+            with self.assertRaisesRegex(Exception, "CPU pages 2 or 3"):
+                msx_mcp_server.t_app_load(str(path))
+
+        self.assertEqual(self.backend.screen_reads, 0)
+        self.assertEqual(self.backend.typed, [])
+        self.assertEqual(self.backend.ram[0x7000], 0)
+
+    def test_agent_bload_auto_rejects_page_zero_before_prompt(self):
+        self.backend.runtime_mode = "resident"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "PAGE0.BIN"
+            path.write_bytes(self._bload(start=0x2000, payload=b"\xC9"))
+            with self.assertRaisesRegex(Exception, "page 0 is Main-ROM"):
+                msx_mcp_server.t_app_load(str(path))
+
+        self.assertEqual(self.backend.screen_reads, 0)
+        self.assertEqual(self.backend.typed, [])
+        self.assertEqual(self.backend.ram[0x2000], 0)
+
+    def test_agent_bload_direct_preserves_foreground_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DIRECT.BIN"
+            path.write_bytes(self._bload(start=0x8000))
+            result = msx_mcp_server.t_app_load(
+                str(path), environment="direct", verify=True)
+
+        self.assertEqual(self.backend.stops, 1)
+        self.assertEqual(self.backend.calls, [("run", 0x8000)])
+        self.assertEqual(result["execution_environment"], "direct")
+        self.assertFalse(result["environment_auto_selected"])
+
+    def test_resident_direct_execute_none_never_calls_stop(self):
+        self.backend.runtime_mode = "resident"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DATA.COM"
+            path.write_bytes(b"\x01\x02")
+            result = msx_mcp_server.t_app_load(
+                str(path), format="com", execute="none",
+                environment="direct")
+
+        self.assertEqual(self.backend.stops, 0)
+        self.assertEqual(self.backend.ram[0x100:0x102], b"\x01\x02")
+        self.assertEqual(result["required_capabilities"], ["write:ram"])
+
+    def test_resident_direct_execution_is_rejected_before_write_or_stop(self):
+        self.backend.runtime_mode = "resident"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "RUN.COM"
+            path.write_bytes(b"\xC9")
+            with self.assertRaisesRegex(Exception, "foreground monitor"):
+                msx_mcp_server.t_app_load(
+                    str(path), format="com", environment="direct")
+
+        self.assertEqual(self.backend.stops, 0)
+        self.assertEqual(self.backend.ram[0x100], 0)
+        self.assertEqual(self.backend.calls, [])
+
+    def test_foreground_overlap_is_rejected_before_write_or_stop(self):
+        self.backend.resident_base = 0x8600
+        payload = bytes([0xA5]) * 0x200
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "OVERLAP.BIN"
+            path.write_bytes(self._bload(start=0x8500, payload=payload))
+            with self.assertRaisesRegex(Exception, "protected foreground"):
+                msx_mcp_server.t_app_load(
+                    str(path), environment="direct", execute="none")
+
+        self.assertEqual(self.backend.stops, 0)
+        self.assertEqual(self.backend.ram[0x8500:0x8700], bytes(0x200))
+
+    def test_foreground_direct_data_load_stops_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "DATA.COM"
+            path.write_bytes(b"\x01\x02")
+            result = msx_mcp_server.t_app_load(
+                str(path), format="com", execute="none",
+                environment="direct")
+
+        self.assertEqual(self.backend.stops, 1)
+        self.assertEqual(self.backend.ram[0x100:0x102], b"\x01\x02")
+        self.assertEqual(result["execution_submission"], "none")
+
+    def test_resident_direct_asm_execution_is_rejected_before_dispatch(self):
+        self.backend.runtime_mode = "resident"
+        with self.assertRaisesRegex(Exception, "No bytes were written"):
+            msx_mcp_server.t_asm_load(
+                "ret", address=0x8000, execute="call")
+
+        self.assertEqual(self.backend.ram[0x8000], 0)
         self.assertEqual(self.backend.calls, [])
 
     def test_hardware_control_handlers_validate_and_dispatch(self):
@@ -478,6 +686,12 @@ class MCPApplicationToolsTest(unittest.TestCase):
             self.assertIn(name, msx_mcp_server.TOOLS)
         app_schema = msx_mcp_server.TOOLS["msx_agent_app_load"][2]
         self.assertEqual(app_schema["required"], ["path"])
+        self.assertEqual(
+            app_schema["properties"]["environment"]["enum"],
+            ["auto", "direct", "basic"])
+        self.assertNotIn(
+            "environment",
+            msx_mcp_server.TOOLS["msx_local_app_load"][2]["properties"])
         self.assertEqual(
             msx_mcp_server.TOOLS["msx_agent_slot_select"][2]["properties"]["page"]["maximum"],
             1)

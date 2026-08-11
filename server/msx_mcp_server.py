@@ -26,8 +26,9 @@ if __package__:
     from ._version import __version__
     from .msx_client import OpenMSX, OpenMSXError
     from .msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
-                           FEATURE_FILE_TRANSFER, UART8251_BAUD)
-    from .msx_application import load_application
+                           CAPABILITY_RUN, FEATURE_FILE_TRANSFER,
+                           UART8251_BAUD)
+    from .msx_application import load_application, parse_application
     from . import msx_screenshot
     from .msx_transfer import TransferError, normalize_msx_basic_text
     from .execution import (current_cancellation_callback,
@@ -50,8 +51,9 @@ else:  # Preserve ``python server/msx_mcp_server.py`` and existing imports.
     from _version import __version__
     from msx_client import OpenMSX, OpenMSXError
     from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
-                          FEATURE_FILE_TRANSFER, UART8251_BAUD)
-    from msx_application import load_application
+                          CAPABILITY_RUN, FEATURE_FILE_TRANSFER,
+                          UART8251_BAUD)
+    from msx_application import load_application, parse_application
     import msx_screenshot
     from msx_transfer import TransferError, normalize_msx_basic_text
     from execution import (current_cancellation_callback,
@@ -121,6 +123,7 @@ REAL_BASIC_FILE_LIMIT = 0x4000
 UART_BITS_PER_BYTE = 10
 UART_SCREENSHOT_MARGIN = 1.15
 SLOW_SCREENSHOT_SECONDS = 10.0
+APPLICATION_ENVIRONMENTS = ("auto", "direct", "basic")
 
 LOCAL_PROFILES = ("basic", "disk", "dos", "msx2plus", "cbios", "auto")
 OPENMSX_CONFIG_MODES = ("isolated", "user", "overlay")
@@ -1792,7 +1795,152 @@ class _OpenMSXApplicationBackend:
             f'debug write "CPU regs" 21 {address & 0xFF}; debug cont')
 
 
-def t_app_load(path, format=None, execute=None, verify=False):
+def _application_entry(application, execute):
+    """Return the effective entry without touching the selected target."""
+    mode = application.entry.mode if execute is None else execute
+    address = None if mode == "none" else application.entry.address
+    if mode != "none" and address is None:
+        raise ValueError(
+            f"{application.source_format} has no entry address; use "
+            "execute='none' or provide an artifact with an entry point")
+    return mode, address
+
+
+def _validate_basic_bload(application, mode, address):
+    """Fail before target I/O when a BLOAD cannot use the BASIC trampoline."""
+    if application.source_format != "bload":
+        raise ValueError(
+            "environment='basic' is supported only for a BLOAD file with "
+            "the seven-byte FE header")
+    if len(application.segments) != 1 or application.segments[0].space != "ram":
+        raise ValueError("BLOAD BASIC execution requires one RAM segment")
+    segment = application.segments[0]
+    if segment.address < 0x8000:
+        raise OpenMSXError(
+            "BLOAD BASIC execution requires its complete payload in writable "
+            "CPU pages 2 or 3 (0x8000-0xFFFF); page 0 is Main-ROM and page 1 "
+            "is occupied while the resident MSXAI agent services requests. "
+            "No target state was changed")
+    if mode != "none" and not segment.address <= address < segment.end:
+        raise ValueError(
+            f"BLOAD entry 0x{address:04X} is outside its loaded RAM range "
+            f"0x{segment.address:04X}-0x{segment.end - 1:04X}")
+
+
+def _wait_for_basic_prompt(m, timeout=10.0):
+    """Wait for a DOS-to-BASIC transition without writing application RAM."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        screen = m.screen_text(timeout=remaining)
+        if _basic_prompt_visible(screen):
+            return screen
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.1, remaining))
+
+
+def _preflight_agent_direct(m, application, mode, address):
+    """Validate direct-agent loading before STOP or the first target write."""
+    runtime = getattr(m, "runtime_mode", None)
+    capabilities = getattr(m, "capabilities", None)
+    if mode != "none" and (
+            runtime == "resident" or
+            (capabilities is not None and not capabilities & CAPABILITY_RUN)):
+        raise OpenMSXError(
+            f"direct execute='{mode}' requires the foreground monitor; the "
+            "resident agent can load safe RAM/VRAM data only with "
+            "execute='none'. No target state was changed")
+
+    resident = runtime == "resident"
+    protected_base = getattr(m, "resident_base", None)
+    for segment in application.segments:
+        if segment.space != "ram" or not segment.data:
+            continue
+        if resident and segment.address < 0x8000 and segment.end > 0x4000:
+            raise OpenMSXError(
+                "application overlaps CPU page 1 (0x4000-0x7FFF), which "
+                "contains the resident MSXAI agent; no target state was "
+                "changed")
+        if (not resident and protected_base is not None and
+                segment.end > protected_base):
+            raise OpenMSXError(
+                "application overlaps the protected foreground monitor area "
+                f"at 0x{protected_base:04X}+; no target state was changed")
+
+    if mode == "none" or address is None:
+        return
+    if resident and 0x4000 <= address < 0x8000:
+        raise OpenMSXError(
+            "entry point is inside CPU page 1 (0x4000-0x7FFF), which "
+            "contains the resident MSXAI agent; no target state was changed")
+    if (not resident and protected_base is not None and
+            address >= protected_base):
+        raise OpenMSXError(
+            "entry point is inside the protected foreground monitor area at "
+            f"0x{protected_base:04X}+; no target state was changed")
+
+
+def _load_agent_bload_in_basic(m, application, execute, *, automatic):
+    """Enter BASIC, load an FE-header BLOAD verbatim, and submit it via USR."""
+    mode, address = _application_entry(application, execute)
+    _validate_basic_bload(application, mode, address)
+    if getattr(m, "runtime_mode", None) != "resident":
+        raise OpenMSXError(
+            "automatic BLOAD/BASIC execution requires the resident agent; "
+            "restart MSXAI without /MONITOR. Foreground mode cannot enter "
+            "BASIC without terminating its TCP session")
+
+    screen = m.screen_text(timeout=10.0)
+    if _basic_prompt_visible(screen):
+        transition = "already-basic"
+    elif _dos_prompt_visible(screen):
+        m.type_line("BASIC")
+        screen = _wait_for_basic_prompt(m, timeout=10.0)
+        if screen is None:
+            raise OpenMSXError(
+                "MSX accepted the BASIC command but no BASIC Ok prompt was "
+                "observed within 10 seconds; BLOAD RAM was not written")
+        transition = "dos-to-basic"
+    else:
+        raise OpenMSXError(
+            "automatic BLOAD loading requires a visible MSX-DOS prompt or "
+            "MSX BASIC Ok prompt; target RAM was not written")
+
+    # BASIC owns the correct Main-ROM page-0 environment. Load without asking
+    # the resident protocol to CALL/RUN: resident execution is deliberately
+    # submitted through BASIC's documented USR trampoline instead.
+    result = dict(load_application(
+        m, application, execute="none", verify=True,
+        stop_before_load=False))
+    result["entry"] = {"mode": mode, "address": address}
+    capabilities = [
+        item for item in result["required_capabilities"]
+        if not item.startswith("execute:")
+    ]
+    if mode != "none":
+        capabilities.append("input:basic-usr")
+        m.type_line(f"DEFUSR0={address}:A=USR0(0)")
+        if mode == "call" and _wait_for_basic_prompt(m, timeout=10.0) is None:
+            raise OpenMSXError(
+                "BASIC USR call did not return to an Ok prompt within 10 "
+                "seconds; the injected routine may still be running")
+    result["required_capabilities"] = list(dict.fromkeys(capabilities))
+    result.update({
+        "execution_environment": "msx-basic",
+        "environment_auto_selected": bool(automatic),
+        "target_transition": transition,
+        "execution_submission": "basic-usr" if mode != "none" else "none",
+        "screen_probe_performed": True,
+    })
+    return result
+
+
+def t_app_load(path, format=None, execute=None, verify=False,
+               environment="auto"):
     """Load a manifest, COM, BLOAD BIN or flat ROM through the fixed route."""
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         raise ValueError("path must be a non-empty filesystem path")
@@ -1806,14 +1954,43 @@ def t_app_load(path, format=None, execute=None, verify=False):
             raise ValueError("execute must be 'none', 'call' or 'run'")
     if not isinstance(verify, bool):
         raise TypeError("verify must be a boolean")
+    if not isinstance(environment, str) or environment not in APPLICATION_ENVIRONMENTS:
+        allowed = ", ".join(repr(item) for item in APPLICATION_ENVIRONMENTS)
+        raise ValueError(f"environment must be one of {allowed}")
 
     source = resolve_user_path(path)
     msx = SESSION.require()
     real = SESSION.profile == "real"
     backend = msx if real else _OpenMSXApplicationBackend(msx)
-    result = dict(load_application(
-        backend, source, format=format, execute=execute, verify=verify,
-        stop_before_load=real))
+    application = parse_application(source, format=format)
+    selected_environment = (
+        "basic" if real and environment == "auto" and
+        application.source_format == "bload" else
+        "direct" if environment == "auto" else environment)
+    if selected_environment == "basic":
+        if not real:
+            raise ValueError(
+                "environment='basic' is available only through the resident "
+                "ASM-agent route")
+        result = _load_agent_bload_in_basic(
+            msx, application, execute, automatic=environment == "auto")
+    else:
+        mode, address = _application_entry(application, execute)
+        if real:
+            _preflight_agent_direct(msx, application, mode, address)
+        result = dict(load_application(
+            backend, application, execute=execute, verify=verify,
+            stop_before_load=(
+                real and getattr(msx, "runtime_mode", None) != "resident")))
+        result.update({
+            "execution_environment": "direct",
+            "environment_auto_selected": environment == "auto",
+            "target_transition": "none",
+            "execution_submission": (
+                "none" if mode == "none" else
+                ("agent-" if real else "openmsx-") + mode),
+            "screen_probe_performed": False,
+        })
     result["backend"] = "agent" if real else "openmsx"
     return result
 
@@ -2309,6 +2486,14 @@ def t_asm_load(source, address=0x8000, run=False, execute=None):
     if action not in ("none", "call", "run"):
         raise ValueError("execute must be 'none', 'call' or 'run'")
     if SESSION.profile == "real":
+        if action != "none" and (
+                getattr(m, "runtime_mode", None) == "resident" or
+                (hasattr(m, "capabilities") and
+                 not m.capabilities & CAPABILITY_RUN)):
+            raise OpenMSXError(
+                f"direct ASM execute='{action}' requires the foreground "
+                "monitor; the resident agent accepts safe RAM injection only "
+                "with execute='none'. No bytes were written")
         return m.asm_load(source, address=addr, execute=action)
     with tempfile.TemporaryDirectory() as td:
         src = pathlib.Path(td) / "a.asm"
@@ -2795,14 +2980,22 @@ TOOLS = {
         "paths are resolved from MSX_AI_USER_ROOT, or the server's current "
         "working directory by default. Optional execute overrides "
         "the file entry mode; verify reads every segment back (slower over TCP). "
-        "A MemMan resident target accepts safe segment transfers but rejects "
-        "call/run entry modes and RAM page 1; use the foreground monitor for "
-        "agent-launched code, or launch a DOS program normally after install.",
+        "On the agent route, environment='auto' recognizes FE-header BLOAD "
+        "files, safely enters MSX BASIC from a verified DOS prompt, injects "
+        "and always verifies their declared RAM range, then submits the entry through "
+        "DEFUSR/USR. BASIC run returns after submission; call waits up to 10 "
+        "seconds for the Ok prompt. Other formats keep direct loading "
+        "semantics. A resident "
+        "target always rejects RAM page 1, which contains the mapped TSR.",
         _s({"path": {"type": "string", "minLength": 1},
             "format": {"type": "string",
                        "enum": ["manifest", "com", "bload", "flat-rom"]},
             "execute": {"type": "string", "enum": ["none", "call", "run"]},
-            "verify": {"type": "boolean", "default": False}},
+            "verify": {"type": "boolean", "default": False},
+            "environment": {
+                "type": "string", "enum": ["auto", "direct", "basic"],
+                "default": "auto",
+            }},
            ["path"])),
     "msx_asm_load": (t_asm_load,
         "Assemble Z80 source with z80asm and load the bytes into MSX RAM at "
@@ -2929,6 +3122,8 @@ LOCAL_SCHEMA_OVERRIDES = {
     "msx_local_run_basic": _schema_without(
         TOOLS["msx_run_basic"][2], "transfer", "dos_prompt_confirmed",
         "dos_drive", "allow_existing_basic"),
+    "msx_local_app_load": _schema_without(
+        TOOLS["msx_app_load"][2], "environment"),
 }
 
 EXPLICIT_DESCRIPTIONS = {
@@ -3000,8 +3195,14 @@ EXPLICIT_DESCRIPTIONS = {
         "Load a validated application only through local openMSX debugger "
         "memory operations, with optional verification and execution."),
     "msx_agent_app_load": (
-        "Load a validated application only through ASM-agent memory and "
-        "execution operations, subject to its negotiated runtime limits."),
+        "Load a validated application only through the ASM-agent protocol. "
+        "The default environment='auto' treats FE-header BLOAD files as BASIC "
+        "artifacts: on a resident agent at a verified DOS/BASIC prompt it "
+        "enters BASIC when needed, injects and always verifies the declared "
+        "RAM payload, and submits its entry through DEFUSR/USR. BASIC run is "
+        "asynchronous; call waits up to 10 seconds for an Ok prompt. Use "
+        "environment='direct' only for artifacts intentionally built for the "
+        "foreground monitor. No openMSX API is used."),
     "msx_local_asm_load": (
         "Assemble Z80 source and load it only through local openMSX debugger "
         "memory operations, with optional call or run."),

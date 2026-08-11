@@ -22,7 +22,7 @@
       "id": "overview",
       "path": "overview.md",
       "title": "MSX-AI overview",
-      "summary": "Purpose, architecture paths, capabilities, and navigation for the MSX-AI documentation corpus.",
+      "summary": "Purpose, architecture paths, capabilities, application loading, and navigation for the MSX-AI documentation corpus.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -32,16 +32,20 @@
           "README.md",
           "TECHNICAL.md",
           "server/mcp_runtime.py",
+          "server/msx_application.py",
           "server/msx_mcp_server.py",
           "tests/test_backend_optionality.py",
-          "tests/test_backend_routing.py"
+          "tests/test_backend_routing.py",
+          "tests/test_mcp_application_tools.py"
         ]
       },
       "tags": [
         "overview",
         "architecture",
         "mcp",
-        "msx"
+        "msx",
+        "applications",
+        "bload"
       ],
       "audience": [
         "users",
@@ -54,14 +58,14 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "624cd57a2779a1493c8958330e525279a294fba59806c4ea534eaf43c6503fe7",
+      "sha256": "7a82f5de1263eee7543b91f4d21890906c3d1b5037126222b80b42d2a8a92aac",
       "external_references": []
     },
     {
       "id": "getting-started",
       "path": "getting-started.md",
       "title": "Getting started",
-      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal successful workflows for direct, simulated-agent, and physical-agent targets.",
+      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal workflows for direct, simulated-agent, physical-agent, and resident BLOAD targets.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -74,11 +78,13 @@
           "agent/README.md",
           "pyproject.toml",
           "server/mcp_runtime.py",
+          "server/msx_application.py",
           "server/msx_client.py",
           "server/msx_mcp_server.py",
           "server/windows_sspi.py",
           "tests/test_backend_optionality.py",
           "tests/test_backend_routing.py",
+          "tests/test_mcp_application_tools.py",
           "tests/test_openmsx_cbios_integration.py",
           "tests/test_openmsx_launcher.py",
           "tests/test_windows_sspi.py"
@@ -88,7 +94,9 @@
         "installation",
         "quick-start",
         "connection",
-        "configuration"
+        "configuration",
+        "applications",
+        "bload"
       ],
       "audience": [
         "users",
@@ -100,7 +108,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "d5dcb2f85275509501aa675b22a2e57312b30da26e05e47637f6ad273be95e4f",
+      "sha256": "453809cf9dffdff1a94927b9e30b6759aef203e5b898c2be67f072a813e7fcf3",
       "external_references": [
         {
           "url": "https://github.com/mefroio/msx-ai.git",
@@ -114,7 +122,7 @@
       "id": "backends",
       "path": "backends.md",
       "title": "Backends and runtime modes",
-      "summary": "Capability matrix and selection guidance for direct openMSX, simulated agents, physical agents, residents, and monitors.",
+      "summary": "Capability matrix and selection guidance for direct openMSX, simulated agents, physical agents, residents, monitors, and BLOAD environments.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -123,12 +131,14 @@
         "evidence": [
           "TECHNICAL.md",
           "agent/README.md",
+          "server/msx_application.py",
           "server/msx_client.py",
           "server/msx_mcp_server.py",
           "server/msx_real.py",
           "server/windows_sspi.py",
           "tests/test_backend_optionality.py",
           "tests/test_backend_routing.py",
+          "tests/test_mcp_application_tools.py",
           "tests/test_mcp_cpu_snapshot.py",
           "tests/test_windows_sspi.py"
         ]
@@ -137,7 +147,9 @@
         "backends",
         "capabilities",
         "resident",
-        "monitor"
+        "monitor",
+        "applications",
+        "bload"
       ],
       "audience": [
         "users",
@@ -150,14 +162,14 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "32c8e4675b0a59fa862913e46e31e7cbeeeb2d382a7499701935a771f3f510a4",
+      "sha256": "9dad3a59f32243ae8320379100ff47ee159a36412e36461dfef59994a0c80fd2",
       "external_references": []
     },
     {
       "id": "safety",
       "path": "safety.md",
       "title": "Safety and operational limits",
-      "summary": "Fail-closed behavior, cooperative-control boundaries, memory hazards, input limits, and screenshot constraints.",
+      "summary": "Fail-closed behavior, cooperative-control boundaries, application loading, memory hazards, input limits, and screenshot constraints.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -166,8 +178,11 @@
         "evidence": [
           "TECHNICAL.md",
           "agent/README.md",
+          "server/msx_application.py",
+          "server/msx_mcp_server.py",
           "server/msx_real.py",
           "server/msx_screenshot.py",
+          "tests/test_mcp_application_tools.py",
           "tests/test_snapshot_safety.py",
           "tests/test_screenshot.py"
         ]
@@ -176,7 +191,9 @@
         "safety",
         "memory",
         "timeouts",
-        "screenshots"
+        "screenshots",
+        "applications",
+        "bload"
       ],
       "audience": [
         "users",
@@ -189,7 +206,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "733cf429ed6bd240fbfaec66471ae7ca303df19aaa3edbdb04ae489e65cb8bff",
+      "sha256": "4d8314cfbedc84bfbe760e9adc0b14fade019d26c3d0cf1d35718ec61bdaa903",
       "external_references": []
     },
     {

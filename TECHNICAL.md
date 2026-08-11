@@ -103,7 +103,9 @@ state. A paired bench binds both identities to one emulator with a shared
 - Rendering for standard SCREEN 0-8 and SCREEN 10-12 modes, including display
   pages, scroll, palettes, and sprites.
 - A backend-neutral loader for `msx-ai-app-v1` manifests, MSX-DOS COM files,
-  BLOAD binaries, and flat 16/32 KiB ROM images.
+  BLOAD binaries, and flat 16/32 KiB ROM images. On the agent route, automatic
+  FE-header BLOAD handling uses the resident's DOS/BASIC input and verified RAM
+  primitives without replacing direct foreground injection.
 - A standards-based MCP runtime with structured results, output schemas,
   explicit safety annotations, resources, prompts, STDIO, and loopback-only
   Streamable HTTP. PUT/GET report MCP progress and honor cooperative
@@ -608,6 +610,7 @@ framed protocols, transport ABI, and driver implementation details.
 | Observe a normally launched DOS program/game | Yes | No |
 | Pause/read/patch/screenshot/resume | Bounded atomic lease; no persistent manual pause | Yes |
 | BIOS keyboard input | Yes | No |
+| FE-header BLOAD with `environment="auto"` | Verified DOS/BASIC-to-`USR` path | Not automatic; use `environment="direct"` for compatible payloads |
 | Agent-side `call` and `run` | No | Yes |
 | Agent-side `stop` | No | Yes |
 | Slot and mapper selection | No | Yes, pages 0 and 1 |
@@ -913,8 +916,7 @@ interlaced-field timing are not reconstructed.
 ## Loading applications
 
 `msx_local_app_load` and `msx_agent_app_load` use one parser and validation
-path with fixed routing. It
-recognizes:
+path with fixed routing. It recognizes:
 
 - `.com`: loaded at `0x0100`.
 - BLOAD `.bin`: start, end, and entry addresses come from the `0xFE` header.
@@ -926,13 +928,63 @@ Manifest payloads can use `hex`, `base64`, a relative `file`, or `fill`.
 Paths cannot escape the manifest directory; optional SHA-256 values and all
 address ranges are validated before target state changes.
 
-Execution constraints depend on the runtime:
+The local tool retains direct openMSX debugger loading and does not expose an
+`environment` argument. The agent tool accepts `environment="auto"`,
+`"direct"`, or `"basic"`:
+
+- `auto`, the default, selects the BASIC path only when the parsed artifact is a
+  BLOAD with a valid seven-byte `0xFE` header. All other agent formats retain
+  direct semantics.
+- `basic` explicitly requests that same BLOAD-only path. It is rejected for
+  manifests, COM files, ROM images, and the foreground monitor.
+- `direct` preserves the original RAM/VRAM writer and agent call/run path. It is
+  the appropriate choice for an artifact deliberately built for `/MONITOR`.
+
+The automatic resident BLOAD sequence is:
+
+1. Parse the complete host file and validate its FE header, effective entry, and
+   declared inclusive start/end range before target input or RAM writes. The one
+   segment must lie wholly in CPU pages 2/3 (`0x8000-0xFFFF`).
+2. Require a negotiated resident agent and read the target screen through that
+   agent. Continue only from a recognized MSX-DOS prompt or MSX BASIC `Ok`
+   prompt.
+3. From DOS, type `BASIC` through the resident keyboard spool and confirm that
+   an `Ok` prompt appears. An unrecognized initial prompt causes no target RAM
+   write.
+4. Write the payload verbatim to its header-declared RAM range with
+   `execute="none"`, then read the entire range back. This verification is
+   mandatory regardless of the public `verify` argument.
+5. If the effective entry mode is not `none`, type
+   `DEFUSR0=<entry>:A=USR0(0)`. BASIC therefore owns the expected page-0 ROM
+   environment; the resident does not advertise or perform an agent-side
+   `call`/`run`. For `run`, the host returns after submission. For `call`, it
+   waits up to ten seconds for BASIC to return to an `Ok` prompt.
+
+This sequence is host orchestration over the ASM-agent channel. It does not use
+the local openMSX API, create a DOS file, invoke `MSXAIXF.COM`, or reinterpret
+the operation as PUT/GET. Its structured result reports
+`execution_environment="msx-basic"`, whether selection was automatic, the
+DOS-to-BASIC transition, the `basic-usr` submission, and that a screen probe was
+performed.
+
+The loader never relocates a BLOAD payload. The FE header contains start, end,
+and entry addresses but no relocation table; changing those values cannot safely
+fix embedded absolute references. The entire automatic payload must be in
+`0x8000-0xFFFF`, and a nonzero effective entry must lie inside that one segment.
+Page 0 is mapped as Main-ROM in BASIC, and page 1 is unavailable as a resident
+BLOAD destination while the TSR/BASIC environment owns that address space. A
+binary built for an incompatible address must be rebuilt from source or loaded
+through a suitable direct environment; it is never moved heuristically.
+
+Other execution constraints remain runtime-specific:
 
 - openMSX and the foreground monitor support `execute="call"` and
   `execute="run"`.
-- The default resident supports safe transfers with `execute="none"`, but
-  rejects page 1 and agent-side call/run. Launch DOS software normally after
-  installing the TSR.
+- The default resident supports safe direct transfers with `execute="none"`
+  and the automatic BLOAD/BASIC path above. Automatic BLOAD is confined to pages
+  2/3, and direct agent-side call/run remains rejected.
+- `msx_agent_asm_load` remains a direct assembler/upload operation. It does not
+  inspect BLOAD headers, enter BASIC, or relocate the assembled code.
 - Copying a game or ROM into VRAM does not make it executable.
 - Bank-switched cartridge images require an explicitly mapper-aware backend;
   the generic loader does not emulate arbitrary cartridge hardware.

@@ -80,6 +80,7 @@ class MCPMetadataTest(unittest.TestCase):
                 "msx_targets_status", "msx_local_cpu_snapshot",
                 "msx_agent_cpu_snapshot", "msx_agent_file_put",
                 "msx_agent_file_get", "msx_local_app_load",
+                "msx_agent_app_load",
                 "msx_agent_type_line", "msx_agent_type_lines",
                 "msx_agent_type", "msx_agent_key",
                 "msx_agent_run_basic", "msx_agent_run_basic_file"):
@@ -275,10 +276,17 @@ class MCPMetadataTest(unittest.TestCase):
             "entry": {"mode": "call", "address": 0x100},
             "mapper": None,
             "required_capabilities": ["write:ram", "execute:call"],
+            "execution_environment": "direct",
+            "environment_auto_selected": False,
+            "target_transition": "none",
+            "execution_submission": "agent-call",
+            "screen_probe_performed": False,
         }
         jsonschema.validate(
             application, mcp_metadata.output_schema_for("msx_agent_app_load"))
-        local_application = dict(application, backend="openmsx")
+        local_application = dict(
+            application, backend="openmsx",
+            execution_submission="openmsx-call")
         jsonschema.validate(
             local_application, mcp_metadata.output_schema_for(
                 "msx_local_app_load"))
@@ -296,6 +304,99 @@ class MCPMetadataTest(unittest.TestCase):
                 dict(application, bytes_loaded=-1),
                 mcp_metadata.output_schema_for("msx_agent_app_load"),
             )
+
+    def test_application_environment_fields_are_required(self):
+        application = {
+            "backend": "agent",
+            "name": "demo.bin",
+            "format": "bload",
+            "origin": "/tmp/demo.bin",
+            "segments": [{
+                "space": "ram",
+                "address": 0x8000,
+                "length": 1,
+                "sha256": "b" * 64,
+                "verified": True,
+            }],
+            "bytes_loaded": 1,
+            "entry": {"mode": "run", "address": 0x8000},
+            "mapper": None,
+            "required_capabilities": ["write:ram", "input:basic-usr"],
+            "execution_environment": "msx-basic",
+            "environment_auto_selected": True,
+            "target_transition": "dos-to-basic",
+            "execution_submission": "basic-usr",
+            "screen_probe_performed": True,
+        }
+        schema = mcp_metadata.output_schema_for("msx_agent_app_load")
+        jsonschema.validate(application, schema)
+
+        environment_fields = {
+            "execution_environment", "environment_auto_selected",
+            "target_transition", "execution_submission",
+            "screen_probe_performed",
+        }
+        self.assertLessEqual(
+            environment_fields,
+            set(mcp_metadata.APP_LOAD_OUTPUT_SCHEMA["required"]))
+        for field in sorted(environment_fields):
+            with self.subTest(field=field), self.assertRaises(
+                    jsonschema.ValidationError):
+                invalid = dict(application)
+                invalid.pop(field)
+                jsonschema.validate(invalid, schema)
+
+    def test_application_execution_metadata_rejects_cross_route_values(self):
+        common = {
+            "name": "demo.com",
+            "format": "com",
+            "origin": "/tmp/demo.com",
+            "segments": [{
+                "space": "ram",
+                "address": 0x100,
+                "length": 1,
+                "sha256": "c" * 64,
+                "verified": False,
+            }],
+            "bytes_loaded": 1,
+            "entry": {"mode": "run", "address": 0x100},
+            "mapper": None,
+            "required_capabilities": ["write:ram", "execute:run"],
+            "execution_environment": "direct",
+            "environment_auto_selected": False,
+            "target_transition": "none",
+            "screen_probe_performed": False,
+        }
+        agent_schema = mcp_metadata.output_schema_for("msx_agent_app_load")
+        local_schema = mcp_metadata.output_schema_for("msx_local_app_load")
+
+        agent = dict(
+            common, backend="agent", execution_submission="agent-run")
+        local = dict(
+            common, backend="openmsx",
+            execution_submission="openmsx-run")
+        jsonschema.validate(agent, agent_schema)
+        jsonschema.validate(local, local_schema)
+
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(
+                dict(agent, execution_submission="openmsx-run"),
+                agent_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(
+                dict(local, execution_submission="agent-run"),
+                local_schema)
+
+        basic = dict(
+            agent, format="bload", execution_environment="msx-basic",
+            environment_auto_selected=True,
+            target_transition="already-basic",
+            execution_submission="basic-usr",
+            screen_probe_performed=True)
+        jsonschema.validate(basic, agent_schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(
+                dict(basic, backend="openmsx"), local_schema)
 
     def test_input_schemas_are_fixed_to_local_text_or_agent_ack(self):
         local_schema = mcp_metadata.output_schema_for("msx_local_type_lines")

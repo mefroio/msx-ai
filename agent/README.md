@@ -20,7 +20,9 @@ installation and removal lifecycle; it has no file-transfer engine code.
 
 The external contract is a full-duplex byte stream. TCP roles, MCP tools,
 application parsing, and screenshot rendering live on the host and are not
-embedded in the Z80 code.
+embedded in the Z80 code. In particular, the host recognizes FE-header BLOAD
+files and orchestrates their resident BASIC path; the agent never parses or
+relocates a BLOAD image itself.
 
 ## Build
 
@@ -115,6 +117,7 @@ passes to MemMan or the foreground monitor.
 | Pause/resume | Bounded snapshot lease; persistent manual pause disabled | Yes |
 | BIOS keyboard-buffer input | Yes | No |
 | Transient DOS PUT/GET | Yes, by launching `MSXAIXF.COM` from DOS | Not applicable |
+| Automatic FE-header BLOAD/BASIC path | Yes, host-orchestrated and read-back verified | No; direct loading remains available |
 | Direct call/run/stop | No | Yes |
 | Slot/mapper selection | No | Yes, pages 0 and 1 |
 | `DEBUG` | Rejected | Optional |
@@ -431,6 +434,40 @@ documented `INTFLG` byte at `FC9Bh` through the framed RAM-write command.
 Ctrl+C is exposed as a convenience alias for the Ctrl+STOP break event. This
 interrupts MSX-BASIC and other cooperative BIOS software without claiming to
 emulate a physical key matrix.
+
+### Host-orchestrated BLOAD/BASIC execution
+
+`msx_agent_app_load` defaults to an automatic environment on the host. Only a
+file parsed as BLOAD with the seven-byte `0xFE` header selects this path. The
+agent must be the default MemMan resident, and its screen must expose either an
+MSX-DOS prompt or an MSX BASIC `Ok` prompt. The host enters BASIC from DOS when
+needed and confirms the new prompt before it writes payload RAM.
+
+The resident itself receives only ordinary, already validated operations:
+
+1. keyboard-spool input for `BASIC` when a DOS-to-BASIC transition is needed;
+2. RAM writes for the exact inclusive start/end range declared by the header;
+3. RAM reads of that complete range for mandatory byte-for-byte verification;
+4. keyboard-spool input for `DEFUSR0=<entry>:A=USR0(0)` when execution was
+   requested.
+
+The host always performs step 3, even when the MCP caller passes `verify=false`.
+For `execute="run"`, it returns after the BASIC line is submitted; for
+`execute="call"`, it waits up to ten seconds for BASIC to return to `Ok`.
+BASIC supplies the expected Main-ROM page-0 environment, so this flow does not
+add forbidden resident `call` or `run` operations. It also does not invoke
+protocol X, `MSXAIXF.COM`, or an openMSX control API: the binary is injected
+directly into RAM through the resident protocol and is not copied to disk.
+
+The FE container has no relocation records. Bytes, range, and entry are never
+rewritten. The complete automatic payload must fit in CPU pages 2/3
+(`0x8000-0xFFFF`), and its entry must lie inside that segment; both checks occur
+before the prompt transition. Page 0 is Main-ROM in BASIC, while page 1 is not
+available for payload injection while the TSR/BASIC environment owns that
+address space. Other address-dependent incompatibilities remain the program's
+responsibility. `environment="direct"` preserves explicit foreground-monitor
+loading and call/run for compatible artifacts. `msx_agent_asm_load` likewise
+remains a direct assembly/upload path and never enters BASIC automatically.
 
 ## Memory model
 
