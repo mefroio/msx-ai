@@ -217,38 +217,6 @@ The agent does not configure Wi-Fi, issue modem AT commands, or depend on a
 specific network-adapter brand. BaDCaT is one planned 16C550-compatible
 transport, not a project requirement.
 
-### Loading an FE-header BLOAD through the resident
-
-`msx_agent_app_load` defaults to `environment="auto"`. On the agent route, only
-a valid BLOAD binary with the seven-byte `0xFE` header selects the automatic
-MSX-BASIC path. The connected agent must be resident, and the visible target
-must be at either an MSX-DOS prompt or an MSX BASIC `Ok` prompt. From DOS, the
-host types `BASIC` and confirms the `Ok` prompt before writing any payload RAM.
-
-The host then injects the payload at the exact start/end range declared by the
-header and always reads the complete range back for verification, even if the
-caller supplied `verify=false`. When the effective entry mode is not `none`, the
-host submits it through BASIC with `DEFUSR0=<entry>:A=USR0(0)`. This is direct
-RAM injection through the ASM-agent protocol; it neither copies a file to the
-MSX disk nor uses a local openMSX API. `execute="run"` returns after submitting
-the line; `execute="call"` waits for up to three bounded screen probes for
-BASIC to return to `Ok`.
-
-```text
-msx_agent_status()
-msx_agent_app_load(path="/host/path/GAME.BIN")
-```
-
-The automatic path never relocates or rewrites machine code. Its complete
-declared segment must fit in CPU pages 2/3 (`0x8000-0xFFFF`), and the entry must
-lie inside that segment. Page 0 is mapped as Main-ROM in BASIC, while page 1 is
-not a valid resident/BASIC payload area. A binary built for another address is
-rejected rather than moved heuristically. `environment="basic"` explicitly
-requests the same checked path. Use `environment="direct"` for an artifact
-intentionally built for foreground-monitor call/run semantics.
-`msx_agent_asm_load` also remains a direct assembly-and-injection tool and does
-not enter BASIC automatically.
-
 ## Reproducible demonstrations
 
 With a visible direct-openMSX BASIC session, these MCP calls draw a simple
