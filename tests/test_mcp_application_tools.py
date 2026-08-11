@@ -175,20 +175,27 @@ class MCPApplicationToolsTest(unittest.TestCase):
 
     def test_agent_bload_waits_for_delayed_basic_prompt(self):
         self.backend.runtime_mode = "resident"
+        timeouts = []
         screens = iter([
             "MSX-DOS 2\nA:\\>",
             "A:\\>BASIC",
             "Microsoft MSX BASIC\nOk",
         ])
+
+        def screen_text(timeout=None):
+            timeouts.append(timeout)
+            return next(screens)
+
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "DELAY.BIN"
             path.write_bytes(self._bload(payload=b"\xC9"))
             with mock.patch.object(
-                    self.backend, "screen_text",
-                    side_effect=lambda timeout=None: next(screens)):
+                    self.backend, "screen_text", side_effect=screen_text), \
+                    mock.patch.object(msx_mcp_server.time, "sleep"):
                 result = msx_mcp_server.t_app_load(str(path))
 
         self.assertEqual(result["target_transition"], "dos-to-basic")
+        self.assertEqual(timeouts, [10.0, 10.0, 10.0])
         self.assertEqual(self.backend.ram[0xC000], 0xC9)
         self.assertEqual(self.backend.typed, [
             ("line", "BASIC"),

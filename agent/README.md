@@ -453,7 +453,8 @@ The resident itself receives only ordinary, already validated operations:
 
 The host always performs step 3, even when the MCP caller passes `verify=false`.
 For `execute="run"`, it returns after the BASIC line is submitted; for
-`execute="call"`, it waits up to ten seconds for BASIC to return to `Ok`.
+`execute="call"`, it waits for up to three bounded screen probes for BASIC to
+return to `Ok`.
 BASIC supplies the expected Main-ROM page-0 environment, so this flow does not
 add forbidden resident `call` or `run` operations. It also does not invoke
 protocol X, `MSXAIXF.COM`, or an openMSX control API: the binary is injected

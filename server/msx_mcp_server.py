@@ -124,6 +124,9 @@ UART_BITS_PER_BYTE = 10
 UART_SCREENSHOT_MARGIN = 1.15
 SLOW_SCREENSHOT_SECONDS = 10.0
 APPLICATION_ENVIRONMENTS = ("auto", "direct", "basic")
+BASIC_PROMPT_ATTEMPTS = 3
+BASIC_PROMPT_SCREEN_TIMEOUT = 10.0
+BASIC_PROMPT_SETTLE_SECONDS = 0.5
 
 LOCAL_PROFILES = ("basic", "disk", "dos", "msx2plus", "cbios", "auto")
 OPENMSX_CONFIG_MODES = ("isolated", "user", "overlay")
@@ -1827,20 +1830,18 @@ def _validate_basic_bload(application, mode, address):
             f"0x{segment.address:04X}-0x{segment.end - 1:04X}")
 
 
-def _wait_for_basic_prompt(m, timeout=10.0):
-    """Wait for a DOS-to-BASIC transition without writing application RAM."""
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        screen = m.screen_text(timeout=remaining)
+def _wait_for_basic_prompt(
+        m, *, attempts=BASIC_PROMPT_ATTEMPTS,
+        screen_timeout=BASIC_PROMPT_SCREEN_TIMEOUT,
+        settle=BASIC_PROMPT_SETTLE_SECONDS):
+    """Wait for BASIC without starting a capture on a depleted deadline."""
+    for _attempt in range(attempts):
+        if settle:
+            time.sleep(settle)
+        screen = m.screen_text(timeout=screen_timeout)
         if _basic_prompt_visible(screen):
             return screen
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        time.sleep(min(0.1, remaining))
+    return None
 
 
 def _preflight_agent_direct(m, application, mode, address):
@@ -1899,11 +1900,12 @@ def _load_agent_bload_in_basic(m, application, execute, *, automatic):
         transition = "already-basic"
     elif _dos_prompt_visible(screen):
         m.type_line("BASIC")
-        screen = _wait_for_basic_prompt(m, timeout=10.0)
+        screen = _wait_for_basic_prompt(m)
         if screen is None:
             raise OpenMSXError(
                 "MSX accepted the BASIC command but no BASIC Ok prompt was "
-                "observed within 10 seconds; BLOAD RAM was not written")
+                "observed after three bounded screen probes; BLOAD RAM was "
+                "not written")
         transition = "dos-to-basic"
     else:
         raise OpenMSXError(
@@ -1924,10 +1926,11 @@ def _load_agent_bload_in_basic(m, application, execute, *, automatic):
     if mode != "none":
         capabilities.append("input:basic-usr")
         m.type_line(f"DEFUSR0={address}:A=USR0(0)")
-        if mode == "call" and _wait_for_basic_prompt(m, timeout=10.0) is None:
+        if mode == "call" and _wait_for_basic_prompt(m) is None:
             raise OpenMSXError(
-                "BASIC USR call did not return to an Ok prompt within 10 "
-                "seconds; the injected routine may still be running")
+                "BASIC USR call did not return to an Ok prompt after three "
+                "bounded screen probes; the injected routine may still be "
+                "running")
     result["required_capabilities"] = list(dict.fromkeys(capabilities))
     result.update({
         "execution_environment": "msx-basic",
@@ -2983,8 +2986,8 @@ TOOLS = {
         "On the agent route, environment='auto' recognizes FE-header BLOAD "
         "files, safely enters MSX BASIC from a verified DOS prompt, injects "
         "and always verifies their declared RAM range, then submits the entry through "
-        "DEFUSR/USR. BASIC run returns after submission; call waits up to 10 "
-        "seconds for the Ok prompt. Other formats keep direct loading "
+        "DEFUSR/USR. BASIC run returns after submission; call waits for up to "
+        "three bounded Ok-prompt probes. Other formats keep direct loading "
         "semantics. A resident "
         "target always rejects RAM page 1, which contains the mapped TSR.",
         _s({"path": {"type": "string", "minLength": 1},
@@ -3200,7 +3203,7 @@ EXPLICIT_DESCRIPTIONS = {
         "artifacts: on a resident agent at a verified DOS/BASIC prompt it "
         "enters BASIC when needed, injects and always verifies the declared "
         "RAM payload, and submits its entry through DEFUSR/USR. BASIC run is "
-        "asynchronous; call waits up to 10 seconds for an Ok prompt. Use "
+        "asynchronous; call waits for up to three bounded Ok-prompt probes. Use "
         "environment='direct' only for artifacts intentionally built for the "
         "foreground monitor. No openMSX API is used."),
     "msx_local_asm_load": (

@@ -231,7 +231,8 @@ caller supplied `verify=false`. When the effective entry mode is not `none`, the
 host submits it through BASIC with `DEFUSR0=<entry>:A=USR0(0)`. This is direct
 RAM injection through the ASM-agent protocol; it neither copies a file to the
 MSX disk nor uses a local openMSX API. `execute="run"` returns after submitting
-the line; `execute="call"` waits up to ten seconds for BASIC to return to `Ok`.
+the line; `execute="call"` waits for up to three bounded screen probes for
+BASIC to return to `Ok`.
 
 ```text
 msx_agent_status()

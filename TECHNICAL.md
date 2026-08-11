@@ -958,7 +958,8 @@ The automatic resident BLOAD sequence is:
    `DEFUSR0=<entry>:A=USR0(0)`. BASIC therefore owns the expected page-0 ROM
    environment; the resident does not advertise or perform an agent-side
    `call`/`run`. For `run`, the host returns after submission. For `call`, it
-   waits up to ten seconds for BASIC to return to an `Ok` prompt.
+   waits for up to three full, bounded screen probes for BASIC to return to an
+   `Ok` prompt. No probe is started with a depleted timeout budget.
 
 This sequence is host orchestration over the ASM-agent channel. It does not use
 the local openMSX API, create a DOS file, invoke `MSXAIXF.COM`, or reinterpret

@@ -171,7 +171,8 @@ the `Ok` prompt. It then injects the exact header-declared RAM range through the
 agent, always reads the complete range back, and submits a nonzero entry through
 `DEFUSR0`/`USR0`. The host path is not copied onto an MSX disk and no local
 openMSX API is involved. `execute="run"` returns after submission, whereas
-`execute="call"` waits up to ten seconds for BASIC to return to `Ok`.
+`execute="call"` waits for up to three bounded screen probes for BASIC to
+return to `Ok`.
 
 The flow never relocates code. Its complete segment must fit in CPU pages 2/3
 (`0x8000-0xFFFF`), and its entry must lie inside that segment. Page 0 is mapped
