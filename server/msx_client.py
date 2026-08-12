@@ -943,9 +943,30 @@ class OpenMSX:
             self.advance(0.3)
         return sum(len(line) + 1 for line in lines)
 
-    # MSX keyboard matrix positions (row, mask) for the special keys we need
-    KEYS = {"RET": (7, 0x80), "ESC": (7, 0x04), "SPACE": (8, 0x01),
-            "STOP": (7, 0x10), "SELECT": (7, 0x40), "TAB": (7, 0x08)}
+    # Standard MSX keyboard-matrix positions (row, mask).  Keep this an
+    # explicit allow-list: values are interpolated into openMSX Tcl below.
+    KEYS = {
+        "1": (0, 0x02),
+        "2": (0, 0x04),
+        "3": (0, 0x08),
+        "4": (0, 0x10),
+        "5": (0, 0x20),
+        "F1": (6, 0x20),
+        "F2": (6, 0x40),
+        "F3": (6, 0x80),
+        "F4": (7, 0x01),
+        "F5": (7, 0x02),
+        "ESC": (7, 0x04),
+        "TAB": (7, 0x08),
+        "STOP": (7, 0x10),
+        "SELECT": (7, 0x40),
+        "RET": (7, 0x80),
+        "SPACE": (8, 0x01),
+        "LEFT": (8, 0x10),
+        "UP": (8, 0x20),
+        "DOWN": (8, 0x40),
+        "RIGHT": (8, 0x80),
+    }
     KEY_CHORDS = {
         # BREAKX scans the physical matrix; INTFLG/key-buffer injection is not
         # equivalent while the foreground monitor owns the CPU.

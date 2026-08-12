@@ -84,6 +84,45 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
             "keymatrixdown 6 2; keymatrixdown 7 16; "
             "after time 0.10 {keymatrixup 7 16; keymatrixup 6 2}")
 
+    def test_named_single_keys_emit_one_matrix_down_up_pair(self):
+        expected = {
+            "1": (0, 2),
+            "2": (0, 4),
+            "3": (0, 8),
+            "4": (0, 16),
+            "5": (0, 32),
+            "F1": (6, 32),
+            "F2": (6, 64),
+            "F3": (6, 128),
+            "F4": (7, 1),
+            "F5": (7, 2),
+            "ESC": (7, 4),
+            "TAB": (7, 8),
+            "STOP": (7, 16),
+            "SELECT": (7, 64),
+            "RET": (7, 128),
+            "SPACE": (8, 1),
+            "UP": (8, 32),
+            "DOWN": (8, 64),
+            "LEFT": (8, 16),
+            "RIGHT": (8, 128),
+        }
+        self.assertEqual(OpenMSX.KEYS, expected)
+        machine = OpenMSX(bin="/fake/openmsx", platform="linux")
+        machine.cmd = mock.Mock(return_value="")
+
+        for key, (row, mask) in expected.items():
+            with self.subTest(key=key):
+                machine.cmd.reset_mock()
+                machine.press(key.lower())
+                command = (
+                    f"keymatrixdown {row} {mask}; "
+                    f"after time 0.06 {{keymatrixup {row} {mask}}}"
+                )
+                machine.cmd.assert_called_once_with(command)
+                self.assertEqual(command.count("keymatrixdown"), 1)
+                self.assertEqual(command.count("keymatrixup"), 1)
+
     def test_adapter_supports_package_import_and_snapshot_transaction(self):
         packaged = importlib.import_module("server.msx_client")
         machine = packaged.OpenMSX(bin="/fake/openmsx", platform="linux")

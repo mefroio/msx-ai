@@ -3125,6 +3125,15 @@ LOCAL_SCHEMA_OVERRIDES = {
     "msx_local_run_basic": _schema_without(
         TOOLS["msx_run_basic"][2], "transfer", "dos_prompt_confirmed",
         "dos_drive", "allow_existing_basic"),
+    "msx_local_key": _s({
+        "key": {
+            "type": "string",
+            "description": (
+                "Case-insensitive named key: 1-5, F1-F5, UP, DOWN, LEFT, "
+                "RIGHT, ESC, RET, STOP, SPACE, SELECT, TAB, or CTRL+STOP."
+            ),
+        },
+    }, ["key"]),
     "msx_local_app_load": _schema_without(
         TOOLS["msx_app_load"][2], "environment"),
 }
@@ -3174,8 +3183,11 @@ EXPLICIT_DESCRIPTIONS = {
         "API and return the resulting text screen."),
     "msx_local_key": (
         "Send one named key through the local openMSX input API and return "
-        "the resulting text screen. CTRL+STOP is emitted as a real CTRL and "
-        "STOP keyboard-matrix chord, suitable for the foreground monitor."),
+        "the resulting text screen. Accepted names (case-insensitive): 1-5, "
+        "F1-F5, UP, DOWN, LEFT, RIGHT, ESC, RET, STOP, SPACE, SELECT, TAB, "
+        "and CTRL+STOP. Single keys emit one keyboard-matrix down/up pair; "
+        "CTRL+STOP emits the real CTRL and STOP chord required by the "
+        "foreground monitor."),
     "msx_agent_type_line": (
         "Send one line through the ASM agent's credited BIOS keyboard spool; "
         "returns an acknowledgement without capturing VRAM."),

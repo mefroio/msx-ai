@@ -109,6 +109,14 @@ class ExplicitBackendRoutingTest(unittest.TestCase):
         self.assertNotIn("dos_prompt_confirmed", local_basic_description)
         self.assertNotIn("openMSX", agent_cpu_description)
 
+        local_key = msx_mcp_server.TOOLS["msx_local_key"]
+        for name in ("1-5", "F1-F5", "UP", "DOWN", "LEFT", "RIGHT",
+                     "CTRL+STOP"):
+            with self.subTest(local_key_name=name):
+                self.assertIn(name, local_key[1])
+                self.assertIn(
+                    name, local_key[2]["properties"]["key"]["description"])
+
     def test_fixed_screen_routes_can_alternate_without_selection_state(self):
         local = _Local()
         agent = _Agent()
