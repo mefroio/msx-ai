@@ -193,7 +193,7 @@ class AgentPackBitsTransferSourceTest(unittest.TestCase):
             "loader_xfer_progress_message:", 1)[1].split(
             "loader_xfer_expected_direction:", 1)[0]
 
-        self.assertIn("XFER_PROGRESS_BAR_WIDTH: equ 18", XFER)
+        self.assertIn("XFER_PROGRESS_BAR_WIDTH: equ 14", XFER)
         self.assertIn("XFER_PROGRESS_DIVISOR:   equ 100", XFER)
         self.assertIn("loader_xfer_progress_step + 2", progress)
         self.assertIn("loader_xfer_progress_next + 3", progress)

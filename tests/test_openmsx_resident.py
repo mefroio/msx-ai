@@ -431,7 +431,7 @@ mailbox: dw 0
         allowed_transfer_row = re.compile(
             r"^(?:(?:A:\\>)(?:MSXAIXF /(?:PUT|GET) [0-9A-F]*)?|"
             r"[0-9A-F]{1,32}|MSXAI (?:PUT|GET) (?:READY|OK)|"
-            r"\[[#-]{18}\]\s+\d{1,3}%\s+\d+\s+B/s)$")
+            r"\[[#-]{14}\]\s+\d{1,3}%\s+\d+\s+B/s)$")
         for row in transfer_rows:
             self.assertRegex(row, allowed_transfer_row, transfer_screen)
 

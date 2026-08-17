@@ -188,6 +188,7 @@ AGENT_FEATURE_NAMES = {
 AGENT_TRANSPORT_NAMES = {
     0: "uart-8251",
     1: "uart-16c550",
+    2: "tcpip-unapi",
 }
 AGENT_RUNTIME_MODES = {0: "resident", 1: "foreground-monitor"}
 
@@ -360,6 +361,8 @@ class RealMSX:
         """Connect to an adapter that exposes the agent as a TCP server."""
         target_host = self.host if host is None else host
         target_port = self.port if port is None else int(port)
+        if not 1 <= target_port <= 65535:
+            raise ValueError("port must be in range 1..65535")
         if ":" in str(target_host):
             raise RealMSXError("IPv6 is not supported; use an IPv4 endpoint")
         try:

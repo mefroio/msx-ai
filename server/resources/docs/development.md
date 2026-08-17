@@ -84,12 +84,17 @@ fail-closed. Linux and macOS continue to require Make. This pre-commit gate
 builds a clean snapshot
 of the checkout's current on-disk source, including uncommitted changes while
 excluding generated and local-state directories. It runs the unit suite,
-builds and inspects the sdist and wheel, rebuilds both the wheel and seven-file
+builds and inspects the sdist and wheel, rebuilds both the wheel and nine-file
 agent suite from the sdist, and compares their same-host payloads. It installs
 the rebuilt wheel into a clean environment, runs `pip check`, verifies
 import/CLI state discipline and packaged openMSX resource materialization, and
 exercises modern and legacy STDIO plus IPv4-loopback Streamable HTTP with the
 official MCP client.
+
+The separate TCP/IP UNAPI emulator gate is intentionally opt-in. After its
+pinned openMSXnet/UNAPINET assets and licensed local ROM/DOS paths pass
+`make unapi-emulation-preflight`, run `make test-unapi-emulation`. The normal
+release gate neither downloads those assets nor installs native dependencies.
 
 Use strict mode only after committing the intended release tree:
 
@@ -109,7 +114,7 @@ On Windows, use `python tools/release_check.py --publish` for strict mode and
 `python tools/release_check.py --publish --output-dir dist` to persist assets.
 
 This writes the sdist, the wheel rebuilt from that sdist, and a deterministic
-`msx-ai-agent-<host-version>.zip`. The ZIP contains exactly seven binaries,
+`msx-ai-agent-<host-version>.zip`. The ZIP contains exactly nine binaries,
 the project `LICENSE`, `MEMMAN-NOTICE.txt`, `SHA256SUMS`, and
 `COMPATIBILITY.json` recording the Python distribution version derived at build
 time, wire v3, transfer `fast-v1`, and the pinned assembler; it does not assign
@@ -141,10 +146,16 @@ MSXAI.COM
 MSXAIXF.COM
 MCP8251.TSR
 MCP16550.TSR
+MCPUNAPI.TSR
+MP.COM
 MEMMAN.COM
 TL.COM
 TK.COM
 ```
+
+`MP.COM` is the ninth, transient first-install helper. It applies the selected
+UNAPI listener port after the MemMan warm boot, including the default 6603; its
+compact hexadecimal command is private to the install chain.
 
 Keep files from one build together. Internal relocation templates under the
 build subdirectory are not deployable alternatives. The three MemMan utilities

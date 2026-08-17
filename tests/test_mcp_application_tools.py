@@ -407,6 +407,12 @@ class MCPApplicationToolsTest(unittest.TestCase):
             msx_mcp_server.t_agent_listen()
         listen.assert_called_once_with(
             host="127.0.0.1", port=6603, timeout=60.0, cancelled=None)
+        with mock.patch.object(
+                msx_mcp_server.SESSION, "connect_agent",
+                return_value=("127.0.0.1", 43123)) as connect:
+            msx_mcp_server.t_agent_connect("127.0.0.1", port=43123)
+        connect.assert_called_once_with(
+            host="127.0.0.1", port=43123, timeout=60.0)
 
         invalid = (
             lambda: msx_mcp_server.t_agent_listen(host="0.0.0.0"),
@@ -414,6 +420,8 @@ class MCPApplicationToolsTest(unittest.TestCase):
             lambda: msx_mcp_server.t_agent_listen(host="::1"),
             lambda: msx_mcp_server.t_agent_listen(port=0),
             lambda: msx_mcp_server.t_agent_connect("224.0.0.1"),
+            lambda: msx_mcp_server.t_agent_connect(
+                "127.0.0.1", port=65536),
             lambda: msx_mcp_server.t_agent_connect(
                 "127.0.0.1", timeout=float("nan")),
         )

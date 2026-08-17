@@ -57,13 +57,14 @@ uart8251_init:
     out (UART8251_STATUS),a
     ld a,037h                   ; TxEN|DTR|RxEN|ER|RTS
     out (UART8251_STATUS),a
-
+    xor a                       ; transport init status: success
     ret
 
 uart8251_restore:
     ld a,(transport_state + UART8251_SAVED_COMMSK)
     ld (UART8251_COMMSK),a
     out (082h),a
+    xor a
     ret
 
 uart8251_rx_ready:
@@ -92,4 +93,9 @@ uart8251_read:
 
 uart8251_write:
     out (UART8251_DATA),a
+    ret
+
+uart8251_service:
+uart8251_flush:
+    xor a
     ret

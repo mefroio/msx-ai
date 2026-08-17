@@ -40,6 +40,7 @@ class OpenMSXMCPLauncherTest(unittest.TestCase):
             self.launcher)
         self.assertIn("MCP_PACKAGE_NAMES=(MSXAI.COM MSXAIXF.COM", self.launcher)
         self.assertIn("MCP8251.TSR MCP16550.TSR", self.launcher)
+        self.assertIn("MCPUNAPI.TSR MP.COM MEMMAN.COM", self.launcher)
         self.assertIn("MEMMAN.COM TL.COM TK.COM", self.launcher)
         self.assertIn(
             'cp "$suite_source" "$suite_destination"', self.launcher)
@@ -57,9 +58,10 @@ class OpenMSXMCPLauncherTest(unittest.TestCase):
     def test_startup_keeps_agent_manual_and_retries_transport(self):
         self.assertNotIn('//type "MSXAI ', self.startup)
         self.assertIn("A:\\\\MSXAI is on PATH", self.startup)
-        self.assertIn("MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR",
-                      self.startup)
-        self.assertIn("MEMMAN.COM TL.COM TK.COM", self.startup)
+        self.assertIn(
+            "MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR MCPUNAPI.TSR",
+            self.startup)
+        self.assertIn("MP.COM MEMMAN.COM TL.COM TK.COM", self.startup)
         self.assertIn("diskmanipulator mkdir hda1 MSXAI", self.startup)
         self.assertIn("diskmanipulator chdir hda1 MSXAI", self.startup)
         self.assertIn("diskmanipulator chdir hda1 /", self.startup)

@@ -27,7 +27,7 @@ if __package__:
     from .msx_client import OpenMSX, OpenMSXError
     from .msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
                            CAPABILITY_RUN, FEATURE_FILE_TRANSFER,
-                           UART8251_BAUD)
+                           UART8251_BAUD, DEFAULT_PORT)
     from .msx_application import load_application, parse_application
     from . import msx_screenshot
     from .msx_transfer import TransferError, normalize_msx_basic_text
@@ -52,7 +52,7 @@ else:  # Preserve ``python server/msx_mcp_server.py`` and existing imports.
     from msx_client import OpenMSX, OpenMSXError
     from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
                           CAPABILITY_RUN, FEATURE_FILE_TRANSFER,
-                          UART8251_BAUD)
+                          UART8251_BAUD, DEFAULT_PORT)
     from msx_application import load_application, parse_application
     import msx_screenshot
     from msx_transfer import TransferError, normalize_msx_basic_text
@@ -88,6 +88,8 @@ AGENT_COM = AGENT_DIR / "MSXAI.COM"
 AGENT_XFER_COM = AGENT_DIR / "MSXAIXF.COM"
 AGENT_TSR_8251 = AGENT_DIR / "MCP8251.TSR"
 AGENT_TSR_16C550 = AGENT_DIR / "MCP16550.TSR"
+AGENT_TSR_UNAPI = AGENT_DIR / "MCPUNAPI.TSR"
+AGENT_PORT_COM = AGENT_DIR / "MP.COM"
 AGENT_MEMMAN_COM = AGENT_DIR / "MEMMAN.COM"
 AGENT_TL_COM = AGENT_DIR / "TL.COM"
 AGENT_TK_COM = AGENT_DIR / "TK.COM"
@@ -114,6 +116,8 @@ AGENT_PACKAGE_NAMES = (
     BENCH_XFER_NAME,
     "MCP8251.TSR",
     "MCP16550.TSR",
+    "MCPUNAPI.TSR",
+    "MP.COM",
     "MEMMAN.COM",
     "TL.COM",
     "TK.COM",
@@ -160,6 +164,8 @@ def _build_agent_artifacts():
         AGENT_XFER_COM,
         AGENT_TSR_8251,
         AGENT_TSR_16C550,
+        AGENT_TSR_UNAPI,
+        AGENT_PORT_COM,
         AGENT_MEMMAN_COM,
         AGENT_TL_COM,
         AGENT_TK_COM,
@@ -470,7 +476,7 @@ class Session:
         self.local_id = "local-" + secrets.token_hex(6)
         return screen
 
-    def listen_agent(self, host="127.0.0.1", port=6603, timeout=60,
+    def listen_agent(self, host="127.0.0.1", port=DEFAULT_PORT, timeout=60,
                      cancelled=None):
         """Wait for an ASM agent or transparent adapter to connect over TCP."""
         if self.backend("agent")[0] is not None:
@@ -491,7 +497,7 @@ class Session:
         self.agent_id = "agent-" + secrets.token_hex(6)
         return peer
 
-    def connect_agent(self, host, port=6603, timeout=60):
+    def connect_agent(self, host, port=DEFAULT_PORT, timeout=60):
         """Connect to an ASM agent or transparent adapter over TCP."""
         if self.backend("agent")[0] is not None:
             raise OpenMSXError(
@@ -532,7 +538,7 @@ class Session:
         root = pathlib.Path(runtime.name)
         disk = root / "msxdos.dsk"
         home = root / "openmsx-home"
-        # The disposable bench disk receives the complete seven-file package
+        # The disposable bench disk receives the complete nine-file package
         # under A:\MSXAI. Legacy root copies and stale directory copies are
         # removed because diskmanipulator does not overwrite same-name files.
         machine = None
@@ -1343,7 +1349,7 @@ def t_local_doctor(profile="auto", config_mode=None):
     }
 
 
-def t_real_listen(host="127.0.0.1", port=6603, timeout=60):
+def t_real_listen(host="127.0.0.1", port=DEFAULT_PORT, timeout=60):
     return t_agent_listen(host=host, port=port, timeout=timeout)
 
 
@@ -1383,7 +1389,7 @@ def _validate_agent_endpoint(host, port, timeout, *, maximum_timeout):
     return str(address), port, timeout
 
 
-def t_agent_listen(host="127.0.0.1", port=6603, timeout=60):
+def t_agent_listen(host="127.0.0.1", port=DEFAULT_PORT, timeout=60):
     host, port, timeout = _validate_agent_endpoint(
         host, port, timeout, maximum_timeout=86400)
     peer = SESSION.listen_agent(
@@ -1393,7 +1399,7 @@ def t_agent_listen(host="127.0.0.1", port=6603, timeout=60):
             f"over TCP/IP to {host}:{int(port)}]")
 
 
-def t_agent_connect(host, port=6603, timeout=60):
+def t_agent_connect(host, port=DEFAULT_PORT, timeout=60):
     host, port, timeout = _validate_agent_endpoint(
         host, port, timeout, maximum_timeout=300)
     peer = SESSION.connect_agent(host=host, port=port, timeout=timeout)
@@ -2711,7 +2717,7 @@ TOOLS = {
         "control APIs.",
         _s({"host": {"type": "string", "default": "127.0.0.1"},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535,
-                     "default": 6603},
+                     "default": DEFAULT_PORT},
             "timeout": {"type": "number", "exclusiveMinimum": 0,
                         "maximum": 86400,
                         "default": 60}})),
@@ -2725,7 +2731,7 @@ TOOLS = {
         "is independent of emulator and adapter brands.",
         _s({"host": {"type": "string", "default": "127.0.0.1"},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535,
-                     "default": 6603},
+                     "default": DEFAULT_PORT},
             "timeout": {"type": "number", "exclusiveMinimum": 0,
                         "maximum": 86400,
                         "default": 60}})),
@@ -2735,7 +2741,7 @@ TOOLS = {
         "of msx_agent_listen and uses the identical transport-neutral protocol.",
         _s({"host": {"type": "string", "minLength": 1},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535,
-                     "default": 6603},
+                     "default": DEFAULT_PORT},
             "timeout": {"type": "number", "exclusiveMinimum": 0,
                         "maximum": 300,
                         "default": 60}}, ["host"])),
@@ -2988,7 +2994,11 @@ TOOLS = {
         "and always verifies their declared RAM range, then submits the entry through "
         "DEFUSR/USR. BASIC run returns after submission; call waits for up to "
         "three bounded Ok-prompt probes. Other formats keep direct loading "
-        "semantics. A resident "
+        "semantics. Foreground direct payloads run in the MSX-DOS mapping: "
+        "page 0 is RAM, so they must use BDOS or BIOS inter-slot calls rather "
+        "than jumping to Main-ROM BIOS entry addresses. Use execute='run' "
+        "for an interactive program and execute='call' only when the routine "
+        "will return before the request timeout. A resident "
         "target always rejects RAM page 1, which contains the mapped TSR.",
         _s({"path": {"type": "string", "minLength": 1},
             "format": {"type": "string",
@@ -3217,7 +3227,11 @@ EXPLICIT_DESCRIPTIONS = {
         "RAM payload, and submits its entry through DEFUSR/USR. BASIC run is "
         "asynchronous; call waits for up to three bounded Ok-prompt probes. Use "
         "environment='direct' only for artifacts intentionally built for the "
-        "foreground monitor. No openMSX API is used."),
+        "foreground monitor. Direct payloads run with the MSX-DOS mapping, "
+        "where page 0 is RAM: use BDOS or BIOS inter-slot calls, not fixed "
+        "Main-ROM entry addresses. Prefer execute='run' for interactive code; "
+        "execute='call' waits for the routine to return. No openMSX API is "
+        "used."),
     "msx_local_asm_load": (
         "Assemble Z80 source and load it only through local openMSX debugger "
         "memory operations, with optional call or run."),

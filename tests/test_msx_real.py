@@ -154,7 +154,7 @@ class _FakeTCPListener:
 
 
 class _ConnectedStream:
-    def __init__(self, stream, peer=("198.51.100.7", 6603)):
+    def __init__(self, stream, peer=("198.51.100.7", 43123)):
         self.stream = stream
         self.peer = peer
         self.family = socket.AF_INET
@@ -474,7 +474,7 @@ class RealMSXTCPConnectionModesTest(unittest.TestCase):
 
     def test_tcp_connector_reaches_adapter_server(self):
         connected, resident = socket.socketpair()
-        stream = _ConnectedStream(connected)
+        stream = _ConnectedStream(connected, peer=("198.51.100.7", 43123))
         agent = FakeResidentAgent(resident)
         msx = RealMSX(socket_timeout=1)
         try:
@@ -484,12 +484,13 @@ class RealMSXTCPConnectionModesTest(unittest.TestCase):
                  mock.patch.object(
                     msx_real.socket, "create_connection",
                     return_value=stream) as create_connection:
-                peer = msx.connect("adapter.example", 6603, timeout=1)
+                peer = msx.connect("adapter.example", 43123, timeout=1)
 
             gethostbyname.assert_called_once_with("adapter.example")
             create_connection.assert_called_once_with(
-                ("198.51.100.7", 6603), timeout=1.0)
-            self.assertEqual(peer, ("198.51.100.7", 6603))
+                ("198.51.100.7", 43123), timeout=1.0)
+            self.assertEqual(peer, ("198.51.100.7", 43123))
+            self.assertEqual(msx.port, 43123)
             self.assertEqual(msx.network_transport, "tcp")
             self.assertEqual(msx.network_role, "connect")
             self.assertIn(
@@ -503,7 +504,14 @@ class RealMSXTCPConnectionModesTest(unittest.TestCase):
 
     def test_tcp_connector_rejects_ipv6_target(self):
         with self.assertRaisesRegex(RealMSXError, "IPv6 is not supported"):
-            RealMSX(socket_timeout=1).connect("::1", 6603, timeout=1)
+            RealMSX(socket_timeout=1).connect("::1", 43123, timeout=1)
+
+    def test_tcp_connector_rejects_out_of_range_port(self):
+        for port in (0, 65536):
+            with self.subTest(port=port), self.assertRaisesRegex(
+                    ValueError, "1..65535"):
+                RealMSX(socket_timeout=1).connect(
+                    "adapter.example", port, timeout=1)
 
     def test_stream_contract_is_explicit(self):
         with self.assertRaisesRegex(TypeError, "recv"):

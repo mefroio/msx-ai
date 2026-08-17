@@ -140,15 +140,22 @@ _SDIST_REQUIRED_FILES = {
     "agent/msx_agent_core.asm",
     "agent/msx_agent_tsr.asm",
     "agent/msx_memman_loader.asm",
+    "agent/msx_port_helper.asm",
+    "agent/msx_unapi_probe.asm",
     "agent/msx_xfer.asm",
     "agent/msx_xfer_engine.inc",
     "agent/msx_xfer_protocol.inc",
     "agent/transports/msx_transport_16c550.inc",
     "agent/transports/msx_transport_8251.inc",
+    "agent/transports/msx_transport_unapi.inc",
     "assets/NOTICE.md",
     "assets/msx-ai-robot.png",
+    "docs/openmsx-unapi-validation.md",
     "server/resources/docs/manifest.json",
+    "tests/test_port_helper.py",
     "tests/test_release_check.py",
+    "tests/test_openmsx_unapi_validation.py",
+    "tests/test_unapi_probe.py",
     "third_party/memman/NOTICE",
     "third_party/memman/SHA256SUMS",
     "third_party/memman/memman.com.b64",
@@ -158,14 +165,19 @@ _SDIST_REQUIRED_FILES = {
     "third_party/openmsx/NOTICE",
     "tools/build_agent_tsr.py",
     "tools/build_memman_tsr.py",
+    "tools/build_port_helper.py",
+    "tools/build_unapi_probe.py",
     "tools/check_msx_com_size.py",
     "tools/materialize_memman.py",
     "tools/openmsx_mcp_test.tcl",
+    "tools/openmsx_unapi_validation.py",
     "tools/release_check.py",
 } | {f"server/{name}" for name in _RUNTIME_MODULES}
 _AGENT_SUITE_FILES = {
     "MCP16550.TSR",
     "MCP8251.TSR",
+    "MCPUNAPI.TSR",
+    "MP.COM",
     "MEMMAN.COM",
     "MSXAI.COM",
     "MSXAIXF.COM",
@@ -175,6 +187,7 @@ _AGENT_SUITE_FILES = {
 _AGENT_COM_SIZE_CEILINGS = {
     "MSXAI.COM": 36_760,
     "MSXAIXF.COM": 16_128,
+    "MP.COM": 16_128,
 }
 _WIRE_VERSION = "v3"
 _TRANSFER_VERSION = "fast-v1"
@@ -327,6 +340,7 @@ def _release_environment() -> dict[str, str]:
     # The release suite is intentionally hardware-free even if a developer's
     # interactive shell has integration testing enabled.
     environment["MSX_RUN_INTEGRATION"] = "0"
+    environment["MSX_RUN_UNAPI_INTEGRATION"] = "0"
     return environment
 
 
@@ -828,7 +842,7 @@ def _assert_agent_archive(path: Path, source: Path,
         names = archive.namelist()
         if len(names) != len(set(names)) or set(names) != expected_names:
             raise ReleaseCheckError(
-                "agent archive must contain exactly seven binaries, LICENSE, "
+                "agent archive must contain exactly nine binaries, LICENSE, "
                 "MEMMAN-NOTICE.txt, SHA256SUMS, and COMPATIBILITY.json")
         for name in _AGENT_SUITE_FILES:
             digest = hashlib.sha256(archive.read(name)).hexdigest()
@@ -947,6 +961,13 @@ def _build_agent_suite_portable(
             "--metadata-output", str(build_directory / "MSXAI_TSR.INC"),
             "--8251-output", str(agent_directory / "MCP8251.TSR"),
             "--16c550-output", str(agent_directory / "MCP16550.TSR"),
+            "--unapi-output", str(agent_directory / "MCPUNAPI.TSR"),
+        ],
+        [
+            sys.executable, str(tools / "build_port_helper.py"),
+            "--repository", str(source), "--assembler", assembler,
+            "--source", str(source / "agent" / "msx_port_helper.asm"),
+            "--output", str(agent_directory / "MP.COM"),
         ],
         [
             assembler, str(source / "agent" / "msx_agent.asm"),
@@ -974,7 +995,7 @@ def _build_agent_suite_portable(
 def _build_agent_suite(source: Path, env: dict[str, str]) -> Path:
     make, assembler = _resolve_build_tools(env)
     _z80asm_version_line(assembler, env)
-    _say("building the seven-file Z80 agent suite in the staged snapshot")
+    _say("building the nine-file Z80 agent suite in the staged snapshot")
     agent_directory = source / "work" / "agent"
     if make is None:
         _say("using the portable Python agent builder on Windows")
@@ -1372,7 +1393,7 @@ def run_release_check(*, publish: bool = False,
         rebuilt_source = _extract_sdist(sdist, extracted)
         rebuilt_agent = _build_agent_suite(rebuilt_source, environment)
         _assert_matching_agent_suites(staged_agent, rebuilt_agent)
-        _say("sdist-rebuilt agent suite matches all seven staged payloads")
+        _say("sdist-rebuilt agent suite matches all nine staged payloads")
 
         bundle_a = temporary / "agent-bundle-a"
         bundle_b = temporary / "agent-bundle-b"

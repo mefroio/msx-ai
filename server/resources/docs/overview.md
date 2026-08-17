@@ -17,8 +17,9 @@ TCP/IPv4 path.
 - **Direct openMSX** controls an emulator through its control API. It does not
   use TCP or install the MSX-side agent.
 - **Physical agent** exchanges framed protocol messages with the MSX-DOS agent
-  through a selected host byte-stream transport. The current host adapter uses
-  TCP over IPv4 and a transparent network-to-UART bridge.
+  through a selected host byte-stream transport. TCP over IPv4 can reach a
+  transparent network-to-UART bridge or a passive TCP/IP UNAPI listener running
+  directly on a Wi-Fi-equipped MSX.
 - **Simulated agent** runs the same MSX-DOS agent inside openMSX and reaches it
   through RS232-Net and TCP. Agent operations do not fall back to openMSX
   debugger memory access.

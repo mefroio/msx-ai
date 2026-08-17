@@ -83,6 +83,7 @@ uart16c550_restore:
     out (UART16C550_IER),a
     ld a,(transport_state + UART16C550_SAVED_LCR)
     out (UART16C550_LCR),a
+    xor a
     ret
 
 uart16c550_rx_ready:
@@ -104,4 +105,9 @@ uart16c550_read:
 
 uart16c550_write:
     out (UART16C550_DATA),a
+    ret
+
+uart16c550_service:
+uart16c550_flush:
+    xor a
     ret

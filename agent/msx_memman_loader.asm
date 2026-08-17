@@ -1,6 +1,6 @@
 ; MemMan lifecycle used by the transient half of MSXAI.COM.
 ;
-; The public-domain MemMan utilities and the two transport-patched TSR images
+; The public-domain MemMan utilities and the transport-patched TSR images
 ; are separate files in the canonical MSX-AI package.  Keeping them outside
 ; MSXAI.COM reduces transient TPA pressure and lets DOS load each component
 ; only while it is needed.
@@ -23,7 +23,6 @@ DOS_SEEK:                equ 04Ah
 DOS_TERM_ERROR:          equ 062h
 DOS_DEFAB:               equ 063h
 DOS_GET_ENV:             equ 06Bh
-DOS_SET_ENV:             equ 06Ch
 DOS_VERSION:             equ 06Fh
 
 OPEN_READ_ONLY:          equ 001h
@@ -37,6 +36,7 @@ ERR_BAD_VERSION:         equ 085h
 
 DRIVER_8251:             equ 0
 DRIVER_16C550:           equ 1
+DRIVER_UNAPI:             equ 2
 
 INVALID_HANDLE:          equ 0FFh
 
@@ -49,7 +49,9 @@ COM_ENTRY:               equ 00100h
 
 MEMMAN_ACTION_INSTALL:   equ 0
 MEMMAN_ACTION_UNINSTALL: equ 1
-MEMMAN_COMMAND_MAX:      equ 40
+; MemMan's 40-byte buffer includes its terminator. At most 39 command bytes
+; survive the warm boot; a 40th byte is silently lost by version 2.42.
+MEMMAN_COMMAND_MAX:      equ 39
 SUITE_PATH_MAX:          equ 63
 SUITE_PATH_BUFFER_SIZE:  equ SUITE_PATH_MAX + 1
 DOS_PATH_SEPARATOR:      equ 05Ch
@@ -59,6 +61,7 @@ DOS_PATH_SEPARATOR:      equ 05Ch
 MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
+MP_FILE_SIZE:            equ 002A6h ; 678-byte first-install port helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
 ; Once MEMMAN.COM starts, the old loader image and trampoline are disposable.
@@ -81,6 +84,7 @@ memman_loader_uninstall:
 memman_loader_entry:
     xor a
     ld (dos2_available),a
+    ld (suite_port_helper_required),a
     ld a,INVALID_HANDLE
     ld (suite_handle),a
 
@@ -138,6 +142,8 @@ loader_preflight:
     jr z,preflight_select_8251
     cp DRIVER_16C550
     jr z,preflight_select_16c550
+    cp DRIVER_UNAPI
+    jr z,preflight_select_unapi
     ld a,ERR_INVALID_PARAMETER
     ret
 
@@ -149,6 +155,13 @@ preflight_select_8251:
 preflight_select_16c550:
     ld de,suite_mcp16550_tsr_path
     ld a,DRIVER_16C550
+    jr preflight_install_selected
+
+preflight_select_unapi:
+    ld de,suite_mcpunapi_tsr_path
+    ld a,1
+    ld (suite_port_helper_required),a
+    ld a,DRIVER_UNAPI
 
 preflight_install_selected:
     ld (suite_expected_transport),a
@@ -177,6 +190,14 @@ preflight_install_selected:
     call suite_validate_selected_tsr
     or a
     ret nz
+    ld a,(suite_port_helper_required)
+    or a
+    jr z,preflight_command_length
+    ld de,suite_mp_path
+    ld hl,MP_FILE_SIZE
+    call suite_validate_regular_file
+    or a
+    ret nz
     jr preflight_command_length
 
 preflight_select_uninstall:
@@ -192,8 +213,8 @@ preflight_select_uninstall:
     or a
     ret nz
 
-    ; MSX-DOS accepts 127 characters, but the MemMan install path preserves
-    ; only 40 across its warm boot. Keep both supported tails inside that limit.
+    ; MSX-DOS accepts 127 characters, but MemMan 2.42 preserves only 39 command
+    ; bytes across its warm boot. Keep both supported tails inside that limit.
 preflight_command_length:
     ld hl,(suite_command_length)
     ld a,h
@@ -297,6 +318,16 @@ suite_resolve_paths:
     ld bc,mcp16550_tsr_name
     ld de,suite_mcp16550_tsr_path
     call suite_build_path
+    or a
+    ret nz
+    ld bc,mcpunapi_tsr_name
+    ld de,suite_mcpunapi_tsr_path
+    call suite_build_path
+    or a
+    ret nz
+    ld bc,mp_name
+    ld de,suite_mp_path
+    call suite_build_path
     ret
 
 ; Input BC=canonical filename and DE=destination buffer. Return A=0 on success.
@@ -384,6 +415,47 @@ suite_build_install_command_suffix:
     ld a,'@'
     ld (de),a
     inc de
+    ld a,(suite_port_helper_required)
+    or a
+    jr z,suite_build_install_command_length
+    ld hl,install_port_helper_prefix
+    ld bc,install_port_helper_prefix_length
+    ldir
+    ld hl,(loader_unapi_port)
+    ld a,h
+    rrca
+    rrca
+    rrca
+    rrca
+    call suite_build_install_command_hex_nibble
+    ld a,h
+    call suite_build_install_command_hex_nibble
+    ld a,l
+    rrca
+    rrca
+    rrca
+    rrca
+    call suite_build_install_command_hex_nibble
+    ld a,l
+    call suite_build_install_command_hex_nibble
+suite_build_install_command_port_done:
+    ld a,'@'
+    ld (de),a
+    inc de
+    jr suite_build_install_command_length
+
+; Append one uppercase hexadecimal nibble from A to the command at DE.
+suite_build_install_command_hex_nibble:
+    and 00Fh
+    cp 10
+    jr c,suite_build_install_command_hex_decimal
+    add a,'A' - 10 - '0'
+suite_build_install_command_hex_decimal:
+    add a,'0'
+    ld (de),a
+    inc de
+    ret
+suite_build_install_command_length:
     ld hl,install_command_buffer
     ex de,hl                     ; HL=end, DE=start
     or a
@@ -656,12 +728,20 @@ memman_agent_incompatible:
     scf
     ret
 
-; Input BC is the ID returned by GetTsrID.  The TSR's talk entry accepts A=A5h
-; and H=the desired byte-stream transport, then returns the active transport.
+; Input BC is the ID returned by GetTsrID. UART selection uses the original
+; A=A5/H=driver ABI. UNAPI uses the private A=A6/HL=port ABI because HL is the
+; only free 16-bit input that MemMan TsrCall 63 guarantees to the resident.
 memman_reconfigure_agent:
     ld a,(loader_transport_id)
+    cp DRIVER_UNAPI
+    jr z,memman_reconfigure_unapi
     ld h,a
-    ld a,0A5h
+    ld a,TSR_TALK_CONFIG
+    jr memman_reconfigure_call
+memman_reconfigure_unapi:
+    ld hl,(loader_unapi_port)
+    ld a,TSR_TALK_UNAPI_PORT
+memman_reconfigure_call:
     ld d,'M'
     ld e,63                    ; TsrCall
     jp EXTBIO
@@ -696,6 +776,8 @@ suite_close_error:
     db 0
 suite_expected_transport:
     db DRIVER_8251
+suite_port_helper_required:
+    db 0
 suite_probe_byte:
     db 0
 last_error:
@@ -723,7 +805,10 @@ mcp8251_tsr_name:
     db "MCP8251.TSR",0
 mcp16550_tsr_name:
     db "MCP16550.TSR",0
-
+mcpunapi_tsr_name:
+    db "MCPUNAPI.TSR",0
+mp_name:
+    db "MP.COM",0
 suite_home_buffer:
     ds SUITE_PATH_BUFFER_SIZE,0
 suite_memman_path:
@@ -736,16 +821,28 @@ suite_mcp8251_tsr_path:
     ds SUITE_PATH_BUFFER_SIZE,0
 suite_mcp16550_tsr_path:
     ds SUITE_PATH_BUFFER_SIZE,0
+suite_mcpunapi_tsr_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
+suite_mp_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
 
 ; '@' is MemMan's documented representation of Return.  MemMan 2.42 consumes
 ; the first Return while warm-booting COMMAND2, so the second '@' is required
 ; before the visible TL command. TL accepts a TSR path without extension.
 install_command_prefix:
+    ; MemMan consumes this normal command-tail leading blank before injecting
+    ; the post-warm-boot commands into COMMAND2.
     db " _SYSTEM@@TL "
 install_command_prefix_end:
 install_command_prefix_length: equ install_command_prefix_end - install_command_prefix
+install_port_helper_prefix:
+    ; COMMAND2 recognizes slash as the executable/tail delimiter. The following
+    ; fixed four hex digits keep `@MP/FFFE@` within the 39-byte payload limit.
+    db "MP/"
+install_port_helper_prefix_end:
+install_port_helper_prefix_length: equ install_port_helper_prefix_end - install_port_helper_prefix
 install_command_buffer:
-    ds install_command_prefix_length + SUITE_PATH_MAX + 1,0
+    ds install_command_prefix_length + SUITE_PATH_MAX + 1 + install_port_helper_prefix_length + 5 + 1,0
 
 uninstall_command:
     db " ",34,"MSXAI MCP1",34

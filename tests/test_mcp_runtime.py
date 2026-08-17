@@ -141,7 +141,7 @@ class MCPRuntimeTest(unittest.TestCase):
         backend = SimpleNamespace(
             status=lambda: {"state": "monitor", "state_code": 0,
                             "protocol": 3},
-            peer=("192.0.2.20", 6603), capabilities=0,
+            peer=("192.0.2.20", 43123), capabilities=0,
             resident_base=0xC000, agent_transport=None,
             agent_transport_id=None, network_transport="tcp",
             network_role="connect", local_endpoint=("192.0.2.10", 41000),
@@ -159,7 +159,8 @@ class MCPRuntimeTest(unittest.TestCase):
         finally:
             mcp_runtime.core.SESSION = previous
 
-        self.assertEqual(result.structured_content["peer"], ["192.0.2.20", 6603])
+        self.assertEqual(
+            result.structured_content["peer"], ["192.0.2.20", 43123])
         self.assertEqual(result.structured_content["local_endpoint"],
                          ["192.0.2.10", 41000])
 

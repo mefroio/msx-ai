@@ -66,6 +66,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
     def test_release_environment_cannot_enable_openmsx_integration(self):
         environment = release_check._release_environment()
         self.assertEqual(environment["MSX_RUN_INTEGRATION"], "0")
+        self.assertEqual(environment["MSX_RUN_UNAPI_INTEGRATION"], "0")
 
     def test_installed_probe_uses_default_private_state_location(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +107,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
         environment = run.call_args_list[0].kwargs["env"]
         self.assertEqual(environment["HOME"], environment["USERPROFILE"])
         self.assertEqual(environment["MSX_RUN_INTEGRATION"], "0")
+        self.assertEqual(environment["MSX_RUN_UNAPI_INTEGRATION"], "0")
 
     def test_runtime_smoke_uses_unambiguous_target_inventory(self):
         client = mock.MagicMock()
@@ -168,6 +170,8 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             release_check._assert_wheel_contents(list(extra_openmsx))
 
     def test_positive_sdist_content_policy_requires_release_sources(self):
+        self.assertIn(
+            "tests/test_port_helper.py", release_check._SDIST_REQUIRED_FILES)
         names = [f"msx_ai-0.6.0/{name}"
                  for name in release_check._SDIST_REQUIRED_FILES]
         release_check._assert_sdist_contents(names)
@@ -177,7 +181,9 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 release_check.ReleaseCheckError, "missing required source"):
             release_check._assert_sdist_contents(without_asset)
 
-    def test_agent_suite_requires_exactly_seven_nonempty_files(self):
+    def test_agent_suite_requires_exactly_nine_nonempty_files(self):
+        self.assertEqual(len(release_check._AGENT_SUITE_FILES), 9)
+        self.assertIn("MP.COM", release_check._AGENT_SUITE_FILES)
         with tempfile.TemporaryDirectory() as directory:
             agent = pathlib.Path(directory)
             for name in release_check._AGENT_SUITE_FILES:
@@ -197,7 +203,11 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     release_check.ReleaseCheckError, "empty artifacts"):
                 release_check._assert_agent_suite(agent)
 
-    def test_agent_suite_enforces_both_com_size_ceilings(self):
+    def test_agent_suite_enforces_all_three_com_size_ceilings(self):
+        self.assertEqual(
+            set(release_check._AGENT_COM_SIZE_CEILINGS),
+            {"MSXAI.COM", "MSXAIXF.COM", "MP.COM"},
+        )
         for oversized_name, ceiling in (
                 release_check._AGENT_COM_SIZE_CEILINGS.items()):
             with self.subTest(artifact=oversized_name), \
@@ -363,6 +373,13 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     "--metadata-output", str(build / "MSXAI_TSR.INC"),
                     "--8251-output", str(agent / "MCP8251.TSR"),
                     "--16c550-output", str(agent / "MCP16550.TSR"),
+                    "--unapi-output", str(agent / "MCPUNAPI.TSR"),
+                ],
+                [
+                    sys.executable, str(tools / "build_port_helper.py"),
+                    "--repository", str(source), "--assembler", assembler,
+                    "--source", str(source / "agent" / "msx_port_helper.asm"),
+                    "--output", str(agent / "MP.COM"),
                 ],
                 [
                     assembler, str(source / "agent" / "msx_agent.asm"),
@@ -552,7 +569,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             missing = root / "missing.zip"
             self.rewrite_zip(valid, missing, drop="TL.COM")
             with self.assertRaisesRegex(
-                    release_check.ReleaseCheckError, "exactly seven"):
+                    release_check.ReleaseCheckError, "exactly nine"):
                 release_check._assert_agent_archive(
                     missing, source, suite,
                     release_check._Z80ASM_VERSION_LINE)

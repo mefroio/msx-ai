@@ -27,7 +27,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
         makefile = MAKEFILE.read_text(encoding="utf-8")
         for artifact in (
                 "MSXAI.COM", "MSXAIXF.COM", "MCP8251.TSR",
-                "MCP16550.TSR", "MEMMAN.COM", "TL.COM", "TK.COM"):
+                "MCP16550.TSR", "MCPUNAPI.TSR", "MP.COM", "MEMMAN.COM",
+                "TL.COM", "TK.COM"):
             self.assertIn(artifact, makefile)
         self.assertNotIn("incbin", self.source.lower())
         self.assertIn('db "MEMMAN.COM",0', self.source)
@@ -35,12 +36,16 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn('db "TK.COM",0', self.source)
         self.assertIn('db "MCP8251.TSR",0', self.source)
         self.assertIn('db "MCP16550.TSR",0', self.source)
+        self.assertIn('db "MCPUNAPI.TSR",0', self.source)
+        self.assertIn('db "MP.COM",0', self.source)
         self.assertRegex(
             self.source, r"(?m)^MEMMAN_FILE_SIZE:\s+equ\s+01E00h")
         self.assertRegex(
             self.source, r"(?m)^TL_FILE_SIZE:\s+equ\s+00A00h")
         self.assertRegex(
             self.source, r"(?m)^TK_FILE_SIZE:\s+equ\s+00580h")
+        self.assertRegex(
+            self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+002A6h")
 
     def test_resident_lifecycle_creates_no_temporary_files(self):
         lifecycle = self.source.split(
@@ -84,6 +89,7 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld a,(loader_transport_id)", preflight)
         self.assertIn("cp DRIVER_8251", preflight)
         self.assertIn("cp DRIVER_16C550", preflight)
+        self.assertIn("cp DRIVER_UNAPI", preflight)
         validate = self.source.split(
             "suite_validate_selected_tsr:", 1)[1].split(
                 "suite_close_preserving_error:", 1)[0]
@@ -102,15 +108,24 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("strip .TSR", command_builder)
         self.assertIn("ld a,'@'", command_builder)
         self.assertIn("cp MEMMAN_COMMAND_MAX + 1", command_builder)
+        self.assertIn('db "MP/"', self.source)
+        self.assertEqual(
+            command_builder.count("call suite_build_install_command_hex_nibble"),
+            4,
+        )
         uninstall = self.source.split("uninstall_command:", 1)[1].split(
             "uninstall_command_end:", 1)[0]
         self.assertIn('db " ",34,"MSXAI MCP1",34', uninstall)
         self.assertNotIn("_SYSTEM", uninstall)
         self.assertRegex(
-            self.source, r"(?m)^MEMMAN_COMMAND_MAX:\s+equ\s+40$")
-        self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP8251@"), 40)
-        self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP16550@"), 40)
-        self.assertLessEqual(len(' "MSXAI MCP1"'), 40)
+            self.source, r"(?m)^MEMMAN_COMMAND_MAX:\s+equ\s+39$")
+        self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP8251@"), 39)
+        self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP16550@"), 39)
+        self.assertEqual(
+            len(" _SYSTEM@@TL A:\\MSXAI\\MCPUNAPI@MP/19CB@"), 39)
+        self.assertEqual(
+            len(" _SYSTEM@@TL A:\\MSXAI\\MCPUNAPI@MP/A873@"), 39)
+        self.assertLessEqual(len(' "MSXAI MCP1"'), 39)
         self.assertIn("ld de,COMMAND_TEXT", self.source)
         self.assertIn("ld (COMMAND_TAIL),a", self.source)
 
@@ -124,7 +139,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld c,DOS_GET_ENV", resolver)
         for destination in (
                 "suite_memman_path", "suite_tl_path", "suite_tk_path",
-                "suite_mcp8251_tsr_path", "suite_mcp16550_tsr_path"):
+                "suite_mcp8251_tsr_path", "suite_mcp16550_tsr_path",
+                "suite_mcpunapi_tsr_path", "suite_mp_path"):
             self.assertIn(f"ld de,{destination}", resolver)
         self.assertIn("ld a,(suite_home_buffer)", resolver)
         self.assertIn("jr z,suite_build_path_name", resolver)
@@ -141,7 +157,40 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld e,62", discovery)
         self.assertIn("ld e,63", discovery)
         self.assertIn('db "MSXAI MCP1  "', discovery)
-        self.assertIn("ld a,0A5h", discovery)
+        self.assertIn("ld a,TSR_TALK_CONFIG", discovery)
+        self.assertIn("ld a,TSR_TALK_UNAPI_PORT", discovery)
+
+    def test_unapi_port_handoff_separates_first_and_existing_resident(self):
+        entry = self.source.split("memman_loader_entry:", 1)[1].split(
+            "; ---------------------------------------------------------------------------\n"
+            "; Preflight", 1)[0]
+        self.assertNotIn("call loader_publish_unapi_port", entry)
+
+        builder = self.source.split(
+            "suite_build_install_command:", 1)[1].split(
+                "; ---------------------------------------------------------------------------\n"
+                "; External suite validation", 1)[0]
+        self.assertIn("ld a,(suite_port_helper_required)", builder)
+        self.assertIn("ld hl,install_port_helper_prefix", builder)
+        self.assertIn("ld hl,(loader_unapi_port)", builder)
+
+        reconfigure = self.source.split(
+            "memman_reconfigure_agent:", 1)[1].split(
+                "memman_tsr_name:", 1)[0]
+        self.assertIn("cp DRIVER_UNAPI", reconfigure)
+        self.assertIn("ld h,a", reconfigure)
+        self.assertIn("ld a,TSR_TALK_CONFIG", reconfigure)
+        self.assertIn("ld hl,(loader_unapi_port)", reconfigure)
+        self.assertIn("ld a,TSR_TALK_UNAPI_PORT", reconfigure)
+        self.assertNotIn("loader_publish_unapi_port", self.source)
+        self.assertNotIn("DOS_SET_ENV", self.source)
+        self.assertNotIn("MSXAI_PORT", self.source)
+
+        core = (ROOT / "agent" / "msx_agent_core.asm").read_text(
+            encoding="utf-8")
+        installed = core.split("loader_install_resident:", 1)[1].split(
+            "loader_install_resident_new:", 1)[0]
+        self.assertIn("call memman_reconfigure_agent", installed)
 
     def test_overlay_has_guards_and_an_explicit_point_of_no_return(self):
         self.assertIn("POINT OF NO RETURN", self.source)

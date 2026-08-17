@@ -590,6 +590,20 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(self.msx._v3.frame_wake_ack, FRAME_WAKE_ACK)
         self.assertEqual(self.msx._v3.frame_wake_delay, 0.0)
 
+    def test_unapi_transport_is_named_in_negotiated_status(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, transport_id=2, frame_wake_ack_feature=True)
+
+        info = self.msx.info()
+
+        self.assertEqual(info["transport"], "tcpip-unapi")
+        self.assertEqual(info["agent_transport"], "tcpip-unapi")
+        self.assertEqual(info["agent_transport_id"], 2)
+
     def test_safe_resident_negotiates_single_attempt_write_quarantine(self):
         self.msx.close()
         self.agent.close()

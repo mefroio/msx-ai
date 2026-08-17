@@ -16,6 +16,7 @@ from tools.build_agent_tsr import (  # noqa: E402
     H_TIMI,
     TRANSPORT_16C550,
     TRANSPORT_8251,
+    TRANSPORT_UNAPI,
     TSR_NAME,
     AgentTsrBuildError,
     LinkedImage,
@@ -76,6 +77,7 @@ class AgentTsrBuilderTest(unittest.TestCase):
             first_metadata = metadata.read_bytes()
             driver_8251 = first.driver_8251_path.read_bytes()
             driver_16c550 = first.driver_16c550_path.read_bytes()
+            driver_unapi = first.driver_unapi_path.read_bytes()
 
             self.assertEqual(first.size, len(first_data))
             self.assertEqual(len(first_data) % 128, 0)
@@ -104,14 +106,17 @@ class AgentTsrBuilderTest(unittest.TestCase):
             self.assertEqual(first_data[first.transport_file_offset], 0xFE)
             self.assertEqual(len(driver_8251), len(first_data))
             self.assertEqual(len(driver_16c550), len(first_data))
+            self.assertEqual(len(driver_unapi), len(first_data))
             self.assertEqual(
                 driver_8251[first.transport_file_offset], TRANSPORT_8251)
             self.assertEqual(
                 driver_16c550[first.transport_file_offset], TRANSPORT_16C550)
             self.assertEqual(
-                [index for index, pair in enumerate(
-                 zip(driver_8251, driver_16c550, strict=True))
-                 if pair[0] != pair[1]],
+                driver_unapi[first.transport_file_offset], TRANSPORT_UNAPI)
+            self.assertEqual(
+                [index for index, values in enumerate(zip(
+                    driver_8251, driver_16c550, driver_unapi, strict=True))
+                 if len(set(values)) != 1],
                 [first.transport_file_offset])
 
             metadata_text = first_metadata.decode("ascii")
@@ -134,6 +139,8 @@ class AgentTsrBuilderTest(unittest.TestCase):
             self.assertEqual(first.driver_8251_path.read_bytes(), driver_8251)
             self.assertEqual(
                 first.driver_16c550_path.read_bytes(), driver_16c550)
+            self.assertEqual(
+                first.driver_unapi_path.read_bytes(), driver_unapi)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ H_TIMI = 0xFD9F
 TRANSPORT_TEMPLATE = 0xFE
 TRANSPORT_8251 = 0
 TRANSPORT_16C550 = 1
+TRANSPORT_UNAPI = 2
 LABEL_LINE = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*):\s*equ\s+\$([0-9A-Fa-f]+)\s*$")
 REQUIRED_LABELS = (
@@ -70,6 +71,7 @@ class AgentTsrOutputs:
     metadata_path: pathlib.Path
     driver_8251_path: pathlib.Path
     driver_16c550_path: pathlib.Path
+    driver_unapi_path: pathlib.Path
     size: int
     transport_file_offset: int
     relocation_offsets: tuple[int, ...]
@@ -246,6 +248,7 @@ def build_agent_tsr(
         metadata_output: pathlib.Path, assembler: str = "z80asm",
         driver_8251_output: pathlib.Path | None = None,
         driver_16c550_output: pathlib.Path | None = None,
+        driver_unapi_output: pathlib.Path | None = None,
 ) -> AgentTsrOutputs:
     """Build, cross-check, and emit the template plus fixed-driver TSRs."""
 
@@ -306,8 +309,11 @@ def build_agent_tsr(
         driver_8251_output = output.with_name("MCP8251.TSR")
     if driver_16c550_output is None:
         driver_16c550_output = output.with_name("MCP16550.TSR")
+    if driver_unapi_output is None:
+        driver_unapi_output = output.with_name("MCPUNAPI.TSR")
     if len({output.resolve(), driver_8251_output.resolve(),
-            driver_16c550_output.resolve()}) != 3:
+            driver_16c550_output.resolve(),
+            driver_unapi_output.resolve()}) != 4:
         raise AgentTsrBuildError(
             "template and fixed-driver TSR outputs must be distinct")
 
@@ -315,10 +321,12 @@ def build_agent_tsr(
     driver_8251[transport_file_offset] = TRANSPORT_8251
     driver_16c550 = bytearray(result.data)
     driver_16c550[transport_file_offset] = TRANSPORT_16C550
+    driver_unapi = bytearray(result.data)
+    driver_unapi[transport_file_offset] = TRANSPORT_UNAPI
     differing = tuple(
-        index for index, (left, right) in enumerate(
-            zip(driver_8251, driver_16c550, strict=True))
-        if left != right)
+        index for index, values in enumerate(
+            zip(driver_8251, driver_16c550, driver_unapi, strict=True))
+        if len(set(values)) != 1)
     if differing != (transport_file_offset,):
         raise AgentTsrBuildError(
             "fixed-driver TSRs must differ only at the transport byte")
@@ -328,9 +336,11 @@ def build_agent_tsr(
     _atomic_write(metadata_output, metadata)
     _atomic_write(driver_8251_output, bytes(driver_8251))
     _atomic_write(driver_16c550_output, bytes(driver_16c550))
+    _atomic_write(driver_unapi_output, bytes(driver_unapi))
     return AgentTsrOutputs(
         output, metadata_output, driver_8251_output, driver_16c550_output,
-        len(result.data), transport_file_offset, result.relocation_offsets)
+        driver_unapi_output, len(result.data), transport_file_offset,
+        result.relocation_offsets)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -353,6 +363,9 @@ def _parser() -> argparse.ArgumentParser:
         "--16c550-output", dest="driver_16c550_output", type=pathlib.Path,
         default=REPOSITORY / "work" / "agent" / "MCP16550.TSR")
     parser.add_argument(
+        "--unapi-output", dest="driver_unapi_output", type=pathlib.Path,
+        default=REPOSITORY / "work" / "agent" / "MCPUNAPI.TSR")
+    parser.add_argument(
         "--assembler", default=os.environ.get("Z80ASM", "z80asm"))
     return parser
 
@@ -363,7 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         outputs = build_agent_tsr(
             args.repository, args.output, args.metadata_output,
             args.assembler, args.driver_8251_output,
-            args.driver_16c550_output)
+            args.driver_16c550_output, args.driver_unapi_output)
     except (AgentTsrBuildError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -374,6 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"wrote {outputs.metadata_path}")
     print(f"wrote {outputs.driver_8251_path}: transport 8251")
     print(f"wrote {outputs.driver_16c550_path}: transport 16C550")
+    print(f"wrote {outputs.driver_unapi_path}: transport UNAPI")
     return 0
 
 

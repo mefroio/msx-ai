@@ -23,7 +23,7 @@ class _FakePhysicalBackend:
 
     def connect(self, timeout):
         self.connect_timeout = timeout
-        return ("192.0.2.20", 6603)
+        return ("192.0.2.20", 43123)
 
     def close(self):
         self.closed = True
@@ -100,13 +100,13 @@ class BackendOptionalityTest(unittest.TestCase):
         with (mock.patch.object(msx_mcp_server, "OpenMSX") as openmsx,
               mock.patch.object(
                   msx_mcp_server, "RealMSX", return_value=physical) as real):
-            peer = session.connect_agent("192.0.2.20", port=6603, timeout=7)
+            peer = session.connect_agent("192.0.2.20", port=43123, timeout=7)
 
-        self.assertEqual(peer, ("192.0.2.20", 6603))
+        self.assertEqual(peer, ("192.0.2.20", 43123))
         self.assertEqual(session.profile, "real")
         self.assertIs(session.msx, physical)
         self.assertEqual(physical.connect_timeout, 7.0)
-        real.assert_called_once_with(host="192.0.2.20", port=6603)
+        real.assert_called_once_with(host="192.0.2.20", port=43123)
         openmsx.assert_not_called()
         session.shutdown()
         self.assertTrue(physical.closed)

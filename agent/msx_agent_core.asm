@@ -2,12 +2,12 @@
 ; MSX-AI universal MCP agent
 ; ============================================================================
 ; The default path installs a relocatable MemMan TSR in CPU page 1 and returns
-; to MSX-DOS. The BIOS H.TIMI chain keeps the UART service reachable while
+; to MSX-DOS. The BIOS H.TIMI chain keeps the selected transport reachable while
 ; ordinary DOS programs and cooperative games run. /MONITOR selects the older
 ; foreground supervisor below BDOS for explicit call/run workflows.
 ;
 ; The single wrapper includes every supported byte-stream driver. The loader
-; selects one explicitly from the MSX-DOS command line and binds six resident
+; selects one explicitly from the MSX-DOS command line and binds eight resident
 ; JP vectors once, so protocol throughput has no per-byte selection branch.
 ; Protocol v2 (all lengths are 1..255):
 ;   ?                         -> 'M', version, capabilities, resident-page
@@ -96,12 +96,14 @@ KEYBUF_SPOOL_FLAG_BARRIER: equ 1
 KEYBUF_SPOOL_FLAG_ACTIVE: equ 2
 KEYBUF_SPOOL_FLAG_AUTHORIZED: equ 4
 TSR_TALK_CONFIG: equ 0A5h
+TSR_TALK_UNAPI_PORT: equ 0A6h
 include 'agent/msx_xfer_protocol.inc'
 XFER_INLINE_GET_CAPACITY: equ FRAMED_SAFE_MAX - 8
-; The hook stack has no recursion, no local frame buffers and never calls user
-; code. A static high-water audit stays below 64 bytes; 224 bytes leaves more
-; than three times that headroom while keeping the universal build below BDOS.
-STACK_RESERVE:  equ 00E0h       ; 224 bytes; audited hook high-water is <64
+; The hook stack's protocol work itself stays below 64 bytes. A block transport
+; may reserve one additional 64-byte non-page-1 UNAPI staging window below SP.
+; The reserve of 224 bytes still leaves at least 96 bytes of call/interrupt
+; headroom while keeping the universal foreground build below BDOS.
+STACK_RESERVE:  equ 00E0h       ; 224 bytes; hook + UNAPI stage are <128
 
 RUNTIME_RESIDENT: equ 0
 RUNTIME_MONITOR:  equ 1
@@ -170,7 +172,10 @@ installer:
     or a
     ld de,transport_8251_banner
     jr z,install_banner_transport_ready
+    cp UART16C550_ID
     ld de,transport_16c550_banner
+    jr z,install_banner_transport_ready
+    ld de,transport_unapi_banner
 install_banner_transport_ready:
     ld c,9
     call 0005h
@@ -259,6 +264,8 @@ install_new:
     ld (runtime_mode),a
     ld a,(loader_debug_enabled)
     ld (debug_enabled),a
+    ld hl,(loader_unapi_port)
+    ld (unapi_listen_port),hl
 
     ; Preserve the CP/M compatibility bytes immediately preceding BDOS and
     ; create a proxy whose low byte remains 06h, as required by MSX-DOS.
@@ -315,6 +322,28 @@ install_new:
 install_tpa_ready:
 
     call resident_initialize
+    or a
+    jr z,install_enter_monitor
+    push af
+    call transport_restore
+    di
+    ld hl,old_keyi
+    ld de,H_KEYI
+    ld bc,5
+    ldir
+    ld hl,old_timi
+    ld de,H_TIMI
+    ld bc,5
+    ldir
+    ld hl,(old_bdos)
+    ld (0006h),hl
+    ei
+    ld de,transport_init_error_message
+    ld c,9
+    call 0005h
+    pop af
+    ld c,0                     ; keep /MONITOR failure portable to MSX-DOS 1
+    jp 0005h
 
 install_enter_monitor:
     ; The foreground monitor stack grows down through the reduced TPA, while
@@ -387,6 +416,8 @@ transport_8251_banner:
     db "Driver: 8251-compatible MSX RS-232",13,10,"$"
 transport_16c550_banner:
     db "Driver: 16C550-compatible UART, 115200 RTS/CTS",13,10,"$"
+transport_unapi_banner:
+    db "Driver: TCP/IP UNAPI passive listener",13,10,"$"
 resident_mode_banner:
     db "Mode: MemMan resident agent (default)",13,10,"$"
 monitor_mode_banner:
@@ -415,12 +446,18 @@ usage_message:
     db "Usage:",13,10
     db "  MSXAI /DRIVER:8251",13,10
     db "  MSXAI /DRIVER:16C550",13,10
+    db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>]",13,10
     db "  MSXAI /DRIVER:8251 /MONITOR [DEBUG]",13,10
     db "  MSXAI /DRIVER:16C550 /MONITOR [DEBUG]",13,10
+    db "  MSXAI /DRIVER:UNAPI /MONITOR [DEBUG]",13,10
     db "  MSXAI /UNINSTALL",13,10
     db "DEBUG is intentionally restricted to /MONITOR.",13,10,"$"
 driver_required_message:
-    db "Select exactly one /DRIVER:8251 or /DRIVER:16C550",13,10,"$"
+    db "Select exactly one /DRIVER:8251, /DRIVER:16C550, or /DRIVER:UNAPI",13,10,"$"
+transport_init_error_message:
+    db "Transport initialization failed",13,10,"$"
+port_requires_unapi_message:
+    db "/PORT requires /DRIVER:UNAPI and a value from 1 through 65534",13,10,"$"
 debug_requires_monitor_message:
     db "DEBUG requires /MONITOR",13,10,"$"
 uninstall_syntax_message:
@@ -445,6 +482,9 @@ loader_parse_command_line:
     ld (loader_runtime_mode),a
     ld (loader_debug_enabled),a
     ld (loader_action),a
+    ld (loader_port_seen),a
+    ld hl,6603
+    ld (loader_unapi_port),hl
 
     ; Normalize the counted CP/M command tail to uppercase and terminate it.
     ld a,(0080h)
@@ -490,15 +530,21 @@ loader_parse_token_loop:
     ld de,option_driver_16c550
     call loader_token_equals
     jr z,loader_parse_16c550
+    ld de,option_driver_unapi
+    call loader_token_equals
+    jr z,loader_parse_unapi
+    ld de,option_port_prefix
+    call loader_token_has_prefix
+    jr z,loader_parse_port
     ld de,option_monitor
     call loader_token_equals
-    jr z,loader_parse_monitor
+    jp z,loader_parse_monitor
     ld de,option_debug
     call loader_token_equals
-    jr z,loader_parse_debug
+    jp z,loader_parse_debug
     ld de,option_uninstall
     call loader_token_equals
-    jr z,loader_parse_uninstall
+    jp z,loader_parse_uninstall
     ld de,unknown_option_message
     jp loader_parse_error
 
@@ -517,6 +563,96 @@ loader_parse_16c550:
     ld a,UART16C550_ID
     ld (loader_transport_id),a
     call loader_skip_token
+    jp loader_parse_token_loop
+loader_parse_unapi:
+    ld a,(loader_transport_id)
+    cp 0FFh
+    jp nz,loader_parse_driver_error
+    ld a,UNAPI_ID
+    ld (loader_transport_id),a
+    call loader_skip_token
+    jp loader_parse_token_loop
+loader_parse_port:
+    ld a,(loader_port_seen)
+    or a
+    jp nz,loader_parse_port_error
+    ld a,1
+    ld (loader_port_seen),a
+    ; Advance HL past "/PORT:". The prefix comparison above preserved HL.
+    ld de,option_port_prefix
+loader_parse_port_prefix_loop:
+    ld a,(de)
+    or a
+    jr z,loader_parse_port_digits
+    inc hl
+    inc de
+    jr loader_parse_port_prefix_loop
+loader_parse_port_digits:
+    ld bc,0                    ; accumulated 16-bit decimal port
+    xor a
+    ld (loader_port_digit_count),a
+loader_parse_port_digit_loop:
+    ld a,(hl)
+    or a
+    jr z,loader_parse_port_complete
+    cp ' '
+    jr z,loader_parse_port_complete
+    cp 9
+    jr z,loader_parse_port_complete
+    cp '0'
+    jp c,loader_parse_port_error
+    cp '9' + 1
+    jp nc,loader_parse_port_error
+    ld e,a
+    ld a,(loader_port_digit_count)
+    inc a
+    cp 6
+    jp nc,loader_parse_port_error
+    ld (loader_port_digit_count),a
+    ld a,e
+    sub '0'
+    ld (loader_port_digit),a
+    push hl
+    ld h,b
+    ld l,c
+    add hl,hl                 ; value * 2
+    jp c,loader_parse_port_overflow_pop
+    ld d,h
+    ld e,l
+    add hl,hl                 ; value * 4
+    jp c,loader_parse_port_overflow_pop
+    add hl,hl                 ; value * 8
+    jp c,loader_parse_port_overflow_pop
+    add hl,de                 ; value * 10
+    jp c,loader_parse_port_overflow_pop
+    ld a,(loader_port_digit)
+    ld e,a
+    ld d,0
+    add hl,de
+    jp c,loader_parse_port_overflow_pop
+    ld b,h
+    ld c,l
+    pop hl
+    inc hl
+    jr loader_parse_port_digit_loop
+loader_parse_port_overflow_pop:
+    pop hl
+    jp loader_parse_port_error
+loader_parse_port_complete:
+    ld a,(loader_port_digit_count)
+    or a
+    jp z,loader_parse_port_error
+    ld a,b
+    or c
+    jp z,loader_parse_port_error
+    ld a,b
+    cp 0FFh
+    jr nz,loader_parse_port_storable
+    ld a,c
+    cp 0FFh                       ; FFFFh means a random local port in UNAPI
+    jp z,loader_parse_port_error
+loader_parse_port_storable:
+    ld (loader_unapi_port),bc
     jp loader_parse_token_loop
 loader_parse_monitor:
     ld a,RUNTIME_MONITOR
@@ -544,6 +680,13 @@ loader_parse_tokens_done:
     ld a,(loader_transport_id)
     cp 0FFh
     jr z,loader_parse_driver_error
+    ld a,(loader_port_seen)
+    or a
+    jr z,loader_parse_port_driver_ok
+    ld a,(loader_transport_id)
+    cp UNAPI_ID
+    jr nz,loader_parse_port_error
+loader_parse_port_driver_ok:
     ld a,(loader_debug_enabled)
     or a
     jr z,loader_parse_ok
@@ -552,6 +695,9 @@ loader_parse_tokens_done:
     jr nz,loader_parse_debug_error
     jr loader_parse_ok
 loader_parse_uninstall_done:
+    ld a,(loader_port_seen)
+    or a
+    jr nz,loader_parse_uninstall_error
     ld a,(loader_transport_id)
     cp 0FFh
     jr nz,loader_parse_uninstall_error
@@ -569,6 +715,9 @@ loader_parse_help:
     ret
 loader_parse_driver_error:
     ld de,driver_required_message
+    jr loader_parse_error
+loader_parse_port_error:
+    ld de,port_requires_unapi_message
     jr loader_parse_error
 loader_parse_debug_error:
     ld de,debug_requires_monitor_message
@@ -648,6 +797,37 @@ loader_token_yes:
     xor a
     ret
 
+; Compare only the zero-terminated prefix at DE. Z means that the token at HL
+; begins with that prefix; both pointers and BC are preserved.
+loader_token_has_prefix:
+    push hl
+    push de
+    push bc
+loader_token_prefix_compare:
+    ld a,(de)
+    or a
+    jr z,loader_token_prefix_yes
+    ld c,a
+    ld a,(hl)
+    cp c
+    jr nz,loader_token_prefix_no
+    inc hl
+    inc de
+    jr loader_token_prefix_compare
+loader_token_prefix_no:
+    pop bc
+    pop de
+    pop hl
+    ld a,1
+    or a
+    ret
+loader_token_prefix_yes:
+    pop bc
+    pop de
+    pop hl
+    xor a
+    ret
+
 option_help_short:
     db "/?",0
 option_help_long:
@@ -656,6 +836,10 @@ option_driver_8251:
     db "/DRIVER:8251",0
 option_driver_16c550:
     db "/DRIVER:16C550",0
+option_driver_unapi:
+    db "/DRIVER:UNAPI",0
+option_port_prefix:
+    db "/PORT:",0
 option_monitor:
     db "/MONITOR",0
 option_debug:
@@ -664,6 +848,14 @@ option_uninstall:
     db "/UNINSTALL",0
 loader_old_bdos:
     dw 0
+loader_unapi_port:
+    dw 6603
+loader_port_seen:
+    db 0
+loader_port_digit_count:
+    db 0
+loader_port_digit:
+    db 0
 
 install_inconsistent:
     ld de,inconsistent_message
@@ -706,7 +898,7 @@ endif
 resident_start:
 if MSXAI_TSR_BUILD
 active_transport_id:
-    db 0FEh                     ; build-time template; packaged TSRs patch 0/1
+    db 0FEh                     ; build-time template; packaged TSRs patch 0/1/2
 resident_page:
     db 0
 else
@@ -766,6 +958,11 @@ transport_state:
     ; Opaque to the core. Offsets are private constants in the selected driver.
     ds TRANSPORT_STATE_SIZE,0
 framed_mode:
+    db 0
+transport_session_lost:
+    ; Set by stream transports when the peer disappears.  The driver must not
+    ; reopen while a parser stack still belongs to the old stream; the core
+    ; unwinds to its hook/pump/monitor checkpoint and clears this flag there.
     db 0
 post_action_pending:
     db 0
@@ -903,10 +1100,29 @@ xfer_last_accepted:
     dw 0
 xfer_math32:
     ds 4,0
+; TsrCall configuration is transactional. These values survive transport_init,
+; whose implementation is free to clobber registers or briefly enable IRQs.
+tsr_config_old_transport:
+    db 0
+tsr_config_requested_transport:
+    db 0
+tsr_config_old_port:
+    dw 0
+tsr_config_requested_port:
+    dw 0
+tsr_config_explicit_port:
+    db 0
+tsr_config_old_unapi_live:
+    db 0
 endif
 
 resident_initialize:
     di
+    ; A UNAPI implementation may execute EI internally. Close the hook guard
+    ; before discovery so an initialization-time timer tick cannot enter an
+    ; unbound or half-initialized transport.
+    ld a,1
+    ld (in_hook),a
     ld hl,resident_start
     ld a,h
     ld (resident_page),a
@@ -919,6 +1135,17 @@ resident_initialize:
     call detect_vram_capacity
     call transport_bind
     call transport_init
+if MSXAI_TSR_BUILD
+    ; Only a fixed UNAPI image defers its initial TCP_OPEN. Clear the one-shot
+    ; marker after every first transport initialization so a TSR initially
+    ; installed for a UART never defers a later foreground switch to UNAPI.
+    push af
+    xor a
+    ld (unapi_defer_first_open),a
+    pop af
+endif
+    or a
+    ret nz
     xor a
     ld (in_hook),a
     ld (resume_requested),a
@@ -932,9 +1159,11 @@ if MSXAI_TSR_BUILD
 endif
     ld a,(runtime_mode)
     cp RUNTIME_RESIDENT
-    ret nz
+    jr nz,resident_initialize_ok
     ld a,1
     ld (run_state),a
+resident_initialize_ok:
+    xor a
     ret
 
 resident_main:
@@ -954,6 +1183,9 @@ endif
 main_loop:
 if MSXAI_TSR_BUILD
 else
+    ld (hook_dispatch_sp),sp    ; safe foreground unwind boundary
+    call transport_service
+    call transport_session_finalize
     call transport_rx_ready
     or a
     jr nz,main_loop_receive
@@ -1119,6 +1351,8 @@ hook_poll_transport:
     ld a,(xfer_fast_pump_active)
     or a
     jr nz,hook_done
+    call transport_service
+    call transport_session_guard
     call transport_rx_ready
     or a
     jr z,hook_done
@@ -1134,6 +1368,7 @@ hook_dispatch_frame:
     call receive_dispatch
 
 hook_done:
+    call transport_session_finalize
     xor a
     ld (in_hook),a
     exx
@@ -1271,6 +1506,8 @@ hook_chain_ready:
     and TRANSPORT_FLAG_TIMI_ONLY
     jr nz,hook_done             ; TIMI-only drivers never dispatch from H.KEYI
 hook_poll_transport:
+    call transport_service
+    call transport_session_guard
     call transport_rx_ready
     or a
     jr z,hook_done
@@ -1285,6 +1522,7 @@ hook_poll_transport:
 hook_dispatch_frame:
     call receive_dispatch
 hook_done:
+    call transport_session_finalize
     xor a
     ld (in_hook),a
 
@@ -1921,7 +2159,7 @@ monitor_exit_to_dos:
     ldir
     ld hl,(old_bdos)
     ld (0006h),hl
-    call transport_restore
+    call transport_restore_foreground_retry
     ei
     ld c,0
     jp 0005h
@@ -2005,6 +2243,7 @@ frame_have_magic_m:
     jr z,frame_wait_second_magic
     ld a,FRAME_WAKE_ACK
     call ser_put
+    call transport_flush_checked
 frame_wait_second_magic:
     call ser_get
     cp 'X'
@@ -2021,6 +2260,7 @@ frame_reconnect_byte:
     jr z,frame_reconnect_count_byte
     ld a,FRAME_WAKE_ACK
     call ser_put
+    call transport_flush_checked
 frame_reconnect_count_byte:
     ld a,(frame_reconnect_count)
     inc a
@@ -2452,6 +2692,7 @@ frame_emit_crc:
     call ser_put
     ld a,h
     call ser_put
+    call transport_flush_checked
 if MSXAI_TSR_BUILD
     ; In redesigned fast-v1, successfully emitting the complete GET response
     ; is the delivery boundary. The reliable ordered stream makes a second
@@ -2999,6 +3240,89 @@ xfer_reset:
     ld bc,4 + 4 + 4 + 4 + 2 + 2 + 4 - 1
     ld (hl),a
     ldir
+    ret
+
+; An explicit foreground transport reconfiguration cannot share the transient
+; MSXAIXF.COM process that owned page-zero buffers before it.  Preserve the
+; durable descriptor/checkpoint for a bound resume, but discard every pointer
+; and uncommitted byte owned by that old helper.  This is deliberately separate
+; from a normal TCP stream loss, where the same foreground helper remains alive.
+xfer_reconfigure_detach:
+    xor a
+    ld (xfer_pending),a
+    ld (xfer_close_requested),a
+    ld (xfer_foreground_ready),a
+    ld (xfer_fast_armed),a
+    ld (xfer_fast_pump_active),a
+    ld (xfer_fast_get_commit_after_send),a
+    ld (xfer_fast_get_rewind_pending),a
+    ld (frame_external_request),a
+    ld (frame_external_response),a
+    ld (xfer_get_ack_pending),a
+    ld hl,0
+    ld (xfer_fast_pump_sp),hl
+    ld (xfer_fast_page0_buffer),hl
+    ld (xfer_fast_page0_frame),hl
+    ld (xfer_fast_rate_hint),hl
+    ld (xfer_buffer_length),hl
+    ld (xfer_request_count),hl
+    ld (xfer_last_accepted),hl
+    ld hl,xfer_durable
+    ld de,xfer_accepted
+    ld bc,4
+    ldir
+    ld hl,xfer_durable
+    ld de,xfer_buffer_offset
+    ld bc,4
+    ldir
+    ld hl,xfer_durable
+    ld de,xfer_fast_get_sent_offset
+    ld bc,4
+    ldir
+    ld hl,xfer_durable
+    ld de,xfer_descriptor + XFER_DESC_RESUME_OFFSET
+    ld bc,4
+    ldir
+    ld hl,xfer_prefix_crc
+    ld de,xfer_descriptor + XFER_DESC_PREFIX_CRC
+    ld bc,4
+    ldir
+
+    ld a,(xfer_state)
+    cp XFER_STATE_STAGED
+    ret c                           ; IDLE remains terminal/empty
+    cp XFER_STATE_POSTPROCESS
+    jr z,xfer_reconfigure_postprocess_failed
+    cp XFER_STATE_COMPLETE
+    jr c,xfer_reconfigure_restage  ; STAGED through VERIFYING
+    cp XFER_STATE_SUSPENDED
+    jr z,xfer_reconfigure_restage
+    ret                             ; COMPLETE, FAILED, CANCELLED stay terminal
+
+xfer_reconfigure_restage:
+    ; PUT resume with a zero boundary safely falls back to creating a new
+    ; sidecar; a nonzero boundary must never be reopened as a new transfer.
+    ld a,(xfer_descriptor + XFER_DESC_FLAGS)
+    or XFER_FLAG_RESUME
+    ld (xfer_descriptor + XFER_DESC_FLAGS),a
+    ld a,XFER_STATE_STAGED
+    ld (xfer_state),a
+    xor a
+    ld (xfer_error),a
+    ld a,XFER_STATUS_ACTIVE | XFER_STATUS_RESUMABLE
+    ld (xfer_result_flags),a
+    ret
+
+xfer_reconfigure_postprocess_failed:
+    ; Publication may already have removed the sidecar before FINISH.  A host
+    ; journal carrying fsync-backed close intent must issue a fresh OPEN so the
+    ; receiptless-replay checks run; do not relaunch the stale descriptor.
+    ld a,XFER_STATE_FAILED
+    ld (xfer_state),a
+    ld a,XFER_ERROR_IO
+    ld (xfer_error),a
+    ld a,XFER_STATUS_RESUMABLE
+    ld (xfer_result_flags),a
     ret
 endif
 
@@ -4807,8 +5131,10 @@ get_addr:
     ret
 
 ; ------------------------------------------------------- transport layer ----
-; The installer selects one descriptor and patches these six JP operands once.
-; There is therefore no 8251/16C550 branch in the per-byte hot path.
+; The installer selects one descriptor and patches these eight JP operands once.
+; The original six-entry byte ABI remains intact; service and flush are no-ops
+; for UARTs and let buffered/block transports make progress without per-byte
+; product branches in the protocol core. Init returns A=0 or an error code.
 transport_init:
     jp 0000h
 transport_restore:
@@ -4821,15 +5147,43 @@ transport_read:
     jp 0000h
 transport_write:
     jp 0000h
+transport_service:
+    jp 0000h
+transport_flush:
+    jp 0000h
+
+; Foreground teardown is immediately followed by discarding the monitor image
+; or by TK releasing the MemMan segment. Retry transient restore/ABORT failures
+; three times, but never hang teardown indefinitely. If every attempt fails, a
+; UNAPI implementation may retain an orphan socket after the caller exits.
+transport_restore_foreground_retry:
+    ld b,3
+transport_restore_foreground_retry_loop:
+    push bc
+    call transport_restore
+    pop bc
+    or a
+    ret z
+    djnz transport_restore_foreground_retry_loop
+    ret
 
 transport_bind:
     ld a,(active_transport_id)
     cp UART8251_ID
     jr z,transport_bind_8251
+    cp UNAPI_ID
+    jr z,transport_bind_unapi
     ld hl,uart16c550_vector_table
     ld a,UART16C550_FLAGS
     ld (active_transport_flags),a
     ld a,UART16C550_CONTROL_LEVEL
+    ld (active_transport_control_level),a
+    jr transport_bind_vectors
+transport_bind_unapi:
+    ld hl,unapi_vector_table
+    ld a,UNAPI_FLAGS
+    ld (active_transport_flags),a
+    ld a,UNAPI_CONTROL_LEVEL
     ld (active_transport_control_level),a
     jr transport_bind_vectors
 transport_bind_8251:
@@ -4840,7 +5194,7 @@ transport_bind_8251:
     ld (active_transport_control_level),a
 transport_bind_vectors:
     ld de,transport_init + 1
-    ld b,6
+    ld b,8
 transport_bind_loop:
     ld a,(hl)
     ld (de),a
@@ -4857,12 +5211,97 @@ transport_bind_loop:
 uart8251_vector_table:
     dw uart8251_init,uart8251_restore,uart8251_rx_ready
     dw uart8251_tx_ready,uart8251_read,uart8251_write
+    dw uart8251_service,uart8251_flush
 uart16c550_vector_table:
     dw uart16c550_init,uart16c550_restore,uart16c550_rx_ready
     dw uart16c550_tx_ready,uart16c550_read,uart16c550_write
+    dw uart16c550_service,uart16c550_flush
+unapi_vector_table:
+    dw unapi_init,unapi_restore,unapi_rx_ready
+    dw unapi_tx_ready,unapi_read,unapi_write
+    dw unapi_service,unapi_flush
+
+; A clean TCP disconnect is a stream boundary, not a serial timeout.  Reset
+; only protocol state owned by that stream.  In particular, preserve the
+; protocol-X descriptor, accepted/durable offsets, and foreground helper state
+; so a new host can FAST_BEGIN at the last durable checkpoint.
+transport_session_reset:
+    xor a
+    ld (transport_session_lost),a
+    ld (framed_mode),a
+    ld (last_response_valid),a
+    ld (last_request_valid),a
+    ld (frame_reconnect_count),a
+    ld (post_action_pending),a
+if MSXAI_TSR_BUILD
+    ld (xfer_fast_armed),a
+    ld (xfer_fast_get_commit_after_send),a
+    ld (frame_external_request),a
+    ld (frame_external_response),a
+endif
+    ld hl,0
+    ld (next_sequence),hl
+    call keybuf_spool_reset
+    ret
+
+; Finalization is called only at a stack checkpoint that no longer contains a
+; parser for the disconnected stream.  Until then the UNAPI driver leaves the
+; listener closed, preventing bytes from a new peer from completing an old
+; frame.
+transport_session_finalize:
+    ld a,(transport_session_lost)
+    or a
+    ret z
+    jp transport_session_reset
+
+transport_session_guard:
+    ld a,(transport_session_lost)
+    or a
+    ret z
+    jp transport_session_abort
+
+; A flush is a delivery boundary for framed responses and fast GET blocks.
+; Buffered transports must either accept all resident bytes or declare the
+; stream lost; never commit protocol state after a failed/partial flush.
+transport_flush_checked:
+    call transport_flush
+    or a
+    jr nz,transport_flush_failed
+    ld a,(transport_session_lost)
+    or a
+    ret z
+    jp transport_session_abort
+transport_flush_failed:
+    ld a,(transport_session_lost)
+    or a
+    jp nz,transport_session_abort
+    ld a,1
+    ld (transport_session_lost),a
+    jp transport_session_abort
+
+transport_session_abort:
+if MSXAI_TSR_BUILD
+    ld a,(xfer_fast_pump_active)
+    or a
+    jp nz,xfer_fast_pump_session_lost
+    ; A resident protocol dispatcher outside the foreground pump is necessarily
+    ; running from a BIOS hook and owns hook_dispatch_sp.
+    jp hook_transport_session_lost
+else
+    ld a,(in_hook)
+    or a
+    jp nz,hook_transport_session_lost
+    ld sp,(hook_dispatch_sp)
+    ld a,(vram_active)
+    or a
+    call nz,restore_r14
+    call transport_session_finalize
+    jp main_loop
+endif
 
 include 'agent/transports/msx_transport_8251.inc'
 include 'agent/transports/msx_transport_16c550.inc'
+include 'agent/transports/msx_transport_unapi.inc'
 
 ; In foreground monitor mode serial I/O waits indefinitely. Inside a BIOS hook
 ; a missing byte/peer gets one explicitly bounded polling period; expiration
@@ -4883,6 +5322,8 @@ ser_put_hook_wait:
     call transport_tx_ready
     or a
     jr nz,ser_put_hook_ready
+    call transport_service
+    call transport_session_guard
     dec bc
     ld a,b
     or c
@@ -4900,6 +5341,8 @@ ser_put_pump_wait:
     call transport_tx_ready
     or a
     jr nz,ser_put_pump_ready
+    call transport_service
+    call transport_session_guard
     dec bc
     ld a,b
     or c
@@ -4913,7 +5356,11 @@ endif
 ser_put_wait:
     call transport_tx_ready
     or a
-    jr z,ser_put_wait
+    jr nz,ser_put_wait_ready
+    call transport_service
+    call transport_session_guard
+    jr ser_put_wait
+ser_put_wait_ready:
     pop af
     jp transport_write
 
@@ -4932,6 +5379,8 @@ ser_get_hook_wait:
     call transport_rx_ready
     or a
     jr nz,ser_get_hook_ready
+    call transport_service
+    call transport_session_guard
     dec bc
     ld a,b
     or c
@@ -4948,6 +5397,8 @@ ser_get_pump_wait:
     call transport_rx_ready
     or a
     jr nz,ser_get_pump_ready
+    call transport_service
+    call transport_session_guard
     dec bc
     ld a,b
     or c
@@ -4960,8 +5411,34 @@ endif
 ser_get_wait:
     call transport_rx_ready
     or a
-    jr z,ser_get_wait
+    jr nz,ser_get_wait_ready
+    call transport_service
+    call transport_session_guard
+    jr ser_get_wait
+ser_get_wait_ready:
     jp transport_read
+
+hook_transport_session_lost:
+    ; Drop every return address belonging to the disconnected stream before a
+    ; fresh listener can be opened.  A paused program is resumed: its old host
+    ; can no longer send RESUME, and the next host starts a new protocol epoch.
+    ld sp,(hook_dispatch_sp)
+    ld a,(vram_active)
+    or a
+    call nz,restore_r14
+    xor a
+    ld (post_action_pending),a
+    ld (resume_requested),a
+    ld (snapshot_lease),a
+    ld (snapshot_lease_reload),a
+    ld a,(run_state)
+    cp 2
+    jr nz,hook_session_state_ready
+    ld a,1
+    ld (run_state),a
+hook_session_state_ready:
+    call transport_session_finalize
+    jp hook_done
 
 hook_transport_timeout:
     ; Drop all nested dispatcher return addresses, resume a paused application
@@ -5010,8 +5487,15 @@ if MSXAI_TSR_BUILD
 ; A foreground pump owns a different stack from a BIOS hook.  A partial or
 ; lost frame is abandoned at its own saved TsrCall boundary; the helper then
 ; loops and can receive an idempotent retry or reconnect marker safely.
+xfer_fast_pump_session_lost:
+    ld sp,(xfer_fast_pump_sp)
+    call xfer_fast_pump_abandon
+    call transport_session_finalize
+    ret
+
 xfer_fast_pump_timeout:
     ld sp,(xfer_fast_pump_sp)
+xfer_fast_pump_abandon:
     xor a
     ; Never let a later unrelated response commit a GET block whose original
     ; response stopped part-way through transmission.
@@ -5041,7 +5525,9 @@ if MSXAI_TSR_BUILD
 ; TsrKill calls this only after MemMan has detached both registered hooks.
 tsr_kill:
     di
-    call transport_restore
+    ; TK 2.42 ignores this routine's result and releases the segment, so use the
+    ; same bounded foreground teardown policy as the transient monitor.
+    call transport_restore_foreground_retry
     ret
 
 ; Foreground suite programs use TsrCall to configure the selected driver and
@@ -5049,6 +5535,8 @@ tsr_kill:
 tsr_talk:
     cp TSR_TALK_CONFIG
     jp z,tsr_talk_config
+    cp TSR_TALK_UNAPI_PORT
+    jp z,tsr_talk_unapi_port
     cp TSR_TALK_XFER_CLAIM
     jp z,tsr_talk_xfer_claim
     cp TSR_TALK_XFER_READY
@@ -5073,32 +5561,144 @@ tsr_talk:
 
 tsr_talk_config:
     ld a,h
-    cp 2
+    cp UNAPI_ID + 1
     jp nc,tsr_talk_unsupported
     ld b,a
     ld a,(active_transport_id)
     cp b
-    jr z,tsr_talk_done
-    push bc
-    di
-    call transport_restore
-    pop bc
+    jr nz,tsr_talk_config_begin
+    ; A same-driver UART request is already satisfied. The legacy A5 UNAPI
+    ; request still relistens on its current binary port for compatibility.
     ld a,b
+    cp UNAPI_ID
+    jp nz,tsr_talk_done
+tsr_talk_config_begin:
+    xor a
+    ld (tsr_config_explicit_port),a
+tsr_talk_config_begin_common:
+    ld a,(active_transport_id)
+    ld (tsr_config_old_transport),a
+    ld hl,(unapi_listen_port)
+    ld (tsr_config_old_port),hl
+    ; A freshly installed fixed UNAPI image has completed discovery but owns no
+    ; listener until MP's A6 call. Remember actual ownership, not merely ID 2,
+    ; so a failed first OPEN cannot manufacture a default-port rollback socket.
+    xor a
+    ld (tsr_config_old_unapi_live),a
+    ld a,(active_transport_id)
+    cp UNAPI_ID
+    jr nz,tsr_talk_config_old_live_ready
+    ld a,(unapi_connection)
+    or a
+    jr z,tsr_talk_config_old_live_ready
+    ld a,1
+    ld (tsr_config_old_unapi_live),a
+tsr_talk_config_old_live_ready:
+    ld a,b
+    ld (tsr_config_requested_transport),a
+    di
+    ld a,1
+    ld (in_hook),a
+    call transport_restore
+    or a
+    jp nz,tsr_talk_config_abort_failed
+    ld a,(tsr_config_requested_transport)
     ld (active_transport_id),a
     call transport_bind
+    ld a,(tsr_config_explicit_port)
+    or a
+    jr z,tsr_talk_config_init_selected
+    ld hl,(tsr_config_requested_port)
+    ld (unapi_listen_port),hl
+    call unapi_init_current_port
+    jr tsr_talk_config_init_done
+tsr_talk_config_init_selected:
     call transport_init
-    call keybuf_spool_reset     ; never carry synthetic input to a new driver
-    call xfer_reset             ; staged descriptors are transport-bound
+tsr_talk_config_init_done:
+    or a
+    jr nz,tsr_talk_config_failed
+    call transport_session_reset ; parser and mailboxes are transport-bound
+    ld a,(tsr_config_old_transport)
+    ld b,a
+    ld a,(tsr_config_requested_transport)
+    cp b
+    jr nz,tsr_talk_config_reset_xfer
+    call xfer_reconfigure_detach  ; same UNAPI, but a different foreground COM
+    jr tsr_talk_config_xfer_done
+tsr_talk_config_reset_xfer:
+    call xfer_reset               ; a real driver change invalidates staging
+tsr_talk_config_xfer_done:
     xor a
-    ld (framed_mode),a
-    ld (last_response_valid),a
-    ld (last_request_valid),a
-    ld (frame_reconnect_count),a
-    ld hl,0
-    ld (next_sequence),hl
+    ld (in_hook),a
+    jr tsr_talk_done
+
+tsr_talk_config_failed:
+    ; Best-effort rollback. For an old UNAPI transport, reopen exactly the
+    ; saved binary port without consulting any transient process state.
+    call transport_restore
+    or a
+    jr nz,tsr_talk_config_failed_detach
+    ld hl,(tsr_config_old_port)
+    ld (unapi_listen_port),hl
+    ld a,(tsr_config_old_transport)
+    ld (active_transport_id),a
+    call transport_bind
+    ld a,(active_transport_id)
+    cp UNAPI_ID
+    jr nz,tsr_talk_config_restore_uart
+    ld a,(tsr_config_old_unapi_live)
+    or a
+    jr z,tsr_talk_config_restore_unapi_idle
+    call unapi_init_current_port
+    jr tsr_talk_config_restore_done
+tsr_talk_config_restore_unapi_idle:
+    ; The old UNAPI state had no live listener (possibly only a cleanup retry).
+    ; Restore that fail-closed shape exactly; a later explicit A6 may retry.
+    call unapi_clear_runtime
+    jr tsr_talk_config_restore_done
+tsr_talk_config_restore_uart:
+    call transport_init
+tsr_talk_config_restore_done:
+    ; The requested transport failed after the old stream was destroyed.  Drop
+    ; its framing/cache epoch and detach any transient helper even if the
+    ; best-effort rollback could not reopen the old transport.
+tsr_talk_config_failed_detach:
+    call transport_session_reset
+    call xfer_reconfigure_detach
+    xor a
+    ld (in_hook),a
+    ld a,0FFh                  ; never report the requested ID after init failed
+    ret
+tsr_talk_config_abort_failed:
+    ; The old driver still owns a handle that could not be aborted. Preserve
+    ; its transport/session state and refuse to initialize a second endpoint.
+    xor a
+    ld (in_hook),a
+    ld a,0FFh
+    ret
 tsr_talk_done:
     ld a,(active_transport_id)
     ret
+
+; Private suite ABI for an explicit UNAPI listener: MemMan TsrCall 63 passes HL
+; unchanged, while BC identifies the TSR and DE carries the MemMan function.
+; Validating here keeps every caller from exposing UNAPI's FFFFh random-port
+; sentinel and makes a successful return mean TCP_OPEN actually ran.
+tsr_talk_unapi_port:
+    ld a,h
+    or l
+    jp z,tsr_talk_unsupported
+    ld a,h
+    and l
+    inc a
+    jp z,tsr_talk_unsupported
+    ld (tsr_config_requested_port),hl
+    ld a,1
+    ld (tsr_config_explicit_port),a
+    ld a,UNAPI_ID
+    ld b,a
+    ld (tsr_config_requested_transport),a
+    jp tsr_talk_config_begin_common
 
 ; Validate that an entire caller range beginning at HL remains in page zero.
 ; Input BC=count. Carry means that TsrCall's page-1 mapping would hide part of
@@ -5166,6 +5766,8 @@ tsr_talk_xfer_pump_store_buffer:
     ld (xfer_fast_pump_sp),sp
     ld a,1
     ld (xfer_fast_pump_active),a
+    call transport_service
+    call transport_session_guard
     call transport_rx_ready
     or a
     jr z,tsr_talk_xfer_pump_done
@@ -5175,6 +5777,7 @@ tsr_talk_xfer_pump_done:
     ld (xfer_fast_pump_active),a
     ld (xfer_fast_pump_sp),a
     ld (xfer_fast_pump_sp + 1),a
+    call transport_session_finalize
     ret
 tsr_talk_xfer_pump_idle:
     xor a
@@ -5619,12 +6222,30 @@ if MSXAI_TSR_BUILD
 ; Initialization is deliberately last: TsrLoad releases this tail after the
 ; resident code and hook table have been registered.
 tsr_init:
+    ; The resident template is copied by TsrLoad independently of this tail.
+    ; Arm the one-shot only in the final resident mapping so TL cannot restore
+    ; a stale `1` after initialization and accidentally defer MP's A6 TsrCall.
+    ld a,1
+    ld (unapi_defer_first_open),a
     call resident_initialize
+    or a
+    jr nz,tsr_init_failed
     ld de,tsr_intro_message
     ld a,2                     ; install and ask TsrLoad to print the intro
     ret
+tsr_init_failed:
+    ; TsrLoad bit 0 rejects the image. Release any handle that TCP_OPEN may have
+    ; allocated before returning the failure message in the disposable tail.
+    call transport_restore
+    xor a
+    ld (in_hook),a
+    ld de,tsr_init_error_message
+    ld a,3                     ; reject installation and ask TsrLoad to print DE
+    ret
 tsr_intro_message:
     db "MSX-AI MCP resident agent installed",13,10,0
+tsr_init_error_message:
+    db "MSX-AI transport initialization failed",13,10,0
 tsr_init_end:
 else
 hook_stack_top: equ resident_end + STACK_RESERVE

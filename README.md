@@ -202,20 +202,41 @@ does not prevent `msx_local_screenshot` from diagnosing the existing machine.
 
 Use this path when actual MSX hardware behavior is the subject of the session.
 
-1. Install the seven-file suite described below and run either
-   `MSXAI /DRIVER:8251` or `MSXAI /DRIVER:16C550`.
-2. Configure a compatible adapter as a transparent binary TCP/IPv4 bridge with
-   matching UART settings and flow control.
-3. If the adapter connects outward, call `msx_agent_listen` with the host
-   machine's specific LAN IPv4 address. The safe default `127.0.0.1` accepts
-   only local simulation. If the adapter accepts an incoming connection, call
-   `msx_agent_connect` with its IPv4 address.
-4. Call `msx_agent_status` before any mutation and verify runtime, transport, and
-   feature negotiation.
+1. Install the nine-file suite described below.
+2. For a UART bridge, run `MSXAI /DRIVER:8251` or
+   `MSXAI /DRIVER:16C550` and configure the bridge with matching serial
+   settings and flow control. If it connects outward, call
+   `msx_agent_listen` on the host's specific LAN IPv4 address; if it accepts
+   connections, call `msx_agent_connect` with its IPv4 address.
+3. For an MSX Pico+ or an original MSX Pico equipped with Wi-Fi, first use the
+   cartridge's existing Wi-Fi Setup. Then run `MSXAI /DRIVER:UNAPI`, or add
+   `/PORT:<1..65534>` to choose a listener port other than the default `6603`.
+   UNAPI reserves `65535` (`FFFFh`) as a random-port sentinel, so it cannot be
+   selected as a predictable listener endpoint.
+   Call `msx_agent_connect` with the MSX's IPv4 address and the same port.
+   For the first physical test, `/MONITOR` is the conservative choice because
+   listener lifecycle calls remain in foreground while it is idle. After
+   `RUN`, data-path polling still occurs from `H.TIMI` and remains a hardware
+   validation item. The Pico stack advertises `TCP_OPEN` as potentially
+   blocking; after a resident connection is lost, rerun the same
+   `MSXAI /DRIVER:UNAPI /PORT:...` command at DOS to clean up the old handle
+   and listen again outside `H.TIMI`.
+4. Before installing the resident, an optional `make unapi-probe` builds
+   `work/agent/UNAPIPRB.COM`. Run `UNAPIPRB` or `UNAPIPRB 43123` to verify
+   discovery, passive capability, the effective IP/port, and TCP state; quit
+   the probe before starting `MSXAI` on that port.
+5. Before the cartridge arrives, the opt-in
+   [openMSX UNAPI validation](docs/openmsx-unapi-validation.md) exercises the
+   same EXTBIO, passive-listener, bidirectional-stream, and relisten contract
+   with a matched openMSXnet/UNAPINET pair. It is a contract emulator, not Pico/Pico+
+   firmware or bus-timing emulation.
+6. Call `msx_agent_status` before any mutation and verify runtime, transport,
+   and feature negotiation.
 
 The agent does not configure Wi-Fi, issue modem AT commands, or depend on a
-specific network-adapter brand. BaDCaT is one planned 16C550-compatible
-transport, not a project requirement.
+specific network-adapter brand. The UNAPI path discovers a TCP/IP UNAPI
+implementation by capability, so it is not tied to the Pico+ product name.
+BaDCaT is one planned 16C550-compatible transport, not a project requirement.
 
 ## Reproducible demonstrations
 
@@ -259,10 +280,13 @@ MSX-AI Python server
                   |
                   +-- RS232-Net -----------------> simulated MSX agent
                   |
-                  `-- transparent UART bridge --> physical MSX agent
-                                                     |
-                                                     +-- 8251
-                                                     `-- 16C550-compatible UART
+                  +-- transparent UART bridge --> physical MSX agent
+                  |                                  |
+                  |                                  +-- 8251
+                  |                                  `-- 16C550-compatible UART
+                  |
+                  `-- TCP/IP UNAPI listener ------> physical MSX agent
+                                                     `-- Pico/Pico+ Wi-Fi
 ```
 
 The MCP interface, target protocol, network link, and MSX UART driver are
@@ -294,8 +318,8 @@ The physical and simulated agent paths use these files:
 
 ```text
 A:\MSXAI\
-  MSXAI.COM    MSXAIXF.COM  MCP8251.TSR  MCP16550.TSR
-  MEMMAN.COM   TL.COM       TK.COM
+  MSXAI.COM     MSXAIXF.COM  MCP8251.TSR  MCP16550.TSR
+  MCPUNAPI.TSR  MP.COM       MEMMAN.COM   TL.COM       TK.COM
 ```
 
 Build them from source with `make agent`, or use matching binaries from a
@@ -307,8 +331,12 @@ PATH A:\MSXAI;%PATH%
 ```
 
 The default MemMan resident returns to MSX-DOS. `MSXAIXF.COM` is its transient
-foreground file helper; the other COM/TSR files are part of the same versioned
-suite. MSX-DOS 2 or Nextor and a memory mapper are required for resident mode.
+foreground file helper, while `MP.COM` is the one-shot helper that applies the
+selected UNAPI port after MemMan's first-install warm boot, including the
+default 6603 when `/PORT` is omitted. The public `/PORT` syntax remains decimal;
+the compact hexadecimal form passed to `MP.COM` is private to the install
+chain. The other COM/TSR files are part of the same versioned suite. MSX-DOS 2
+or Nextor and a memory mapper are required for resident mode.
 
 ## MCP interface
 
@@ -370,8 +398,9 @@ msx_docs_search(query="resident screenshot safety")
   sandbox. Absolute paths remain available to explicit MCP calls with the same
   permissions as the server process; use an appropriately restricted account
   and working directory.
-- ROMs and bootable disk images are not distributed. Physical BaDCaT SMD
-  validation and measured performance remain pending until hardware testing.
+- ROMs and bootable disk images are not distributed. Physical Pico/Pico+ UNAPI
+  and BaDCaT SMD validation, including measured performance, remain pending
+  until the corresponding hardware tests.
 
 ## Development and validation
 
@@ -387,8 +416,13 @@ currently schedule a real-emulator job. That smoke performs the same read-only
 adapter preflight used by the doctor, boots through both adapter and public
 Session/profile paths, exercises the platform control transport, reads emulator
 state, and shuts down without an orphan process. The larger
-MSX-DOS/RS232-Net suite with local media and physical BaDCaT hardware remain
-separate explicit integration gates.
+MSX-DOS/RS232-Net suite with local media and physical Pico/Pico+ or BaDCaT
+hardware remain separate explicit integration gates.
+
+TCP/IP UNAPI has a second opt-in emulator gate. Set the paths documented in
+`docs/openmsx-unapi-validation.md`, run `make unapi-emulation-preflight`, then
+`make test-unapi-emulation`. The normal unit and release suites never download
+that emulator or install host libraries.
 
 For an editable environment:
 
@@ -443,7 +477,7 @@ The corresponding direct Windows commands are
 
 `release-assets` writes the sdist, the wheel rebuilt from it, and
 `msx-ai-agent-<version>.zip` under ignored `dist/`, with `<version>` derived
-from the Python package metadata. The agent ZIP contains the seven matching
+from the Python package metadata. The agent ZIP contains the nine matching
 MSX files, the project license, the MemMan notice, checksums, and explicit
 wire-protocol, transfer-protocol, and toolchain metadata. Existing artifacts
 are never overwritten. The gate proves same-host equivalence with the pinned

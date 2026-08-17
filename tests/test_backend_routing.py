@@ -43,7 +43,7 @@ class _Agent:
     write_quarantined = True
     capabilities = 0
     resident_base = 0xC000
-    peer = ("127.0.0.1", 6603)
+    peer = ("127.0.0.1", 43123)
     local_endpoint = ("127.0.0.1", 49152)
     vram_size = 0x20000
     _v3 = None

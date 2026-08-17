@@ -7,6 +7,7 @@ exclude .mcp.json
 
 recursive-include agent *.asm *.inc *.md
 recursive-include assets *.png *.md
+recursive-include docs *.md
 recursive-include server/resources *.md *.json
 recursive-include server/resources/openmsx *.xml README
 recursive-include tests *.py

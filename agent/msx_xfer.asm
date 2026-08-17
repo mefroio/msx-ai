@@ -48,10 +48,11 @@ RG9SAV:                  equ 0FFE8h
 TPA_TOP_POINTER:         equ 00006h
 
 FILE_TRANSFER_TIMEOUT_TICKS: equ 3600 ; one minute NTSC, 72 seconds PAL
-; Keep the complete progress line at 35 columns. Brazilian MSX machines may
-; expose only 37 text columns in DOS, and writing the last column can trigger
-; an automatic wrap before the next carriage return.
-XFER_PROGRESS_BAR_WIDTH: equ 18
+; Keep the complete progress line at 31 columns. SCREEN 0 commonly starts at
+; WIDTH 32, and writing the last column can trigger an automatic wrap before
+; the next carriage return. Leaving one spare column keeps every CR update on
+; the same physical row on both 32- and 40-column DOS screens.
+XFER_PROGRESS_BAR_WIDTH: equ 14
 XFER_PROGRESS_DIVISOR:   equ 100
 XFER_META_PATH:          equ 43
 XFER_META_PHASE:         equ 107

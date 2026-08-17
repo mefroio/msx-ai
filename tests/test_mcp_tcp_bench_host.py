@@ -14,6 +14,16 @@ from msx_client import OpenMSXError  # noqa: E402
 
 
 class CanonicalAgentBuildTest(unittest.TestCase):
+    def test_package_names_include_complete_nine_file_suite(self):
+        self.assertEqual(
+            msx_mcp_server.AGENT_PACKAGE_NAMES,
+            (
+                "MSXAI.COM", "MSXAIXF.COM", "MCP8251.TSR",
+                "MCP16550.TSR", "MCPUNAPI.TSR", "MP.COM", "MEMMAN.COM",
+                "TL.COM", "TK.COM",
+            ),
+        )
+
     def test_build_uses_make_target_and_returns_agent_package(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "work" / "agent"
@@ -27,7 +37,8 @@ class CanonicalAgentBuildTest(unittest.TestCase):
 
             constants = (
                 "AGENT_COM", "AGENT_XFER_COM", "AGENT_TSR_8251",
-                "AGENT_TSR_16C550", "AGENT_MEMMAN_COM", "AGENT_TL_COM",
+                "AGENT_TSR_16C550", "AGENT_TSR_UNAPI",
+                "AGENT_PORT_COM", "AGENT_MEMMAN_COM", "AGENT_TL_COM",
                 "AGENT_TK_COM")
             replacements = dict(zip(constants, paths, strict=True))
             with (mock.patch.multiple(msx_mcp_server, **replacements),
@@ -52,7 +63,8 @@ class CanonicalAgentBuildTest(unittest.TestCase):
                 ["test-make", "agent"], 0, "", "")
             constants = (
                 "AGENT_COM", "AGENT_XFER_COM", "AGENT_TSR_8251",
-                "AGENT_TSR_16C550", "AGENT_MEMMAN_COM", "AGENT_TL_COM",
+                "AGENT_TSR_16C550", "AGENT_TSR_UNAPI",
+                "AGENT_PORT_COM", "AGENT_MEMMAN_COM", "AGENT_TL_COM",
                 "AGENT_TK_COM")
             replacements = dict(zip(constants, paths, strict=True))
             with (mock.patch.multiple(msx_mcp_server, **replacements),

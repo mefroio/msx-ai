@@ -100,7 +100,7 @@ class MCPMetadataTest(unittest.TestCase):
             "backend": "agent", "target": "agent",
             "channel": "agent-protocol", "target_id": "agent-1",
             "bench_id": "bench-123", "state": "connected",
-            "peer": ["127.0.0.1", 6603],
+            "peer": ["127.0.0.1", 43123],
             "local_endpoint": ["127.0.0.1", 41000],
             "runtime_mode": "resident", "agent_transport": "uart-8251",
         }

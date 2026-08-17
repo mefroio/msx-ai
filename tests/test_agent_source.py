@@ -9,6 +9,8 @@ GENERIC_WRAPPER = ROOT / "agent" / "msx_agent.asm"
 GENERIC_TRANSPORT = ROOT / "agent" / "transports" / "msx_transport_8251.inc"
 UART16C550_TRANSPORT = (
     ROOT / "agent" / "transports" / "msx_transport_16c550.inc")
+UNAPI_TRANSPORT = (
+    ROOT / "agent" / "transports" / "msx_transport_unapi.inc")
 TSR_BUILDER = ROOT / "tools" / "build_agent_tsr.py"
 MAKEFILE = ROOT / "Makefile"
 
@@ -357,6 +359,7 @@ class ResidentAgentSourceTests(unittest.TestCase):
         stack_comment = self.source.split("; The hook stack", 1)[1].split(
             "STACK_RESERVE:", 1)[0]
         self.assertIn("224 bytes", stack_comment)
+        self.assertIn("64-byte non-page-1 UNAPI staging", stack_comment)
         self.assertNotIn("384 bytes", stack_comment)
 
     def test_reconnect_marker_is_not_a_single_raw_byte(self):
@@ -667,8 +670,10 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("msx_agent_core.asm", wrapper)
         self.assertIn("msx_transport_8251.inc", self.source)
         self.assertIn("msx_transport_16c550.inc", self.source)
+        self.assertIn("msx_transport_unapi.inc", self.source)
         self.assertIn('db "/DRIVER:8251",0', self.source)
         self.assertIn('db "/DRIVER:16C550",0', self.source)
+        self.assertIn('db "/DRIVER:UNAPI",0', self.source)
         makefile = MAKEFILE.read_text(encoding="utf-8")
         self.assertIn("work/agent/MSXAI.COM", makefile)
         self.assertNotIn("MSXAI2.COM", makefile)
@@ -693,8 +698,239 @@ class ResidentAgentSourceTests(unittest.TestCase):
                 self.assertIn(f"{prefix}_CONTROL_LEVEL:", source)
                 label_prefix = prefix.lower().replace("uart", "uart")
                 for operation in ("init", "restore", "rx_ready", "tx_ready",
-                                  "read", "write"):
+                                  "read", "write", "service", "flush"):
                     self.assertIn(f"{label_prefix}_{operation}:", source)
+                restore = source.split(
+                    f"{label_prefix}_restore:", 1)[1].split(
+                        f"{label_prefix}_rx_ready:", 1)[0]
+                self.assertIn("xor a", restore)
+
+    def test_unapi_transport_is_passive_buffered_and_reconnectable(self):
+        source = UNAPI_TRANSPORT.read_text(encoding="utf-8")
+        self.assertRegex(source, r"(?m)^UNAPI_ID:\s+equ\s+2\s*$")
+        self.assertRegex(
+            source,
+            r"(?m)^UNAPI_FLAGS:\s+equ\s+TRANSPORT_FLAG_TIMI_ONLY\s+\|\s+"
+            r"TRANSPORT_FLAG_FRAME_WAKE_ACK\s*$")
+        for operation in ("init", "restore", "rx_ready", "tx_ready",
+                          "read", "write", "service", "flush"):
+            self.assertIn(f"unapi_{operation}:", source)
+
+        discovery = source.split("unapi_discover:", 1)[1].split(
+            "; ----------------------------------------------------- connection lifecycle", 1)[0]
+        self.assertIn("bit 5,l", discovery)
+        self.assertIn("and 008h", discovery)
+        self.assertIn("ld (unapi_open_blocking),a", discovery)
+        self.assertIn("cp 0C0h", discovery)
+        self.assertIn("call CALSLT", discovery)
+        self.assertIn("unapi_mapped_dispatch:", discovery)
+
+        listener = source.split("unapi_open_listener:", 1)[1].split(
+            "unapi_abort_current:", 1)[0]
+        self.assertIn("ld de,13", listener)
+        self.assertIn("ld de,(unapi_listen_port)", listener)
+        self.assertIn("ld (hl),003h", listener)
+        self.assertIn("ld a,UNAPI_TCP_OPEN", listener)
+        open_result = listener.split("ld a,UNAPI_TCP_OPEN", 1)[1]
+        self.assertIn("ld a,b\n    or a", open_result)
+        self.assertLess(open_result.index("ld a,UNAPI_ERR_NO_CONN"),
+                        open_result.index("ld (unapi_connection),a"))
+
+        abort = source.split("unapi_abort_current:", 1)[1].split(
+            "unapi_drop_connection:", 1)[0]
+        current_abort = abort.split("unapi_abort_deferred:", 1)[0]
+        self.assertLess(current_abort.index("cp UNAPI_ERR_OK"),
+                        current_abort.index("cp UNAPI_ERR_NO_CONN"))
+        self.assertLess(current_abort.index("cp UNAPI_ERR_NO_CONN"),
+                        current_abort.index("ret nz"))
+        self.assertLess(current_abort.index("ret nz"),
+                        current_abort.index("ld (unapi_connection),a"))
+        cleanup_abort = abort.split("unapi_abort_deferred:", 1)[1]
+        self.assertLess(cleanup_abort.index("cp UNAPI_ERR_OK"),
+                        cleanup_abort.index("cp UNAPI_ERR_NO_CONN"))
+        self.assertLess(cleanup_abort.index("ret nz"),
+                        cleanup_abort.index(
+                            "ld (unapi_cleanup_connection),a"))
+
+        restore = source.split("unapi_restore:", 1)[1].split(
+            "unapi_clear_runtime:", 1)[0]
+        self.assertRegex(
+            restore,
+            r"(?s)call unapi_abort_current\s+or a\s+"
+            r"jr nz,unapi_restore_finish.*unapi_restore_clear:.*"
+            r"call unapi_clear_runtime")
+
+        lifecycle = source.split("unapi_service:", 1)[1].split(
+            "; ---------------------------------------------------------- buffered bytes", 1)[0]
+        self.assertIn("cp UNAPI_TCP_CLOSE_WAIT", lifecycle)
+        self.assertIn("call unapi_drop_connection", lifecycle)
+        self.assertIn("call unapi_open_listener", lifecycle)
+        self.assertIn("ld a,UNAPI_TCP_WAIT", lifecycle)
+
+        drop = source.split("unapi_drop_connection:", 1)[1].split(
+            "unapi_service:", 1)[0]
+        self.assertIn("ld (unapi_cleanup_connection),a", drop)
+        self.assertIn("ld (transport_session_lost),a", drop)
+        self.assertNotIn("call unapi_abort_current", drop)
+        self.assertNotIn("call transport_session_reset", drop)
+
+        relisten = source.split("unapi_service_relisten:", 1)[1].split(
+            "unapi_service_have_connection:", 1)[0]
+        self.assertIn("ld a,(transport_session_lost)", relisten)
+        self.assertIn("ld a,(in_hook)", relisten)
+        self.assertRegex(
+            relisten,
+            r"(?s)ld a,\(in_hook\).*ret nz.*call unapi_abort_current\s+"
+            r"or a\s+jr nz,unapi_service_relisten_abort_failed\s+"
+            r"call unapi_open_listener")
+
+        flush = source.split("unapi_flush:", 1)[1].split(
+            "unapi_receive_block:", 1)[0]
+        self.assertIn("UNAPI_FLUSH_RETRIES", flush)
+        self.assertIn("unapi_flush_retry:", flush)
+        self.assertIn("call unapi_drop_connection", flush)
+
+        buffers = source.split("unapi_runtime_start:", 1)[1]
+        self.assertEqual(buffers.count("ds UNAPI_BLOCK_SIZE,0"), 2)
+        self.assertIn("dw UNAPI_DEFAULT_PORT", buffers)
+
+    def test_stream_loss_unwinds_before_relisten_and_preserves_xfer(self):
+        reset = self.source.split("transport_session_reset:", 1)[1].split(
+            "transport_session_finalize:", 1)[0]
+        self.assertIn("ld (transport_session_lost),a", reset)
+        self.assertIn("ld (xfer_fast_armed),a", reset)
+        self.assertNotIn("call xfer_reset", reset)
+        self.assertNotIn("xfer_descriptor", reset)
+        self.assertNotIn("xfer_accepted", reset)
+        self.assertNotIn("xfer_durable", reset)
+
+        guard = self.source.split("transport_session_guard:", 1)[1].split(
+            "include 'agent/transports/msx_transport_8251.inc'", 1)[0]
+        self.assertIn("transport_flush_checked:", guard)
+        self.assertIn("jp transport_session_abort", guard)
+        self.assertIn("jp nz,xfer_fast_pump_session_lost", guard)
+        self.assertIn("jp hook_transport_session_lost", guard)
+        self.assertRegex(
+            guard,
+            r"(?s)ld sp,\(hook_dispatch_sp\).*ld a,\(vram_active\).*"
+            r"call nz,restore_r14.*call transport_session_finalize.*"
+            r"jp main_loop")
+
+        hook_loss = self.source.split(
+            "hook_transport_session_lost:", 1)[1].split(
+                "hook_transport_timeout:", 1)[0]
+        self.assertIn("ld sp,(hook_dispatch_sp)", hook_loss)
+        self.assertIn("call transport_session_finalize", hook_loss)
+
+        pump_loss = self.source.split(
+            "xfer_fast_pump_session_lost:", 1)[1].split(
+                "xfer_fast_pump_timeout:", 1)[0]
+        self.assertLess(
+            pump_loss.index("ld sp,(xfer_fast_pump_sp)"),
+            pump_loss.index("call transport_session_finalize"))
+
+        self.assertEqual(self.source.count("call transport_flush_checked"), 3)
+
+    def test_unapi_port_and_tsr_reconfiguration_fail_closed(self):
+        parser = self.source.split("loader_parse_port:", 1)[1].split(
+            "loader_parse_monitor:", 1)[0]
+        self.assertIn("ld (loader_unapi_port),bc", parser)
+        self.assertIn("cp 0FFh", parser)
+        self.assertIn("jp z,loader_parse_port_error", parser)
+
+        talk = self.source.split("tsr_talk_config:", 1)[1].split(
+            "; Validate that an entire caller range", 1)[0]
+        self.assertIn("cp UNAPI_ID + 1", talk)
+        self.assertIn("tsr_talk_unapi_port:", talk)
+        self.assertIn("ld (tsr_config_requested_port),hl", talk)
+        self.assertIn("TSR_TALK_UNAPI_PORT: equ 0A6h", self.source)
+        self.assertIn("cp TSR_TALK_UNAPI_PORT", self.source)
+        self.assertIn("call unapi_init_current_port", talk)
+        self.assertIn("call xfer_reconfigure_detach", talk)
+        self.assertIn("call xfer_reset", talk)
+        rollback = talk.split("tsr_talk_config_failed:", 1)[1]
+        begin = talk.split("tsr_talk_config_begin_common:", 1)[1].split(
+            "tsr_talk_config_failed:", 1)[0]
+        self.assertRegex(
+            begin,
+            r"(?s)call transport_restore\s+or a\s+"
+            r"jp nz,tsr_talk_config_abort_failed.*"
+            r"ld \(active_transport_id\),a")
+        self.assertRegex(
+            begin,
+            r"(?s)ld \(tsr_config_old_unapi_live\),a.*"
+            r"cp UNAPI_ID.*ld a,\(unapi_connection\).*"
+            r"ld \(tsr_config_old_unapi_live\),a.*"
+            r"call transport_restore")
+        old_live_capture = begin.split(
+            "tsr_talk_config_old_live_ready:", 1)[0]
+        self.assertNotIn("unapi_cleanup_connection", old_live_capture)
+        self.assertRegex(
+            rollback,
+            r"(?s)call transport_restore\s+or a\s+"
+            r"jr nz,tsr_talk_config_failed_detach.*"
+            r"ld hl,\(tsr_config_old_port\)")
+        self.assertRegex(
+            rollback,
+            r"(?s)ld a,\(tsr_config_old_unapi_live\)\s+or a\s+"
+            r"jr z,tsr_talk_config_restore_unapi_idle\s+"
+            r"call unapi_init_current_port.*"
+            r"tsr_talk_config_restore_unapi_idle:\s+"
+            r".*call unapi_clear_runtime")
+        self.assertIn("call transport_session_reset", rollback)
+        self.assertIn("call xfer_reconfigure_detach", rollback)
+        self.assertIn("ld a,0FFh", talk)
+        self.assertIn("tsr_config_old_port", talk)
+        self.assertNotIn("UNAPI_DOS_GET_ENV", self.source)
+        self.assertNotIn("unapi_port_environment_name", self.source)
+
+        detach = self.source.split("xfer_reconfigure_detach:", 1)[1].split(
+            "endif", 1)[0]
+        for stale_field in (
+                "xfer_pending", "xfer_foreground_ready",
+                "xfer_fast_page0_buffer", "xfer_fast_page0_frame",
+                "xfer_fast_pump_sp", "xfer_get_ack_pending"):
+            self.assertIn(stale_field, detach)
+        self.assertRegex(
+            detach,
+            r"(?s)ld hl,xfer_durable\s+ld de,xfer_accepted\s+ld bc,4\s+ldir")
+        self.assertIn(
+            "ld de,xfer_descriptor + XFER_DESC_RESUME_OFFSET", detach)
+        self.assertIn(
+            "ld de,xfer_descriptor + XFER_DESC_PREFIX_CRC", detach)
+        self.assertIn("or XFER_FLAG_RESUME", detach)
+        self.assertIn("cp XFER_STATE_POSTPROCESS", detach)
+        self.assertIn("ld a,XFER_STATE_FAILED", detach)
+
+        initializer = self.source.split("tsr_init:", 1)[1].split(
+            "tsr_intro_message:", 1)[0]
+        self.assertIn("call resident_initialize", initializer)
+        self.assertIn("jr nz,tsr_init_failed", initializer)
+        self.assertIn("ld a,3", initializer)
+
+    def test_foreground_teardown_bounds_restore_retries_before_image_release(self):
+        retry = self.source.split(
+            "transport_restore_foreground_retry:", 1)[1].split(
+                "transport_bind:", 1)[0]
+        self.assertRegex(
+            retry,
+            r"(?s)ld b,3\s+transport_restore_foreground_retry_loop:\s+"
+            r"push bc\s+call transport_restore\s+pop bc\s+or a\s+"
+            r"ret z\s+djnz transport_restore_foreground_retry_loop\s+ret")
+        self.assertIn("orphan socket", self.source)
+
+        kill = self.source.split("tsr_kill:", 1)[1].split(
+            "; Foreground suite programs use TsrCall", 1)[0]
+        self.assertIn("call transport_restore_foreground_retry", kill)
+
+        monitor_exit = self.source.split("monitor_exit_to_dos:", 1)[1].split(
+            "endif", 1)[0]
+        self.assertIn("call transport_restore_foreground_retry", monitor_exit)
+
+        transactional = self.source.split(
+            "tsr_talk_config_begin_common:", 1)[1].split(
+                "tsr_talk_done:", 1)[0]
+        self.assertNotIn("transport_restore_foreground_retry", transactional)
 
     def test_8251_driver_programs_the_standard_baud_generator(self):
         source = GENERIC_TRANSPORT.read_text(encoding="utf-8")
