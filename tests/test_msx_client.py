@@ -173,7 +173,7 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
         self.assertIn("quit", calls)
         self.assertTrue(process.waited)
 
-    def test_visible_spawn_does_not_change_host_mute(self):
+    def test_visible_spawn_explicitly_initializes_the_renderer(self):
         process = _Process()
         popen_patch, thread_patch, sleep_patch = self._start_patches(process)
         machine = OpenMSX(bin="/fake/openmsx", platform="linux")
@@ -181,7 +181,9 @@ class OpenMSXHeadlessAudioTests(unittest.TestCase):
                 mock.patch.object(machine, "cmd") as command:
             machine.start(headless=False)
             argv = popen.call_args.args[0]
-            self.assertNotIn("-command", argv)
+            self.assertIn("-command", argv)
+            startup = argv[argv.index("-command") + 1]
+            self.assertEqual(startup, "set renderer SDLGL-PP")
             command.assert_not_called()
             machine.close()
 

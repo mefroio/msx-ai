@@ -560,11 +560,12 @@ class OpenMSX:
         """Spawn an owned openMSX instance over the host-native transport.
 
         Headless instances mute openMSX's host mixer and select renderer none.
-        PSG/SCC/OPLL state, I/O ports and MSX timing remain untouched, so
-        programs continue to run their normal sound routines. Each spawned
-        process has temporary settings and exits while still muted, so no
-        audible shutdown window or persisted setting can leak into a later
-        visible session.
+        Visible instances explicitly select SDLGL-PP because a fresh isolated
+        settings file may otherwise leave the renderer ``uninitialized`` and
+        run successfully without creating a window. PSG/SCC/OPLL state, I/O
+        ports and MSX timing remain untouched, so programs continue to run
+        their normal sound routines. Each spawned process has temporary
+        settings, so no persisted setting leaks into a later session.
         """
         self._reader_eof.clear()
         self._buf = ""
@@ -605,6 +606,10 @@ class OpenMSX:
                 # Execute this before the client begins booting the machine,
                 # preventing an audible interval or visible renderer window.
                 argv += ["-command", "set mute on; set renderer none"]
+            else:
+                # Isolated settings can report renderer=uninitialized. Merely
+                # omitting the headless override does not create a host window.
+                argv += ["-command", "set renderer SDLGL-PP"]
 
             uses_stdio = self.control_transport == "stdio"
             self.proc = subprocess.Popen(
