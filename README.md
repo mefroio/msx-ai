@@ -54,13 +54,31 @@ the developer machine; this repository intentionally does not ship a root
 `.mcp.json`. Such a file commonly grows workstation-specific executable paths
 and environment values, so it is ignored and excluded from distributions.
 
-For Codex, either add the server from the CLI:
+### Register the server in an MCP client
+
+Every client needs the same thing: run the STDIO command `msx-ai-mcp` and name
+the server `msx-ai`. Only the file format and the registration command differ.
+
+Claude Code, from the CLI:
+
+```sh
+claude mcp add msx-ai -- msx-ai-mcp                 # this project only
+claude mcp add --scope user msx-ai -- msx-ai-mcp    # every project
+```
+
+`claude mcp list` then reports the server as connected, and the tools appear as
+`mcp__msx-ai__msx_local_*` and `mcp__msx-ai__msx_agent_*`. A session that was
+already running does not pick the server up: the server list is resolved when
+the session starts, and the `/mcp` reconnect only re-dials entries that are
+already in that list. Start a new session after adding the server.
+
+Codex, from the CLI:
 
 ```sh
 codex mcp add msx-ai -- msx-ai-mcp
 ```
 
-or put this portable entry in the user-level `~/.codex/config.toml` or, for a
+or as a portable entry in the user-level `~/.codex/config.toml` or, for a
 trusted checkout only, the ignored project file `.codex/config.toml`:
 
 ```toml
@@ -71,7 +89,10 @@ command = "msx-ai-mcp"
 The ChatGPT desktop app, Codex CLI, and Codex IDE extension share that Codex
 configuration, as described in the
 [official Codex MCP setup](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
-Other MCP clients can use their own local equivalent, for example:
+
+Clients that read a JSON configuration — Claude Desktop, the VS Code MCP
+integration, Cursor, Windsurf, Zed, and others — express the same server with
+their own local file:
 
 ```json
 {
@@ -82,6 +103,11 @@ Other MCP clients can use their own local equivalent, for example:
   }
 }
 ```
+
+If `msx-ai-mcp` is not on the `PATH` seen by the client, use the absolute path
+of the entry point produced by the installation, for example
+`~/.local/bin/msx-ai-mcp` or `<checkout>/.venv/bin/msx-ai-mcp`, and keep that
+path in the local client file only.
 
 Keep any `OPENMSX_BIN` override in the shell environment or in that local
 client configuration. Do not commit an absolute path from one workstation.

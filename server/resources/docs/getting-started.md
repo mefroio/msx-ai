@@ -31,8 +31,22 @@ python -m venv .venv
 
 MCP configuration is machine/client state and is not published by this
 repository. In particular, root `.mcp.json` is ignored because it commonly
-contains absolute executable paths. For Codex, add the installed STDIO server
-with:
+contains absolute executable paths.
+
+Every client registers the same thing: a STDIO server named `msx-ai` running
+the command `msx-ai-mcp` without arguments. Claude Code adds it from the CLI,
+per project or, with `--scope user`, for every project:
+
+```sh
+claude mcp add msx-ai -- msx-ai-mcp
+claude mcp add --scope user msx-ai -- msx-ai-mcp
+```
+
+A client session that was already running does not pick a newly added server
+up, because its server list is resolved when the session starts. Start a new
+session after registering the server.
+
+Codex adds the same server with:
 
 ```sh
 codex mcp add msx-ai -- msx-ai-mcp
@@ -46,10 +60,23 @@ ignored `.codex/config.toml` of a trusted checkout:
 command = "msx-ai-mcp"
 ```
 
-Other MCP clients should configure the same `msx-ai-mcp` command in their own
-local format. Keep any `OPENMSX_BIN` override local rather than committing an
-absolute path. When running directly from a checkout without installation, the
-compatibility entry point is:
+Clients configured through JSON use their own local file:
+
+```json
+{
+  "mcpServers": {
+    "msx-ai": {
+      "command": "msx-ai-mcp"
+    }
+  }
+}
+```
+
+When the client does not inherit the interactive shell `PATH`, use the absolute
+path of the installed entry point instead of the bare command. Keep that path
+and any `OPENMSX_BIN` override local rather than committing them. When running
+directly from a checkout without installation, the compatibility entry point
+is:
 
 ```sh
 python3 server/msx_mcp_server.py

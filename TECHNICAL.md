@@ -257,8 +257,30 @@ publication.
 
 MCP client configuration is local operational state. The repository therefore
 ignores and excludes root `.mcp.json` files: they commonly contain absolute
-executable paths and host-specific environment values. For Codex, add the
-STDIO server with:
+executable paths and host-specific environment values.
+
+The registration itself is client-neutral: a STDIO server named `msx-ai` whose
+command is `msx-ai-mcp` with no arguments. Only the configuration format and
+the registration command are client-specific.
+
+Claude Code registers the server per project or per user:
+
+~~~~sh
+claude mcp add msx-ai -- msx-ai-mcp
+claude mcp add --scope user msx-ai -- msx-ai-mcp
+~~~~
+
+The default local scope stores the entry in the per-project section of
+`~/.claude.json`, so it never enters the working tree; `--scope user` stores it
+in the top-level `mcpServers` of the same file and applies to every project.
+`--scope project` would instead write a shared root `.mcp.json`, which this
+repository deliberately ignores. `claude mcp list` verifies connectivity, and
+tools are then addressed as `mcp__msx-ai__<tool>`. A session that was already
+running does not pick the server up, because the server list is resolved at
+session start and the `/mcp` reconnect only re-dials entries already present in
+that list; a newly added server therefore requires a new session.
+
+Codex registers the server with:
 
 ~~~~sh
 codex mcp add msx-ai -- msx-ai-mcp
@@ -276,8 +298,9 @@ Codex CLI, the Codex IDE extension, and the ChatGPT desktop app share this
 configuration. Keep `OPENMSX_BIN` in the launching environment or the local
 client file; never publish a workstation's absolute path.
 
-The default transport is STDIO. Other clients can express the same portable
-command in their own local format:
+The default transport is STDIO. JSON-configured clients, including Claude
+Desktop, the VS Code MCP integration, and editor forks such as Cursor,
+Windsurf, and Zed, express the same portable command in their own local format:
 
 ~~~~json
 {
@@ -288,6 +311,11 @@ command in their own local format:
   }
 }
 ~~~~
+
+A client that does not inherit the interactive shell `PATH` needs the absolute
+path of the installed entry point, such as `~/.local/bin/msx-ai-mcp` for a
+pipx installation or `<checkout>/.venv/bin/msx-ai-mcp` for an editable virtual
+environment. That absolute form belongs only in the local, ignored client file.
 
 An editable checkout can use `pipx install .` or `python -m pip install -e .`.
 `python3 server/msx_mcp_server.py` remains a compatibility entry point for the
