@@ -54,6 +54,10 @@ class PackagingMetadataTest(unittest.TestCase):
             'version = { attr = "msx_ai._version.__version__" }',
             self.pyproject)
 
+    def test_generated_version_include_has_platform_stable_lf(self):
+        attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("agent/msx_version.inc text eol=lf", attributes)
+
     def test_sdist_manifest_prunes_private_runtime_and_firmware(self):
         for entry in (
                 "prune work",
