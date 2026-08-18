@@ -1262,17 +1262,20 @@ Git worktree and stage exactly committed `HEAD`:
 make PYTHON=python publish-check
 ~~~~
 
-To persist the three validated artifacts under ignored `dist/`, use:
+To persist the four validated artifacts under the tracked `dist/`, use:
 
 ~~~~sh
 make PYTHON=python release-assets
 ~~~~
 
-The result includes the versioned Python distributions and the stable,
-MSX-DOS-compatible `MSXAI.ZIP`. The agent archive contains
+The result includes the versioned Python distributions, the stable,
+MSX-DOS-compatible `MSXAI.ZIP`, and a standalone copy of its `README.TXT`.
+The agent archive contains
 exactly the nine deployable binaries plus `LICENSE`, `MEMMAN-NOTICE.txt`,
-`SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records the project release,
+`README.TXT`, `SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records the project release,
 framed wire v3, transfer `fast-v1`, and the pinned assembler identity.
+The checksums cover the README as well as every binary, license, notice, and
+compatibility record.
 Publication is atomic per file, refuses overwrite, and rolls back files created
 by the attempt if a later publication fails. Repeated builds prove equivalence
 between the staged and sdist source on the same host and toolchain; this is not

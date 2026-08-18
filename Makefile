@@ -57,7 +57,7 @@ agent-prerequisites: memman-assets agent-tsr
 memman-assets:
 	"$(PYTHON)" tools/materialize_memman.py --output-dir $(MEMMAN_VENDOR_DIR)
 
-agent-tsr:
+agent-tsr: server/_version.py tools/build_version_include.py
 	"$(PYTHON)" tools/build_agent_tsr.py --assembler "$(Z80ASM)" \
 		--output $(AGENT_TSR) --metadata-output $(AGENT_TSR_METADATA) \
 		--8251-output $(AGENT_TSR_8251) \

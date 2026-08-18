@@ -67,7 +67,9 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertNotIn("loader_token_equals", parser)
         usage = self.source.split("usage_message:", 1)[1].split(
             "driver_required_message:", 1)[0]
-        self.assertIn("/MONITOR [DEBUG]", usage)
+        self.assertIn(
+            "include 'work/agent/build/MSXAI_VERSION.INC'", usage)
+        self.assertIn("[/MONITOR] [DEBUG]", usage)
         self.assertNotIn("DEBUG ON", usage)
         self.assertIn("debug_trace_command:", self.source)
         debug = self.source.split("debug_trace_command:", 1)[1].split(

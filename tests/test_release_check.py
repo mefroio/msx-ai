@@ -446,6 +446,23 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     self.assertRaises(release_check.ReleaseCheckError):
                 release_check._assert_release_tag(version, tags)
 
+    def test_publish_rejects_a_lightweight_release_tag(self):
+        with mock.patch.object(
+                release_check, "_project_version", return_value="0.1.0"), \
+                mock.patch.object(
+                    release_check, "_git_capture",
+                    side_effect=[b"v0.1.0\n", b"commit\n"]):
+            with self.assertRaisesRegex(
+                    release_check.ReleaseCheckError, "annotated Git tag"):
+                release_check._require_release_tag({"PATH": "/unused"})
+
+        with mock.patch.object(
+                release_check, "_project_version", return_value="0.1.0"), \
+                mock.patch.object(
+                    release_check, "_git_capture",
+                    side_effect=[b"v0.1.0\n", b"tag\n"]):
+            release_check._require_release_tag({"PATH": "/unused"})
+
     def test_publish_staging_uses_mocked_git_archive_content(self):
         archive_buffer = release_check.io.BytesIO()
         content = b'__version__ = "0.6.0"\n'
@@ -502,6 +519,9 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             encoding="utf-8")
         (agent / "msx_xfer_protocol.inc").write_text(
             "; fast-v1\nXFER_FAST_VERSION: equ 1\n", encoding="utf-8")
+        (agent / "README.TXT").write_bytes(
+            b"MSX-AI AGENT @VERSION@\r\n"
+            b"Read with TYPE README.TXT\r\n")
         suite = root / "suite"
         suite.mkdir()
         for name in release_check._AGENT_SUITE_FILES:
@@ -543,6 +563,10 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 self.assertEqual(
                     archive.read("MEMMAN-NOTICE.txt"),
                     b"MemMan Public Domain notice\n")
+                self.assertEqual(
+                    archive.read("README.TXT"),
+                    b"MSX-AI AGENT 0.6.0\r\n"
+                    b"Read with TYPE README.TXT\r\n")
                 checksum_rows = {
                     row.split("  ", 1)[1]: row.split("  ", 1)[0]
                     for row in archive.read("SHA256SUMS").decode(
@@ -551,6 +575,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 hashed_names = (
                     release_check._AGENT_SUITE_FILES |
                     release_check._AGENT_ARCHIVE_LICENSES |
+                    release_check._AGENT_ARCHIVE_DOCUMENTS |
                     {"COMPATIBILITY.json"})
                 self.assertEqual(set(checksum_rows), hashed_names)
                 for name in hashed_names:
@@ -558,6 +583,26 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                         checksum_rows[name],
                         release_check.hashlib.sha256(
                             archive.read(name)).hexdigest())
+
+    def test_msx_readme_is_rendered_for_dos_and_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, _suite = self.create_agent_archive_fixture(root)
+            rendered = release_check._msx_readme_payload(source)
+            self.assertTrue(rendered.startswith(b"MSX-AI AGENT 0.6.0\r\n"))
+            self.assertNotIn(b"@VERSION@", rendered)
+
+            readme = source / "agent" / "README.TXT"
+            for invalid, message in (
+                    (b"MSX-AI AGENT @VERSION@\n", "CRLF"),
+                    (b"MSX-AI AGENT\r\n", "@VERSION@"),
+                    (b"MSX-AI AGENT @VERSION@\r\n" + b"X" * 79 + b"\r\n",
+                     "78 characters")):
+                with self.subTest(message=message):
+                    readme.write_bytes(invalid)
+                    with self.assertRaisesRegex(
+                            release_check.ReleaseCheckError, message):
+                        release_check._msx_readme_payload(source)
 
     @staticmethod
     def rewrite_zip(source, destination, *, drop=None, replacements=None):

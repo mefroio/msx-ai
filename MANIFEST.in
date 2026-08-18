@@ -6,7 +6,7 @@ include TECHNICAL.md
 include Makefile
 exclude .mcp.json
 
-recursive-include agent *.asm *.inc *.md
+recursive-include agent *.asm *.inc *.md *.TXT
 recursive-include assets *.png *.md
 recursive-include docs *.md
 recursive-include server/resources *.md *.json

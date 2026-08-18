@@ -138,6 +138,7 @@ _SDIST_REQUIRED_FILES = {
     "TECHNICAL.md",
     "pyproject.toml",
     "agent/README.md",
+    "agent/README.TXT",
     "agent/msx_agent.asm",
     "agent/msx_agent_core.asm",
     "agent/msx_agent_tsr.asm",
@@ -155,6 +156,7 @@ _SDIST_REQUIRED_FILES = {
     "docs/openmsx-unapi-validation.md",
     "server/resources/docs/manifest.json",
     "tests/test_port_helper.py",
+    "tests/test_build_version_include.py",
     "tests/test_release_check.py",
     "tests/test_openmsx_unapi_validation.py",
     "tests/test_unapi_probe.py",
@@ -169,6 +171,7 @@ _SDIST_REQUIRED_FILES = {
     "tools/build_memman_tsr.py",
     "tools/build_port_helper.py",
     "tools/build_unapi_probe.py",
+    "tools/build_version_include.py",
     "tools/check_msx_com_size.py",
     "tools/materialize_memman.py",
     "tools/openmsx_mcp_test.tcl",
@@ -197,8 +200,10 @@ _Z80ASM_TOOLCHAIN_ID = "bas-wijnen-z80asm"
 _Z80ASM_VERSION = "1.8"
 _Z80ASM_VERSION_LINE = "Z80 assembler version 1.8"
 _AGENT_ARCHIVE_LICENSES = {"LICENSE", "MEMMAN-NOTICE.txt"}
+_AGENT_ARCHIVE_DOCUMENTS = {"README.TXT"}
 _AGENT_ARCHIVE_METADATA = {
-    "COMPATIBILITY.json", "SHA256SUMS", *_AGENT_ARCHIVE_LICENSES}
+    "COMPATIBILITY.json", "SHA256SUMS", *_AGENT_ARCHIVE_LICENSES,
+    *_AGENT_ARCHIVE_DOCUMENTS}
 
 
 class ReleaseCheckError(RuntimeError):
@@ -403,9 +408,14 @@ def _assert_release_tag(version: str, tags: bytes) -> None:
 
 
 def _require_release_tag(environment: Mapping[str, str]) -> None:
+    version = _project_version(ROOT)
     _assert_release_tag(
-        _project_version(ROOT),
-        _git_capture(["tag", "--points-at", "HEAD"], environment))
+        version, _git_capture(["tag", "--points-at", "HEAD"], environment))
+    tag_type = _git_capture(
+        ["cat-file", "-t", f"refs/tags/v{version}"], environment).strip()
+    if tag_type != b"tag":
+        raise ReleaseCheckError(
+            f"publish tag v{version} must be an annotated Git tag")
 
 
 def _ignore_source(directory: str, names: list[str]) -> set[str]:
@@ -801,6 +811,30 @@ def _zip_info(name: str) -> zipfile.ZipInfo:
     return information
 
 
+def _msx_readme_payload(source: Path) -> bytes:
+    payload = (source / "agent" / "README.TXT").read_bytes()
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ReleaseCheckError("agent README.TXT must contain ASCII only") from exc
+    if b"\n" in payload.replace(b"\r\n", b""):
+        raise ReleaseCheckError("agent README.TXT must use CRLF line endings")
+    marker = b"@VERSION@"
+    if payload.count(marker) != 1:
+        raise ReleaseCheckError(
+            "agent README.TXT must contain one @VERSION@ marker")
+    payload = payload.replace(
+        marker, _project_version(source).encode("ascii"))
+    text = payload.decode("ascii")
+    if any(len(line) > 78 for line in text.splitlines()):
+        raise ReleaseCheckError(
+            "agent README.TXT lines must be at most 78 characters")
+    if not text.startswith(f"MSX-AI AGENT {_project_version(source)}\r\n"):
+        raise ReleaseCheckError(
+            "agent README.TXT heading must match the project release")
+    return payload
+
+
 def _build_agent_archive(source: Path, agent_directory: Path,
                          destination: Path,
                          toolchain_version_line: str) -> Path:
@@ -818,9 +852,11 @@ def _build_agent_archive(source: Path, agent_directory: Path,
         "MEMMAN-NOTICE.txt": (
             source / "third_party" / "memman" / "NOTICE").read_bytes(),
     }
+    documents = {"README.TXT": _msx_readme_payload(source)}
     checksum_sources = {
         **{name: (agent_directory / name).read_bytes() for name in payload},
         **licensed_material,
+        **documents,
         "COMPATIBILITY.json": compatibility,
     }
     checksum_payload = {
@@ -834,6 +870,7 @@ def _build_agent_archive(source: Path, agent_directory: Path,
         **{name: (agent_directory / name).read_bytes()
            for name in sorted(_AGENT_SUITE_FILES)},
         **licensed_material,
+        **documents,
         "SHA256SUMS": checksums.encode("ascii"),
         "COMPATIBILITY.json": compatibility,
     }
@@ -861,7 +898,8 @@ def _assert_agent_archive(path: Path, source: Path,
         if len(names) != len(set(names)) or set(names) != expected_names:
             raise ReleaseCheckError(
                 "agent archive must contain exactly nine binaries, LICENSE, "
-                "MEMMAN-NOTICE.txt, SHA256SUMS, and COMPATIBILITY.json")
+                "MEMMAN-NOTICE.txt, README.TXT, SHA256SUMS, and "
+                "COMPATIBILITY.json")
         for name in _AGENT_SUITE_FILES:
             digest = hashlib.sha256(archive.read(name)).hexdigest()
             if digest != expected_payload[name]:
@@ -873,13 +911,17 @@ def _assert_agent_archive(path: Path, source: Path,
             "MEMMAN-NOTICE.txt": (
                 source / "third_party" / "memman" / "NOTICE").read_bytes(),
         }
+        documents = {"README.TXT": _msx_readme_payload(source)}
         for name, content in licensed_material.items():
             if archive.read(name) != content:
                 raise ReleaseCheckError(
                     f"agent archive license/notice mismatch: {name}")
+        if archive.read("README.TXT") != documents["README.TXT"]:
+            raise ReleaseCheckError("agent archive README.TXT mismatch")
         checksum_sources = {
             **{name: archive.read(name) for name in _AGENT_SUITE_FILES},
             **licensed_material,
+            **documents,
             "COMPATIBILITY.json": compatibility,
         }
         checksum_payload = {
@@ -1430,6 +1472,8 @@ def run_release_check(*, publish: bool = False,
         _say(
             "same-host agent ZIP rebuild is byte-identical with pinned "
             "Bas Wijnen z80asm 1.8")
+        readme_artifact = bundle_a / "README.TXT"
+        readme_artifact.write_bytes(_msx_readme_payload(rebuilt_source))
 
         rebuilt_artifacts = temporary / "rebuilt"
         rebuilt_artifacts.mkdir()
@@ -1449,7 +1493,8 @@ def run_release_check(*, publish: bool = False,
 
         if output_directory is not None:
             published = _persist_release_assets(
-                output_directory, [sdist, rebuilt_wheel, agent_archive])
+                output_directory, [sdist, rebuilt_wheel, agent_archive,
+                                   readme_artifact])
             _say("published release assets: " +
                  ", ".join(str(path) for path in published))
 

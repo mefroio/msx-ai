@@ -104,7 +104,7 @@ make PYTHON=python publish-check
 
 It refuses tracked modifications and untracked non-ignored paths, then stages
 exactly committed `HEAD` through Git before running the same gate. To persist
-validated release files under ignored `dist/`, run:
+validated release files under the tracked `dist/`, run:
 
 ```sh
 make PYTHON=python release-assets
@@ -113,11 +113,12 @@ make PYTHON=python release-assets
 On Windows, use `python tools/release_check.py --publish` for strict mode and
 `python tools/release_check.py --publish --output-dir dist` to persist assets.
 
-This writes the versioned Python distributions and the deterministic,
-MSX-DOS-compatible `MSXAI.ZIP` to `dist/`. The ZIP contains exactly nine binaries,
+This writes the versioned Python distributions, the deterministic,
+MSX-DOS-compatible `MSXAI.ZIP`, and a standalone `README.TXT` to `dist/`.
+The ZIP contains the same README and exactly nine binaries,
 the project `LICENSE`, `MEMMAN-NOTICE.txt`, `SHA256SUMS`, and
 `COMPATIBILITY.json` recording the project release, wire v3, transfer `fast-v1`,
-and the pinned assembler. Checksums cover the binaries, license,
+and the pinned assembler. Checksums cover the binaries, README, license,
 notice, and compatibility manifest. Existing output files are never
 overwritten, and a failed multi-file publication rolls back files created by
 that attempt.

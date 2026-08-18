@@ -3,3 +3,5 @@
 server/resources/docs/** text eol=lf
 server/resources/openmsx/** text eol=lf
 .openmsx-home/** text eol=lf
+# This file is intentionally stored as DOS-readable ASCII with CRLF bytes.
+agent/README.TXT -text

@@ -440,16 +440,14 @@ memman_incompatible_message:
 inconsistent_message:
     db "Inconsistent resident agent state",13,10,"$"
 usage_message:
-    db 13,10,"MSX-AI MCP Agent",13,10
+    db 13,10
+    include 'work/agent/build/MSXAI_VERSION.INC'
     db "Provides remote MCP control of MSX hardware over TCP/IP.",13,10
     db "Author: Rodrigo Galhardi M. Garcia",13,10,13,10
     db "Usage:",13,10
-    db "  MSXAI /DRIVER:8251",13,10
-    db "  MSXAI /DRIVER:16C550",13,10
-    db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>]",13,10
-    db "  MSXAI /DRIVER:8251 /MONITOR [DEBUG]",13,10
-    db "  MSXAI /DRIVER:16C550 /MONITOR [DEBUG]",13,10
-    db "  MSXAI /DRIVER:UNAPI /MONITOR [DEBUG]",13,10
+    db "  MSXAI /DRIVER:8251 [/MONITOR] [DEBUG]",13,10
+    db "  MSXAI /DRIVER:16C550 [/MONITOR] [DEBUG]",13,10
+    db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/MONITOR] [DEBUG]",13,10
     db "  MSXAI /UNINSTALL",13,10
     db "DEBUG is intentionally restricted to /MONITOR.",13,10,"$"
 driver_required_message:

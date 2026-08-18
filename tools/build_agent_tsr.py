@@ -26,6 +26,7 @@ from tools.build_memman_tsr import (  # noqa: E402
     build_memman_tsr,
     infer_relocations,
 )
+from tools.build_version_include import materialize_version_include  # noqa: E402
 
 
 TSR_NAME = "MSXAI MCP1"
@@ -253,6 +254,7 @@ def build_agent_tsr(
     """Build, cross-check, and emit the template plus fixed-driver TSRs."""
 
     repository = repository.resolve()
+    materialize_version_include(repository)
     with tempfile.TemporaryDirectory(prefix="msxai-tsr-") as directory:
         temporary_dir = pathlib.Path(directory)
         images = tuple(

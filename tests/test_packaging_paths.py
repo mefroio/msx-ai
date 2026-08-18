@@ -63,6 +63,8 @@ class PackagingMetadataTest(unittest.TestCase):
             self.assertIn(entry, self.manifest)
         self.assertIn("recursive-include agent *.asm *.inc *.md", self.manifest)
         self.assertIn(
+            "recursive-include agent *.asm *.inc *.md *.TXT", self.manifest)
+        self.assertIn(
             "recursive-include server/resources *.md *.json", self.manifest)
         self.assertIn(
             "recursive-include server/resources/openmsx *.xml README",

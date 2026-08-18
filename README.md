@@ -502,7 +502,8 @@ The corresponding direct Windows commands are
 `python tools/release_check.py --publish --output-dir dist`.
 
 `release-assets` publishes the versioned Python source distribution and wheel,
-plus the stable, MSX-DOS-compatible `MSXAI.ZIP`, under `dist/`. The ZIP contains the nine matching
+plus the stable, MSX-DOS-compatible `MSXAI.ZIP` and its standalone
+`README.TXT`, under `dist/`. The ZIP contains the same README, the nine matching
 MSX files, the project license, the MemMan notice, checksums, and explicit
 wire-protocol, transfer-protocol, and toolchain metadata. Existing artifacts
 are never overwritten. The gate proves same-host equivalence with the pinned
@@ -518,6 +519,8 @@ make PYTHON=python test-integration
 
 Releases follow Semantic Versioning from the single value in
 `server/_version.py` and require a matching annotated `vMAJOR.MINOR.PATCH` tag.
+That same value is generated into the `MSXAI.COM` banner/help and the released
+`README.TXT`, so the installed MSX-side build can be identified on the machine.
 Runtime compatibility is still determined by the negotiated wire protocol,
 capabilities, and versioned subprotocols.
 

@@ -15,6 +15,12 @@ Runtime command-line options select the driver and operating mode. Splitting
 the suite keeps unrelated transient utilities out of the main executable and
 does not make their file sizes cumulative in MSX RAM.
 
+The release archive also contains `README.TXT`, an ASCII/CRLF quick-start guide
+with lines bounded for display through the MSX-DOS `TYPE` command. The same
+file is published beside `MSXAI.ZIP`; it is documentation, not a tenth program
+dependency. Its release number and the `MSXAI.COM` banner are generated from
+the same Python package version used for the wheel and source distribution.
+
 In the source tree, `msx_xfer.asm` owns the transient transfer executable and
 compiles `msx_xfer_engine.inc`, which contains its PUT/GET, resume, progress,
 CRC, and PackBits routines. `msx_memman_loader.asm` contains only the resident
