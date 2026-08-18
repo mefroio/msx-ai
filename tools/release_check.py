@@ -786,8 +786,7 @@ def _build_agent_archive(source: Path, agent_directory: Path,
                          destination: Path,
                          toolchain_version_line: str) -> Path:
     payload = _agent_suite_payload(agent_directory)
-    version = _project_version(source)
-    expected_name = f"msx-ai-agent-{version}.zip"
+    expected_name = "msx-ai-agent.zip"
     if destination.name != expected_name:
         raise ReleaseCheckError(
             f"agent archive must be named {expected_name}")
@@ -1399,8 +1398,7 @@ def run_release_check(*, publish: bool = False,
         bundle_b = temporary / "agent-bundle-b"
         bundle_a.mkdir()
         bundle_b.mkdir()
-        agent_archive_name = (
-            f"msx-ai-agent-{_project_version(rebuilt_source)}.zip")
+        agent_archive_name = "msx-ai-agent.zip"
         agent_archive = _build_agent_archive(
             rebuilt_source, rebuilt_agent, bundle_a / agent_archive_name,
             toolchain_version_line)

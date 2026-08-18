@@ -1269,7 +1269,7 @@ make PYTHON=python release-assets
 ~~~~
 
 The result is the source distribution, the wheel rebuilt from that source
-distribution, and `msx-ai-agent-<host-version>.zip`. The agent archive contains
+distribution, and the unversioned `msx-ai-agent.zip`. The agent archive contains
 exactly the nine deployable binaries plus `LICENSE`, `MEMMAN-NOTICE.txt`,
 `SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records the Python
 distribution version derived at build time, framed wire v3, transfer `fast-v1`,

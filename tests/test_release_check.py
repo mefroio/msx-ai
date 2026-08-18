@@ -501,13 +501,13 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             root = pathlib.Path(directory)
             source, suite = self.create_agent_archive_fixture(root)
             first = release_check._build_agent_archive(
-                source, suite, root / "msx-ai-agent-0.6.0.zip",
+                source, suite, root / "msx-ai-agent.zip",
                 release_check._Z80ASM_VERSION_LINE)
             second_directory = root / "second"
             second_directory.mkdir()
             second = release_check._build_agent_archive(
                 source, suite,
-                second_directory / "msx-ai-agent-0.6.0.zip",
+                second_directory / "msx-ai-agent.zip",
                 release_check._Z80ASM_VERSION_LINE)
             self.assertEqual(first.read_bytes(), second.read_bytes())
             with release_check.zipfile.ZipFile(first) as archive:
@@ -563,7 +563,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             root = pathlib.Path(directory)
             source, suite = self.create_agent_archive_fixture(root)
             valid = release_check._build_agent_archive(
-                source, suite, root / "msx-ai-agent-0.6.0.zip",
+                source, suite, root / "msx-ai-agent.zip",
                 release_check._Z80ASM_VERSION_LINE)
 
             missing = root / "missing.zip"

@@ -501,9 +501,8 @@ The corresponding direct Windows commands are
 `python tools/release_check.py --publish` and
 `python tools/release_check.py --publish --output-dir dist`.
 
-`release-assets` writes the sdist, the wheel rebuilt from it, and
-`msx-ai-agent-<version>.zip` under ignored `dist/`, with `<version>` derived
-from the Python package metadata. The agent ZIP contains the nine matching
+`release-assets` writes the sdist, the wheel rebuilt from it, and the stable
+`msx-ai-agent.zip` under ignored `dist/`. The agent ZIP contains the nine matching
 MSX files, the project license, the MemMan notice, checksums, and explicit
 wire-protocol, transfer-protocol, and toolchain metadata. Existing artifacts
 are never overwritten. The gate proves same-host equivalence with the pinned
