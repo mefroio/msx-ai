@@ -41,11 +41,9 @@ def render_version_include(version: str) -> bytes:
 
 
 def materialize_version_include(repository: Path) -> Path:
-    destination = repository / "work" / "agent" / "build" / \
-        "MSXAI_VERSION.INC"
+    destination = repository / "agent" / "msx_version.inc"
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = render_version_include(read_project_version(repository))
     if not destination.exists() or destination.read_bytes() != payload:
         destination.write_bytes(payload)
     return destination
-

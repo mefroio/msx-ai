@@ -148,6 +148,7 @@ _SDIST_REQUIRED_FILES = {
     "agent/msx_xfer.asm",
     "agent/msx_xfer_engine.inc",
     "agent/msx_xfer_protocol.inc",
+    "agent/msx_version.inc",
     "agent/transports/msx_transport_16c550.inc",
     "agent/transports/msx_transport_8251.inc",
     "agent/transports/msx_transport_unapi.inc",

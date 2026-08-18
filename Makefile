@@ -8,6 +8,7 @@ AGENT_LOADER := agent/msx_memman_loader.asm
 AGENT_XFER_SRC := agent/msx_xfer.asm
 AGENT_XFER_ENGINE := agent/msx_xfer_engine.inc
 AGENT_XFER_PROTOCOL := agent/msx_xfer_protocol.inc
+AGENT_VERSION_INCLUDE := agent/msx_version.inc
 AGENT_PORT_SRC := agent/msx_port_helper.asm
 UNAPI_PROBE_SRC := agent/msx_unapi_probe.asm
 AGENT_TRANSPORTS := agent/transports/msx_transport_8251.inc \
@@ -82,7 +83,7 @@ $(UNAPI_PROBE_COM): $(UNAPI_PROBE_SRC) tools/build_unapi_probe.py
 # is assembled into the loader's external-suite validation, while the verified
 # utilities and fixed-driver TSRs are deployable files in the same package.
 $(AGENT_COM): agent-prerequisites $(AGENT_PORT_COM)
-$(AGENT_COM): $(AGENT_SRC) $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) $(AGENT_TRANSPORTS)
+$(AGENT_COM): $(AGENT_SRC) $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) $(AGENT_VERSION_INCLUDE) $(AGENT_TRANSPORTS)
 	mkdir -p $(dir $@)
 	$(Z80ASM) $< -o $@
 	"$(PYTHON)" tools/check_msx_com_size.py $@ $(MSX_DOS_BENCH_COM_MAX)

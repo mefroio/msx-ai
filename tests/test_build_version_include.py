@@ -6,7 +6,10 @@ from tools.build_version_include import (
     VersionIncludeError,
     materialize_version_include,
     read_project_version,
+    render_version_include,
 )
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class VersionIncludeTest(unittest.TestCase):
@@ -27,6 +30,11 @@ class VersionIncludeTest(unittest.TestCase):
                 output.read_bytes(),
                 b"; Generated from server/_version.py; do not edit.\n"
                 b'db "MSX-AI MCP Agent 1.2.3",13,10\n')
+
+    def test_tracked_include_matches_the_canonical_version(self):
+        self.assertEqual(
+            (ROOT / "agent" / "msx_version.inc").read_bytes(),
+            render_version_include(read_project_version(ROOT)))
 
     def test_rejects_missing_duplicate_or_non_semver_values(self):
         for source in (

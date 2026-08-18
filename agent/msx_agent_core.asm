@@ -441,7 +441,7 @@ inconsistent_message:
     db "Inconsistent resident agent state",13,10,"$"
 usage_message:
     db 13,10
-    include 'work/agent/build/MSXAI_VERSION.INC'
+    include 'agent/msx_version.inc'
     db "Provides remote MCP control of MSX hardware over TCP/IP.",13,10
     db "Author: Rodrigo Galhardi M. Garcia",13,10,13,10
     db "Usage:",13,10
