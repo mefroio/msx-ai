@@ -1,5 +1,6 @@
 include LICENSE
 include AUTHORS.md
+include CHANGELOG.md
 include README.md
 include TECHNICAL.md
 include Makefile

@@ -1268,13 +1268,11 @@ To persist the three validated artifacts under ignored `dist/`, use:
 make PYTHON=python release-assets
 ~~~~
 
-The result is the source distribution, the wheel rebuilt from that source
-distribution, and the unversioned `msx-ai-agent.zip`. The agent archive contains
+The result includes the versioned Python distributions and the stable,
+MSX-DOS-compatible `MSXAI.ZIP`. The agent archive contains
 exactly the nine deployable binaries plus `LICENSE`, `MEMMAN-NOTICE.txt`,
-`SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records the Python
-distribution version derived at build time, framed wire v3, transfer `fast-v1`,
-and the pinned assembler identity; it does not assign a separate agent release
-version.
+`SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records the project release,
+framed wire v3, transfer `fast-v1`, and the pinned assembler identity.
 Publication is atomic per file, refuses overwrite, and rolls back files created
 by the attempt if a later publication fails. Repeated builds prove equivalence
 between the staged and sdist source on the same host and toolchain; this is not

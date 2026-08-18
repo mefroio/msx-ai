@@ -501,8 +501,8 @@ The corresponding direct Windows commands are
 `python tools/release_check.py --publish` and
 `python tools/release_check.py --publish --output-dir dist`.
 
-`release-assets` writes the sdist, the wheel rebuilt from it, and the stable
-`msx-ai-agent.zip` under ignored `dist/`. The agent ZIP contains the nine matching
+`release-assets` publishes the versioned Python source distribution and wheel,
+plus the stable, MSX-DOS-compatible `MSXAI.ZIP`, under `dist/`. The ZIP contains the nine matching
 MSX files, the project license, the MemMan notice, checksums, and explicit
 wire-protocol, transfer-protocol, and toolchain metadata. Existing artifacts
 are never overwritten. The gate proves same-host equivalence with the pinned
@@ -516,10 +516,10 @@ opt in with:
 make PYTHON=python test-integration
 ```
 
-Runtime compatibility is determined by the negotiated wire protocol,
-capabilities, and versioned subprotocols. The Python distribution version names
-packages and release archives; there is no separate agent release version to
-compare at connection time.
+Releases follow Semantic Versioning from the single value in
+`server/_version.py` and require a matching annotated `vMAJOR.MINOR.PATCH` tag.
+Runtime compatibility is still determined by the negotiated wire protocol,
+capabilities, and versioned subprotocols.
 
 ## Documentation
 

@@ -18,6 +18,7 @@ from importlib import metadata
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shlex
 import shutil
 import socket
@@ -129,6 +130,7 @@ _WHEEL_LICENSE_FILES = {
 }
 _SDIST_REQUIRED_FILES = {
     "AUTHORS.md",
+    "CHANGELOG.md",
     "LICENSE",
     "MANIFEST.in",
     "Makefile",
@@ -387,6 +389,23 @@ def _require_clean_git_checkout(environment: Mapping[str, str]) -> None:
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         environment)
     _assert_publish_status(status)
+
+
+def _assert_release_tag(version: str, tags: bytes) -> None:
+    if re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version) is None:
+        raise ReleaseCheckError(
+            f"publish version must be stable SemVer MAJOR.MINOR.PATCH: {version!r}")
+    expected = f"v{version}".encode("ascii")
+    actual = {tag for tag in tags.splitlines() if tag}
+    if expected not in actual:
+        raise ReleaseCheckError(
+            f"publish HEAD must have the annotated release tag v{version}")
+
+
+def _require_release_tag(environment: Mapping[str, str]) -> None:
+    _assert_release_tag(
+        _project_version(ROOT),
+        _git_capture(["tag", "--points-at", "HEAD"], environment))
 
 
 def _ignore_source(directory: str, names: list[str]) -> set[str]:
@@ -760,7 +779,7 @@ def _compatibility_manifest(
     return {
         "schema_version": 1,
         "creator": "Rodrigo Galhardi M. Garcia",
-        "host": _project_version(source),
+        "release": _project_version(source),
         "wire": _WIRE_VERSION,
         "transfer": _TRANSFER_VERSION,
         "toolchain": {
@@ -786,7 +805,7 @@ def _build_agent_archive(source: Path, agent_directory: Path,
                          destination: Path,
                          toolchain_version_line: str) -> Path:
     payload = _agent_suite_payload(agent_directory)
-    expected_name = "msx-ai-agent.zip"
+    expected_name = "MSXAI.ZIP"
     if destination.name != expected_name:
         raise ReleaseCheckError(
             f"agent archive must be named {expected_name}")
@@ -1352,6 +1371,7 @@ def run_release_check(*, publish: bool = False,
         # Do not run tests or builds against a checkout that cannot map exactly
         # to one committed HEAD tree.
         _require_clean_git_checkout(environment)
+        _require_release_tag(environment)
     _require_dependencies(environment)
 
     _say("running the unit suite (openMSX integration forced off)")
@@ -1398,7 +1418,7 @@ def run_release_check(*, publish: bool = False,
         bundle_b = temporary / "agent-bundle-b"
         bundle_a.mkdir()
         bundle_b.mkdir()
-        agent_archive_name = "msx-ai-agent.zip"
+        agent_archive_name = "MSXAI.ZIP"
         agent_archive = _build_agent_archive(
             rebuilt_source, rebuilt_agent, bundle_a / agent_archive_name,
             toolchain_version_line)

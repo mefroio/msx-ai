@@ -434,6 +434,18 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     release_check.ReleaseCheckError, "clean Git checkout"):
                 release_check._assert_publish_status(status)
 
+    def test_publish_requires_matching_stable_semver_tag(self):
+        release_check._assert_release_tag("0.1.0", b"v0.1.0\n")
+        for version, tags in (
+                ("0.1.0", b""),
+                ("0.1.0", b"v0.2.0\n"),
+                ("0.1", b"v0.1\n"),
+                ("01.0.0", b"v01.0.0\n"),
+                ("0.1.0.dev1", b"v0.1.0.dev1\n")):
+            with self.subTest(version=version, tags=tags), \
+                    self.assertRaises(release_check.ReleaseCheckError):
+                release_check._assert_release_tag(version, tags)
+
     def test_publish_staging_uses_mocked_git_archive_content(self):
         archive_buffer = release_check.io.BytesIO()
         content = b'__version__ = "0.6.0"\n'
@@ -501,13 +513,13 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             root = pathlib.Path(directory)
             source, suite = self.create_agent_archive_fixture(root)
             first = release_check._build_agent_archive(
-                source, suite, root / "msx-ai-agent.zip",
+                source, suite, root / "MSXAI.ZIP",
                 release_check._Z80ASM_VERSION_LINE)
             second_directory = root / "second"
             second_directory.mkdir()
             second = release_check._build_agent_archive(
                 source, suite,
-                second_directory / "msx-ai-agent.zip",
+                second_directory / "MSXAI.ZIP",
                 release_check._Z80ASM_VERSION_LINE)
             self.assertEqual(first.read_bytes(), second.read_bytes())
             with release_check.zipfile.ZipFile(first) as archive:
@@ -517,7 +529,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     release_check._AGENT_ARCHIVE_METADATA)
                 manifest = release_check.json.loads(
                     archive.read("COMPATIBILITY.json"))
-                self.assertEqual(manifest["host"], "0.6.0")
+                self.assertEqual(manifest["release"], "0.6.0")
                 self.assertEqual(
                     manifest["creator"], "Rodrigo Galhardi M. Garcia")
                 self.assertNotIn("agent", manifest)
@@ -563,7 +575,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             root = pathlib.Path(directory)
             source, suite = self.create_agent_archive_fixture(root)
             valid = release_check._build_agent_archive(
-                source, suite, root / "msx-ai-agent.zip",
+                source, suite, root / "MSXAI.ZIP",
                 release_check._Z80ASM_VERSION_LINE)
 
             missing = root / "missing.zip"
@@ -588,7 +600,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 entries = {name: archive.read(name)
                            for name in archive.namelist()}
             manifest = release_check.json.loads(entries["COMPATIBILITY.json"])
-            manifest["host"] = "9.9.9"
+            manifest["release"] = "9.9.9"
             changed_manifest = release_check.json.dumps(
                 manifest, indent=2, sort_keys=True,
                 ensure_ascii=True).encode("utf-8") + b"\n"

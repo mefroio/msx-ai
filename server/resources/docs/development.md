@@ -113,12 +113,11 @@ make PYTHON=python release-assets
 On Windows, use `python tools/release_check.py --publish` for strict mode and
 `python tools/release_check.py --publish --output-dir dist` to persist assets.
 
-This writes the sdist, the wheel rebuilt from that sdist, and a deterministic
-`msx-ai-agent.zip`. The ZIP contains exactly nine binaries,
+This writes the versioned Python distributions and the deterministic,
+MSX-DOS-compatible `MSXAI.ZIP` to `dist/`. The ZIP contains exactly nine binaries,
 the project `LICENSE`, `MEMMAN-NOTICE.txt`, `SHA256SUMS`, and
-`COMPATIBILITY.json` recording the Python distribution version derived at build
-time, wire v3, transfer `fast-v1`, and the pinned assembler; it does not assign
-a separate agent release version. Checksums cover the binaries, license,
+`COMPATIBILITY.json` recording the project release, wire v3, transfer `fast-v1`,
+and the pinned assembler. Checksums cover the binaries, license,
 notice, and compatibility manifest. Existing output files are never
 overwritten, and a failed multi-file publication rolls back files created by
 that attempt.
