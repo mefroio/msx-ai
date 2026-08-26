@@ -3,7 +3,7 @@
 ; MEMMAN.COM starts COMMAND2 after `_SYSTEM`, so the original MSXAI.COM process
 ; cannot complete the freshly installed resident's custom-port handoff. The
 ; install command runs this helper after TL.COM has returned. MP validates the
-; port and passes its binary value in HL through MemMan TsrCall before exiting.
+; port and passes a guarded A7 request through MemMan TsrCall before exiting.
 ;
 ; Usage:
 ;   MP <1..65534>
@@ -14,6 +14,7 @@
 EXTBIO:                    equ 0FFCAh
 COMMAND_TAIL:              equ 00080h
 COMMAND_TEXT:              equ 00081h
+TPA_TOP_POINTER:           equ 00006h
 
 DOS_TERM_ERROR:            equ 062h
 DOS_VERSION:               equ 06Fh
@@ -27,8 +28,16 @@ MEMMAN_MINIMUM_MINOR:      equ 4
 MEMMAN_INICHK:             equ 30
 MEMMAN_GET_TSR_ID:         equ 62
 MEMMAN_TSR_CALL:           equ 63
-MSXAI_TALK_UNAPI_PORT:     equ 0A6h
+MSXAI_TALK_UNAPI_PORT:     equ 0A7h
 MSXAI_TRANSPORT_UNAPI:     equ 2
+MSXAI_UNAPI_REQUEST_MAGIC: equ 0A75Ah
+MSXAI_UNAPI_REQUEST_VERSION: equ 1
+MSXAI_UNAPI_REQUEST_SIZE:  equ 16
+MSXAI_UNAPI_STACK_SIZE:    equ 0400h
+MSXAI_UNAPI_GUARD_SIZE:    equ 16
+MSXAI_UNAPI_STACK_HEADROOM: equ 0100h
+MSXAI_UNAPI_LOW_GUARD:     equ 0A5h
+MSXAI_UNAPI_HIGH_GUARD:    equ 05Ah
 
     org 0100h
 
@@ -43,17 +52,32 @@ port_helper_start:
     call find_memman_agent
     jr c,port_helper_agent_missing
 
-    ; BC is MemMan's opaque TSR ID. TsrCall 63 guarantees HL reaches the driver
-    ; entry unchanged, so A=A6 uses it as the explicit UNAPI listener port.
-    ; The resident opens that port before returning its active transport in A.
-    ld hl,(port_value)
+    ; Preserve MemMan's opaque ID while constructing the A7 request. The
+    ; resident moves lifecycle work to this process's guarded page-2 stack and
+    ; restores MemMan's own stack before returning.
+    ld (memman_tsr_id),bc
+    call prepare_unapi_request
+    jr c,port_helper_reconfigure_error
+    ld bc,(memman_tsr_id)
+    ld hl,unapi_request
     ld a,MSXAI_TALK_UNAPI_PORT
     ld d,'M'
     ld e,MEMMAN_TSR_CALL
     call EXTBIO
-    ei
+    di
+    ld (unapi_call_result),a
+    call verify_unapi_guards
+    jr c,port_helper_reconfigure_error_ei
+    ld a,(unapi_request_status)
+    or a
+    jr nz,port_helper_reconfigure_error_ei
+    ld a,(unapi_request_transport)
     cp MSXAI_TRANSPORT_UNAPI
-    jr nz,port_helper_reconfigure_error
+    jr nz,port_helper_reconfigure_error_ei
+    ld a,(unapi_call_result)
+    cp MSXAI_TRANSPORT_UNAPI
+    jr nz,port_helper_reconfigure_error_ei
+    ei
 
     ld de,message_success
     call print_message
@@ -72,6 +96,8 @@ port_helper_agent_missing:
     ld de,message_agent_missing
     ld a,ERR_INTERNAL
     jr port_helper_fail
+port_helper_reconfigure_error_ei:
+    ei
 port_helper_reconfigure_error:
     ld de,message_reconfigure_error
     ld a,ERR_INTERNAL
@@ -364,9 +390,152 @@ find_memman_agent_absent:
     scf
     ret
 
+; Build a 1 KiB page-2 stack below the strictest of C000h, the DOS TPA top,
+; and the current SP minus 256 bytes of caller headroom. Validate the complete
+; low-guard/stack/high-guard span before writing either guard.
+prepare_unapi_request:
+    ld hl,(port_value)
+    ld (unapi_request_port),hl
+
+    ld hl,0C000h
+    ld de,(TPA_TOP_POINTER)
+    or a
+    sbc hl,de
+    jr c,prepare_unapi_limit_is_c000
+    ld hl,(TPA_TOP_POINTER)
+    jr prepare_unapi_have_tpa_limit
+prepare_unapi_limit_is_c000:
+    ld hl,0C000h
+prepare_unapi_have_tpa_limit:
+    ld (unapi_request_stack_limit),hl
+
+    ld hl,0
+    add hl,sp
+    ld de,MSXAI_UNAPI_STACK_HEADROOM
+    or a
+    sbc hl,de
+    jr c,prepare_unapi_no_stack
+    ld (unapi_request_sp_limit),hl
+    ld de,(unapi_request_stack_limit)
+    or a
+    sbc hl,de
+    jr c,prepare_unapi_limit_is_sp
+    ld hl,(unapi_request_stack_limit)
+    jr prepare_unapi_have_limit
+prepare_unapi_limit_is_sp:
+    ld hl,(unapi_request_sp_limit)
+prepare_unapi_have_limit:
+    ld de,MSXAI_UNAPI_GUARD_SIZE
+    or a
+    sbc hl,de
+    jr c,prepare_unapi_no_stack
+    res 0,l
+    ld (unapi_request_stack_top),hl
+    ld de,MSXAI_UNAPI_STACK_SIZE
+    or a
+    sbc hl,de
+    jr c,prepare_unapi_no_stack
+    ld (unapi_request_stack_bottom),hl
+    ld de,MSXAI_UNAPI_GUARD_SIZE
+    or a
+    sbc hl,de
+    jr c,prepare_unapi_no_stack
+    ld a,h
+    cp 080h
+    jr c,prepare_unapi_no_stack
+
+    ; The complete span is now proven to remain within writable page 2.
+    ld b,MSXAI_UNAPI_GUARD_SIZE
+    ld a,MSXAI_UNAPI_LOW_GUARD
+prepare_unapi_low_guard_loop:
+    ld (hl),a
+    inc hl
+    djnz prepare_unapi_low_guard_loop
+    ld hl,(unapi_request_stack_top)
+    ld b,MSXAI_UNAPI_GUARD_SIZE
+    ld a,MSXAI_UNAPI_HIGH_GUARD
+prepare_unapi_high_guard_loop:
+    ld (hl),a
+    inc hl
+    djnz prepare_unapi_high_guard_loop
+
+    ld a,0FFh
+    ld (unapi_request_status),a
+    ld (unapi_request_error),a
+    ld (unapi_request_transport),a
+    ld a,MSXAI_TRANSPORT_UNAPI
+    ld (unapi_request_target),a
+    xor a
+    ld (unapi_request_connection),a
+    ld (unapi_request_reserved),a
+    or a
+    ret
+prepare_unapi_no_stack:
+    scf
+    ret
+
+verify_unapi_guards:
+    ld hl,(unapi_request_stack_bottom)
+    ld de,MSXAI_UNAPI_GUARD_SIZE
+    or a
+    sbc hl,de
+    ld a,MSXAI_UNAPI_LOW_GUARD
+    call verify_unapi_guard
+    jr nz,verify_unapi_guards_bad
+    ld hl,(unapi_request_stack_top)
+    ld a,MSXAI_UNAPI_HIGH_GUARD
+    call verify_unapi_guard
+    jr nz,verify_unapi_guards_bad
+    or a
+    ret
+verify_unapi_guards_bad:
+    scf
+    ret
+
+verify_unapi_guard:
+    ld b,MSXAI_UNAPI_GUARD_SIZE
+verify_unapi_guard_loop:
+    cp (hl)
+    ret nz
+    inc hl
+    djnz verify_unapi_guard_loop
+    ret
+
 memman_tsr_name:
     db "MSXAI MCP1  "
 memman_tsr_name_end:
+
+memman_tsr_id:
+    dw 0
+unapi_call_result:
+    db 0FFh
+unapi_request:
+    dw MSXAI_UNAPI_REQUEST_MAGIC
+    db MSXAI_UNAPI_REQUEST_VERSION
+    db MSXAI_UNAPI_REQUEST_SIZE
+unapi_request_port:
+    dw 0
+unapi_request_stack_bottom:
+    dw 0
+unapi_request_stack_top:
+    dw 0
+unapi_request_status:
+    db 0FFh
+unapi_request_error:
+    db 0FFh
+unapi_request_transport:
+    db 0FFh
+unapi_request_connection:
+    db 0
+unapi_request_target:
+    db MSXAI_TRANSPORT_UNAPI
+unapi_request_reserved:
+    db 0
+
+unapi_request_stack_limit:
+    dw 0
+unapi_request_sp_limit:
+    dw 0
 
 port_value:
     dw 0

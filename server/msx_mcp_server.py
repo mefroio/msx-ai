@@ -570,7 +570,8 @@ class Session:
             machine = OpenMSX(
                 machine=BASIC_MACHINE,
                 extensions=[
-                    MCP_SLOT_EXPANDER, DOS_EXTENSION, "rs232_proto"],
+                    MCP_SLOT_EXPANDER, DOS_EXTENSION, "ram512k",
+                    "rs232_proto"],
                 harddisk=str(disk), home=home,
             ).start(headless=not window)
             # Import while the emulated machine is off. openMSX may otherwise

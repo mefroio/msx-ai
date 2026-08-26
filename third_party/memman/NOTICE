@@ -11,5 +11,9 @@ three programs are Public Domain.
 LT.COM and the TSRFRAME files are not Public Domain and are intentionally not
 included here.
 
-The Base64 representation keeps the binary assets in a text-reviewable form.
-SHA256SUMS records the hashes of the decoded .COM files.
+The Base64 representation keeps the original binary assets in a
+text-reviewable form. SHA256SUMS records the hashes of those decoded upstream
+.COM files. During materialization, this project verifies the complete MemMan
+2.42 configuration structure at file offset 0x01B8 and changes only its
+little-endian heap-size word at offset 0x01BB, from 0x0080 to 0x0500 bytes. The
+committed Base64 asset and its upstream checksum remain unchanged.

@@ -361,8 +361,17 @@ foreground file helper, while `MP.COM` is the one-shot helper that applies the
 selected UNAPI port after MemMan's first-install warm boot, including the
 default 6603 when `/PORT` is omitted. The public `/PORT` syntax remains decimal;
 the compact hexadecimal form passed to `MP.COM` is private to the install
-chain. The other COM/TSR files are part of the same versioned suite. MSX-DOS 2
-or Nextor and a memory mapper are required for resident mode.
+chain. Internally, `MP.COM` and every existing-resident reconfiguration use
+the private MemMan `A7h` v1 lifecycle request: 16 bytes containing the port,
+a caller-owned 1 KiB page-2 stack, structured results, and the requested
+transport at offset 14 (`0=8251`, `1=16C550`, `2=UNAPI`); offset 15 must remain
+zero. `MP.COM` always sets target `2` because it is the first-install UNAPI
+port helper. The stack has 16-byte low/high guards and is placed below the TPA
+limit with 256 bytes of headroom from the caller's current SP. Thus driver
+changes and potentially deep TCP lifecycle work do not use MemMan's internal
+stack. The old `A6h` raw-port ABI is rejected, so mixed old/new suite files
+fail closed. The other COM/TSR files are part of the same versioned suite.
+MSX-DOS 2 or Nextor and a memory mapper are required for resident mode.
 
 ## MCP interface
 

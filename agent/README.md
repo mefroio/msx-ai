@@ -135,11 +135,19 @@ accepted only with `/DRIVER:UNAPI`, takes a decimal value from 1 through
 (`65535`) to request a random local port; the agent rejects that sentinel
 because the host needs a predictable endpoint. For a first resident UNAPI
 install, the loader converts the selected value to the private four-digit
-hexadecimal `MP/HHHH` command and `MP.COM` calls the resident with MemMan talk
-ABI `A=A6h`, `HL=port`. Users never enter that private form. The
-`MSXAIXF /PUT` and `/GET` forms take the 32-hex-digit transfer ID staged by the
-host. `MSXAI.COM` has no file-transfer command; all DOS-file PUT and GET work
-is owned by `MSXAIXF.COM` and protocol X.
+hexadecimal `MP/HHHH` command. `MP.COM` builds a versioned 16-byte request and
+calls the resident with MemMan talk ABI `A=A7h`, `HL=request`. A7 v1 is the
+safe lifecycle ABI for all three targets: offset 14 selects `0=8251`,
+`1=16C550`, or `2=UNAPI`, while offset 15 is reserved and must be zero.
+`MP.COM` always selects target `2`. The request also provides the port and a
+caller-owned 1 KiB page-2 stack surrounded by 16-byte low/high guards. The
+caller fits the complete guarded span below `C000h`, the TPA top, and the
+current SP minus 256 bytes; caller and resident validate both guards around
+the complete transport lifecycle. The old `A6h`, `HL=port` raw ABI is reserved
+and rejected so a mixed old/new suite fails closed. Users never enter either
+private form. The `MSXAIXF /PUT` and `/GET` forms take the 32-hex-digit
+transfer ID staged by the host. `MSXAI.COM` has no file-transfer command; all
+DOS-file PUT and GET work is owned by `MSXAIXF.COM` and protocol X.
 
 The startup banner reports the selected driver and runtime mode before control
 passes to MemMan or the foreground monitor.
@@ -188,8 +196,13 @@ existing resident instead of installing a duplicate. Reconfiguration restores
 the previous transport, binds the new driver, resets protocol sequencing, and
 initializes the new transport. A UNAPI port selected with `/PORT` is also
 applied during the first MemMan installation, as is the default 6603 when the
-option is omitted. Neither case requires a second invocation or a patched TSR
-file.
+option is omitted. Both the first-install `MP.COM` handoff and an existing
+resident selection use the guarded `A7h` request. The target byte makes this
+the general safe lifecycle path for transitions among 8251, 16C550, and UNAPI,
+while the first-install `MP.COM` handoff specifically selects UNAPI. This keeps
+driver teardown/startup and potentially deep `TCP_ABORT`/`TCP_OPEN` calls off
+MemMan's small internal `TsrCall` stack. Neither case requires a second
+invocation or a patched TSR file.
 
 Changing drivers can drop the active host connection. Reconnect through the
 newly selected interface.
@@ -897,8 +910,10 @@ block. Therefore connection lifecycle calls are foreground-only: `/MONITOR`
 automatically cleans the old handle and relistens from its main loop; after a
 resident connection is lost, run the same
 `MSXAI /DRIVER:UNAPI /PORT:<port>` command again at a DOS prompt. That TsrCall
-performs `TCP_ABORT` plus `TCP_OPEN` without trapping the interrupted program
-inside `H.TIMI`. Implementations may still enable interrupts or wait internally
+uses the versioned `A7h` v1 request with target `2` and its guarded,
+caller-owned 1 KiB page-2 stack to perform `TCP_ABORT` plus `TCP_OPEN` without
+trapping the interrupted program inside `H.TIMI` or consuming MemMan's
+internal stack. Implementations may still enable interrupts or wait internally
 during `TCP_STATE`, `TCP_SEND`, or `TCP_RCV`; the resident prevents its own
 nested entry, but exact hook latency, throughput, and long-frame operation
 remain physical-hardware validation items. Start physical validation with
@@ -956,8 +971,8 @@ make test-unapi-emulation
 
 This second path uses a real TCP/IP UNAPI implementation inside openMSX and
 checks a custom passive port, host connection, SEND/RCV, disconnect, and
-foreground relisten. It does not emulate the Pico/Pico+ firmware, Wi-Fi radio, cartridge
-registers, or physical timing.
+foreground relisten. It does not emulate the Pico/Pico+ firmware, Wi-Fi radio,
+cartridge registers, or physical timing.
 
 The integration suite owns at most one openMSX process at a time. It validates:
 

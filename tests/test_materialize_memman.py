@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import pathlib
 import shutil
@@ -10,6 +11,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.materialize_memman import (  # noqa: E402
+    MEMMAN_CONFIGURED_HEAP_SIZE,
+    MEMMAN_CONFIG_FILE_OFFSET,
+    MEMMAN_HEAP_WORD_OFFSET,
+    MEMMAN_UPSTREAM_CONFIG_SIGNATURE,
     MaterializeError,
     materialize_memman,
 )
@@ -18,7 +23,7 @@ from tools.materialize_memman import (  # noqa: E402
 EXPECTED = {
     "MEMMAN.COM": (
         7680,
-        "28c3a6193728d062533ae3ca3691f6b06a256a8d2a6efd457a05c8110cd984d5",
+        "beba69a5351925c8f7147d5bb4b80e54a8e6702effc7b6ce7d37c48ba9519875",
     ),
     "TL.COM": (
         2560,
@@ -48,6 +53,28 @@ class MaterializeMemmanTest(unittest.TestCase):
                     hashlib.sha256(asset.path.read_bytes()).hexdigest(), digest)
             self.assertEqual(
                 {path.name for path in output.iterdir()}, set(EXPECTED))
+
+            encoded = (
+                ROOT / "third_party" / "memman" / "memman.com.b64"
+            ).read_bytes()
+            upstream = base64.b64decode(encoded)
+            start = MEMMAN_CONFIG_FILE_OFFSET
+            end = start + len(MEMMAN_UPSTREAM_CONFIG_SIGNATURE)
+            self.assertEqual(
+                upstream[start:end], MEMMAN_UPSTREAM_CONFIG_SIGNATURE)
+            self.assertEqual(
+                upstream.count(MEMMAN_UPSTREAM_CONFIG_SIGNATURE), 1)
+            heap_start = start + MEMMAN_HEAP_WORD_OFFSET
+            self.assertEqual(upstream[heap_start:heap_start + 2], b"\x80\x00")
+            configured = (output / "MEMMAN.COM").read_bytes()
+            self.assertEqual(
+                int.from_bytes(configured[heap_start:heap_start + 2], "little"),
+                MEMMAN_CONFIGURED_HEAP_SIZE,
+            )
+            self.assertEqual(
+                configured[:heap_start] + configured[heap_start + 2:],
+                upstream[:heap_start] + upstream[heap_start + 2:],
+            )
 
     def test_hash_failure_does_not_partially_replace_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -85,6 +112,33 @@ class MaterializeMemmanTest(unittest.TestCase):
             with self.assertRaisesRegex(
                     MaterializeError, "checksum entries differ"):
                 materialize_memman(source, temporary / "output")
+
+    def test_rejects_memman_with_rehashed_configuration_signature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = pathlib.Path(directory)
+            source = temporary / "source"
+            output = temporary / "output"
+            shutil.copytree(ROOT / "third_party" / "memman", source)
+            output.mkdir()
+            sentinel = output / "MEMMAN.COM"
+            sentinel.write_bytes(b"existing verified output")
+
+            encoded = source / "memman.com.b64"
+            data = bytearray(base64.b64decode(encoded.read_bytes()))
+            data[MEMMAN_CONFIG_FILE_OFFSET] ^= 0x01
+            encoded.write_bytes(base64.encodebytes(data))
+            digest = hashlib.sha256(data).hexdigest()
+            manifest = source / "SHA256SUMS"
+            lines = manifest.read_text(encoding="ascii").splitlines()
+            lines[0] = f"{digest}  memman.com"
+            manifest.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+            with self.assertRaisesRegex(
+                    MaterializeError, "configuration signature mismatch"):
+                materialize_memman(source, output)
+            self.assertEqual(sentinel.read_bytes(), b"existing verified output")
+            self.assertFalse((output / "TL.COM").exists())
+            self.assertFalse((output / "TK.COM").exists())
 
 
 if __name__ == "__main__":

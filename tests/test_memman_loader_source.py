@@ -45,7 +45,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertRegex(
             self.source, r"(?m)^TK_FILE_SIZE:\s+equ\s+00580h")
         self.assertRegex(
-            self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+002A6h")
+            self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+0039Ah")
+        self.assertIn("922-byte guarded-stack port helper", self.source)
 
     def test_resident_lifecycle_creates_no_temporary_files(self):
         lifecycle = self.source.split(
@@ -157,8 +158,17 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld e,62", discovery)
         self.assertIn("ld e,63", discovery)
         self.assertIn('db "MSXAI MCP1  "', discovery)
-        self.assertIn("ld a,TSR_TALK_CONFIG", discovery)
         self.assertIn("ld a,TSR_TALK_UNAPI_PORT", discovery)
+        reconfigure = discovery.split("memman_reconfigure_agent:", 1)[1]
+        self.assertNotIn("TSR_TALK_CONFIG", reconfigure)
+        self.assertNotIn("cp DRIVER_UNAPI", reconfigure)
+        self.assertIn("ld a,(loader_transport_id)", reconfigure)
+        self.assertIn("ld (memman_unapi_request_target),a", reconfigure)
+
+        core = (ROOT / "agent" / "msx_agent_core.asm").read_text(
+            encoding="utf-8")
+        self.assertIn("TSR_TALK_UNAPI_PORT_LEGACY: equ 0A6h", core)
+        self.assertIn("TSR_TALK_UNAPI_PORT: equ 0A7h", core)
 
     def test_unapi_port_handoff_separates_first_and_existing_resident(self):
         entry = self.source.split("memman_loader_entry:", 1)[1].split(
@@ -176,12 +186,67 @@ class MemManLoaderSourceTests(unittest.TestCase):
 
         reconfigure = self.source.split(
             "memman_reconfigure_agent:", 1)[1].split(
+            "memman_tsr_name:", 1)[0]
+        self.assertNotIn("cp DRIVER_UNAPI", reconfigure)
+        self.assertNotIn("ld a,TSR_TALK_CONFIG", reconfigure)
+        unapi_call = reconfigure.split(
+            "memman_reconfigure_unapi_failed:", 1)[0]
+        self.assertIn("call memman_prepare_unapi_request", unapi_call)
+        self.assertIn("ld hl,memman_unapi_request", unapi_call)
+        self.assertIn("ld a,TSR_TALK_UNAPI_PORT", unapi_call)
+        self.assertIn("ld e,63", unapi_call)
+        self.assertIn("call EXTBIO", unapi_call)
+        self.assertIn("call memman_verify_unapi_guards", unapi_call)
+        self.assertIn("ld a,(memman_unapi_request_status)", unapi_call)
+        self.assertIn("ld a,(memman_unapi_request_transport)", unapi_call)
+        self.assertIn("ld a,(loader_transport_id)", unapi_call)
+        self.assertNotIn("ld hl,(loader_unapi_port)", unapi_call)
+
+        request = self.source.split(
+            "memman_unapi_request:", 1)[1].split(
+                "; ---------------------------------------------------------------------------\n"
+                "; Mutable state", 1)[0]
+        self.assertRegex(
+            request,
+            r"(?s)dw TSR_UNAPI_REQUEST_MAGIC\s+"
+            r"db TSR_UNAPI_REQUEST_VERSION\s+"
+            r"db TSR_UNAPI_REQUEST_SIZE")
+        self.assertIn("memman_unapi_request_stack_bottom:", request)
+        self.assertIn("memman_unapi_request_stack_top:", request)
+        self.assertRegex(
+            request,
+            r"(?s)memman_unapi_request_connection:\s+db 0\s+"
+            r"memman_unapi_request_target:\s+db DRIVER_UNAPI\s+"
+            r"memman_unapi_request_reserved:\s+db 0")
+
+        prepare = reconfigure.split(
+            "memman_prepare_unapi_request:", 1)[1].split(
+            "memman_verify_unapi_guards:", 1)[0]
+        self.assertIn("ld hl,0C000h", prepare)
+        self.assertIn("ld de,(TPA_TOP_POINTER)", prepare)
+        self.assertIn("ld hl,0\n    add hl,sp", prepare)
+        self.assertIn("ld de,0100h", prepare)
+        self.assertIn("ld de,TSR_UNAPI_STACK_MINIMUM", prepare)
+        self.assertIn("ld b,TSR_UNAPI_STACK_GUARD_SIZE", prepare)
+        self.assertIn("ld a,TSR_UNAPI_STACK_LOW_GUARD", prepare)
+        self.assertIn("ld a,TSR_UNAPI_STACK_HIGH_GUARD", prepare)
+        self.assertLess(
+            prepare.index("cp 080h"),
+            prepare.index("memman_prepare_unapi_low_guard_loop:"),
+        )
+        self.assertLess(
+            prepare.index("memman_prepare_unapi_low_guard_loop:"),
+            prepare.index("memman_prepare_unapi_high_guard_loop:"),
+        )
+        self.assertIn("ld (memman_unapi_request_target),a", prepare)
+        self.assertIn("ld (memman_unapi_request_reserved),a", prepare)
+
+        verify = reconfigure.split(
+            "memman_verify_unapi_guards:", 1)[1].split(
                 "memman_tsr_name:", 1)[0]
-        self.assertIn("cp DRIVER_UNAPI", reconfigure)
-        self.assertIn("ld h,a", reconfigure)
-        self.assertIn("ld a,TSR_TALK_CONFIG", reconfigure)
-        self.assertIn("ld hl,(loader_unapi_port)", reconfigure)
-        self.assertIn("ld a,TSR_TALK_UNAPI_PORT", reconfigure)
+        self.assertIn("ld a,TSR_UNAPI_STACK_LOW_GUARD", verify)
+        self.assertIn("ld a,TSR_UNAPI_STACK_HIGH_GUARD", verify)
+        self.assertIn("ld b,TSR_UNAPI_STACK_GUARD_SIZE", verify)
         self.assertNotIn("loader_publish_unapi_port", self.source)
         self.assertNotIn("DOS_SET_ENV", self.source)
         self.assertNotIn("MSXAI_PORT", self.source)
@@ -191,6 +256,11 @@ class MemManLoaderSourceTests(unittest.TestCase):
         installed = core.split("loader_install_resident:", 1)[1].split(
             "loader_install_resident_new:", 1)[0]
         self.assertIn("call memman_reconfigure_agent", installed)
+        self.assertRegex(
+            installed,
+            r"call memman_reconfigure_agent\s+ld b,a\s+ei\s+"
+            r"ld a,\(loader_transport_id\)",
+        )
 
     def test_overlay_has_guards_and_an_explicit_point_of_no_return(self):
         self.assertIn("POINT OF NO RETURN", self.source)

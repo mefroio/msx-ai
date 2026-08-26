@@ -2,8 +2,11 @@
 """Materialize the redistributable MemMan utilities from committed Base64.
 
 Only MEMMAN.COM, TL.COM and TK.COM are redistributed by this project.  All
-inputs are decoded and verified before any output is replaced, so a corrupt or
-incomplete source bundle cannot leave a partially updated vendor directory.
+inputs are decoded and verified before any output is replaced.  The pinned
+MEMMAN.COM configuration is then changed from its upstream 128-byte heap to a
+1280-byte heap at a verified structure, without modifying the upstream asset.
+A corrupt, incompatible, or incomplete source bundle cannot leave a partially
+updated vendor directory.
 """
 
 from __future__ import annotations
@@ -27,6 +30,16 @@ ASSETS = {
     "tk.com": ("tk.com.b64", "TK.COM"),
 }
 CHECKSUM_LINE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)")
+
+# CFGMMAN 2.4 locates this configuration block by its FE FD trailer.  The
+# preceding fields are recursion depth, TSR entries, hook entries, and the
+# little-endian heap size.  Pin both the file location and the complete
+# structure so a different MemMan image is rejected instead of patched at a
+# coincidental byte sequence.
+MEMMAN_CONFIG_FILE_OFFSET = 0x01B8
+MEMMAN_UPSTREAM_CONFIG_SIGNATURE = bytes.fromhex("08 1e 32 80 00 fe fd")
+MEMMAN_HEAP_WORD_OFFSET = 3
+MEMMAN_CONFIGURED_HEAP_SIZE = 0x0500
 
 
 class MaterializeError(ValueError):
@@ -87,6 +100,30 @@ def _decode_asset(path: pathlib.Path) -> bytes:
         raise MaterializeError(f"invalid Base64 in {path}: {exc}") from exc
 
 
+def _configure_memman_heap(data: bytes) -> bytes:
+    """Set the pinned MemMan 2.42 heap after verifying its exact structure."""
+
+    start = MEMMAN_CONFIG_FILE_OFFSET
+    end = start + len(MEMMAN_UPSTREAM_CONFIG_SIGNATURE)
+    actual = data[start:end]
+    if actual != MEMMAN_UPSTREAM_CONFIG_SIGNATURE:
+        raise MaterializeError(
+            "MEMMAN.COM configuration signature mismatch at file offset "
+            f"0x{start:04X}: expected "
+            f"{MEMMAN_UPSTREAM_CONFIG_SIGNATURE.hex(' ')}, got "
+            f"{actual.hex(' ')}")
+    if data.count(MEMMAN_UPSTREAM_CONFIG_SIGNATURE) != 1:
+        raise MaterializeError(
+            "MEMMAN.COM configuration signature is not unique")
+
+    heap_start = start + MEMMAN_HEAP_WORD_OFFSET
+    heap_end = heap_start + 2
+    configured = bytearray(data)
+    configured[heap_start:heap_end] = (
+        MEMMAN_CONFIGURED_HEAP_SIZE.to_bytes(2, "little"))
+    return bytes(configured)
+
+
 def _atomic_write(path: pathlib.Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: pathlib.Path | None = None
@@ -119,6 +156,8 @@ def materialize_memman(
             raise MaterializeError(
                 f"SHA-256 mismatch for {manifest_name}: expected {expected}, "
                 f"got {actual}")
+        if manifest_name == "memman.com":
+            data = _configure_memman_heap(data)
         decoded[manifest_name] = data
 
     results: list[MaterializedAsset] = []
@@ -127,7 +166,8 @@ def materialize_memman(
         data = decoded[manifest_name]
         _atomic_write(destination, data)
         results.append(MaterializedAsset(
-            output_name, destination, len(data), checksums[manifest_name]))
+            output_name, destination, len(data),
+            hashlib.sha256(data).hexdigest()))
     return tuple(results)
 
 
@@ -136,7 +176,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Decode the committed MemMan 2.42 Base64 assets and verify "
-            "their exact SHA256SUMS entries."))
+            "their exact SHA256SUMS entries; configure MEMMAN.COM with "
+            "a verified 1280-byte heap."))
     parser.add_argument(
         "--source-dir", type=pathlib.Path,
         default=repository / "third_party" / "memman")

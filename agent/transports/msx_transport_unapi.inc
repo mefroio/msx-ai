@@ -77,7 +77,7 @@ unapi_init_inner:
 if MSXAI_TSR_BUILD
     ; TsrInit runs inside TL's MemMan install chain, before the post-TL MP.COM
     ; command can pass its explicit port. Discover and validate UNAPI now, but
-    ; defer this one initial potentially blocking TCP_OPEN. The foreground A6
+    ; defer this one initial potentially blocking TCP_OPEN. The foreground A7
     ; TsrCall uses unapi_init_current_port and therefore always opens directly.
     ld a,(unapi_defer_first_open)
     or a
@@ -165,6 +165,26 @@ unapi_clear_runtime:
     ld bc,unapi_runtime_end - unapi_runtime_start - 1
     ld (hl),a
     ldir
+    ret
+
+; End one TCP stream epoch without discarding the selected UNAPI implementation
+; or either handle. Call this only when no active handle exists (or immediately
+; after ABORT succeeded), so an abort failure can still preserve a live peer.
+unapi_reset_stream_state:
+    xor a
+    ld (unapi_connection_state),a
+    ld (unapi_retry_count),a
+    ld (unapi_poll_skip),a
+    ld (unapi_rx_count),a
+    ld (unapi_rx_position),a
+    ld (unapi_tx_count),a
+    ld (unapi_flush_retries),a
+    ld (unapi_last_error),a
+    ld hl,0
+    ld (unapi_saved_sp),hl
+    ld (unapi_io_pointer),hl
+    ld (unapi_io_count),hl
+    ld (unapi_pending_rx),hl
     ret
 
 ; --------------------------------------------------------------- discovery --
@@ -501,6 +521,7 @@ unapi_service_relisten:
     call unapi_abort_current
     or a
     jr nz,unapi_service_relisten_abort_failed
+    call unapi_reset_stream_state
     call unapi_open_listener
     ret z
     jr unapi_service_relisten_failed

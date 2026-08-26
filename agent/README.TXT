@@ -40,6 +40,11 @@ required.
 The default mode installs the agent as a MemMan resident and returns to DOS.
 This is the recommended mode for file transfers and DOS applications.
 
+MemMan A7 v1 is the safe lifecycle request for targets 0, 1, and 2. Offset
+14 selects 8251, 16C550, or UNAPI; offset 15 is reserved and stays zero.
+MP.COM selects UNAPI. Its 1 KiB page-2 stack has low/high guards and leaves
+256 bytes below the caller SP. A6 is rejected; keep the suite at one version.
+
 MONITOR MODE
 ------------
 

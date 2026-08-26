@@ -301,12 +301,12 @@ class PortHelperTest(unittest.TestCase):
         second = assemble_port_helper()
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.sha256, second.sha256)
-        self.assertEqual(len(first.data), 678)
+        self.assertEqual(len(first.data), 922)
         self.assertLess(first.labels["port_helper_end"], 0x4000)
 
         loader = (ROOT / "agent" / "msx_memman_loader.asm").read_text(
             encoding="utf-8")
-        self.assertIn("MP_FILE_SIZE:            equ 002A6h", loader)
+        self.assertIn("MP_FILE_SIZE:            equ 0039Ah", loader)
 
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "MP.COM"
@@ -327,6 +327,58 @@ class PortHelperTest(unittest.TestCase):
         mutated[image.labels["memman_tsr_name"] - ORIGIN] ^= 1
         with self.assertRaisesRegex(PortHelperBuildError, "MSXAI MCP1"):
             validate_port_helper_image(bytes(mutated), image.labels)
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_validator_pins_complete_a7_request_contract(self):
+        image = assemble_port_helper()
+        request = image.labels["unapi_request"] - ORIGIN
+        expected_offsets = {
+            "unapi_request_port": 4,
+            "unapi_request_stack_bottom": 6,
+            "unapi_request_stack_top": 8,
+            "unapi_request_status": 10,
+            "unapi_request_error": 11,
+            "unapi_request_transport": 12,
+            "unapi_request_connection": 13,
+            "unapi_request_target": 14,
+            "unapi_request_reserved": 15,
+        }
+        for name, expected in expected_offsets.items():
+            with self.subTest(field=name):
+                self.assertEqual(
+                    image.labels[name] - image.labels["unapi_request"],
+                    expected,
+                )
+        self.assertEqual(image.data[request + 2], 1)
+        self.assertEqual(image.data[request + 3], 16)
+        self.assertEqual(image.data[request + 14], 2)
+        self.assertEqual(image.data[request + 15], 0)
+
+        mutated = bytearray(image.data)
+        mutated[request + 2] ^= 1
+        with self.assertRaisesRegex(PortHelperBuildError, "header"):
+            validate_port_helper_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        mutated[request + 14] = 0
+        with self.assertRaisesRegex(PortHelperBuildError, "target"):
+            validate_port_helper_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        mutated[request + 15] = 1
+        with self.assertRaisesRegex(PortHelperBuildError, "reserved"):
+            validate_port_helper_image(bytes(mutated), image.labels)
+
+        shifted = dict(image.labels)
+        shifted["unapi_request_target"] -= 1
+        with self.assertRaisesRegex(PortHelperBuildError, "offset"):
+            validate_port_helper_image(image.data, shifted)
+
+        bad_guard = dict(image.labels)
+        bad_guard["MSXAI_UNAPI_LOW_GUARD"] = 0
+        with self.assertRaisesRegex(
+                PortHelperBuildError, "MSXAI_UNAPI_LOW_GUARD"):
+            validate_port_helper_image(image.data, bad_guard)
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
     def test_actual_z80_parser_accepts_public_range_and_private_hex(self):
@@ -368,11 +420,18 @@ class PortHelperTest(unittest.TestCase):
         entry = source.split("port_helper_start:", 1)[1].split(
             "port_helper_bad_version:", 1)[0]
         self.assertLess(entry.index("call find_memman_agent"),
-                        entry.index("ld hl,(port_value)"))
-        self.assertLess(entry.index("ld hl,(port_value)"),
+                        entry.index("call prepare_unapi_request"))
+        self.assertLess(entry.index("call prepare_unapi_request"),
+                        entry.index("ld hl,unapi_request"))
+        self.assertLess(entry.index("ld hl,unapi_request"),
                         entry.index("ld a,MSXAI_TALK_UNAPI_PORT"))
+        self.assertIn("MSXAI_TALK_UNAPI_PORT:     equ 0A7h", source)
+        self.assertNotIn("equ 0A6h", source)
         self.assertIn("ld d,'M'", entry)
         self.assertIn("ld e,MEMMAN_TSR_CALL", entry)
+        self.assertIn("call verify_unapi_guards", entry)
+        self.assertIn("ld a,(unapi_request_status)", entry)
+        self.assertIn("ld a,(unapi_request_transport)", entry)
         self.assertIn("cp MSXAI_TRANSPORT_UNAPI", entry)
 
         discovery = source.split("find_memman_agent:", 1)[1].split(
@@ -383,6 +442,61 @@ class PortHelperTest(unittest.TestCase):
         self.assertIn("ld e,MEMMAN_GET_TSR_ID", discovery)
         self.assertIn("ld c,DOS_TERM_ERROR", source)
         self.assertIn("MP: MSXAI UNAPI relisten failed.", source)
+
+    def test_helper_builds_a_versioned_guarded_one_kib_request(self):
+        source = (ROOT / "agent" / "msx_port_helper.asm").read_text(
+            encoding="utf-8")
+        for declaration in (
+                "MSXAI_UNAPI_REQUEST_MAGIC: equ 0A75Ah",
+                "MSXAI_UNAPI_REQUEST_VERSION: equ 1",
+                "MSXAI_UNAPI_REQUEST_SIZE:  equ 16",
+                "MSXAI_UNAPI_STACK_SIZE:    equ 0400h",
+                "MSXAI_UNAPI_GUARD_SIZE:    equ 16",
+                "MSXAI_UNAPI_STACK_HEADROOM: equ 0100h"):
+            self.assertIn(declaration, source)
+
+        request = source.split("unapi_request:", 1)[1].split(
+            "port_value:", 1)[0]
+        self.assertRegex(
+            request,
+            r"(?s)dw MSXAI_UNAPI_REQUEST_MAGIC\s+"
+            r"db MSXAI_UNAPI_REQUEST_VERSION\s+"
+            r"db MSXAI_UNAPI_REQUEST_SIZE")
+        self.assertIn("unapi_request_stack_bottom:", request)
+        self.assertIn("unapi_request_stack_top:", request)
+        self.assertRegex(
+            request,
+            r"(?s)unapi_request_connection:\s+db 0\s+"
+            r"unapi_request_target:\s+db MSXAI_TRANSPORT_UNAPI\s+"
+            r"unapi_request_reserved:\s+db 0")
+
+        prepare = source.split("prepare_unapi_request:", 1)[1].split(
+            "verify_unapi_guards:", 1)[0]
+        self.assertIn("ld hl,0C000h", prepare)
+        self.assertIn("ld de,(TPA_TOP_POINTER)", prepare)
+        self.assertIn("ld hl,0\n    add hl,sp", prepare)
+        self.assertIn("ld de,MSXAI_UNAPI_STACK_HEADROOM", prepare)
+        self.assertIn("ld de,MSXAI_UNAPI_STACK_SIZE", prepare)
+        self.assertIn("ld b,MSXAI_UNAPI_GUARD_SIZE", prepare)
+        self.assertIn("ld a,MSXAI_UNAPI_LOW_GUARD", prepare)
+        self.assertIn("ld a,MSXAI_UNAPI_HIGH_GUARD", prepare)
+        self.assertIn("cp 080h", prepare)
+        self.assertLess(
+            prepare.index("cp 080h"),
+            prepare.index("prepare_unapi_low_guard_loop:"),
+        )
+        self.assertLess(
+            prepare.index("prepare_unapi_low_guard_loop:"),
+            prepare.index("prepare_unapi_high_guard_loop:"),
+        )
+        self.assertIn("ld (unapi_request_target),a", prepare)
+        self.assertIn("ld (unapi_request_reserved),a", prepare)
+
+        verify = source.split("verify_unapi_guards:", 1)[1].split(
+            "memman_tsr_name:", 1)[0]
+        self.assertIn("ld a,MSXAI_UNAPI_LOW_GUARD", verify)
+        self.assertIn("ld a,MSXAI_UNAPI_HIGH_GUARD", verify)
+        self.assertIn("ld b,MSXAI_UNAPI_GUARD_SIZE", verify)
 
     def test_first_tsr_unapi_open_is_deferred_until_helper_tsr_call(self):
         transport = (ROOT / "agent" / "transports" /

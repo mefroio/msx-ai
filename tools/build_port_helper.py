@@ -29,6 +29,16 @@ REQUIRED_LABELS = (
     "find_memman_agent",
     "memman_tsr_name",
     "memman_tsr_name_end",
+    "unapi_request",
+    "unapi_request_port",
+    "unapi_request_stack_bottom",
+    "unapi_request_stack_top",
+    "unapi_request_status",
+    "unapi_request_error",
+    "unapi_request_transport",
+    "unapi_request_connection",
+    "unapi_request_target",
+    "unapi_request_reserved",
     "port_value",
 )
 REQUIRED_CONSTANTS = {
@@ -37,8 +47,27 @@ REQUIRED_CONSTANTS = {
     "MEMMAN_INICHK": 30,
     "MEMMAN_GET_TSR_ID": 62,
     "MEMMAN_TSR_CALL": 63,
-    "MSXAI_TALK_UNAPI_PORT": 0xA6,
+    "MSXAI_TALK_UNAPI_PORT": 0xA7,
     "MSXAI_TRANSPORT_UNAPI": 2,
+    "MSXAI_UNAPI_REQUEST_MAGIC": 0xA75A,
+    "MSXAI_UNAPI_REQUEST_VERSION": 1,
+    "MSXAI_UNAPI_REQUEST_SIZE": 16,
+    "MSXAI_UNAPI_STACK_SIZE": 0x400,
+    "MSXAI_UNAPI_GUARD_SIZE": 16,
+    "MSXAI_UNAPI_STACK_HEADROOM": 0x100,
+    "MSXAI_UNAPI_LOW_GUARD": 0xA5,
+    "MSXAI_UNAPI_HIGH_GUARD": 0x5A,
+}
+REQUEST_FIELD_OFFSETS = {
+    "unapi_request_port": 4,
+    "unapi_request_stack_bottom": 6,
+    "unapi_request_stack_top": 8,
+    "unapi_request_status": 10,
+    "unapi_request_error": 11,
+    "unapi_request_transport": 12,
+    "unapi_request_connection": 13,
+    "unapi_request_target": 14,
+    "unapi_request_reserved": 15,
 }
 
 
@@ -123,6 +152,40 @@ def validate_port_helper_image(
     if not (ORIGIN <= value and value + 2 <= labels["port_helper_end"]):
         raise PortHelperBuildError(
             "binary port value is not wholly inside MP.COM")
+    request = labels["unapi_request"]
+    if not (ORIGIN <= request and
+            request + labels["MSXAI_UNAPI_REQUEST_SIZE"] <=
+            labels["port_helper_end"]):
+        raise PortHelperBuildError(
+            "A7 UNAPI request is not wholly inside MP.COM page zero")
+
+    for name, offset in REQUEST_FIELD_OFFSETS.items():
+        actual = labels[name] - request
+        if actual != offset:
+            raise PortHelperBuildError(
+                f"{name} is at A7 request offset {actual}, expected {offset}")
+
+    first = request - ORIGIN
+    last = first + labels["MSXAI_UNAPI_REQUEST_SIZE"]
+    request_data = data[first:last]
+    expected_header = bytes((
+        labels["MSXAI_UNAPI_REQUEST_MAGIC"] & 0xFF,
+        labels["MSXAI_UNAPI_REQUEST_MAGIC"] >> 8,
+        labels["MSXAI_UNAPI_REQUEST_VERSION"],
+        labels["MSXAI_UNAPI_REQUEST_SIZE"],
+    ))
+    if request_data[:4] != expected_header:
+        raise PortHelperBuildError(
+            "A7 request header does not contain the pinned magic, version, "
+            "and size")
+    target_offset = REQUEST_FIELD_OFFSETS["unapi_request_target"]
+    if request_data[target_offset] != labels["MSXAI_TRANSPORT_UNAPI"]:
+        raise PortHelperBuildError(
+            "MP.COM A7 request target is not the UNAPI transport")
+    reserved_offset = REQUEST_FIELD_OFFSETS["unapi_request_reserved"]
+    if request_data[reserved_offset] != 0:
+        raise PortHelperBuildError(
+            "MP.COM A7 request reserved byte is not zero")
 
 
 def assemble_port_helper(

@@ -104,9 +104,18 @@ MSXAI /DRIVER:UNAPI /PORT:43123
 
 The public command keeps the port decimal. During the first resident install,
 the loader encodes the selected value as the private fixed-width `MP/HHHH`
-command and `MP.COM` applies it through MemMan's `A=A6h`, `HL=port` talk ABI.
-That internal handoff is also used when `/PORT` is omitted and the selected
-value is the default 6603; users never invoke the hexadecimal form directly.
+command. `MP.COM` applies it through a versioned 16-byte MemMan request with
+`A=A7h`, `HL=request`. A7 v1 is the general safe-lifecycle ABI for target
+transport `0=8251`, `1=16C550`, or `2=UNAPI`; `MP.COM` writes target `2` at
+offset 14, and the reserved byte at offset 15 remains zero. The request also
+identifies the port and a caller-owned 1 KiB page-2 stack surrounded by
+16-byte low/high guards. Its complete guarded span fits below `C000h`, the TPA
+top, and the current SP minus 256 bytes of caller headroom. Caller and resident
+check both guards around `TCP_ABORT`/`TCP_OPEN`, keeping those potentially deep
+calls off MemMan's small internal `TsrCall` stack. The old `A6h`, `HL=port`
+raw ABI is reserved and rejected so mixed suite versions fail closed. The
+guarded handoff is also used when `/PORT` is omitted and the selected value is
+the default 6603; users never invoke the hexadecimal form directly.
 
 The host side is exercised exclusively through the project's public MCP
 server over STDIO. The harness calls `msx_agent_connect`,

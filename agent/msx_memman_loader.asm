@@ -61,7 +61,7 @@ DOS_PATH_SEPARATOR:      equ 05Ch
 MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
-MP_FILE_SIZE:            equ 002A6h ; 678-byte first-install port helper
+MP_FILE_SIZE:            equ 0039Ah ; 922-byte guarded-stack port helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
 ; Once MEMMAN.COM starts, the old loader image and trampoline are disposable.
@@ -728,26 +728,178 @@ memman_agent_incompatible:
     scf
     ret
 
-; Input BC is the ID returned by GetTsrID. UART selection uses the original
-; A=A5/H=driver ABI. UNAPI uses the private A=A6/HL=port ABI because HL is the
-; only free 16-bit input that MemMan TsrCall 63 guarantees to the resident.
+; Input BC is the ID returned by GetTsrID. Every transport selection uses the
+; A7 request ABI so transitions into or out of UNAPI always run lifecycle work
+; on a guarded page-2 stack instead of MemMan's small internal TsrCall stack.
 memman_reconfigure_agent:
-    ld a,(loader_transport_id)
-    cp DRIVER_UNAPI
-    jr z,memman_reconfigure_unapi
-    ld h,a
-    ld a,TSR_TALK_CONFIG
-    jr memman_reconfigure_call
-memman_reconfigure_unapi:
-    ld hl,(loader_unapi_port)
+    ld (memman_reconfigure_id),bc
+    call memman_prepare_unapi_request
+    jr c,memman_reconfigure_unapi_failed
+    ld bc,(memman_reconfigure_id)
+    ld hl,memman_unapi_request
     ld a,TSR_TALK_UNAPI_PORT
-memman_reconfigure_call:
     ld d,'M'
     ld e,63                    ; TsrCall
-    jp EXTBIO
+    call EXTBIO
+    di
+    ld (memman_unapi_call_result),a
+    call memman_verify_unapi_guards
+    jr c,memman_reconfigure_unapi_failed
+    ld a,(memman_unapi_request_status)
+    or a
+    jr nz,memman_reconfigure_unapi_failed
+    ld a,(memman_unapi_request_transport)
+    ld b,a
+    ld a,(loader_transport_id)
+    cp b
+    jr nz,memman_reconfigure_unapi_failed
+    ld a,(memman_unapi_call_result)
+    ret
+memman_reconfigure_unapi_failed:
+    ld a,0FFh
+    ret
+
+memman_prepare_unapi_request:
+    ld hl,(loader_unapi_port)
+    ld (memman_unapi_request_port),hl
+
+    ld hl,0C000h
+    ld de,(TPA_TOP_POINTER)
+    or a
+    sbc hl,de
+    jr c,memman_prepare_unapi_limit_is_c000
+    ld hl,(TPA_TOP_POINTER)
+    jr memman_prepare_unapi_have_tpa_limit
+memman_prepare_unapi_limit_is_c000:
+    ld hl,0C000h
+memman_prepare_unapi_have_tpa_limit:
+    ld (memman_unapi_request_stack_limit),hl
+
+    ld hl,0
+    add hl,sp
+    ld de,0100h
+    or a
+    sbc hl,de
+    jr c,memman_prepare_unapi_no_stack
+    ld (memman_unapi_request_sp_limit),hl
+    ld de,(memman_unapi_request_stack_limit)
+    or a
+    sbc hl,de
+    jr c,memman_prepare_unapi_limit_is_sp
+    ld hl,(memman_unapi_request_stack_limit)
+    jr memman_prepare_unapi_have_limit
+memman_prepare_unapi_limit_is_sp:
+    ld hl,(memman_unapi_request_sp_limit)
+memman_prepare_unapi_have_limit:
+    ld de,TSR_UNAPI_STACK_GUARD_SIZE
+    or a
+    sbc hl,de
+    jr c,memman_prepare_unapi_no_stack
+    res 0,l
+    ld (memman_unapi_request_stack_top),hl
+    ld de,TSR_UNAPI_STACK_MINIMUM
+    or a
+    sbc hl,de
+    jr c,memman_prepare_unapi_no_stack
+    ld (memman_unapi_request_stack_bottom),hl
+    ld de,TSR_UNAPI_STACK_GUARD_SIZE
+    or a
+    sbc hl,de
+    jr c,memman_prepare_unapi_no_stack
+    ld a,h
+    cp 080h
+    jr c,memman_prepare_unapi_no_stack
+
+    ; The complete span is now proven to remain within writable page 2.
+    ld b,TSR_UNAPI_STACK_GUARD_SIZE
+    ld a,TSR_UNAPI_STACK_LOW_GUARD
+memman_prepare_unapi_low_guard_loop:
+    ld (hl),a
+    inc hl
+    djnz memman_prepare_unapi_low_guard_loop
+    ld hl,(memman_unapi_request_stack_top)
+    ld b,TSR_UNAPI_STACK_GUARD_SIZE
+    ld a,TSR_UNAPI_STACK_HIGH_GUARD
+memman_prepare_unapi_high_guard_loop:
+    ld (hl),a
+    inc hl
+    djnz memman_prepare_unapi_high_guard_loop
+
+    ld a,0FFh
+    ld (memman_unapi_request_status),a
+    ld (memman_unapi_request_error),a
+    ld (memman_unapi_request_transport),a
+    ld a,(loader_transport_id)
+    ld (memman_unapi_request_target),a
+    xor a
+    ld (memman_unapi_request_connection),a
+    ld (memman_unapi_request_reserved),a
+    or a
+    ret
+memman_prepare_unapi_no_stack:
+    scf
+    ret
+
+memman_verify_unapi_guards:
+    ld hl,(memman_unapi_request_stack_bottom)
+    ld de,TSR_UNAPI_STACK_GUARD_SIZE
+    or a
+    sbc hl,de
+    ld a,TSR_UNAPI_STACK_LOW_GUARD
+    call memman_verify_unapi_guard
+    jr nz,memman_verify_unapi_guards_bad
+    ld hl,(memman_unapi_request_stack_top)
+    ld a,TSR_UNAPI_STACK_HIGH_GUARD
+    call memman_verify_unapi_guard
+    jr nz,memman_verify_unapi_guards_bad
+    or a
+    ret
+memman_verify_unapi_guards_bad:
+    scf
+    ret
+memman_verify_unapi_guard:
+    ld b,TSR_UNAPI_STACK_GUARD_SIZE
+memman_verify_unapi_guard_loop:
+    cp (hl)
+    ret nz
+    inc hl
+    djnz memman_verify_unapi_guard_loop
+    ret
 
 memman_tsr_name:
     db "MSXAI MCP1  "           ; exactly 12 bytes, padded for GetTsrID
+
+memman_reconfigure_id:
+    dw 0
+memman_unapi_call_result:
+    db 0FFh
+memman_unapi_request:
+    dw TSR_UNAPI_REQUEST_MAGIC
+    db TSR_UNAPI_REQUEST_VERSION
+    db TSR_UNAPI_REQUEST_SIZE
+memman_unapi_request_port:
+    dw 0
+memman_unapi_request_stack_bottom:
+    dw 0
+memman_unapi_request_stack_top:
+    dw 0
+memman_unapi_request_status:
+    db 0FFh
+memman_unapi_request_error:
+    db 0FFh
+memman_unapi_request_transport:
+    db 0FFh
+memman_unapi_request_connection:
+    db 0
+memman_unapi_request_target:
+    db DRIVER_UNAPI
+memman_unapi_request_reserved:
+    db 0
+
+memman_unapi_request_stack_limit:
+    dw 0
+memman_unapi_request_sp_limit:
+    dw 0
 
 ; ---------------------------------------------------------------------------
 ; Mutable state and command/name templates.

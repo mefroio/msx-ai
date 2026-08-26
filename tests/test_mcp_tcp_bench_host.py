@@ -236,7 +236,8 @@ class TCPBenchHostFlowTest(unittest.TestCase):
                 self.assertEqual(
                     openmsx.call_args.kwargs["extensions"],
                     [msx_mcp_server.MCP_SLOT_EXPANDER,
-                     msx_mcp_server.DOS_EXTENSION, "rs232_proto"])
+                     msx_mcp_server.DOS_EXTENSION, "ram512k",
+                     "rs232_proto"])
                 self.assertEqual(machine.imported_files, expected_files)
                 self.assertEqual(
                     machine.imported_locations,

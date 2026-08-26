@@ -1,0 +1,445 @@
+import pathlib
+import re
+import shutil
+import sys
+import tempfile
+import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CORE = ROOT / "agent" / "msx_agent_core.asm"
+sys.path.insert(0, str(ROOT))
+
+
+def _section(source: str, start: str, end: str) -> str:
+    return source.split(start, 1)[1].split(end, 1)[0]
+
+
+def _assert_in_order(test: unittest.TestCase, source: str, *needles: str) -> None:
+    position = 0
+    for needle in needles:
+        found = source.find(needle, position)
+        test.assertNotEqual(
+            found, -1, f"{needle!r} is missing or out of order")
+        position = found + len(needle)
+
+
+def _equ_value(source: str, name: str) -> int:
+    match = re.search(
+        rf"(?m)^{re.escape(name)}:\s+equ\s+([0-9A-Fa-f]+h|[0-9]+)\b",
+        source,
+    )
+    if match is None:
+        raise AssertionError(f"missing numeric equate {name}")
+    value = match.group(1)
+    return int(value[:-1], 16) if value.endswith("h") else int(value)
+
+
+class ResidentHeapStackSourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = CORE.read_text(encoding="utf-8")
+
+    def test_heap_contract_reserves_one_kib_between_two_guards(self):
+        self.assertEqual(
+            _equ_value(self.source, "MEMMAN_FUNCTION_HANDLER"), 0x4002)
+        self.assertEqual(_equ_value(self.source, "MEMMAN_HEAP_ALLOC"), 70)
+        self.assertEqual(_equ_value(self.source, "MEMMAN_HEAP_DEALLOC"), 71)
+
+        stack = _equ_value(self.source, "TSR_HEAP_STACK_SIZE")
+        guard = _equ_value(self.source, "TSR_HEAP_GUARD_SIZE")
+        block = _equ_value(self.source, "TSR_HEAP_BLOCK_SIZE")
+        self.assertEqual(stack, 0x400)
+        self.assertEqual(guard, 16)
+        self.assertEqual(block, stack + 2 * guard)
+        self.assertNotEqual(
+            _equ_value(self.source, "TSR_HEAP_LOW_GUARD"),
+            _equ_value(self.source, "TSR_HEAP_HIGH_GUARD"),
+        )
+
+    def test_heap_allocation_derives_bounds_and_fails_on_null(self):
+        allocate = _section(
+            self.source, "tsr_heap_allocate:", "tsr_heap_release:")
+        _assert_in_order(
+            self,
+            allocate,
+            "di",
+            "ld hl,TSR_HEAP_BLOCK_SIZE",
+            "ld de,MEMMAN_HEAP_ALLOC",
+            "call MEMMAN_FUNCTION_HANDLER",
+            "di",
+            "ld a,h",
+            "or l",
+            "jr z,tsr_heap_allocate_failed",
+            "ld (tsr_heap_base),hl",
+            "ld de,TSR_HEAP_GUARD_SIZE",
+            "add hl,de",
+            "ld (tsr_heap_stack_bottom),hl",
+            "ld de,TSR_HEAP_STACK_SIZE",
+            "add hl,de",
+            "ld (tsr_heap_stack_top),hl",
+            "ld (tsr_heap_fault),a",
+            "call tsr_heap_fill_guards",
+        )
+        failed = allocate.split("tsr_heap_allocate_failed:", 1)[1]
+        self.assertRegex(failed, r"(?s)^\s*scf\s+ret\s*$")
+
+    def test_heap_release_invalidates_pointers_before_deallocation(self):
+        release = _section(
+            self.source, "tsr_heap_release:", "tsr_heap_fill_guards:")
+        _assert_in_order(
+            self,
+            release,
+            "ld hl,(tsr_heap_base)",
+            "ld a,h",
+            "or l",
+            "ret z",
+            "ld (tsr_heap_base),a",
+            "ld (tsr_heap_base + 1),a",
+            "ld (tsr_heap_stack_bottom),a",
+            "ld (tsr_heap_stack_bottom + 1),a",
+            "ld (tsr_heap_stack_top),a",
+            "ld (tsr_heap_stack_top + 1),a",
+            "ld de,MEMMAN_HEAP_DEALLOC",
+            "call MEMMAN_FUNCTION_HANDLER",
+            "di",
+        )
+        self.assertEqual(release.count("call MEMMAN_FUNCTION_HANDLER"), 1)
+
+    def test_heap_guards_cover_both_ends_and_missing_heap_is_failure(self):
+        fill = _section(
+            self.source, "tsr_heap_fill_guards:", "tsr_heap_guards_ok:")
+        _assert_in_order(
+            self,
+            fill,
+            "ld hl,(tsr_heap_base)",
+            "ld b,TSR_HEAP_GUARD_SIZE",
+            "ld a,TSR_HEAP_LOW_GUARD",
+            "tsr_heap_fill_low_guard:",
+            "djnz tsr_heap_fill_low_guard",
+            "ld hl,(tsr_heap_stack_top)",
+            "ld b,TSR_HEAP_GUARD_SIZE",
+            "ld a,TSR_HEAP_HIGH_GUARD",
+            "tsr_heap_fill_high_guard:",
+            "djnz tsr_heap_fill_high_guard",
+        )
+
+        check = _section(
+            self.source,
+            "tsr_heap_guards_ok:",
+            "; TsrKill calls this only after",
+        )
+        _assert_in_order(
+            self,
+            check,
+            "ld hl,(tsr_heap_base)",
+            "jr z,tsr_heap_guards_missing",
+            "ld a,TSR_HEAP_LOW_GUARD",
+            "call tsr_heap_guard_check",
+            "ret nz",
+            "ld hl,(tsr_heap_stack_top)",
+            "ld a,TSR_HEAP_HIGH_GUARD",
+            "tsr_heap_guard_check:",
+            "ld b,TSR_HEAP_GUARD_SIZE",
+            "cp (hl)",
+            "ret nz",
+            "djnz tsr_heap_guard_check_loop",
+            "tsr_heap_guards_missing:",
+            "ld a,1",
+            "or a",
+            "ret",
+        )
+
+    def test_h_timi_uses_heap_stack_and_restores_saved_memman_frame(self):
+        hooks = _section(
+            self.source,
+            "; ------------------------------------------------------------ BIOS hooks",
+            "else\nresident_keyi_hook:",
+        )
+        timi_entry = _section(
+            hooks, "resident_timi_hook:", "; A nested MemMan hook")
+        _assert_in_order(
+            self,
+            timi_entry,
+            "push af",
+            "ld a,(in_hook)",
+            "jr nz,memman_nested_timi_return",
+            "ld a,(tsr_heap_fault)",
+            "jr nz,memman_nested_timi_return",
+            "ld (in_hook),a",
+        )
+
+        dispatch = _section(
+            hooks, "resident_hook_saved_af:", "hook_done:")
+        _assert_in_order(
+            self,
+            dispatch,
+            "push bc",
+            "push de",
+            "push hl",
+            "push ix",
+            "push iy",
+            "ld (hook_context_sp),sp",
+            "di",
+            "ld sp,(tsr_heap_stack_top)",
+            "ld (hook_dispatch_sp),sp",
+            "call transport_service",
+        )
+
+        unwind = _section(hooks, "hook_done:", "memman_hook_continue:")
+        _assert_in_order(
+            self,
+            unwind,
+            "call transport_session_finalize",
+            "di",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "ld sp,(hook_context_sp)",
+            "ld (in_hook),a",
+            "pop hl",
+            "pop de",
+            "pop bc",
+        )
+        self.assertLess(
+            unwind.index("ld sp,(hook_context_sp)"),
+            unwind.index("pop iy"),
+        )
+
+    def test_tsr_kill_restores_memman_sp_before_heap_release(self):
+        kill = _section(
+            self.source,
+            "tsr_kill:",
+            "; Foreground suite programs use TsrCall",
+        )
+        _assert_in_order(
+            self,
+            kill,
+            "di",
+            "ld (tsr_heap_memman_sp),sp",
+            "ld hl,(tsr_heap_base)",
+            "jr z,tsr_kill_release_heap",
+            "call tsr_heap_fill_guards",
+            "ld sp,(tsr_heap_stack_top)",
+            "call transport_restore_foreground_retry",
+            "di",
+            "call tsr_heap_guards_ok",
+            "ld sp,(tsr_heap_memman_sp)",
+            "tsr_kill_release_heap:",
+            "call tsr_heap_release",
+        )
+        self.assertLess(
+            kill.index("ld sp,(tsr_heap_memman_sp)"),
+            kill.index("call tsr_heap_release"),
+        )
+
+    def test_a5_lifecycle_uses_heap_and_fails_closed_on_guard_damage(self):
+        lifecycle = _section(
+            self.source,
+            "tsr_talk_config_begin:",
+            "tsr_talk_config_begin_common:",
+        )
+        _assert_in_order(
+            self,
+            lifecycle,
+            "ld a,(tsr_heap_fault)",
+            "jp nz,tsr_talk_unsupported",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "jp tsr_talk_unsupported",
+            "tsr_talk_config_heap_ready:",
+            "ld (in_hook),a",
+            "ld (tsr_heap_memman_sp),sp",
+            "ld sp,(tsr_heap_stack_top)",
+            "call tsr_talk_config_begin_common",
+            "ld (tsr_heap_result),a",
+            "di",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "ld (tsr_heap_result),a",
+            "ld sp,(tsr_heap_memman_sp)",
+            "ld (in_hook),a",
+            "ld a,(tsr_heap_result)",
+            "ret",
+        )
+
+    def test_a7_keeps_caller_guards_but_runs_lifecycle_on_page_three(self):
+        lifecycle = _section(
+            self.source,
+            "tsr_talk_unapi_port:",
+            "; Validate that an entire caller range",
+        )
+        self.assertEqual(lifecycle.count("call tsr_talk_unapi_guards_ok"), 2)
+        _assert_in_order(
+            self,
+            lifecycle,
+            "call tsr_talk_unapi_guards_ok",
+            "ld a,(tsr_heap_fault)",
+            "jp nz,tsr_talk_unapi_bad_stack",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "jp tsr_talk_unapi_bad_stack",
+            "tsr_talk_unapi_heap_ready:",
+            "ld (in_hook),a",
+            "ld (tsr_heap_memman_sp),sp",
+            "ld sp,(tsr_heap_stack_top)",
+            "call tsr_talk_unapi_port_inner",
+            "ld (tsr_unapi_result),a",
+            "di",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "ld sp,(tsr_heap_memman_sp)",
+            "ld a,(tsr_heap_fault)",
+            "jr nz,tsr_talk_unapi_stack_corrupted",
+            "call tsr_talk_unapi_guards_ok",
+            "jr nz,tsr_talk_unapi_stack_corrupted",
+        )
+        self.assertNotIn("ld sp,(tsr_unapi_stack_top)", lifecycle)
+        self.assertNotIn("tsr_unapi_memman_sp", lifecycle)
+        self.assertLess(
+            lifecycle.index("ld sp,(tsr_heap_memman_sp)"),
+            lifecycle.index("call tsr_talk_unapi_write_result"),
+        )
+
+    def test_protocol_x_pump_uses_the_same_guarded_heap_stack(self):
+        pump = _section(
+            self.source, "tsr_talk_xfer_pump:", "; CLAIM input HL points")
+        _assert_in_order(
+            self,
+            pump,
+            "ld a,(in_hook)",
+            "jp nz,tsr_talk_unsupported",
+            "ld a,(tsr_heap_fault)",
+            "jp nz,tsr_talk_unsupported",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "jp tsr_talk_unsupported",
+            "tsr_talk_xfer_pump_heap_ready:",
+            "ld (in_hook),a",
+            "ld (tsr_heap_memman_sp),sp",
+            "ld sp,(tsr_heap_stack_top)",
+            "ld (xfer_fast_pump_sp),sp",
+            "call transport_service",
+            "call transport_session_guard",
+            "call transport_session_finalize",
+            "tsr_talk_xfer_pump_leave_heap:",
+            "di",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "ld sp,(tsr_heap_memman_sp)",
+            "ld (in_hook),a",
+        )
+        self.assertEqual(pump.count("ld sp,(tsr_heap_memman_sp)"), 1)
+        self.assertLess(
+            pump.index("ld (in_hook),a"),
+            pump.index("ld sp,(tsr_heap_stack_top)"),
+        )
+        self.assertLess(
+            pump.index("call tsr_heap_guards_ok", pump.index(
+                "tsr_talk_xfer_pump_leave_heap:")),
+            pump.index("ld sp,(tsr_heap_memman_sp)"),
+        )
+
+    def test_protocol_x_loss_and_timeout_unwind_through_heap_exit(self):
+        unwind = _section(
+            self.source,
+            "xfer_fast_pump_session_lost:",
+            "xfer_fast_pump_abandon:",
+        )
+        session_lost = unwind.split("xfer_fast_pump_timeout:", 1)[0]
+        timeout = unwind.split("xfer_fast_pump_timeout:", 1)[1]
+        _assert_in_order(
+            self,
+            session_lost,
+            "ld sp,(xfer_fast_pump_sp)",
+            "call xfer_fast_pump_abandon",
+            "call transport_session_finalize",
+            "ld (tsr_heap_result),a",
+            "jp tsr_talk_xfer_pump_leave_heap",
+        )
+        _assert_in_order(
+            self,
+            timeout,
+            "ld sp,(xfer_fast_pump_sp)",
+            "call xfer_fast_pump_abandon",
+            "ld (tsr_heap_result),a",
+            "jp tsr_talk_xfer_pump_leave_heap",
+        )
+        self.assertNotIn("ld sp,(tsr_heap_memman_sp)", unwind)
+
+        put_wait = _section(
+            self.source, "ser_put_pump_wait:", "ser_put_pump_ready:")
+        get_wait = _section(
+            self.source, "ser_get_pump_wait:", "ser_get_pump_ready:")
+        self.assertIn("jp xfer_fast_pump_timeout", put_wait)
+        self.assertIn("jp xfer_fast_pump_timeout", get_wait)
+
+    def test_tsr_init_allocates_before_transport_and_releases_all_failures(self):
+        initializer = _section(self.source, "tsr_init:", "tsr_intro_message:")
+        _assert_in_order(
+            self,
+            initializer,
+            "di",
+            "call tsr_heap_allocate",
+            "jr c,tsr_init_heap_failed",
+            "ld (tsr_heap_memman_sp),sp",
+            "ld sp,(tsr_heap_stack_top)",
+            "ld (unapi_defer_first_open),a",
+            "call resident_initialize",
+            "jr nz,tsr_init_failed_on_heap",
+            "di",
+            "call tsr_heap_guards_ok",
+            "jr z,tsr_init_heap_succeeded",
+            "ld (tsr_heap_fault),a",
+            "tsr_init_failed_on_heap:",
+            "call transport_restore_foreground_retry",
+            "di",
+            "ld sp,(tsr_heap_memman_sp)",
+            "call tsr_heap_release",
+            "tsr_init_failed:",
+            "ld a,3",
+            "tsr_init_heap_succeeded:",
+            "di",
+            "ld sp,(tsr_heap_memman_sp)",
+            "ld a,2",
+            "tsr_init_heap_failed:",
+            "ld a,3",
+        )
+        allocation_failure = initializer.split(
+            "tsr_init_heap_failed:", 1)[1]
+        self.assertNotIn("resident_initialize", allocation_failure)
+        self.assertNotIn("transport_restore", allocation_failure)
+        success = initializer.split("tsr_init_heap_succeeded:", 1)[1].split(
+            "tsr_init_heap_failed:", 1)[0]
+        self.assertNotIn("tsr_heap_release", success)
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_heap_contract_is_present_in_the_assembled_tsr(self):
+        from tools.build_agent_tsr import BUILD_ORIGINS, _assemble
+
+        with tempfile.TemporaryDirectory() as directory:
+            image = _assemble(
+                ROOT, pathlib.Path(directory), "z80asm", BUILD_ORIGINS[0])
+
+        for label in (
+                "tsr_heap_base", "tsr_heap_stack_bottom",
+                "tsr_heap_stack_top", "tsr_heap_fault",
+                "tsr_heap_allocate", "tsr_heap_release",
+                "tsr_heap_fill_guards", "tsr_heap_guards_ok"):
+            self.assertIn(label, image.labels)
+            self.assertGreaterEqual(image.labels[label], image.origin)
+            self.assertLess(image.labels[label], image.labels["resident_end"])
+
+        allocate = image.data[
+            image.labels["tsr_heap_allocate"] - image.origin:
+            image.labels["tsr_heap_release"] - image.origin
+        ]
+        release = image.data[
+            image.labels["tsr_heap_release"] - image.origin:
+            image.labels["tsr_heap_fill_guards"] - image.origin
+        ]
+        self.assertIn(b"\x21\x20\x04\x11\x46\x00\xcd\x02\x40", allocate)
+        self.assertIn(b"\x11\x47\x00\xcd\x02\x40", release)
+
+
+if __name__ == "__main__":
+    unittest.main()

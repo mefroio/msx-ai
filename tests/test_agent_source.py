@@ -784,7 +784,22 @@ class ResidentAgentSourceTests(unittest.TestCase):
             relisten,
             r"(?s)ld a,\(in_hook\).*ret nz.*call unapi_abort_current\s+"
             r"or a\s+jr nz,unapi_service_relisten_abort_failed\s+"
-            r"call unapi_open_listener")
+            r"call unapi_reset_stream_state\s+call unapi_open_listener")
+
+        stream_reset = source.split("unapi_reset_stream_state:", 1)[1].split(
+            "; --------------------------------------------------------------- discovery", 1)[0]
+        for stale_field in (
+                "unapi_connection_state", "unapi_retry_count",
+                "unapi_poll_skip", "unapi_rx_count", "unapi_rx_position",
+                "unapi_tx_count", "unapi_flush_retries", "unapi_last_error",
+                "unapi_saved_sp", "unapi_io_pointer", "unapi_io_count",
+                "unapi_pending_rx"):
+            self.assertIn(stale_field, stream_reset)
+        for preserved_field in (
+                "unapi_connection)", "unapi_cleanup_connection",
+                "unapi_initialized", "unapi_mode", "unapi_entry",
+                "unapi_open_blocking"):
+            self.assertNotIn(preserved_field, stream_reset)
 
         flush = source.split("unapi_flush:", 1)[1].split(
             "unapi_receive_block:", 1)[0]
@@ -840,18 +855,29 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("cp 0FFh", parser)
         self.assertIn("jp z,loader_parse_port_error", parser)
 
-        talk = self.source.split("tsr_talk_config:", 1)[1].split(
-            "; Validate that an entire caller range", 1)[0]
-        self.assertIn("cp UNAPI_ID + 1", talk)
-        self.assertIn("tsr_talk_unapi_port:", talk)
-        self.assertIn("ld (tsr_config_requested_port),hl", talk)
-        self.assertIn("TSR_TALK_UNAPI_PORT: equ 0A6h", self.source)
-        self.assertIn("cp TSR_TALK_UNAPI_PORT", self.source)
-        self.assertIn("call unapi_init_current_port", talk)
-        self.assertIn("call xfer_reconfigure_detach", talk)
-        self.assertIn("call xfer_reset", talk)
-        rollback = talk.split("tsr_talk_config_failed:", 1)[1]
-        begin = talk.split("tsr_talk_config_begin_common:", 1)[1].split(
+        dispatch = self.source.split("tsr_talk:", 1)[1].split(
+            "tsr_talk_config:", 1)[0]
+        self.assertIn("TSR_TALK_UNAPI_PORT_LEGACY: equ 0A6h", self.source)
+        self.assertIn("TSR_TALK_UNAPI_PORT: equ 0A7h", self.source)
+        self.assertRegex(
+            dispatch,
+            r"(?s)cp TSR_TALK_UNAPI_PORT_LEGACY\s+"
+            r"jp z,tsr_talk_unsupported\s+"
+            r"cp TSR_TALK_UNAPI_PORT\s+jp z,tsr_talk_unapi_port")
+
+        config = self.source.split("tsr_talk_config:", 1)[1].split(
+            "; Private safe lifecycle ABI", 1)[0]
+        self.assertIn("cp UNAPI_ID + 1", config)
+        self.assertRegex(
+            config,
+            r"(?s)cp UNAPI_ID\s+jp z,tsr_talk_unsupported.*"
+            r"ld a,\(active_transport_id\)\s+cp UNAPI_ID\s+"
+            r"jp z,tsr_talk_unsupported")
+        self.assertIn("call unapi_init_current_port", config)
+        self.assertIn("call xfer_reconfigure_detach", config)
+        self.assertIn("call xfer_reset", config)
+        rollback = config.split("tsr_talk_config_failed:", 1)[1]
+        begin = config.split("tsr_talk_config_begin_common:", 1)[1].split(
             "tsr_talk_config_failed:", 1)[0]
         self.assertRegex(
             begin,
@@ -881,10 +907,92 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r".*call unapi_clear_runtime")
         self.assertIn("call transport_session_reset", rollback)
         self.assertIn("call xfer_reconfigure_detach", rollback)
-        self.assertIn("ld a,0FFh", talk)
-        self.assertIn("tsr_config_old_port", talk)
+        self.assertIn("ld a,0FFh", config)
+        self.assertIn("tsr_config_old_port", config)
         self.assertNotIn("UNAPI_DOS_GET_ENV", self.source)
         self.assertNotIn("unapi_port_environment_name", self.source)
+
+        for declaration in (
+                "TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah",
+                "TSR_UNAPI_REQUEST_VERSION: equ 1",
+                "TSR_UNAPI_REQUEST_SIZE: equ 16",
+                "TSR_UNAPI_REQUEST_TARGET: equ 14",
+                "TSR_UNAPI_REQUEST_RESERVED: equ 15",
+                "TSR_UNAPI_STACK_MINIMUM: equ 0400h",
+                "TSR_UNAPI_STACK_GUARD_SIZE: equ 16"):
+            self.assertIn(declaration, self.source)
+
+        safe = self.source.split("tsr_talk_unapi_port:", 1)[1].split(
+            "; Validate that an entire caller range", 1)[0]
+        self.assertIn("ld bc,TSR_UNAPI_REQUEST_SIZE", safe)
+        self.assertIn("call tsr_talk_page0_range", safe)
+        self.assertRegex(
+            safe,
+            r"(?s)ld a,\(in_hook\)\s+or a\s+"
+            r"jp nz,tsr_talk_unsupported")
+        self.assertRegex(
+            safe,
+            r"(?s)cp TSR_UNAPI_REQUEST_MAGIC & 0FFh.*"
+            r"cp TSR_UNAPI_REQUEST_MAGIC >> 8.*"
+            r"cp TSR_UNAPI_REQUEST_VERSION.*"
+            r"cp TSR_UNAPI_REQUEST_SIZE")
+        self.assertIn("jp nz,tsr_talk_unapi_bad_abi", safe)
+        self.assertRegex(
+            safe,
+            r"(?s)cp UNAPI_ID \+ 1\s+jp nc,tsr_talk_unapi_bad_abi\s+"
+            r"ld \(tsr_config_requested_transport\),a.*"
+            r"ld a,\(hl\)\s+or a\s+jp nz,tsr_talk_unapi_bad_abi")
+        self.assertRegex(
+            safe,
+            r"(?s)ld a,\(tsr_config_requested_transport\)\s+"
+            r"cp UNAPI_ID\s+jr nz,tsr_talk_unapi_port_valid.*"
+            r"reject FFFFh random-port sentinel")
+        self.assertIn("ld de,TSR_UNAPI_STACK_MINIMUM", safe)
+        self.assertIn("ld de,TSR_UNAPI_STACK_GUARD_SIZE", safe)
+        self.assertIn("ld a,TSR_UNAPI_STACK_LOW_GUARD", safe)
+        self.assertIn("ld a,TSR_UNAPI_STACK_HIGH_GUARD", safe)
+        self.assertEqual(safe.count("call tsr_talk_unapi_guards_ok"), 2)
+        self.assertRegex(
+            safe,
+            r"(?s)call tsr_talk_unapi_guards_ok.*"
+            r"call tsr_heap_guards_ok.*"
+            r"ld \(tsr_heap_memman_sp\),sp\s+"
+            r"ld sp,\(tsr_heap_stack_top\)\s+"
+            r"call tsr_talk_unapi_port_inner.*"
+            r"di\s+call tsr_heap_guards_ok.*"
+            r"ld sp,\(tsr_heap_memman_sp\)")
+        self.assertNotIn("ld sp,(tsr_unapi_stack_top)", safe)
+        self.assertRegex(
+            safe,
+            r"(?s)ld a,\(tsr_config_requested_transport\)\s+ld b,a\s+"
+            r"ld a,\(tsr_unapi_result\)\s+cp b")
+
+        inner = safe.split("tsr_talk_unapi_port_inner:", 1)[1]
+        self.assertRegex(
+            inner,
+            r"(?s)ld a,\(tsr_config_requested_transport\).*"
+            r"ld a,\(active_transport_id\)\s+cp b.*"
+            r"cp UNAPI_ID\s+jr z,tsr_talk_unapi_port_switch")
+        self.assertRegex(
+            inner,
+            r"(?s)cp UNAPI_ID\s+jr nz,tsr_talk_unapi_port_switch_default.*"
+            r"ld \(tsr_config_explicit_port\),a.*"
+            r"jp tsr_talk_config_begin_common")
+        self.assertNotIn("call unapi_abort_current", inner)
+        self.assertNotIn("call unapi_open_listener", inner)
+        self.assertNotIn("call unapi_discover", inner)
+        self.assertNotIn("call EXTBIO", inner)
+
+        abort_failed = config.split(
+            "tsr_talk_config_abort_failed:", 1)[1].split(
+                "tsr_talk_done:", 1)[0]
+        self.assertRegex(
+            abort_failed,
+            r"(?s)ld a,\(unapi_connection\)\s+or a\s+"
+            r"jr nz,tsr_talk_config_abort_failed_report\s+"
+            r"call unapi_reset_stream_state\s+"
+            r"call transport_session_reset\s+"
+            r"call xfer_reconfigure_detach")
 
         detach = self.source.split("xfer_reconfigure_detach:", 1)[1].split(
             "endif", 1)[0]

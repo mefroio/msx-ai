@@ -96,7 +96,43 @@ KEYBUF_SPOOL_FLAG_BARRIER: equ 1
 KEYBUF_SPOOL_FLAG_ACTIVE: equ 2
 KEYBUF_SPOOL_FLAG_AUTHORIZED: equ 4
 TSR_TALK_CONFIG: equ 0A5h
-TSR_TALK_UNAPI_PORT: equ 0A6h
+; A6 used HL as a raw port and ran TCP_OPEN on MemMan's tiny internal stack.
+; Keep it reserved so mixed old/new suite files fail closed. A7 carries a
+; versioned page-zero request with a caller-owned 1 KiB lifecycle stack.
+TSR_TALK_UNAPI_PORT_LEGACY: equ 0A6h
+TSR_TALK_UNAPI_PORT: equ 0A7h
+TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah
+TSR_UNAPI_REQUEST_VERSION: equ 1
+TSR_UNAPI_REQUEST_SIZE: equ 16
+TSR_UNAPI_REQUEST_PORT: equ 4
+TSR_UNAPI_REQUEST_STACK_BOTTOM: equ 6
+TSR_UNAPI_REQUEST_STACK_TOP: equ 8
+TSR_UNAPI_REQUEST_STATUS: equ 10
+TSR_UNAPI_REQUEST_ERROR: equ 11
+TSR_UNAPI_REQUEST_TRANSPORT: equ 12
+TSR_UNAPI_REQUEST_CONNECTION: equ 13
+TSR_UNAPI_REQUEST_TARGET: equ 14
+TSR_UNAPI_REQUEST_RESERVED: equ 15
+TSR_UNAPI_STACK_MINIMUM: equ 0400h
+TSR_UNAPI_STACK_GUARD_SIZE: equ 16
+TSR_UNAPI_STACK_LOW_GUARD: equ 0A5h
+TSR_UNAPI_STACK_HIGH_GUARD: equ 05Ah
+TSR_UNAPI_STATUS_OK: equ 0
+TSR_UNAPI_STATUS_ABI: equ 1
+TSR_UNAPI_STATUS_REQUEST_RANGE: equ 2
+TSR_UNAPI_STATUS_STACK: equ 3
+TSR_UNAPI_STATUS_TRANSPORT: equ 4
+; MemMan 2.4 exposes its function handler at the fixed segment entry 4002h.
+; Reserve one persistent page-3 heap block for every resident path that may
+; enter BIOS/EXTBIO/UNAPI code. The guards are outside the usable 1 KiB stack.
+MEMMAN_FUNCTION_HANDLER: equ 04002h
+MEMMAN_HEAP_ALLOC: equ 70
+MEMMAN_HEAP_DEALLOC: equ 71
+TSR_HEAP_STACK_SIZE: equ 0400h
+TSR_HEAP_GUARD_SIZE: equ 16
+TSR_HEAP_BLOCK_SIZE: equ 0420h
+TSR_HEAP_LOW_GUARD: equ 0A5h
+TSR_HEAP_HIGH_GUARD: equ 05Ah
 include 'agent/msx_xfer_protocol.inc'
 XFER_INLINE_GET_CAPACITY: equ FRAMED_SAFE_MAX - 8
 ; The hook stack's protocol work itself stays below 64 bytes. A block transport
@@ -367,8 +403,10 @@ install_no_room:
 loader_install_resident:
     call memman_find_agent
     jr c,loader_install_resident_new
+    ; A7 returns after restoring MemMan with DI.
     call memman_reconfigure_agent
     ld b,a
+    ei
     ld a,(loader_transport_id)
     cp b
     jr nz,loader_resident_call_error
@@ -411,7 +449,7 @@ loader_resident_message_exit:
     jp 0005h
 
 install_banner:
-    db 13,10,"MSX-AI universal MCP agent v2",13,10,"$"
+    db 13,10,"MSX-AI universal MCP agent",13,10,"$"
 transport_8251_banner:
     db "Driver: 8251-compatible MSX RS-232",13,10,"$"
 transport_16c550_banner:
@@ -1112,6 +1150,32 @@ tsr_config_explicit_port:
     db 0
 tsr_config_old_unapi_live:
     db 0
+tsr_config_unapi_error:
+    db 0
+tsr_config_previous_in_hook:
+    db 0
+tsr_heap_base:
+    dw 0
+tsr_heap_stack_bottom:
+    dw 0
+tsr_heap_stack_top:
+    dw 0
+tsr_heap_memman_sp:
+    dw 0
+tsr_heap_fault:
+    db 0
+tsr_heap_result:
+    db 0FFh
+tsr_unapi_request_pointer:
+    dw 0
+tsr_unapi_stack_bottom:
+    dw 0
+tsr_unapi_stack_top:
+    dw 0
+tsr_unapi_result:
+    db 0FFh
+tsr_unapi_status:
+    db TSR_UNAPI_STATUS_ABI
 endif
 
 resident_initialize:
@@ -1259,6 +1323,9 @@ resident_keyi_hook:
     ld a,(in_hook)
     or a
     jr nz,memman_nested_keyi_return
+    ld a,(tsr_heap_fault)
+    or a
+    jr nz,memman_nested_keyi_return
     ld a,1
     ld (in_hook),a             ; close the guard before saving more context
     xor a
@@ -1268,6 +1335,9 @@ resident_keyi_hook:
 resident_timi_hook:
     push af
     ld a,(in_hook)
+    or a
+    jr nz,memman_nested_timi_return
+    ld a,(tsr_heap_fault)
     or a
     jr nz,memman_nested_timi_return
     ld a,1
@@ -1310,9 +1380,11 @@ resident_hook_saved_af:
     push hl
     exx
 
-    ; MemMan entered through a BIOS hook with its dispatcher and stack in
-    ; stable page-3 RAM. Keep that stack: switching page 1 cannot invalidate it.
+    ; Keep only the fixed register frame on MemMan's inherited hook stack. All
+    ; protocol and transport work runs on our guarded persistent page-3 heap.
     ld (hook_context_sp),sp
+    di
+    ld sp,(tsr_heap_stack_top)
     ld (hook_dispatch_sp),sp
     ; An exclusive H.KEYI transport must suppress the previous RS-232 handler
     ; even when RxRDY is not set at this exact instruction. Otherwise a byte
@@ -1367,6 +1439,15 @@ hook_dispatch_frame:
 
 hook_done:
     call transport_session_finalize
+    ; Pico/Pico+ UNAPI entry points may execute EI. Close that window before
+    ; validating the private stack and restoring MemMan's opaque hook stack.
+    di
+    call tsr_heap_guards_ok
+    jr z,hook_heap_guards_ok
+    ld a,1
+    ld (tsr_heap_fault),a       ; fail closed on every later hook/TsrCall
+hook_heap_guards_ok:
+    ld sp,(hook_context_sp)
     xor a
     ld (in_hook),a
     exx
@@ -5489,10 +5570,16 @@ xfer_fast_pump_session_lost:
     ld sp,(xfer_fast_pump_sp)
     call xfer_fast_pump_abandon
     call transport_session_finalize
-    ret
+    xor a
+    ld (tsr_heap_result),a
+    jp tsr_talk_xfer_pump_leave_heap
 
 xfer_fast_pump_timeout:
     ld sp,(xfer_fast_pump_sp)
+    call xfer_fast_pump_abandon
+    xor a
+    ld (tsr_heap_result),a
+    jp tsr_talk_xfer_pump_leave_heap
 xfer_fast_pump_abandon:
     xor a
     ; Never let a later unrelated response commit a GET block whose original
@@ -5520,12 +5607,125 @@ last_response_small:
     ds FRAME_CACHE_MAX,0
 
 if MSXAI_TSR_BUILD
+; MemMan's page-3 heap remains mapped while this page-1 TSR calls EXTBIO,
+; CALSLT, a mapped-RAM helper, or a page-1 Pico/Pico+ implementation. Function
+; 70/71 are invoked through the fixed handler present at 4002h in every MemMan
+; TSR segment. Never release this block while SP still points inside it.
+tsr_heap_allocate:
+    di
+    ld hl,TSR_HEAP_BLOCK_SIZE
+    ld de,MEMMAN_HEAP_ALLOC
+    call MEMMAN_FUNCTION_HANDLER
+    di
+    ld a,h
+    or l
+    jr z,tsr_heap_allocate_failed
+    ld (tsr_heap_base),hl
+    ld de,TSR_HEAP_GUARD_SIZE
+    add hl,de
+    ld (tsr_heap_stack_bottom),hl
+    ld de,TSR_HEAP_STACK_SIZE
+    add hl,de
+    ld (tsr_heap_stack_top),hl
+    xor a
+    ld (tsr_heap_fault),a
+    call tsr_heap_fill_guards
+    or a
+    ret
+tsr_heap_allocate_failed:
+    scf
+    ret
+
+tsr_heap_release:
+    ld hl,(tsr_heap_base)
+    ld a,h
+    or l
+    ret z
+    ; Clear every published pointer before HeapDeAlloc can temporarily enable
+    ; interrupts. TsrKill has already detached hooks, and failed TsrInit has not
+    ; registered them yet, but stale pointers must still fail closed.
+    xor a
+    ld (tsr_heap_base),a
+    ld (tsr_heap_base + 1),a
+    ld (tsr_heap_stack_bottom),a
+    ld (tsr_heap_stack_bottom + 1),a
+    ld (tsr_heap_stack_top),a
+    ld (tsr_heap_stack_top + 1),a
+    ld (tsr_heap_fault),a
+    ld de,MEMMAN_HEAP_DEALLOC
+    call MEMMAN_FUNCTION_HANDLER
+    di
+    ret
+
+tsr_heap_fill_guards:
+    ld hl,(tsr_heap_base)
+    ld b,TSR_HEAP_GUARD_SIZE
+    ld a,TSR_HEAP_LOW_GUARD
+tsr_heap_fill_low_guard:
+    ld (hl),a
+    inc hl
+    djnz tsr_heap_fill_low_guard
+    ld hl,(tsr_heap_stack_top)
+    ld b,TSR_HEAP_GUARD_SIZE
+    ld a,TSR_HEAP_HIGH_GUARD
+tsr_heap_fill_high_guard:
+    ld (hl),a
+    inc hl
+    djnz tsr_heap_fill_high_guard
+    ret
+
+; Return Z only when the heap exists and both 16-byte sentinels are intact.
+tsr_heap_guards_ok:
+    ld hl,(tsr_heap_base)
+    ld a,h
+    or l
+    jr z,tsr_heap_guards_missing
+    ld a,TSR_HEAP_LOW_GUARD
+    call tsr_heap_guard_check
+    ret nz
+    ld hl,(tsr_heap_stack_top)
+    ld a,TSR_HEAP_HIGH_GUARD
+tsr_heap_guard_check:
+    ld b,TSR_HEAP_GUARD_SIZE
+tsr_heap_guard_check_loop:
+    cp (hl)
+    ret nz
+    inc hl
+    djnz tsr_heap_guard_check_loop
+    ret
+tsr_heap_guards_missing:
+    ld a,1
+    or a
+    ret
+
 ; TsrKill calls this only after MemMan has detached both registered hooks.
 tsr_kill:
     di
+    ld a,1
+    ld (in_hook),a
+    ld (tsr_heap_memman_sp),sp
+    ld hl,(tsr_heap_base)
+    ld a,h
+    or l
+    jr z,tsr_kill_release_heap
+    ; Re-arm the sentinels even after a prior fail-closed guard event. Teardown
+    ; still needs the large stack, and the segment will be discarded immediately.
+    call tsr_heap_fill_guards
+    ld sp,(tsr_heap_stack_top)
     ; TK 2.42 ignores this routine's result and releases the segment, so use the
     ; same bounded foreground teardown policy as the transient monitor.
     call transport_restore_foreground_retry
+    di
+    call tsr_heap_guards_ok
+    jr z,tsr_kill_heap_guards_ok
+    ld a,1
+    ld (tsr_heap_fault),a
+tsr_kill_heap_guards_ok:
+    ld sp,(tsr_heap_memman_sp)
+tsr_kill_release_heap:
+    call tsr_heap_release
+    xor a
+    ld (in_hook),a
     ret
 
 ; Foreground suite programs use TsrCall to configure the selected driver and
@@ -5533,6 +5733,8 @@ tsr_kill:
 tsr_talk:
     cp TSR_TALK_CONFIG
     jp z,tsr_talk_config
+    cp TSR_TALK_UNAPI_PORT_LEGACY
+    jp z,tsr_talk_unsupported
     cp TSR_TALK_UNAPI_PORT
     jp z,tsr_talk_unapi_port
     cp TSR_TALK_XFER_CLAIM
@@ -5558,28 +5760,63 @@ tsr_talk:
     jp tsr_talk_unsupported
 
 tsr_talk_config:
+    ld a,(in_hook)
+    or a
+    jp nz,tsr_talk_unsupported
     ld a,h
     cp UNAPI_ID + 1
     jp nc,tsr_talk_unsupported
     ld b,a
+    ; A5 cannot express the required binary listener port, so the suite reserves
+    ; UNAPI transitions for A7. UART-to-UART lifecycle still uses the heap below.
+    cp UNAPI_ID
+    jp z,tsr_talk_unsupported
     ld a,(active_transport_id)
+    cp UNAPI_ID
+    jp z,tsr_talk_unsupported
     cp b
     jr nz,tsr_talk_config_begin
-    ; A same-driver UART request is already satisfied. The legacy A5 UNAPI
-    ; request still relistens on its current binary port for compatibility.
-    ld a,b
-    cp UNAPI_ID
-    jp nz,tsr_talk_done
+    ; A same-driver UART request is already satisfied.
+    jp tsr_talk_done
 tsr_talk_config_begin:
+    ld a,(tsr_heap_fault)
+    or a
+    jp nz,tsr_talk_unsupported
+    call tsr_heap_guards_ok
+    jr z,tsr_talk_config_heap_ready
+    ld a,1
+    ld (tsr_heap_fault),a
+    jp tsr_talk_unsupported
+tsr_talk_config_heap_ready:
     xor a
     ld (tsr_config_explicit_port),a
+    di
+    ld a,1
+    ld (in_hook),a
+    ld (tsr_heap_memman_sp),sp
+    ld sp,(tsr_heap_stack_top)
+    call tsr_talk_config_begin_common
+    ld (tsr_heap_result),a
+    di
+    call tsr_heap_guards_ok
+    jr z,tsr_talk_config_heap_guards_ok
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,0FFh
+    ld (tsr_heap_result),a
+tsr_talk_config_heap_guards_ok:
+    ld sp,(tsr_heap_memman_sp)
+    xor a
+    ld (in_hook),a
+    ld a,(tsr_heap_result)
+    ret
 tsr_talk_config_begin_common:
     ld a,(active_transport_id)
     ld (tsr_config_old_transport),a
     ld hl,(unapi_listen_port)
     ld (tsr_config_old_port),hl
     ; A freshly installed fixed UNAPI image has completed discovery but owns no
-    ; listener until MP's A6 call. Remember actual ownership, not merely ID 2,
+    ; listener until MP's A7 request. Remember actual ownership, not merely ID 2,
     ; so a failed first OPEN cannot manufacture a default-port rollback socket.
     xor a
     ld (tsr_config_old_unapi_live),a
@@ -5595,6 +5832,8 @@ tsr_talk_config_old_live_ready:
     ld a,b
     ld (tsr_config_requested_transport),a
     di
+    ld a,(in_hook)
+    ld (tsr_config_previous_in_hook),a
     ld a,1
     ld (in_hook),a
     call transport_restore
@@ -5626,11 +5865,12 @@ tsr_talk_config_init_done:
 tsr_talk_config_reset_xfer:
     call xfer_reset               ; a real driver change invalidates staging
 tsr_talk_config_xfer_done:
-    xor a
+    ld a,(tsr_config_previous_in_hook)
     ld (in_hook),a
     jr tsr_talk_done
 
 tsr_talk_config_failed:
+    ld (tsr_config_unapi_error),a
     ; Best-effort rollback. For an old UNAPI transport, reopen exactly the
     ; saved binary port without consulting any transient process state.
     call transport_restore
@@ -5651,7 +5891,7 @@ tsr_talk_config_failed:
     jr tsr_talk_config_restore_done
 tsr_talk_config_restore_unapi_idle:
     ; The old UNAPI state had no live listener (possibly only a cleanup retry).
-    ; Restore that fail-closed shape exactly; a later explicit A6 may retry.
+    ; Restore that fail-closed shape exactly; a later explicit A7 may retry.
     call unapi_clear_runtime
     jr tsr_talk_config_restore_done
 tsr_talk_config_restore_uart:
@@ -5663,14 +5903,25 @@ tsr_talk_config_restore_done:
 tsr_talk_config_failed_detach:
     call transport_session_reset
     call xfer_reconfigure_detach
-    xor a
+    ld a,(tsr_config_previous_in_hook)
     ld (in_hook),a
     ld a,0FFh                  ; never report the requested ID after init failed
     ret
 tsr_talk_config_abort_failed:
-    ; The old driver still owns a handle that could not be aborted. Preserve
-    ; its transport/session state and refuse to initialize a second endpoint.
-    xor a
+    ; Preserve a still-live stream, but if ABORT already cleared the active
+    ; handle before a deferred-cleanup failure, close that stream epoch now.
+    ld (tsr_config_unapi_error),a
+    ld a,(tsr_config_old_transport)
+    cp UNAPI_ID
+    jr nz,tsr_talk_config_abort_failed_report
+    ld a,(unapi_connection)
+    or a
+    jr nz,tsr_talk_config_abort_failed_report
+    call unapi_reset_stream_state
+    call transport_session_reset
+    call xfer_reconfigure_detach
+tsr_talk_config_abort_failed_report:
+    ld a,(tsr_config_previous_in_hook)
     ld (in_hook),a
     ld a,0FFh
     ret
@@ -5678,24 +5929,271 @@ tsr_talk_done:
     ld a,(active_transport_id)
     ret
 
-; Private suite ABI for an explicit UNAPI listener: MemMan TsrCall 63 passes HL
-; unchanged, while BC identifies the TSR and DE carries the MemMan function.
-; Validating here keeps every caller from exposing UNAPI's FFFFh random-port
-; sentinel and makes a successful return mean TCP_OPEN actually ran.
+; Private safe lifecycle ABI. HL points to a versioned 16-byte request in page
+; zero. The caller still supplies and guards the historical 1 KiB page-2 stack
+; so mixed suite files fail closed, but lifecycle work now always uses the
+; resident's persistent page-3 heap stack. The old A6/raw-port ABI is rejected.
 tsr_talk_unapi_port:
+    ; Do not touch shared request/stack globals from a nested TsrCall. A UNAPI
+    ; implementation may briefly execute EI while the outer lifecycle is live.
+    ld a,(in_hook)
+    or a
+    jp nz,tsr_talk_unsupported
     ld a,h
-    or l
-    jp z,tsr_talk_unsupported
+    or a
+    jp z,tsr_talk_unsupported       ; request must begin at 0100h or above
+    push hl
+    ld bc,TSR_UNAPI_REQUEST_SIZE
+    call tsr_talk_page0_range
+    pop hl
+    jp c,tsr_talk_unsupported
+    ld (tsr_unapi_request_pointer),hl
+    xor a
+    ld (tsr_config_unapi_error),a
+
+    ld a,(hl)
+    cp TSR_UNAPI_REQUEST_MAGIC & 0FFh
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp TSR_UNAPI_REQUEST_MAGIC >> 8
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp TSR_UNAPI_REQUEST_VERSION
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp TSR_UNAPI_REQUEST_SIZE
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    ld (tsr_config_requested_port),de
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    ld (tsr_unapi_stack_bottom),de
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    ld (tsr_unapi_stack_top),de
+    ld de,5                         ; skip four outputs to target transport
+    add hl,de
+    ld a,(hl)
+    cp UNAPI_ID + 1
+    jp nc,tsr_talk_unapi_bad_abi
+    ld (tsr_config_requested_transport),a
+    inc hl
+    ld a,(hl)
+    or a
+    jp nz,tsr_talk_unapi_bad_abi
+
+    ld a,(tsr_config_requested_transport)
+    cp UNAPI_ID
+    jr nz,tsr_talk_unapi_port_valid
+    ld de,(tsr_config_requested_port)
+    ld a,d
+    or e
+    jp z,tsr_talk_unapi_bad_abi
+    ld a,d
+    and e
+    inc a                           ; reject FFFFh random-port sentinel
+    jp z,tsr_talk_unapi_bad_abi
+tsr_talk_unapi_port_valid:
+
+    ; The low guard occupies the 16 bytes immediately below stack_bottom.
+    ld hl,(tsr_unapi_stack_bottom)
+    ld de,TSR_UNAPI_STACK_GUARD_SIZE
+    or a
+    sbc hl,de
+    jp c,tsr_talk_unapi_bad_stack
     ld a,h
-    and l
-    inc a
-    jp z,tsr_talk_unsupported
-    ld (tsr_config_requested_port),hl
+    cp 080h
+    jp c,tsr_talk_unapi_bad_stack
+    ld de,(tsr_unapi_stack_bottom)
+    ld a,d
+    cp 0C0h
+    jp nc,tsr_talk_unapi_bad_stack
+
+    ; stack_top is exclusive. Its following high guard must also fit in page 2,
+    ; so the largest valid value is BFF0h.
+    ld hl,(tsr_unapi_stack_top)
+    bit 0,l
+    jp nz,tsr_talk_unapi_bad_stack
+    ld a,h
+    cp 080h
+    jp c,tsr_talk_unapi_bad_stack
+    cp 0C0h
+    jr c,tsr_talk_unapi_top_in_page2
+    jp nz,tsr_talk_unapi_bad_stack
+    ld a,l
+    or a
+    jp nz,tsr_talk_unapi_bad_stack
+tsr_talk_unapi_top_in_page2:
+    ld de,TSR_UNAPI_STACK_GUARD_SIZE
+    add hl,de
+    jp c,tsr_talk_unapi_bad_stack
+    ld a,h
+    cp 0C0h
+    jr c,tsr_talk_unapi_high_guard_fits
+    jp nz,tsr_talk_unapi_bad_stack
+    ld a,l
+    or a
+    jp nz,tsr_talk_unapi_bad_stack
+tsr_talk_unapi_high_guard_fits:
+    ld hl,(tsr_unapi_stack_top)
+    ld de,(tsr_unapi_stack_bottom)
+    or a
+    sbc hl,de
+    jp c,tsr_talk_unapi_bad_stack
+    ld de,TSR_UNAPI_STACK_MINIMUM
+    or a
+    sbc hl,de
+    jp c,tsr_talk_unapi_bad_stack
+
+    call tsr_talk_unapi_guards_ok
+    jp nz,tsr_talk_unapi_bad_stack
+    ld a,(tsr_heap_fault)
+    or a
+    jp nz,tsr_talk_unapi_bad_stack
+    call tsr_heap_guards_ok
+    jr z,tsr_talk_unapi_heap_ready
+    ld a,1
+    ld (tsr_heap_fault),a
+    jp tsr_talk_unapi_bad_stack
+tsr_talk_unapi_heap_ready:
+
+    di
+    ld a,1
+    ld (in_hook),a
+    ld (tsr_heap_memman_sp),sp
+    ld sp,(tsr_heap_stack_top)
+    call tsr_talk_unapi_port_inner
+    ld (tsr_unapi_result),a
+    di
+    call tsr_heap_guards_ok
+    jr z,tsr_talk_unapi_heap_guards_ok
+    ld a,1
+    ld (tsr_heap_fault),a
+tsr_talk_unapi_heap_guards_ok:
+    ld sp,(tsr_heap_memman_sp)
+
+    ld a,(tsr_heap_fault)
+    or a
+    jr nz,tsr_talk_unapi_stack_corrupted
+    call tsr_talk_unapi_guards_ok
+    jr nz,tsr_talk_unapi_stack_corrupted
+    ld a,(tsr_config_requested_transport)
+    ld b,a
+    ld a,(tsr_unapi_result)
+    cp b
+    jr nz,tsr_talk_unapi_transport_failed
+    xor a
+    ld (tsr_unapi_status),a
+    jr tsr_talk_unapi_finish
+tsr_talk_unapi_transport_failed:
+    ld a,TSR_UNAPI_STATUS_TRANSPORT
+    ld (tsr_unapi_status),a
+    jr tsr_talk_unapi_finish
+tsr_talk_unapi_stack_corrupted:
+    ld a,TSR_UNAPI_STATUS_STACK
+    ld (tsr_unapi_status),a
+    ld a,0FFh
+    ld (tsr_unapi_result),a
+tsr_talk_unapi_finish:
+    call tsr_talk_unapi_write_result
+    xor a
+    ld (in_hook),a
+    ld a,(tsr_unapi_result)
+    ret
+
+tsr_talk_unapi_bad_abi:
+    ld a,TSR_UNAPI_STATUS_ABI
+    jr tsr_talk_unapi_fail_request
+tsr_talk_unapi_bad_stack:
+    ld a,TSR_UNAPI_STATUS_STACK
+    jr tsr_talk_unapi_fail_request
+tsr_talk_unapi_bad_transport:
+    ld a,TSR_UNAPI_STATUS_TRANSPORT
+tsr_talk_unapi_fail_request:
+    ld (tsr_unapi_status),a
+    ld a,0FFh
+    ld (tsr_unapi_result),a
+    call tsr_talk_unapi_write_result
+    ld a,0FFh
+    ret
+
+; Compare both 16-byte guards. Return Z only when neither lifecycle call grew
+; outside the advertised stack interval.
+tsr_talk_unapi_guards_ok:
+    ld hl,(tsr_unapi_stack_bottom)
+    ld de,TSR_UNAPI_STACK_GUARD_SIZE
+    or a
+    sbc hl,de
+    ld a,TSR_UNAPI_STACK_LOW_GUARD
+    call tsr_talk_unapi_guard_check
+    ret nz
+    ld hl,(tsr_unapi_stack_top)
+    ld a,TSR_UNAPI_STACK_HIGH_GUARD
+tsr_talk_unapi_guard_check:
+    ld b,TSR_UNAPI_STACK_GUARD_SIZE
+tsr_talk_unapi_guard_check_loop:
+    cp (hl)
+    ret nz
+    inc hl
+    djnz tsr_talk_unapi_guard_check_loop
+    ret
+
+; Publish structured diagnostics without exposing transient process memory to
+; the hook path. This runs only after the MemMan stack has been restored.
+tsr_talk_unapi_write_result:
+    ld hl,(tsr_unapi_request_pointer)
+    ld de,TSR_UNAPI_REQUEST_STATUS
+    add hl,de
+    ld a,(tsr_unapi_status)
+    ld (hl),a
+    inc hl
+    ld a,(tsr_config_unapi_error)
+    ld (hl),a
+    inc hl
+    ld a,(active_transport_id)
+    ld (hl),a
+    inc hl
+    ld a,(unapi_connection)
+    ld (hl),a
+    ret
+
+; Runs exclusively on the persistent page-3 heap stack. All driver changes and
+; UNAPI relistens use the same transactional lifecycle here. Same-driver UART
+; requests remain a no-op because they have no TCP endpoint to rebuild.
+tsr_talk_unapi_port_inner:
+    ld a,(tsr_config_requested_transport)
+    ld b,a
+    ld a,(active_transport_id)
+    cp b
+    jr nz,tsr_talk_unapi_port_switch
+    ld a,b
+    cp UNAPI_ID
+    jr z,tsr_talk_unapi_port_switch
+    ld a,b                         ; an already-selected UART needs no restart
+    ret
+
+tsr_talk_unapi_port_switch:
+    ld a,(tsr_config_requested_transport)
+    ld b,a
+    cp UNAPI_ID
+    jr nz,tsr_talk_unapi_port_switch_default
     ld a,1
     ld (tsr_config_explicit_port),a
-    ld a,UNAPI_ID
-    ld b,a
-    ld (tsr_config_requested_transport),a
+    jr tsr_talk_unapi_port_switch_begin
+tsr_talk_unapi_port_switch_default:
+    xor a
+    ld (tsr_config_explicit_port),a
+tsr_talk_unapi_port_switch_begin:
     jp tsr_talk_config_begin_common
 
 ; Validate that an entire caller range beginning at HL remains in page zero.
@@ -5724,19 +6222,25 @@ tsr_talk_page0_bad:
     scf
     ret
 
-; Service at most one complete protocol-X frame on the foreground helper's
-; stack.  The host's wake ACK holds the rest of the frame until this routine
-; consumes the leading 'M', so DOS disk work cannot overflow a FIFO-less 8251.
+; Service at most one complete protocol-X frame on the private page-3 stack.
+; The host's wake ACK holds the rest of the frame until this routine consumes
+; the leading 'M', so DOS disk work cannot overflow a FIFO-less 8251.
 tsr_talk_xfer_pump:
+    ld a,(in_hook)
+    or a
+    jp nz,tsr_talk_unsupported
+    ld a,(tsr_heap_fault)
+    or a
+    jp nz,tsr_talk_unsupported
     ld a,(xfer_fast_armed)
     or a
-    jr z,tsr_talk_xfer_pump_idle
+    jp z,tsr_talk_xfer_pump_idle
     ld a,(xfer_descriptor + XFER_DESC_FLAGS)
     and XFER_FLAG_FAST_PUMP
-    jr z,tsr_talk_xfer_pump_idle
+    jp z,tsr_talk_xfer_pump_idle
     ld a,(xfer_foreground_ready)
     or a
-    jr z,tsr_talk_xfer_pump_idle
+    jp z,tsr_talk_xfer_pump_idle
     ld a,(xfer_fast_pump_active)
     or a
     jp nz,tsr_talk_unsupported
@@ -5761,8 +6265,18 @@ tsr_talk_xfer_pump_store_buffer:
     ld de,XFER_FAST_WORK_CAPACITY
     add hl,de
     ld (xfer_fast_page0_frame),hl
-    ld (xfer_fast_pump_sp),sp
+    call tsr_heap_guards_ok
+    jr z,tsr_talk_xfer_pump_heap_ready
     ld a,1
+    ld (tsr_heap_fault),a
+    jp tsr_talk_unsupported
+tsr_talk_xfer_pump_heap_ready:
+    di
+    ld a,1
+    ld (in_hook),a
+    ld (tsr_heap_memman_sp),sp
+    ld sp,(tsr_heap_stack_top)
+    ld (xfer_fast_pump_sp),sp
     ld (xfer_fast_pump_active),a
     call transport_service
     call transport_session_guard
@@ -5776,6 +6290,21 @@ tsr_talk_xfer_pump_done:
     ld (xfer_fast_pump_sp),a
     ld (xfer_fast_pump_sp + 1),a
     call transport_session_finalize
+    xor a
+    ld (tsr_heap_result),a
+tsr_talk_xfer_pump_leave_heap:
+    di
+    call tsr_heap_guards_ok
+    jr z,tsr_talk_xfer_pump_heap_guards_ok
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,0FFh
+    ld (tsr_heap_result),a
+tsr_talk_xfer_pump_heap_guards_ok:
+    ld sp,(tsr_heap_memman_sp)
+    xor a
+    ld (in_hook),a
+    ld a,(tsr_heap_result)
     ret
 tsr_talk_xfer_pump_idle:
     xor a
@@ -6220,30 +6749,59 @@ if MSXAI_TSR_BUILD
 ; Initialization is deliberately last: TsrLoad releases this tail after the
 ; resident code and hook table have been registered.
 tsr_init:
+    ; HeapAlloc must precede transport_bind/transport_init: even initial UNAPI
+    ; discovery may enter EXTBIO or Pico/Pico+ firmware and exhaust TsrLoad's
+    ; internal function stack.
+    di
+    call tsr_heap_allocate
+    jr c,tsr_init_heap_failed
+    ld (tsr_heap_memman_sp),sp
+    ld sp,(tsr_heap_stack_top)
     ; The resident template is copied by TsrLoad independently of this tail.
     ; Arm the one-shot only in the final resident mapping so TL cannot restore
-    ; a stale `1` after initialization and accidentally defer MP's A6 TsrCall.
+    ; a stale `1` after initialization and accidentally defer MP's A7 TsrCall.
     ld a,1
     ld (unapi_defer_first_open),a
     call resident_initialize
+    ld (tsr_heap_result),a
     or a
-    jr nz,tsr_init_failed
-    ld de,tsr_intro_message
-    ld a,2                     ; install and ask TsrLoad to print the intro
-    ret
+    jr nz,tsr_init_failed_on_heap
+    di
+    call tsr_heap_guards_ok
+    jr z,tsr_init_heap_succeeded
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,0FFh
+    ld (tsr_heap_result),a
+tsr_init_failed_on_heap:
+    ; A partially initialized transport is torn down before the active stack is
+    ; discarded. Only after restoring TsrLoad's SP may HeapDeAlloc release it.
+    call transport_restore_foreground_retry
+    di
+    ld sp,(tsr_heap_memman_sp)
+    call tsr_heap_release
 tsr_init_failed:
-    ; TsrLoad bit 0 rejects the image. Release any handle that TCP_OPEN may have
-    ; allocated before returning the failure message in the disposable tail.
-    call transport_restore
     xor a
     ld (in_hook),a
     ld de,tsr_init_error_message
     ld a,3                     ; reject installation and ask TsrLoad to print DE
     ret
+tsr_init_heap_succeeded:
+    di
+    ld sp,(tsr_heap_memman_sp)
+    ld de,tsr_intro_message
+    ld a,2                     ; install and ask TsrLoad to print the intro
+    ret
+tsr_init_heap_failed:
+    ld de,tsr_init_heap_error_message
+    ld a,3                     ; reject without executing any transport code
+    ret
 tsr_intro_message:
     db "MSX-AI MCP resident agent installed",13,10,0
 tsr_init_error_message:
     db "MSX-AI transport initialization failed",13,10,0
+tsr_init_heap_error_message:
+    db "MSX-AI requires 1056 bytes of MemMan heap",13,10,0
 tsr_init_end:
 else
 hook_stack_top: equ resident_end + STACK_RESERVE

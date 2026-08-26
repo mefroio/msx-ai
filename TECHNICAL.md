@@ -440,7 +440,10 @@ directory. Integration runs therefore cannot pollute the persistent
 `work/transfers` state used for interrupted transfers with a physical MSX.
 
 The isolated bench also loads the generic four-way slot expander before its
-Sunrise/Nextor and RS-232 cartridges.
+Sunrise/Nextor and RS-232 cartridges. Its 512 KiB mapper is deterministic test
+headroom for Nextor, MemMan, and the resident TSR, not a physical-target
+requirement; physical systems instead need enough free mapper segments for
+their active configuration.
 
 `msx_tcp_bench_status` reports both channel identities and their shared
 `bench_id`. A failed or disconnected agent channel does not prevent
@@ -622,9 +625,36 @@ link, so reconnect through the newly selected interface. On a first install,
 agent is reconfigured through its existing MemMan `TsrCall` entry. On every
 first UNAPI install, the loader appends the selected port as the private
 four-digit hexadecimal command `MP/HHHH`; `MP.COM` then invokes the resident
-through MemMan with `A=A6h` and `HL=port`. This directly applies both an
+through MemMan with `A=A7h` and `HL=request`. This directly applies both an
 explicit decimal `/PORT` value and the default 6603 without a patched TSR or a
-second user command.
+second user command. The old `A6h`, `HL=port` entry is reserved and rejected.
+
+`A7h` version 1 is a private, 16-byte safe-lifecycle ABI used for every
+existing-resident transport selection, not only for UNAPI port changes:
+
+| Offset | Size | Direction | Meaning |
+|---:|---:|---|---|
+| 0 | 2 | In | Magic `A75Ah` |
+| 2 | 1 | In | ABI version `1` |
+| 3 | 1 | In | Request size `16` |
+| 4 | 2 | In | Little-endian listener port; validated when target is UNAPI |
+| 6 | 2 | In | Inclusive caller-owned stack bottom |
+| 8 | 2 | In | Exclusive caller-owned stack top |
+| 10 | 1 | Out | Structured lifecycle status |
+| 11 | 1 | Out | Transport-specific error |
+| 12 | 1 | Out | Active transport after the call |
+| 13 | 1 | Out | Active UNAPI connection handle, or zero |
+| 14 | 1 | In | Target: `0=8251`, `1=16C550`, `2=UNAPI` |
+| 15 | 1 | In | Reserved; must be zero |
+
+The caller supplies a 1 KiB stack wholly in writable page 2, with a 16-byte
+`A5h` guard below it and a 16-byte `5Ah` guard above it. Before writing either
+guard, it validates the complete span against the lowest of `C000h`, the TPA
+top, and its current SP minus `0100h`; this preserves 256 bytes of caller
+headroom. The resident validates the request and both guards before switching
+SP, runs all transport teardown/startup on that stack, restores MemMan's SP,
+and checks both guards again. `MP.COM` always writes target `2`; the general
+resident loader writes whichever target the public `/DRIVER` option selected.
 
 The transfer-ID forms of `/PUT` and `/GET` belong to the small transient
 `MSXAIXF.COM` helper; they do not install another agent. The host first stages
@@ -781,8 +811,9 @@ configured through the cartridge's existing menu. Connection loss first
 unwinds the old stream parser and preserves resumable transfer state. Lifecycle
 calls are then made only in foreground: `/MONITOR` relistens from its main loop;
 for a resident Pico session, rerun the same `/DRIVER:UNAPI /PORT:...` command at
-the DOS prompt. This avoids executing Pico's potentially blocking `TCP_OPEN`
-and `TCP_ABORT` paths inside `H.TIMI`.
+the DOS prompt. The foreground TsrCall uses the guarded A7 v1 lifecycle request
+with target `2`, avoiding both Pico's potentially blocking `TCP_OPEN` and
+`TCP_ABORT` paths inside `H.TIMI` and MemMan's small dispatcher stack.
 Foreground monitor exit and MemMan uninstall retry a failed `TCP_ABORT` three
 times. If the implementation still refuses every abort, the image must be
 released without a trustworthy cleanup acknowledgement; reset the adapter's
