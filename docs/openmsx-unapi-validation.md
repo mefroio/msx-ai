@@ -103,10 +103,15 @@ MSXAI /DRIVER:UNAPI /PORT:43123
 ```
 
 The public command keeps the port decimal. During the first resident install,
-the loader encodes the selected value as the private fixed-width `MP/HHHH`
-command. `MP.COM` applies it through a versioned 16-byte MemMan request with
-`A=A7h`, `HL=request`. A7 v1 is the general safe-lifecycle ABI for target
-transport `0=8251`, `1=16C550`, or `2=UNAPI`; `MP.COM` writes target `2` at
+the loader first invokes transient `TU.COM` after the warm boot and before
+`TL.COM`. `TU.COM` stages and closes `TL.COM`, enumerates TCP/IP UNAPI, and
+overlays the staged loader. Its exact `F7 ?? B8 4C` Pico/Pico+ `H.TIMI` repair
+is signature-guarded and therefore remains a no-op for the UNAPINET fixture.
+UART installs bypass `TU.COM` and invoke `TL.COM` directly. The loader also
+encodes the selected value as the private fixed-width `MP/HHHH` command;
+`MP.COM` runs after `TL.COM` and applies it through a versioned 16-byte MemMan
+request with `A=A7h`, `HL=request`. A7 v1 is the general safe-lifecycle ABI for
+target transport `0=8251`, `1=16C550`, or `2=UNAPI`; `MP.COM` writes target `2` at
 offset 14, and the reserved byte at offset 15 remains zero. The request also
 identifies the port and a caller-owned 1 KiB page-2 stack surrounded by
 16-byte low/high guards. Its complete guarded span fits below `C000h`, the TPA

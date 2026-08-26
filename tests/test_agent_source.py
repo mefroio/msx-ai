@@ -261,8 +261,13 @@ class ResidentAgentSourceTests(unittest.TestCase):
                       hook_spec)
         self.assertIn("Hook(H_TIMI, offsets[\"resident_timi_hook\"])",
                       hook_spec)
+        self.assertIn(
+            "Hook(H_CRUN, offsets[\"resident_basic_crunch_hook\"])",
+                      hook_spec)
         self.assertLess(hook_spec.index("Hook(H_KEYI"),
                         hook_spec.index("Hook(H_TIMI"))
+        self.assertLess(hook_spec.index("Hook(H_TIMI"),
+                        hook_spec.index("Hook(H_CRUN"))
 
     def test_memman_nested_timi_returns_through_quithook_without_resaving(self):
         hooks = self.source.split(
@@ -282,7 +287,26 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertNotIn("ld (hook_dispatch_sp),sp", nested_timi)
         self.assertRegex(
             nested_timi,
-            r"(?s)pop af.*ex af,af'.*xor a.*ex af,af'.*ret")
+            r"(?s)ld a,\(hook_system_suspended\).*or a.*"
+            r"jr z,memman_nested_hook_continue.*pop af.*ex af,af'.*"
+            r"ld a,1.*ex af,af'.*ret.*"
+            r"memman_nested_hook_continue:.*pop af.*ex af,af'.*"
+            r"xor a.*ex af,af'.*ret")
+
+    def test_system_latch_stops_only_normal_timi_chain(self):
+        hooks = self.source.split(
+            "; ------------------------------------------------------------ BIOS hooks", 1
+        )[1].split("else", 1)[0]
+        initial_chain = hooks.split("hook_initial_chain:", 1)[1].split(
+            "hook_chain_ready:", 1)[0]
+        self.assertRegex(
+            initial_chain,
+            r"(?s)ld a,\(hook_kind\).*or a.*"
+            r"jr z,hook_initial_chain_continue.*"
+            r"ld a,\(hook_system_suspended\).*or a.*"
+            r"jr z,hook_initial_chain_continue.*xor a.*"
+            r"jr hook_chain_ready.*hook_initial_chain_continue:.*ld a,1")
+        self.assertNotIn("active_transport_flags", initial_chain)
 
     def test_foreground_idle_hooks_leave_uart_with_monitor_loop(self):
         hooks = self.source.split(

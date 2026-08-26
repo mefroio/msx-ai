@@ -59,6 +59,7 @@ server/msx_mcp_server.py (synchronous tool/backend core)
                                                             + MCP8251.TSR
                                                             + MCP16550.TSR
                                                             + MCPUNAPI.TSR
+                                                            + TU.COM
                                                             + MP.COM
                                                             + MEMMAN.COM
                                                             + TL.COM
@@ -83,7 +84,7 @@ state. A paired bench binds both identities to one emulator with a shared
 ## Current capabilities
 
 - Isolated openMSX sessions in headless or visible shared-window mode.
-- A compact nine-file MSX-DOS suite. `MSXAI.COM` provides setup and the
+- A compact ten-file MSX-DOS suite. `MSXAI.COM` provides setup and the
   foreground monitor, one driver-selected `.TSR` becomes resident, and
   `MSXAIXF.COM` provides the transient large-file PUT/GET workspace.
 - A true MemMan TSR by default: it returns to MSX-DOS and polls from the BIOS
@@ -428,7 +429,7 @@ or `cbios` explicitly.
 ### TCP agent test bench
 
 `msx_tcp_bench_start` starts one isolated openMSX process, imports the complete
-canonical nine-file suite under `A:\MSXAI`, configures `MSXAI_HOME` and
+canonical ten-file suite under `A:\MSXAI`, configures `MSXAI_HOME` and
 `PATH`, selects the 8251 driver, and connects it to the MCP server through
 RS232-Net/TCP. It publishes two fixed routes to the same process:
 `msx_agent_*` uses the TCP protocol and never debugger APIs, while
@@ -481,7 +482,7 @@ On macOS, double-click `open-msx-mcp.command`, or run:
 ./open-msx-mcp.command
 ~~~~
 
-The launcher builds and stages the canonical nine-file suite under
+The launcher builds and stages the canonical ten-file suite under
 `A:\MSXAI`, copies the local MSX-DOS disk to a disposable runtime image, and
 starts one visible openMSX instance with normal sound. It configures
 `MSXAI_HOME` and `PATH` but does not start the agent automatically, so the user
@@ -542,6 +543,7 @@ work/agent/MSXAIXF.COM
 work/agent/MCP8251.TSR
 work/agent/MCP16550.TSR
 work/agent/MCPUNAPI.TSR
+work/agent/TU.COM
 work/agent/MP.COM
 work/agent/MEMMAN.COM
 work/agent/TL.COM
@@ -553,7 +555,7 @@ The build also creates `work/agent/build/MSXAI.TSR` and
 inputs. They are
 not deployable alternatives to the three fixed-driver TSRs listed above.
 
-Copy all nine files to one short MSX-DOS directory. The recommended persistent
+Copy all ten files to one short MSX-DOS directory. The recommended persistent
 layout and `AUTOEXEC.BAT` configuration are:
 
 ~~~~text
@@ -562,6 +564,7 @@ A:\MSXAI\MSXAIXF.COM
 A:\MSXAI\MCP8251.TSR
 A:\MSXAI\MCP16550.TSR
 A:\MSXAI\MCPUNAPI.TSR
+A:\MSXAI\TU.COM
 A:\MSXAI\MP.COM
 A:\MSXAI\MEMMAN.COM
 A:\MSXAI\TL.COM
@@ -573,27 +576,38 @@ SET MSXAI_HOME=A:\MSXAI
 PATH A:\MSXAI;%PATH%
 ~~~~
 
-`PATH` locates the two public commands and the post-warm-boot `TL.COM` and
-`MP.COM` commands from any working directory. `MSXAI_HOME` supplies bounded,
-fully qualified paths for the
-MemMan utilities and selected TSR. If the environment item is missing or
-empty, the loader preserves the historical current-directory behavior. The
-fixed `A:\MSXAI` value also fits the 39 command bytes preserved by MemMan's
-40-byte post-warm-boot buffer. The private fixed-width `MP/HHHH` form keeps
-every selected UNAPI port within that limit; unnecessarily deep paths can be
-rejected before any resident state changes. Mixing files from different builds
-is unsupported.
+`PATH` locates the two public commands and the post-warm-boot `TU.COM`,
+`TL.COM`, and `MP.COM` commands from any working directory. `MSXAI_HOME`
+supplies bounded, fully qualified paths for the MemMan utilities, helpers, and
+selected TSR. If the environment item is missing or empty, the loader preserves
+the historical current-directory behavior. The fixed `A:\MSXAI` value also
+fits the 39 command bytes preserved by MemMan's 40-byte post-warm-boot buffer.
+The private fixed-width `MP/HHHH` form keeps every selected UNAPI port within
+that limit; unnecessarily deep paths can be rejected before any resident state
+changes. Mixing files from different builds is unsupported.
 
-Nine files on disk do not mean nine images occupying RAM at once.
-`MSXAI.COM`, `MP.COM`, the MemMan utilities, and `MSXAIXF.COM` are transient
-and hand off execution sequentially. Installation selects only `MCP8251.TSR`,
+Ten files on disk do not mean ten images occupying RAM at once. `MSXAI.COM`,
+`TU.COM`, `MP.COM`, the MemMan utilities, and `MSXAIXF.COM` are transient and
+hand off execution sequentially. Installation selects only `MCP8251.TSR`,
 `MCP16550.TSR`, or `MCPUNAPI.TSR` for resident allocation. The external
-`MEMMAN.COM` or `TK.COM`
-image is staged in free high TPA alongside the small lifecycle front end, then
-overlaid for its one action; installation subsequently lets external `TL.COM`
-load the selected TSR. No temporary loader or TSR file is created, and there is
-no installation-time `DEL` cleanup. The PackBits worker is loaded only while a
-protocol-X transfer is active and returns its TPA to DOS when it exits.
+`MEMMAN.COM` or `TK.COM` image is staged in free high TPA alongside the small
+lifecycle front end, then overlaid for its one action. UART installation lets
+external `TL.COM` load the selected TSR directly. On a first UNAPI installation
+only,
+external `TU.COM` first loads and closes `TL.COM`, enumerates TCP/IP UNAPI,
+normalizes the fifth byte of an exact Pico/Pico+ `H.TIMI` hook signature
+`F7 ?? B8 4C` to `C9`, and overlays the staged `TL.COM`; `MP.COM` still runs
+afterward. This post-warm-boot, pre-TL order makes MemMan observe the firmware's
+reduced `HIMEM` before it integrates hooks.
+No temporary loader or TSR file is created, and there is no installation-time
+`DEL` cleanup. The PackBits worker is loaded only while a protocol-X transfer
+is active and returns its TPA to DOS when it exits.
+
+A later BASIC-to-DOS transition uses a different mechanism after the resident
+exists. Its `H.CRUN` hook accepts exact direct-mode `_SYSTEM` and `CALL SYSTEM`
+lines, aborts the active UNAPI TCP handle before Nextor reclaims the cartridge,
+and suppresses the later `H.TIMI` chain during the transition. This behavior is
+not part of `TU.COM` or the first-install warm boot.
 
 Driver selection is explicit and case-insensitive:
 
@@ -622,12 +636,14 @@ installing a duplicate. Changing the live driver can disconnect the current
 link, so reconnect through the newly selected interface. On a first install,
 `/DRIVER:8251` selects `MCP8251.TSR`, `/DRIVER:16C550` selects
 `MCP16550.TSR`, and `/DRIVER:UNAPI` selects `MCPUNAPI.TSR`; an already resident
-agent is reconfigured through its existing MemMan `TsrCall` entry. On every
-first UNAPI install, the loader appends the selected port as the private
-four-digit hexadecimal command `MP/HHHH`; `MP.COM` then invokes the resident
-through MemMan with `A=A7h` and `HL=request`. This directly applies both an
-explicit decimal `/PORT` value and the default 6603 without a patched TSR or a
-second user command. The old `A6h`, `HL=port` entry is reserved and rejected.
+agent is reconfigured through its existing MemMan `TsrCall` entry. UART first
+installs run `TL.COM` directly. Every first UNAPI install instead runs `TU.COM`
+after the warm boot and before `TL.COM`, then appends the selected port as the
+private four-digit hexadecimal command `MP/HHHH`. `TU.COM` hands off to the
+staged `TL.COM`; after the TSR is loaded, `MP.COM` invokes the resident through
+MemMan with `A=A7h` and `HL=request`. This directly applies both an explicit
+decimal `/PORT` value and the default 6603 without a patched TSR or a second
+user command. The old `A6h`, `HL=port` entry is reserved and rejected.
 
 `A7h` version 1 is a private, 16-byte safe-lifecycle ABI used for every
 existing-resident transport selection, not only for UNAPI port changes:
@@ -1302,7 +1318,7 @@ make PYTHON=python release-assets
 The result includes the versioned Python distributions, the stable,
 MSX-DOS-compatible `MSXAI.ZIP`, and a standalone copy of its `README.TXT`.
 The agent archive contains
-exactly the nine deployable binaries plus `LICENSE`, `MEMMAN-NOTICE.txt`,
+exactly the ten deployable binaries plus `LICENSE`, `MEMMAN-NOTICE.txt`,
 `README.TXT`, `SHA256SUMS`, and `COMPATIBILITY.json`. The manifest records the project release,
 framed wire v3, transfer `fast-v1`, and the pinned assembler identity.
 The checksums cover the README as well as every binary, license, notice, and

@@ -78,6 +78,7 @@ AGENT_PACKAGE_NAMES = (
     "MCP8251.TSR",
     "MCP16550.TSR",
     "MCPUNAPI.TSR",
+    "TU.COM",
     "MP.COM",
     "MEMMAN.COM",
     "TL.COM",

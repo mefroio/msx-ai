@@ -166,7 +166,7 @@ Use `mode="monitor"` when the host must call, run, or stop injected code.
 
 ## Physical MSX agent
 
-Build or obtain one matching nine-file agent suite and copy it to a short
+Build or obtain one matching ten-file agent suite and copy it to a short
 MSX-DOS directory such as `A:\MSXAI`. Set `MSXAI_HOME` and add that directory
 to `PATH`, then install one driver on the MSX:
 
@@ -188,12 +188,19 @@ The MSX opens a passive TCP/IP UNAPI listener, so call `msx_agent_connect` with
 the MSX IPv4 address and the same port. Port 6603 is only the default; `/PORT`
 accepts a decimal port from 1 through 65534. UNAPI reserves 65535 as its
 random-port sentinel, which is unsuitable when the host must know the endpoint.
-On a first resident install, the bundled `MP.COM` applies the selected listener
-port after the MemMan warm boot, including the default 6603. Its compact
-hexadecimal handoff is private; users continue to enter `/PORT` in decimal and
-never invoke `MP.COM` directly.
-This capability-based path is
-intended for MSX Pico+ and original MSX Pico cartridges equipped with Wi-Fi.
+On a first resident UNAPI install, the bundled transient `TU.COM` runs after
+the MemMan warm boot and before `TL.COM`. It stages and closes `TL.COM`,
+enumerates UNAPI, repairs the guarded Pico/Pico+ `H.TIMI` hook form, and hands
+off to `TL.COM`; this lets MemMan observe the cartridge's reduced `HIMEM` before
+installing the resident. UART installs run `TL.COM` directly. The bundled
+`MP.COM` still runs after `TL.COM` to apply the selected listener port,
+including the default 6603. Both helpers are private; users continue to enter
+`/PORT` in decimal and never invoke them directly.
+On later BASIC-to-DOS transitions, the resident `H.CRUN` hook recognizes exact
+`_SYSTEM` and `CALL SYSTEM` lines, aborts the active UNAPI TCP handle, and
+suppresses later `H.TIMI` handlers while Nextor takes over the cartridge.
+This capability-based path is intended for MSX Pico+ and original MSX Pico
+cartridges equipped with Wi-Fi.
 Start hardware validation with `/MONITOR`, which keeps listener lifecycle calls
 in foreground while idle. After `RUN`, data-path polling still executes from
 `H.TIMI` and requires physical validation. The Pico stack advertises potentially
@@ -202,9 +209,9 @@ blocking `TCP_OPEN`; after a resident socket is lost, rerun the same
 safely outside `H.TIMI`.
 Before the hardware arrives, the opt-in
 `tools/openmsx_unapi_validation.py` harness can validate the same TCP/IP UNAPI
-contract with a matched openMSXnet/UNAPINET pair. It covers discovery,
-passive TCP on a custom port, bidirectional traffic, and foreground relisten, but does not
-emulate Pico firmware, Wi-Fi, cartridge registers, or physical timing.
+contract with a matched openMSXnet/UNAPINET pair. It covers discovery, passive
+TCP on a custom port, bidirectional traffic, and foreground relisten, but does
+not emulate Pico firmware, Wi-Fi, cartridge registers, or physical timing.
 After negotiation, call
 `msx_agent_status` and verify the runtime mode, transport, and feature list before
 performing writes.

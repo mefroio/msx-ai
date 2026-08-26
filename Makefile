@@ -10,6 +10,7 @@ AGENT_XFER_ENGINE := agent/msx_xfer_engine.inc
 AGENT_XFER_PROTOCOL := agent/msx_xfer_protocol.inc
 AGENT_VERSION_INCLUDE := agent/msx_version.inc
 AGENT_PORT_SRC := agent/msx_port_helper.asm
+AGENT_TU_SRC := agent/msx_tu_helper.asm
 UNAPI_PROBE_SRC := agent/msx_unapi_probe.asm
 AGENT_TRANSPORTS := agent/transports/msx_transport_8251.inc \
 	agent/transports/msx_transport_16c550.inc \
@@ -17,6 +18,7 @@ AGENT_TRANSPORTS := agent/transports/msx_transport_8251.inc \
 AGENT_COM := work/agent/MSXAI.COM
 AGENT_XFER_COM := work/agent/MSXAIXF.COM
 AGENT_PORT_COM := work/agent/MP.COM
+AGENT_TU_COM := work/agent/TU.COM
 UNAPI_PROBE_COM := work/agent/UNAPIPRB.COM
 AGENT_BUILD_DIR := work/agent/build
 AGENT_TSR := $(AGENT_BUILD_DIR)/MSXAI.TSR
@@ -30,7 +32,7 @@ MEMMAN_VENDOR := $(MEMMAN_VENDOR_DIR)/MEMMAN.COM \
 	$(MEMMAN_VENDOR_DIR)/TK.COM
 AGENT_SUITE := $(AGENT_COM) $(AGENT_XFER_COM) \
 	$(AGENT_TSR_8251) $(AGENT_TSR_16C550) $(AGENT_TSR_UNAPI) \
-	$(AGENT_PORT_COM) $(MEMMAN_VENDOR)
+	$(AGENT_PORT_COM) $(AGENT_TU_COM) $(MEMMAN_VENDOR)
 # Bench MSX-DOS exposes a TPA from 0100h through 9898h (38,808 bytes).
 # Keep 2 KiB free above each transient COM for its stack and DOS call headroom.
 MSX_DOS_BENCH_COM_MAX := 36760
@@ -38,14 +40,15 @@ MSX_DOS_BENCH_COM_MAX := 36760
 # images load at 0100h, the helper file itself must end no later than 3FFFh.
 MSX_XFER_PAGE0_COM_MAX := 16128
 
-.PHONY: agent agent-prerequisites agent-tsr memman-assets port-helper unapi-probe \
+.PHONY: agent agent-prerequisites agent-tsr memman-assets port-helper tu-helper unapi-probe \
 	unapi-emulation-preflight test test-integration test-unapi-emulation \
 	release-check publish-check release-assets
 
-agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM) $(AGENT_PORT_COM)
+agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM) $(AGENT_PORT_COM) $(AGENT_TU_COM)
 	@test -s $(AGENT_COM)
 	@test -s $(AGENT_XFER_COM)
 	@test -s $(AGENT_PORT_COM)
+	@test -s $(AGENT_TU_COM)
 	@test -s $(AGENT_TSR_8251)
 	@test -s $(AGENT_TSR_16C550)
 	@test -s $(AGENT_TSR_UNAPI)
@@ -72,6 +75,13 @@ $(AGENT_PORT_COM): $(AGENT_PORT_SRC) tools/build_port_helper.py
 	"$(PYTHON)" tools/build_port_helper.py --assembler "$(Z80ASM)" \
 		--source $(AGENT_PORT_SRC) --output $(AGENT_PORT_COM)
 
+tu-helper: $(AGENT_TU_COM)
+	@test -s $(AGENT_TU_COM)
+
+$(AGENT_TU_COM): $(AGENT_TU_SRC) tools/build_tu_helper.py
+	"$(PYTHON)" tools/build_tu_helper.py --assembler "$(Z80ASM)" \
+		--source $(AGENT_TU_SRC) --output $(AGENT_TU_COM)
+
 unapi-probe: $(UNAPI_PROBE_COM)
 	@test -s $(UNAPI_PROBE_COM)
 
@@ -82,7 +92,7 @@ $(UNAPI_PROBE_COM): $(UNAPI_PROBE_SRC) tools/build_unapi_probe.py
 # Prerequisites are intentionally normal (not order-only): generated metadata
 # is assembled into the loader's external-suite validation, while the verified
 # utilities and fixed-driver TSRs are deployable files in the same package.
-$(AGENT_COM): agent-prerequisites $(AGENT_PORT_COM)
+$(AGENT_COM): agent-prerequisites $(AGENT_PORT_COM) $(AGENT_TU_COM)
 $(AGENT_COM): $(AGENT_SRC) $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) $(AGENT_VERSION_INCLUDE) $(AGENT_TRANSPORTS)
 	mkdir -p $(dir $@)
 	$(Z80ASM) $< -o $@

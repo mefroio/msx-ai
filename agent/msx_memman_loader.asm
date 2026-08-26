@@ -11,8 +11,9 @@
 ;   - every suite file is available under MSXAI_HOME, or in the current DOS
 ;     directory when that optional environment item is unset
 ;
-; Installation validates MEMMAN.COM, TL.COM, and the selected fixed-driver TSR,
-; stages external MEMMAN.COM at the top of the TPA, and overlays address 0100h.
+; Installation validates MEMMAN.COM, TL.COM, and the selected fixed-driver TSR.
+; UNAPI additionally validates the pre-TL TU.COM helper and MP.COM.  The loader
+; stages external MEMMAN.COM at the top of the TPA and overlays address 0100h.
 ; Uninstall uses the same mechanism for TK.COM.  No temporary file is created,
 ; patched, deleted, or left behind by either lifecycle.
 
@@ -62,6 +63,7 @@ MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
 MP_FILE_SIZE:            equ 0039Ah ; 922-byte guarded-stack port helper
+TU_FILE_SIZE:            equ 002EDh ; 749-byte pre-TL UNAPI helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
 ; Once MEMMAN.COM starts, the old loader image and trampoline are disposable.
@@ -104,8 +106,9 @@ memman_loader_entry:
     ;
     ; MEMMAN.COM or TK.COM takes over address 0100h.  The selected image is
     ; already verified, resident in the high staging area, and has no open
-    ; handle.  Installation's MemMan command line invokes external TL.COM and
-    ; one fixed-driver TSR; uninstall's tail is consumed directly by TK.COM.
+    ; handle.  Installation's MemMan command line invokes external TL.COM for
+    ; UART or TU.COM followed by TL.COM internally for UNAPI, then loads one
+    ; fixed-driver TSR. Uninstall's tail is consumed directly by TK.COM.
     jp handoff_to_external_overlay
 
 ; ---------------------------------------------------------------------------
@@ -193,6 +196,11 @@ preflight_install_selected:
     ld a,(suite_port_helper_required)
     or a
     jr z,preflight_command_length
+    ld de,suite_tu_path
+    ld hl,TU_FILE_SIZE
+    call suite_validate_regular_file
+    or a
+    ret nz
     ld de,suite_mp_path
     ld hl,MP_FILE_SIZE
     call suite_validate_regular_file
@@ -305,6 +313,11 @@ suite_resolve_paths:
     call suite_build_path
     or a
     ret nz
+    ld bc,tu_name
+    ld de,suite_tu_path
+    call suite_build_path
+    or a
+    ret nz
     ld bc,tk_name
     ld de,suite_tk_path
     call suite_build_path
@@ -390,13 +403,21 @@ suite_build_path_too_long:
     ld a,ERR_INVALID_PARAMETER
     ret
 
-; Build MemMan's post-warm-boot command. COMMAND2 finds TL through PATH; TL is
-; given the fully resolved TSR stem so it never depends on the current
-; directory. The canonical .TSR suffix is removed from the selected path.
+; Build MemMan's post-warm-boot command. COMMAND2 finds TL (UART) or TU
+; (UNAPI) through PATH. TU primes TCP/IP UNAPI and overlays TL internally.
+; Both receive the fully resolved TSR stem, with its canonical suffix removed.
 suite_build_install_command:
-    ld hl,install_command_prefix
+    ld a,(suite_port_helper_required)
+    or a
+    jr nz,suite_build_install_command_select_unapi
+    ld hl,install_uart_command_prefix
+    ld bc,install_uart_command_prefix_length
+    jr suite_build_install_command_copy_prefix
+suite_build_install_command_select_unapi:
+    ld hl,install_unapi_command_prefix
+    ld bc,install_unapi_command_prefix_length
+suite_build_install_command_copy_prefix:
     ld de,install_command_buffer
-    ld bc,install_command_prefix_length
     ldir
     ld hl,(suite_selected_tsr_path)
 suite_build_install_command_copy:
@@ -951,6 +972,8 @@ memman_name:
     db "MEMMAN.COM",0
 tl_name:
     db "TL.COM",0
+tu_name:
+    db "TU.COM",0
 tk_name:
     db "TK.COM",0
 mcp8251_tsr_name:
@@ -967,6 +990,8 @@ suite_memman_path:
     ds SUITE_PATH_BUFFER_SIZE,0
 suite_tl_path:
     ds SUITE_PATH_BUFFER_SIZE,0
+suite_tu_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
 suite_tk_path:
     ds SUITE_PATH_BUFFER_SIZE,0
 suite_mcp8251_tsr_path:
@@ -980,13 +1005,18 @@ suite_mp_path:
 
 ; '@' is MemMan's documented representation of Return.  MemMan 2.42 consumes
 ; the first Return while warm-booting COMMAND2, so the second '@' is required
-; before the visible TL command. TL accepts a TSR path without extension.
-install_command_prefix:
+; before the visible loader command. TL and TU accept a TSR path without an
+; extension; TU overlays TL with the same command tail after priming UNAPI.
+install_uart_command_prefix:
     ; MemMan consumes this normal command-tail leading blank before injecting
     ; the post-warm-boot commands into COMMAND2.
     db " _SYSTEM@@TL "
-install_command_prefix_end:
-install_command_prefix_length: equ install_command_prefix_end - install_command_prefix
+install_uart_command_prefix_end:
+install_uart_command_prefix_length: equ install_uart_command_prefix_end - install_uart_command_prefix
+install_unapi_command_prefix:
+    db " _SYSTEM@@TU "
+install_unapi_command_prefix_end:
+install_unapi_command_prefix_length: equ install_unapi_command_prefix_end - install_unapi_command_prefix
 install_port_helper_prefix:
     ; COMMAND2 recognizes slash as the executable/tail delimiter. The following
     ; fixed four hex digits keep `@MP/FFFE@` within the 39-byte payload limit.
@@ -994,7 +1024,7 @@ install_port_helper_prefix:
 install_port_helper_prefix_end:
 install_port_helper_prefix_length: equ install_port_helper_prefix_end - install_port_helper_prefix
 install_command_buffer:
-    ds install_command_prefix_length + SUITE_PATH_MAX + 1 + install_port_helper_prefix_length + 5 + 1,0
+    ds install_unapi_command_prefix_length + SUITE_PATH_MAX + 1 + install_port_helper_prefix_length + 5 + 1,0
 
 uninstall_command:
     db " ",34,"MSXAI MCP1",34

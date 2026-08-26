@@ -47,7 +47,7 @@ namespace eval msx_ai_mcp {
         set root_listing [diskmanipulator dir hda1]
         foreach suite_name {
             MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR MCPUNAPI.TSR
-            MP.COM MEMMAN.COM TL.COM TK.COM
+            TU.COM MP.COM MEMMAN.COM TL.COM TK.COM
         } {
             if {[string match -nocase "*$suite_name*" $root_listing]} {
                 diskmanipulator delete hda1 $suite_name
@@ -60,7 +60,7 @@ namespace eval msx_ai_mcp {
         diskmanipulator chdir hda1 MSXAI
         foreach suite_name {
             MSXAI.COM MSXAIXF.COM MCP8251.TSR MCP16550.TSR MCPUNAPI.TSR
-            MP.COM MEMMAN.COM TL.COM TK.COM
+            TU.COM MP.COM MEMMAN.COM TL.COM TK.COM
         } {
             set listing [diskmanipulator dir hda1]
             if {[string match -nocase "*$suite_name*" $listing]} {

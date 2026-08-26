@@ -181,9 +181,10 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 release_check.ReleaseCheckError, "missing required source"):
             release_check._assert_sdist_contents(without_asset)
 
-    def test_agent_suite_requires_exactly_nine_nonempty_files(self):
-        self.assertEqual(len(release_check._AGENT_SUITE_FILES), 9)
+    def test_agent_suite_requires_exactly_ten_nonempty_files(self):
+        self.assertEqual(len(release_check._AGENT_SUITE_FILES), 10)
         self.assertIn("MP.COM", release_check._AGENT_SUITE_FILES)
+        self.assertIn("TU.COM", release_check._AGENT_SUITE_FILES)
         with tempfile.TemporaryDirectory() as directory:
             agent = pathlib.Path(directory)
             for name in release_check._AGENT_SUITE_FILES:
@@ -203,10 +204,10 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     release_check.ReleaseCheckError, "empty artifacts"):
                 release_check._assert_agent_suite(agent)
 
-    def test_agent_suite_enforces_all_three_com_size_ceilings(self):
+    def test_agent_suite_enforces_all_four_com_size_ceilings(self):
         self.assertEqual(
             set(release_check._AGENT_COM_SIZE_CEILINGS),
-            {"MSXAI.COM", "MSXAIXF.COM", "MP.COM"},
+            {"MSXAI.COM", "MSXAIXF.COM", "MP.COM", "TU.COM"},
         )
         for oversized_name, ceiling in (
                 release_check._AGENT_COM_SIZE_CEILINGS.items()):
@@ -380,6 +381,12 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     "--repository", str(source), "--assembler", assembler,
                     "--source", str(source / "agent" / "msx_port_helper.asm"),
                     "--output", str(agent / "MP.COM"),
+                ],
+                [
+                    sys.executable, str(tools / "build_tu_helper.py"),
+                    "--repository", str(source), "--assembler", assembler,
+                    "--source", str(source / "agent" / "msx_tu_helper.asm"),
+                    "--output", str(agent / "TU.COM"),
                 ],
                 [
                     assembler, str(source / "agent" / "msx_agent.asm"),
@@ -626,7 +633,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             missing = root / "missing.zip"
             self.rewrite_zip(valid, missing, drop="TL.COM")
             with self.assertRaisesRegex(
-                    release_check.ReleaseCheckError, "exactly nine"):
+                    release_check.ReleaseCheckError, "exactly ten"):
                 release_check._assert_agent_archive(
                     missing, source, suite,
                     release_check._Z80ASM_VERSION_LINE)

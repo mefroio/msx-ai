@@ -1,12 +1,14 @@
 # MSX-AI physical-target agent
 
-The MSX-DOS side of the physical-target backend is a compact nine-file suite:
+The MSX-DOS side of the physical-target backend is a compact ten-file suite:
 
 - `MSXAI.COM` is the command-line lifecycle front end and foreground monitor;
 - `MSXAIXF.COM` is the transient protocol-X PUT/GET worker, 16 KiB fast-I/O
   accumulator, and bounded PackBits decoder;
 - `MCP8251.TSR`, `MCP16550.TSR`, and `MCPUNAPI.TSR` are fixed-driver resident
   images selected by `/DRIVER` on first installation;
+- `TU.COM` is the transient pre-TL helper used only on a first UNAPI
+  installation;
 - `MP.COM` is the transient first-install configurator for the selected UNAPI
   port, including the default 6603; and
 - `MEMMAN.COM`, `TL.COM`, and `TK.COM` provide the external MemMan lifecycle.
@@ -17,9 +19,9 @@ does not make their file sizes cumulative in MSX RAM.
 
 The release archive also contains `README.TXT`, an ASCII/CRLF quick-start guide
 with lines bounded for display through the MSX-DOS `TYPE` command. The same
-file is published beside `MSXAI.ZIP`; it is documentation, not a tenth program
-dependency. Its release number and the `MSXAI.COM` banner are generated from
-the same Python package version used for the wheel and source distribution.
+file is published beside `MSXAI.ZIP`; it is documentation, not an eleventh
+program dependency. Its release number and the `MSXAI.COM` banner are generated
+from the same Python package version used for the wheel and source distribution.
 
 In the source tree, `msx_xfer.asm` owns the transient transfer executable and
 compiles `msx_xfer_engine.inc`, which contains its PUT/GET, resume, progress,
@@ -48,6 +50,7 @@ work/agent/MSXAIXF.COM
 work/agent/MCP8251.TSR
 work/agent/MCP16550.TSR
 work/agent/MCPUNAPI.TSR
+work/agent/TU.COM
 work/agent/MP.COM
 work/agent/MEMMAN.COM
 work/agent/TL.COM
@@ -72,7 +75,7 @@ For a hardware-facing TCP/IP UNAPI diagnostic independent of the resident:
 make unapi-probe
 ~~~~
 
-This creates `work/agent/UNAPIPRB.COM`. It is not a tenth suite dependency.
+This creates `work/agent/UNAPIPRB.COM`. It is not an eleventh suite dependency.
 Copy it separately and run `UNAPIPRB` for port 6603 or `UNAPIPRB 43123` for a
 chosen port. The program enumerates compatible implementations, reports the
 UNAPI location, versions, capabilities, IP and connection pool, opens a passive
@@ -80,7 +83,7 @@ listener, and monitors its state. Press `S` for a state snapshot, `R` to
 abort/reopen, or `Q`/Escape to abort and exit. Exit the probe before installing
 or reconnecting the resident on the same port.
 
-Keep all nine deployable files together. The recommended installation is a
+Keep all ten deployable files together. The recommended installation is a
 short dedicated directory such as `A:\MSXAI`, configured from `AUTOEXEC.BAT`:
 
 ~~~~bat
@@ -88,13 +91,13 @@ SET MSXAI_HOME=A:\MSXAI
 PATH A:\MSXAI;%PATH%
 ~~~~
 
-`PATH` makes `MSXAI`, `MSXAIXF`, and the post-warm-boot `TL` and `MP` commands
-callable from any DOS directory. `MSXAI_HOME` lets the lifecycle construct and
-validate bounded, fully qualified paths for `MEMMAN.COM`, `TL.COM`, `TK.COM`,
-`MP.COM`, and the selected fixed-driver TSR. A missing or empty `MSXAI_HOME`
-deliberately falls back to resolving all nine files in the current directory
-for compatibility with portable test disks. Partial packages or files mixed
-from different builds are unsupported.
+`PATH` makes `MSXAI`, `MSXAIXF`, and the post-warm-boot `TU`, `TL`, and `MP`
+commands callable from any DOS directory. `MSXAI_HOME` lets the lifecycle
+construct and validate bounded, fully qualified paths for `MEMMAN.COM`,
+`TU.COM`, `TL.COM`, `TK.COM`, `MP.COM`, and the selected fixed-driver TSR. A
+missing or empty `MSXAI_HOME` deliberately falls back to resolving all ten
+files in the current directory for compatibility with portable test disks.
+Partial packages or files mixed from different builds are unsupported.
 Keep the configured path short enough for the 39 command bytes preserved by
 MemMan's 40-byte buffer. `A:\MSXAI` is the canonical tested value; the loader's
 private fixed-width `MP/HHHH` form keeps every selected port within that limit.
@@ -179,13 +182,28 @@ The first installation follows this lifecycle:
 3. Validate external `MEMMAN.COM`, `TL.COM`, and the fixed-driver TSR selected
    by `/DRIVER` under `MSXAI_HOME`, or in the current directory when it is
    unset, before changing disk or resident state. Every first UNAPI install
-   also validates `MP.COM`.
+   also validates `TU.COM` and `MP.COM`.
 4. Read `MEMMAN.COM` into guarded free space at the top of the TPA, close its
    handle, and overlay it at `0100h` for the point-of-no-return handoff.
-5. Let the MemMan command chain find external `TL.COM` through `PATH`, pass it
-   the fully resolved `MCP8251`, `MCP16550`, or `MCPUNAPI` TSR path, and invoke
-   `MP.COM` after the warm boot to apply the selected UNAPI port, including the
-   default 6603. It then returns to DOS with only the selected TSR resident.
+5. After the warm boot, let UART installs invoke external `TL.COM` directly.
+   For a first UNAPI install, invoke `TU.COM` first: it loads and closes
+   `TL.COM`, enumerates TCP/IP UNAPI, normalizes the fifth byte of an exact
+   Pico/Pico+ `H.TIMI` hook signature `F7 ?? B8 4C` to `C9`, then overlays
+   `TL.COM` with the original TSR command tail. Invoke `MP.COM` after `TL.COM`
+   to apply the selected port, including the default 6603. It then returns to
+   DOS with only the selected TSR resident.
+
+This post-warm-boot, pre-TL ordering ensures that MemMan sees the firmware's
+already reduced `HIMEM` before it integrates the resident hooks. `TU.COM`
+performs no DOS operation after UNAPI enumeration begins; it has already closed
+`TL.COM` before that side-effect window.
+
+The later BASIC-to-DOS path is independent of this first-install preparation.
+Once the agent is resident, its `H.CRUN` hook recognizes exact direct-mode
+`_SYSTEM` and `CALL SYSTEM` lines. It aborts the active UNAPI TCP handle before
+Nextor reclaims cartridge storage, latches the transport off, and suppresses
+later `H.TIMI` handlers during the transition. UART transports do not enter
+this path.
 
 No executable or TSR is emitted, patched, renamed, deleted, or left behind by
 this lifecycle. Every component was already supplied as a final suite file.
@@ -540,15 +558,17 @@ remains a direct assembly/upload path and never enters BASIC automatically.
 
 ## Memory model
 
-The nine deployable files are not simultaneously resident. DOS initially
+The ten deployable files are not simultaneously resident. DOS initially
 loads `MSXAI.COM` as a normal transient program. For a first resident install,
 the loader validates the external utilities and selected fixed-driver TSR,
 stages `MEMMAN.COM` at the guarded high end of free TPA, and overlays it at
 `0100h`; the old `MSXAI.COM` image is disposable after that handoff. MemMan
-then runs `TL.COM`, which loads only the selected TSR into mapper-managed
-resident memory. For every first UNAPI install, transient `MP.COM` immediately
-applies the selected listener port after the warm boot. The unselected TSR,
-`TK.COM`, and `MSXAIXF.COM` remain disk files.
+then runs `TL.COM` directly for UART, loading only the selected TSR into
+mapper-managed resident memory. For every first UNAPI install, transient
+`TU.COM` runs before `TL.COM`, stages and closes it, primes UNAPI, hardens the
+guarded Pico hook signature, and overlays the staged image. Transient `MP.COM`
+then applies the selected listener port. The unselected TSR, `TK.COM`, and
+`MSXAIXF.COM` remain disk files.
 
 `MSXAIXF.COM` is loaded later as an ordinary foreground transient only for a
 protocol-X PUT or GET. Its transient workspace provides PackBits decoding and
@@ -557,7 +577,7 @@ exits. Uninstall similarly stages and overlays external `TK.COM` for one
 action. During a lifecycle handoff the front end and one staged external
 overlay briefly share the TPA; the other suite components do not. The
 requirement is therefore that active pair plus guarded stack and overlay
-headroom, never the sum of all nine file sizes. Only MemMan and the selected
+headroom, never the sum of all ten file sizes. Only MemMan and the selected
 agent TSR remain allocated after installation.
 
 MemMan relocates the TSR within a managed segment. When a hook or talk entry is
@@ -976,7 +996,7 @@ cartridge registers, or physical timing.
 
 The integration suite owns at most one openMSX process at a time. It validates:
 
-- staging of the canonical nine-file suite and selection of `MCP8251.TSR`;
+- staging of the canonical ten-file suite and selection of `MCP8251.TSR`;
 - MemMan installation returning to DOS;
 - intervention in a DOS-launched program;
 - bounded snapshot pause, patch, resume, and repeated `H.TIMI` entry;

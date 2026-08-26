@@ -10,7 +10,7 @@ REQUIREMENTS
 
 - MSX-DOS 2 or Nextor.
 - A memory mapper with free 16 KiB segments.
-- All nine program files from this ZIP kept together.
+- All ten program files from this ZIP kept together.
 - For UNAPI: a TCP/IP UNAPI implementation and configured Wi-Fi.
 
 INSTALLATION
@@ -45,6 +45,15 @@ MemMan A7 v1 is the safe lifecycle request for targets 0, 1, and 2. Offset
 MP.COM selects UNAPI. Its 1 KiB page-2 stack has low/high guards and leaves
 256 bytes below the caller SP. A6 is rejected; keep the suite at one version.
 
+On the first UNAPI install only, TU.COM runs after warm boot and before
+TL.COM. It loads and closes TL.COM, enumerates UNAPI, and sets the fifth byte
+of an exact Pico hook F7 ?? B8 4C to C9 before overlaying TL.COM. This lets
+MemMan see the firmware-reduced HIMEM. UART installs run TL.COM directly.
+MP.COM configures the UNAPI port after TL.COM.
+
+Later BASIC-to-DOS _SYSTEM or CALL SYSTEM uses the resident H.CRUN hook to
+abort TCP and suppress later H.TIMI handlers while Nextor takes control.
+
 MONITOR MODE
 ------------
 
@@ -76,6 +85,7 @@ MSXAIXF.COM    File-transfer worker launched automatically by the host.
 MCPUNAPI.TSR   TCP/IP UNAPI resident transport.
 MCP8251.TSR    8251 serial resident transport.
 MCP16550.TSR   16C550 serial resident transport.
+TU.COM         Internal pre-TL helper used only for first UNAPI install.
 MP.COM         Internal UNAPI port configurator used during installation.
 MEMMAN.COM     MemMan resident manager.
 TL.COM         MemMan TSR loader.

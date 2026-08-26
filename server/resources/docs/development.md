@@ -84,7 +84,7 @@ fail-closed. Linux and macOS continue to require Make. This pre-commit gate
 builds a clean snapshot
 of the checkout's current on-disk source, including uncommitted changes while
 excluding generated and local-state directories. It runs the unit suite,
-builds and inspects the sdist and wheel, rebuilds both the wheel and nine-file
+builds and inspects the sdist and wheel, rebuilds both the wheel and ten-file
 agent suite from the sdist, and compares their same-host payloads. It installs
 the rebuilt wheel into a clean environment, runs `pip check`, verifies
 import/CLI state discipline and packaged openMSX resource materialization, and
@@ -115,7 +115,7 @@ On Windows, use `python tools/release_check.py --publish` for strict mode and
 
 This writes the versioned Python distributions, the deterministic,
 MSX-DOS-compatible `MSXAI.ZIP`, and a standalone `README.TXT` to `dist/`.
-The ZIP contains the same README and exactly nine binaries,
+The ZIP contains the same README and exactly ten binaries,
 the project `LICENSE`, `MEMMAN-NOTICE.txt`, `SHA256SUMS`, and
 `COMPATIBILITY.json` recording the project release, wire v3, transfer `fast-v1`,
 and the pinned assembler. Checksums cover the binaries, README, license,
@@ -147,15 +147,26 @@ MSXAIXF.COM
 MCP8251.TSR
 MCP16550.TSR
 MCPUNAPI.TSR
+TU.COM
 MP.COM
 MEMMAN.COM
 TL.COM
 TK.COM
 ```
 
-`MP.COM` is the ninth, transient first-install helper. It applies the selected
-UNAPI listener port after the MemMan warm boot, including the default 6603; its
-compact hexadecimal command is private to the install chain.
+`TU.COM` is transient and runs only on a first UNAPI installation, after the
+MemMan warm boot and before `TL.COM`. It loads and closes `TL.COM`, enumerates
+TCP/IP UNAPI, normalizes the fifth byte of an exact Pico/Pico+ hook signature
+`F7 ?? B8 4C` to `C9`, and overlays the staged `TL.COM`. This lets MemMan see
+the firmware-reduced `HIMEM`. UART installs still run `TL.COM` directly.
+`MP.COM` remains transient and runs after `TL.COM` to apply
+the selected listener port, including the default 6603; its compact hexadecimal
+command is private to the install chain.
+
+Later BASIC-to-DOS transitions are handled by the already resident agent, not
+by `TU.COM`. Its `H.CRUN` hook recognizes exact `_SYSTEM` and `CALL SYSTEM`
+lines, aborts the active UNAPI TCP handle before Nextor reclaims cartridge
+storage, and suppresses later `H.TIMI` handlers during the transition.
 
 Keep files from one build together. Internal relocation templates under the
 build subdirectory are not deployable alternatives. The three MemMan utilities

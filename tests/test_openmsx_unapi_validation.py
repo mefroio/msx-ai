@@ -105,7 +105,8 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
     def test_install_commands_use_unapi_custom_port(self):
         self.assertEqual(harness.AGENT_PACKAGE_NAMES, (
             "MSXAI.COM", "MSXAIXF.COM", "MCP8251.TSR", "MCP16550.TSR",
-            "MCPUNAPI.TSR", "MP.COM", "MEMMAN.COM", "TL.COM", "TK.COM",
+            "MCPUNAPI.TSR", "TU.COM", "MP.COM", "MEMMAN.COM", "TL.COM",
+            "TK.COM",
         ))
         self.assertEqual(harness.msx_install_commands(43123), (
             r"SET MSXAI_HOME=A:\MSXAI",

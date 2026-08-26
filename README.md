@@ -228,7 +228,7 @@ does not prevent `msx_local_screenshot` from diagnosing the existing machine.
 
 Use this path when actual MSX hardware behavior is the subject of the session.
 
-1. Install the nine-file suite described below.
+1. Install the ten-file suite described below.
 2. For a UART bridge, run `MSXAI /DRIVER:8251` or
    `MSXAI /DRIVER:16C550` and configure the bridge with matching serial
    settings and flow control. If it connects outward, call
@@ -345,7 +345,8 @@ The physical and simulated agent paths use these files:
 ```text
 A:\MSXAI\
   MSXAI.COM     MSXAIXF.COM  MCP8251.TSR  MCP16550.TSR
-  MCPUNAPI.TSR  MP.COM       MEMMAN.COM   TL.COM       TK.COM
+  MCPUNAPI.TSR  TU.COM       MP.COM       MEMMAN.COM   TL.COM
+  TK.COM
 ```
 
 Build them from source with `make agent`, or use matching binaries from a
@@ -357,11 +358,17 @@ PATH A:\MSXAI;%PATH%
 ```
 
 The default MemMan resident returns to MSX-DOS. `MSXAIXF.COM` is its transient
-foreground file helper, while `MP.COM` is the one-shot helper that applies the
-selected UNAPI port after MemMan's first-install warm boot, including the
-default 6603 when `/PORT` is omitted. The public `/PORT` syntax remains decimal;
-the compact hexadecimal form passed to `MP.COM` is private to the install
-chain. Internally, `MP.COM` and every existing-resident reconfiguration use
+foreground file helper. On a first UNAPI installation only, `TU.COM` runs after
+MemMan's warm boot and before `TL.COM`: it loads and closes `TL.COM`, enumerates
+TCP/IP UNAPI, normalizes the fifth byte of an exact Pico/Pico+ hook signature
+`F7 ?? B8 4C` to `C9`, and then overlays `TL.COM`. This ordering lets MemMan see
+the firmware-reduced `HIMEM` before it installs the resident hooks. UART
+installations invoke `TL.COM` directly and never use `TU.COM`.
+`MP.COM` remains the one-shot helper that runs after `TL.COM` and applies the
+selected UNAPI port, including the default 6603 when `/PORT` is omitted. The
+public `/PORT` syntax remains decimal; the compact hexadecimal form passed to
+`MP.COM` is private to the install chain. Internally, `MP.COM` and every
+existing-resident reconfiguration use
 the private MemMan `A7h` v1 lifecycle request: 16 bytes containing the port,
 a caller-owned 1 KiB page-2 stack, structured results, and the requested
 transport at offset 14 (`0=8251`, `1=16C550`, `2=UNAPI`); offset 15 must remain
@@ -372,6 +379,11 @@ changes and potentially deep TCP lifecycle work do not use MemMan's internal
 stack. The old `A6h` raw-port ABI is rejected, so mixed old/new suite files
 fail closed. The other COM/TSR files are part of the same versioned suite.
 MSX-DOS 2 or Nextor and a memory mapper are required for resident mode.
+
+After that first installation, BASIC-to-DOS is a separate resident lifecycle.
+The agent's `H.CRUN` hook recognizes exact `_SYSTEM` and `CALL SYSTEM` lines,
+aborts the active UNAPI TCP handle before Nextor reclaims cartridge storage,
+and suppresses later `H.TIMI` handlers during the transition.
 
 ## MCP interface
 
@@ -512,7 +524,7 @@ The corresponding direct Windows commands are
 
 `release-assets` publishes the versioned Python source distribution and wheel,
 plus the stable, MSX-DOS-compatible `MSXAI.ZIP` and its standalone
-`README.TXT`, under `dist/`. The ZIP contains the same README, the nine matching
+`README.TXT`, under `dist/`. The ZIP contains the same README, the ten matching
 MSX files, the project license, the MemMan notice, checksums, and explicit
 wire-protocol, transfer-protocol, and toolchain metadata. Existing artifacts
 are never overwritten. The gate proves same-host equivalence with the pinned

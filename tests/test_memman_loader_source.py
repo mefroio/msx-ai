@@ -27,12 +27,13 @@ class MemManLoaderSourceTests(unittest.TestCase):
         makefile = MAKEFILE.read_text(encoding="utf-8")
         for artifact in (
                 "MSXAI.COM", "MSXAIXF.COM", "MCP8251.TSR",
-                "MCP16550.TSR", "MCPUNAPI.TSR", "MP.COM", "MEMMAN.COM",
-                "TL.COM", "TK.COM"):
+                "MCP16550.TSR", "MCPUNAPI.TSR", "MP.COM", "TU.COM",
+                "MEMMAN.COM", "TL.COM", "TK.COM"):
             self.assertIn(artifact, makefile)
         self.assertNotIn("incbin", self.source.lower())
         self.assertIn('db "MEMMAN.COM",0', self.source)
         self.assertIn('db "TL.COM",0', self.source)
+        self.assertIn('db "TU.COM",0', self.source)
         self.assertIn('db "TK.COM",0', self.source)
         self.assertIn('db "MCP8251.TSR",0', self.source)
         self.assertIn('db "MCP16550.TSR",0', self.source)
@@ -46,7 +47,10 @@ class MemManLoaderSourceTests(unittest.TestCase):
             self.source, r"(?m)^TK_FILE_SIZE:\s+equ\s+00580h")
         self.assertRegex(
             self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+0039Ah")
+        self.assertRegex(
+            self.source, r"(?m)^TU_FILE_SIZE:\s+equ\s+002EDh")
         self.assertIn("922-byte guarded-stack port helper", self.source)
+        self.assertIn("749-byte pre-TL UNAPI helper", self.source)
 
     def test_resident_lifecycle_creates_no_temporary_files(self):
         lifecycle = self.source.split(
@@ -101,10 +105,18 @@ class MemManLoaderSourceTests(unittest.TestCase):
 
     def test_memman_install_tail_and_direct_tk_uninstall(self):
         self.assertIn('db " _SYSTEM@@TL "', self.source)
+        self.assertIn('db " _SYSTEM@@TU "', self.source)
         command_builder = self.source.split(
             "suite_build_install_command:", 1)[1].split(
                 "; ---------------------------------------------------------------------------\n"
                 "; External suite validation", 1)[0]
+        self.assertIn("ld a,(suite_port_helper_required)", command_builder)
+        self.assertIn("ld hl,install_uart_command_prefix", command_builder)
+        self.assertIn("ld hl,install_unapi_command_prefix", command_builder)
+        self.assertIn(
+            "ld bc,install_uart_command_prefix_length", command_builder)
+        self.assertIn(
+            "ld bc,install_unapi_command_prefix_length", command_builder)
         self.assertIn("ld hl,(suite_selected_tsr_path)", command_builder)
         self.assertIn("strip .TSR", command_builder)
         self.assertIn("ld a,'@'", command_builder)
@@ -123,9 +135,9 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP8251@"), 39)
         self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP16550@"), 39)
         self.assertEqual(
-            len(" _SYSTEM@@TL A:\\MSXAI\\MCPUNAPI@MP/19CB@"), 39)
+            len(" _SYSTEM@@TU A:\\MSXAI\\MCPUNAPI@MP/19CB@"), 39)
         self.assertEqual(
-            len(" _SYSTEM@@TL A:\\MSXAI\\MCPUNAPI@MP/A873@"), 39)
+            len(" _SYSTEM@@TU A:\\MSXAI\\MCPUNAPI@MP/A873@"), 39)
         self.assertLessEqual(len(' "MSXAI MCP1"'), 39)
         self.assertIn("ld de,COMMAND_TEXT", self.source)
         self.assertIn("ld (COMMAND_TAIL),a", self.source)
@@ -140,6 +152,7 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld c,DOS_GET_ENV", resolver)
         for destination in (
                 "suite_memman_path", "suite_tl_path", "suite_tk_path",
+                "suite_tu_path",
                 "suite_mcp8251_tsr_path", "suite_mcp16550_tsr_path",
                 "suite_mcpunapi_tsr_path", "suite_mp_path"):
             self.assertIn(f"ld de,{destination}", resolver)
@@ -148,6 +161,34 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("cp DOS_PATH_SEPARATOR", resolver)
         self.assertIn("cp '/'", resolver)
         self.assertIn("ld a,ERR_INVALID_PARAMETER", resolver)
+
+    def test_tu_and_mp_are_validated_only_for_first_unapi_install(self):
+        selection = self.source.split("preflight_select_8251:", 1)[1].split(
+            "preflight_install_selected:", 1)[0]
+        unapi = selection.split("preflight_select_unapi:", 1)[1]
+        uart = selection.split("preflight_select_unapi:", 1)[0]
+        self.assertIn("ld (suite_port_helper_required),a", unapi)
+        self.assertNotIn("suite_port_helper_required", uart)
+
+        install = self.source.split("preflight_install_selected:", 1)[1].split(
+            "preflight_select_uninstall:", 1)[0]
+        common, conditional = install.split(
+            "ld a,(suite_port_helper_required)", 1)
+        self.assertIn("ld de,suite_tl_path", common)
+        self.assertNotIn("suite_tu_path", common)
+        self.assertNotIn("suite_mp_path", common)
+        self.assertIn("ld de,suite_tu_path", conditional)
+        self.assertIn("ld hl,TU_FILE_SIZE", conditional)
+        self.assertIn("ld de,suite_mp_path", conditional)
+        self.assertIn("ld hl,MP_FILE_SIZE", conditional)
+        self.assertEqual(
+            conditional.count("call suite_validate_regular_file"), 2)
+
+        uninstall = self.source.split(
+            "preflight_select_uninstall:", 1)[1].split(
+                "preflight_command_length:", 1)[0]
+        self.assertNotIn("suite_tu_path", uninstall)
+        self.assertNotIn("suite_mp_path", uninstall)
 
     def test_memman_discovery_uses_standard_id_and_tsr_call(self):
         discovery = self.source.split("memman_find_agent:", 1)[1].split(

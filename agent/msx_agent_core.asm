@@ -53,6 +53,8 @@ RES_BASE:       equ 08600h
 endif
 H_KEYI:         equ 0FD9Ah
 H_TIMI:         equ 0FD9Fh
+H_CRUN:         equ 0FF20h
+BASIC_BUF:      equ 0F55Eh
 MSXVER:         equ 0002Dh
 RDSLT:          equ 0000Ch
 WRSLT:          equ 00014h
@@ -154,6 +156,9 @@ TRANSPORT_FLAG_FRAME_WAKE_ACK: equ 4
 ; disappears while still allowing active 19,200-baud traffic to flow.
 HOOK_IO_BUDGET: equ 01000h
 FAST_PUMP_IO_BUDGET: equ 0FFFFh
+; After a foreground slot/mapper transition, require roughly two seconds of
+; stable H.TIMI samples (2.0 s NTSC, 2.4 s PAL) before calling UNAPI again.
+HOOK_MAPPING_COOLDOWN: equ 120
 
 FRAME_REQUEST:    equ 1
 FRAME_RESPONSE:   equ 2
@@ -1154,6 +1159,25 @@ tsr_config_unapi_error:
     db 0
 tsr_config_previous_in_hook:
     db 0
+; A TCP/IP UNAPI implementation can share cartridge hardware with the active
+; Nextor disk driver. H.TIMI must not re-enter that firmware while a foreground
+; page-0 slot transaction or an extended BASIC command is in flight.
+hook_safe_page0_primary:
+    db 0
+; 0=no candidate, 1=one sample, 2=stable page-0 baseline locked.
+hook_mapping_state:
+    db 0
+hook_mapping_cooldown:
+    db 0
+; H.CRUN validates the complete direct-mode line before tokenization. Once
+; `_SYSTEM` is confirmed, close UNAPI before Nextor reclaims Pico+ storage and
+; keep it suspended for the rest of this resident instance.
+hook_system_suspended:
+    db 0
+hook_system_sp:
+    dw 0
+hook_system_restore_error:
+    db 0FFh
 tsr_heap_base:
     dw 0
 tsr_heap_stack_bottom:
@@ -1208,6 +1232,15 @@ if MSXAI_TSR_BUILD
 endif
     or a
     ret nz
+if MSXAI_TSR_BUILD
+    ; TsrLoad may invoke initialization with its own code mapped in page 0.
+    ; Learn the real foreground page-0 slot from two later H.TIMI calls.
+    xor a
+    ld (hook_mapping_state),a
+    ld (hook_mapping_cooldown),a
+    ld (hook_system_suspended),a
+    ld (hook_system_restore_error),a
+endif
     xor a
     ld (in_hook),a
     ld (resume_requested),a
@@ -1315,8 +1348,9 @@ receive_dispatch:
 ; a guard: TIMI-only transports never touch the UART or parser there, but an
 ; exclusive transport suppresses an older firmware hook that could otherwise
 ; consume Rx data before H.TIMI. UART receive IRQs are masked, so MCP traffic
-; cannot enter a game during transient slot or VDP state. H.TIMI always chains
-; after normal protocol work. Pause remains here until resume.
+; cannot enter a game during transient slot or VDP state. H.TIMI normally
+; chains after protocol work; the latched _SYSTEM transition stops its later
+; handlers while Nextor takes ownership. Pause remains here until resume.
 if MSXAI_TSR_BUILD
 resident_keyi_hook:
     push af
@@ -1347,7 +1381,7 @@ resident_timi_hook:
 
 ; A nested MemMan hook must return before saving another context or replacing
 ; hook_dispatch_sp. MemMan receives QuitHook in A' bit 0: an exclusive H.KEYI
-; is suppressed, while H.TIMI and a future non-exclusive H.KEYI keep chaining.
+; is suppressed, while H.TIMI normally chains unless _SYSTEM is latched.
 memman_nested_keyi_return:
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_KEYI_EXCLUSIVE
@@ -1358,6 +1392,18 @@ memman_nested_keyi_return:
     ex af,af'
     ret
 memman_nested_timi_return:
+    ; Once H.CRUN has latched an exact _SYSTEM, do not let an EI inside the
+    ; foreground TCP abort reach Pico's later H.TIMI handler. H.KEYI still
+    ; takes its existing path above, and H.TIMI keeps chaining while the latch
+    ; is clear.
+    ld a,(hook_system_suspended)
+    or a
+    jr z,memman_nested_hook_continue
+    pop af
+    ex af,af'
+    ld a,1                     ; QuitHook=1: stop later H.TIMI handlers
+    ex af,af'
+    ret
 memman_nested_hook_continue:
     pop af
     ex af,af'
@@ -1399,6 +1445,19 @@ resident_hook_saved_af:
     xor a
     jr hook_chain_ready
 hook_initial_chain:
+    ; During _SYSTEM, MemMan must remain the end of the H.TIMI chain so the
+    ; Pico+ TCP hook cannot re-enter cartridge firmware while Nextor takes
+    ; ownership. The UNAPI-only latch leaves H.KEYI and ordinary H.TIMI calls
+    ; on their existing chain path.
+    ld a,(hook_kind)
+    or a
+    jr z,hook_initial_chain_continue
+    ld a,(hook_system_suspended)
+    or a
+    jr z,hook_initial_chain_continue
+    xor a
+    jr hook_chain_ready
+hook_initial_chain_continue:
     ld a,1
 hook_chain_ready:
     ld (chain_keyi),a
@@ -1420,6 +1479,8 @@ hook_poll_transport:
     jr nz,hook_done
     ld a,(xfer_fast_pump_active)
     or a
+    jr nz,hook_done
+    call hook_transport_mapping_safe
     jr nz,hook_done
     call transport_service
     call transport_session_guard
@@ -1476,6 +1537,210 @@ memman_hook_continue:
     ex af,af'
     xor a                      ; MemMan QuitHook clear: call the next handler
     ex af,af'
+    ret
+
+; BASIC calls H.CRUN with the source cursor used by CRUNCH. Nextor also invokes
+; it for a synthetic `_SYSTEM` while entering BASIC, but that nested invocation
+; has already advanced HL beyond BUF. Only the initial direct-mode call at BUF
+; belongs to the line the user just submitted. Accept exact `_SYSTEM` and
+; `CALL SYSTEM` forms there (case-insensitive, with optional surrounding
+; spaces), close the active UNAPI handle while BASIC's normal mapping is still
+; intact, then latch UNAPI off before Nextor starts its warm boot. The warm boot
+; detaches the hooks; a later installation starts fresh. Other transports never
+; enter this path.
+resident_basic_crunch_hook:
+    push af
+    push bc
+    push de
+    push hl
+    ld a,(in_hook)
+    push af
+    ld a,1
+    ld (in_hook),a              ; nested timer hooks take the minimal chain path
+    ld a,(active_transport_id)
+    cp UNAPI_ID
+    jr nz,resident_basic_crunch_hook_continue
+
+    ld a,h
+    cp 0F5h                     ; high BASIC_BUF
+    jr nz,resident_basic_crunch_hook_continue
+    ld a,l
+    cp 05Eh                     ; low BASIC_BUF
+    jr nz,resident_basic_crunch_hook_continue
+    ld hl,BASIC_BUF
+resident_basic_crunch_skip_leading_space:
+    ld a,(hl)
+    cp ' '
+    jr nz,resident_basic_crunch_match_start
+    inc hl
+    jr resident_basic_crunch_skip_leading_space
+
+resident_basic_crunch_match_start:
+    ld a,(hl)
+    and 0DFh                    ; BASIC normally uppercases; accept lowercase
+    cp '_'
+    jr z,resident_basic_crunch_match_extension
+
+    ; The long spelling must be CALL, at least one separating space, then
+    ; SYSTEM. Requiring the separator avoids accepting a longer identifier.
+    ld de,resident_basic_call_word
+    ld b,4
+    call resident_basic_crunch_match_word
+    jr nz,resident_basic_crunch_hook_continue
+    ld a,(hl)
+    cp ' '
+    jr nz,resident_basic_crunch_hook_continue
+resident_basic_crunch_skip_call_space:
+    inc hl
+    ld a,(hl)
+    cp ' '
+    jr z,resident_basic_crunch_skip_call_space
+    ld de,resident_basic_call_system_word
+    ld b,6
+    call resident_basic_crunch_match_word
+    jr nz,resident_basic_crunch_hook_continue
+    jr resident_basic_crunch_skip_trailing_space
+
+resident_basic_crunch_match_extension:
+    ld de,resident_basic_system_word
+    ld b,7
+    call resident_basic_crunch_match_word
+    jr nz,resident_basic_crunch_hook_continue
+    jr resident_basic_crunch_skip_trailing_space
+
+resident_basic_crunch_match_word:
+    ld a,(hl)
+    and 0DFh
+    ld c,a
+    ld a,(de)
+    cp c
+    ret nz
+    inc hl
+    inc de
+    djnz resident_basic_crunch_match_word
+    ret
+
+resident_basic_crunch_skip_trailing_space:
+    ld a,(hl)
+    or a
+    jr z,resident_basic_crunch_match_complete
+    cp ' '
+    jr nz,resident_basic_crunch_hook_continue
+    inc hl
+    jr resident_basic_crunch_skip_trailing_space
+
+resident_basic_crunch_match_complete:
+    ld a,1
+    ld (hook_system_suspended),a
+    call resident_basic_system_quiesce_unapi
+resident_basic_crunch_hook_continue:
+    pop af
+    ld (in_hook),a
+    pop hl
+    pop de
+    pop bc
+    pop af
+    ex af,af'
+    xor a                       ; MemMan QuitHook=0: continue to BASIC/Nextor
+    ex af,af'
+    ret
+
+; Pico+ multiplexes TCP/IP UNAPI and Nextor storage through the same cartridge.
+; Merely stopping H.TIMI leaves the TCP handle live when Nextor re-enters its
+; driver. Abort and clear the transport before CRUNCH executes `_SYSTEM`.
+; UNAPI firmware can consume a large stack and may execute EI, so run it on the
+; guarded page-3 heap while in_hook keeps nested timer callbacks minimal.
+resident_basic_system_quiesce_unapi:
+    di
+    ld (hook_system_sp),sp
+    call tsr_heap_guards_ok
+    jr z,resident_basic_system_heap_ready
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,0FFh
+    ld (hook_system_restore_error),a
+    jr resident_basic_system_restore_stack
+resident_basic_system_heap_ready:
+    call tsr_heap_fill_guards
+    ld sp,(tsr_heap_stack_top)
+    call transport_restore_foreground_retry
+    ld (hook_system_restore_error),a
+    di
+    call tsr_heap_guards_ok
+    jr z,resident_basic_system_restore_stack
+    ld a,1
+    ld (tsr_heap_fault),a
+resident_basic_system_restore_stack:
+    ld sp,(hook_system_sp)
+    ei
+    ret
+resident_basic_system_word:
+    db "_SYSTEM"
+resident_basic_call_word:
+    db "CALL"
+resident_basic_call_system_word:
+    db "SYSTEM"
+
+; Return Z when transport work is safe at this H.TIMI boundary. Serial UARTs
+; do not call shared cartridge firmware and therefore retain their exact hook
+; behavior. For UNAPI, an immutable page-0 primary slot catches transitions
+; visible at interrupt time. The H.CRUN latch covers `_SYSTEM` for its complete
+; lifetime instead of guessing how long a physical Nextor warm boot will take.
+hook_transport_mapping_safe:
+    ld a,(active_transport_id)
+    cp UNAPI_ID
+    jr nz,hook_transport_mapping_safe_yes
+
+    ld a,(hook_system_suspended)
+    or a
+    jr nz,hook_transport_mapping_skip
+
+    in a,(0A8h)
+    and 03h
+    ld b,a
+
+    ld a,(hook_mapping_state)
+    cp 2
+    jr z,hook_transport_mapping_locked
+    or a
+    jr z,hook_transport_mapping_learn_candidate
+    ; State 1 is deliberately not trusted yet. Two identical consecutive
+    ; observations are required before any UNAPI firmware call is allowed.
+    ld a,(hook_safe_page0_primary)
+    cp b
+    jr nz,hook_transport_mapping_learn_candidate
+    ld a,2
+    ld (hook_mapping_state),a
+    jr hook_transport_mapping_quiet
+
+hook_transport_mapping_locked:
+    ; Once established, switching page 0 away normally hides the BIOS or marks
+    ; a slot transaction. Keep the original baseline and wait after it returns.
+    ld a,(hook_safe_page0_primary)
+    cp b
+    jr nz,hook_transport_mapping_changed
+hook_transport_mapping_quiet:
+    ld a,(hook_mapping_cooldown)
+    or a
+    jr z,hook_transport_mapping_safe_yes
+    dec a
+    ld (hook_mapping_cooldown),a
+    jr hook_transport_mapping_skip
+hook_transport_mapping_safe_yes:
+    xor a
+    ret
+
+hook_transport_mapping_learn_candidate:
+    ld a,b
+    ld (hook_safe_page0_primary),a
+    ld a,1
+    ld (hook_mapping_state),a
+hook_transport_mapping_changed:
+    ld a,HOOK_MAPPING_COOLDOWN
+    ld (hook_mapping_cooldown),a
+hook_transport_mapping_skip:
+    ld a,1
+    or a
     ret
 else
 resident_keyi_hook:

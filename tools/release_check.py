@@ -144,6 +144,7 @@ _SDIST_REQUIRED_FILES = {
     "agent/msx_agent_tsr.asm",
     "agent/msx_memman_loader.asm",
     "agent/msx_port_helper.asm",
+    "agent/msx_tu_helper.asm",
     "agent/msx_unapi_probe.asm",
     "agent/msx_xfer.asm",
     "agent/msx_xfer_engine.inc",
@@ -159,6 +160,7 @@ _SDIST_REQUIRED_FILES = {
     "tests/test_port_helper.py",
     "tests/test_build_version_include.py",
     "tests/test_release_check.py",
+    "tests/test_tu_helper.py",
     "tests/test_openmsx_unapi_validation.py",
     "tests/test_unapi_probe.py",
     "third_party/memman/NOTICE",
@@ -171,6 +173,7 @@ _SDIST_REQUIRED_FILES = {
     "tools/build_agent_tsr.py",
     "tools/build_memman_tsr.py",
     "tools/build_port_helper.py",
+    "tools/build_tu_helper.py",
     "tools/build_unapi_probe.py",
     "tools/build_version_include.py",
     "tools/check_msx_com_size.py",
@@ -189,11 +192,13 @@ _AGENT_SUITE_FILES = {
     "MSXAIXF.COM",
     "TK.COM",
     "TL.COM",
+    "TU.COM",
 }
 _AGENT_COM_SIZE_CEILINGS = {
     "MSXAI.COM": 36_760,
     "MSXAIXF.COM": 16_128,
     "MP.COM": 16_128,
+    "TU.COM": 16_128,
 }
 _WIRE_VERSION = "v3"
 _TRANSFER_VERSION = "fast-v1"
@@ -898,7 +903,7 @@ def _assert_agent_archive(path: Path, source: Path,
         names = archive.namelist()
         if len(names) != len(set(names)) or set(names) != expected_names:
             raise ReleaseCheckError(
-                "agent archive must contain exactly nine binaries, LICENSE, "
+                "agent archive must contain exactly ten binaries, LICENSE, "
                 "MEMMAN-NOTICE.txt, README.TXT, SHA256SUMS, and "
                 "COMPATIBILITY.json")
         for name in _AGENT_SUITE_FILES:
@@ -1031,6 +1036,12 @@ def _build_agent_suite_portable(
             "--output", str(agent_directory / "MP.COM"),
         ],
         [
+            sys.executable, str(tools / "build_tu_helper.py"),
+            "--repository", str(source), "--assembler", assembler,
+            "--source", str(source / "agent" / "msx_tu_helper.asm"),
+            "--output", str(agent_directory / "TU.COM"),
+        ],
+        [
             assembler, str(source / "agent" / "msx_agent.asm"),
             "-o", str(agent_directory / "MSXAI.COM"),
         ],
@@ -1056,7 +1067,7 @@ def _build_agent_suite_portable(
 def _build_agent_suite(source: Path, env: dict[str, str]) -> Path:
     make, assembler = _resolve_build_tools(env)
     _z80asm_version_line(assembler, env)
-    _say("building the nine-file Z80 agent suite in the staged snapshot")
+    _say("building the ten-file Z80 agent suite in the staged snapshot")
     agent_directory = source / "work" / "agent"
     if make is None:
         _say("using the portable Python agent builder on Windows")
@@ -1455,7 +1466,7 @@ def run_release_check(*, publish: bool = False,
         rebuilt_source = _extract_sdist(sdist, extracted)
         rebuilt_agent = _build_agent_suite(rebuilt_source, environment)
         _assert_matching_agent_suites(staged_agent, rebuilt_agent)
-        _say("sdist-rebuilt agent suite matches all nine staged payloads")
+        _say("sdist-rebuilt agent suite matches all ten staged payloads")
 
         bundle_a = temporary / "agent-bundle-a"
         bundle_b = temporary / "agent-bundle-b"

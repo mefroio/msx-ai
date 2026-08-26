@@ -43,6 +43,9 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
     def test_heap_contract_reserves_one_kib_between_two_guards(self):
         self.assertEqual(
             _equ_value(self.source, "MEMMAN_FUNCTION_HANDLER"), 0x4002)
+        self.assertEqual(_equ_value(self.source, "H_CRUN"), 0xFF20)
+        self.assertEqual(_equ_value(self.source, "BASIC_BUF"), 0xF55E)
+        self.assertEqual(_equ_value(self.source, "HOOK_MAPPING_COOLDOWN"), 120)
         self.assertEqual(_equ_value(self.source, "MEMMAN_HEAP_ALLOC"), 70)
         self.assertEqual(_equ_value(self.source, "MEMMAN_HEAP_DEALLOC"), 71)
 
@@ -203,6 +206,188 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
         self.assertLess(
             unwind.index("ld sp,(hook_context_sp)"),
             unwind.index("pop iy"),
+        )
+
+    def test_unapi_hook_debounces_foreground_page_zero_slot_changes(self):
+        initialize = _section(
+            self.source, "resident_initialize:", "resident_main:")
+        _assert_in_order(
+            self,
+            initialize,
+            "call transport_init",
+            "or a",
+            "ret nz",
+            "ld (hook_mapping_state),a",
+            "ld (hook_mapping_cooldown),a",
+            "ld (hook_system_suspended),a",
+        )
+
+        hooks = _section(
+            self.source,
+            "; ------------------------------------------------------------ BIOS hooks",
+            "else\nresident_keyi_hook:",
+        )
+        dispatch = _section(
+            hooks, "hook_poll_transport:", "hook_dispatch_frame:")
+        _assert_in_order(
+            self,
+            dispatch,
+            "call hook_transport_mapping_safe",
+            "jr nz,hook_done",
+            "call transport_service",
+            "call transport_session_guard",
+            "call transport_rx_ready",
+        )
+
+        guard = _section(
+            self.source,
+            "hook_transport_mapping_safe:",
+            "else\nresident_keyi_hook:",
+        )
+        _assert_in_order(
+            self,
+            guard,
+            "ld a,(active_transport_id)",
+            "cp UNAPI_ID",
+            "jr nz,hook_transport_mapping_safe_yes",
+            "ld a,(hook_system_suspended)",
+            "or a",
+            "jr nz,hook_transport_mapping_skip",
+            "in a,(0A8h)",
+            "and 03h",
+            "ld b,a",
+            "ld a,(hook_mapping_state)",
+            "jr z,hook_transport_mapping_learn_candidate",
+            "ld a,(hook_safe_page0_primary)",
+            "ld (hook_mapping_state),a",
+            "hook_transport_mapping_locked:",
+            "ld a,(hook_safe_page0_primary)",
+            "jr nz,hook_transport_mapping_changed",
+            "hook_transport_mapping_quiet:",
+            "ld a,(hook_mapping_cooldown)",
+            "dec a",
+            "ld (hook_mapping_cooldown),a",
+            "hook_transport_mapping_safe_yes:",
+            "xor a",
+            "ret",
+            "hook_transport_mapping_learn_candidate:",
+            "ld (hook_safe_page0_primary),a",
+            "ld (hook_mapping_state),a",
+            "hook_transport_mapping_changed:",
+            "ld a,HOOK_MAPPING_COOLDOWN",
+            "ld (hook_mapping_cooldown),a",
+            "hook_transport_mapping_skip:",
+            "ld a,1",
+            "or a",
+            "ret",
+        )
+        self.assertNotIn("call MEMMAN_FUNCTION_HANDLER", guard)
+        self.assertNotRegex(guard, r"(?i)\b(?:in|out)\s+.*\(0?f[cd-e]h\)")
+
+    def test_exact_basic_system_line_latches_only_unapi_then_chains(self):
+        hooks = _section(
+            self.source,
+            "; ------------------------------------------------------------ BIOS hooks",
+            "else\nresident_keyi_hook:",
+        )
+        command = _section(
+            hooks, "resident_basic_crunch_hook:",
+            "; Return Z when transport work is safe")
+        _assert_in_order(
+            self,
+            command,
+            "push af",
+            "push bc",
+            "push de",
+            "push hl",
+            "ld a,(in_hook)",
+            "push af",
+            "ld a,1",
+            "ld (in_hook),a",
+            "ld a,(active_transport_id)",
+            "cp UNAPI_ID",
+            "jr nz,resident_basic_crunch_hook_continue",
+            "ld a,h",
+            "cp 0F5h",
+            "ld a,l",
+            "cp 05Eh",
+            "ld hl,BASIC_BUF",
+            "resident_basic_crunch_skip_leading_space:",
+            "cp ' '",
+            "resident_basic_crunch_match_start:",
+            "cp '_'",
+            "jr z,resident_basic_crunch_match_extension",
+            "ld de,resident_basic_call_word",
+            "ld b,4",
+            "call resident_basic_crunch_match_word",
+            "jr nz,resident_basic_crunch_hook_continue",
+            "cp ' '",
+            "resident_basic_crunch_skip_call_space:",
+            "ld de,resident_basic_call_system_word",
+            "ld b,6",
+            "call resident_basic_crunch_match_word",
+            "resident_basic_crunch_match_extension:",
+            "ld de,resident_basic_system_word",
+            "ld b,7",
+            "call resident_basic_crunch_match_word",
+            "resident_basic_crunch_match_word:",
+            "and 0DFh",
+            "ld c,a",
+            "ld a,(de)",
+            "cp c",
+            "ret nz",
+            "djnz resident_basic_crunch_match_word",
+            "resident_basic_crunch_skip_trailing_space:",
+            "or a",
+            "jr z,resident_basic_crunch_match_complete",
+            "cp ' '",
+            "resident_basic_crunch_match_complete:",
+            "ld a,1",
+            "ld (hook_system_suspended),a",
+            "call resident_basic_system_quiesce_unapi",
+            "resident_basic_crunch_hook_continue:",
+            "pop af",
+            "ld (in_hook),a",
+            "pop hl",
+            "pop de",
+            "pop bc",
+            "pop af",
+            "ex af,af'",
+            "xor a",
+            "ex af,af'",
+            "ret",
+            "resident_basic_system_word:",
+            'db "_SYSTEM"',
+            "resident_basic_call_word:",
+            'db "CALL"',
+            "resident_basic_call_system_word:",
+            'db "SYSTEM"',
+        )
+        self.assertNotIn("hook_system_match", command)
+        self.assertNotIn("ld (hook_mapping_cooldown),a", command)
+        _assert_in_order(
+            self,
+            command,
+            "resident_basic_system_quiesce_unapi:",
+            "di",
+            "ld (hook_system_sp),sp",
+            "call tsr_heap_guards_ok",
+            "jr z,resident_basic_system_heap_ready",
+            "ld (tsr_heap_fault),a",
+            "ld a,0FFh",
+            "ld (hook_system_restore_error),a",
+            "resident_basic_system_heap_ready:",
+            "call tsr_heap_fill_guards",
+            "ld sp,(tsr_heap_stack_top)",
+            "call transport_restore_foreground_retry",
+            "ld (hook_system_restore_error),a",
+            "di",
+            "call tsr_heap_guards_ok",
+            "ld (tsr_heap_fault),a",
+            "resident_basic_system_restore_stack:",
+            "ld sp,(hook_system_sp)",
+            "ei",
+            "ret",
         )
 
     def test_tsr_kill_restores_memman_sp_before_heap_release(self):
