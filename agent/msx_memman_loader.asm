@@ -63,7 +63,7 @@ MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
 MP_FILE_SIZE:            equ 0039Ah ; 922-byte guarded-stack port helper
-TU_FILE_SIZE:            equ 002EDh ; 749-byte pre-TL UNAPI helper
+TU_FILE_SIZE:            equ 003D7h ; 983-byte pre-TL UNAPI helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
 ; Once MEMMAN.COM starts, the old loader image and trampoline are disposable.

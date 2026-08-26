@@ -155,18 +155,16 @@ TK.COM
 ```
 
 `TU.COM` is transient and runs only on a first UNAPI installation, after the
-MemMan warm boot and before `TL.COM`. It loads and closes `TL.COM`, enumerates
-TCP/IP UNAPI, normalizes the fifth byte of an exact Pico/Pico+ hook signature
-`F7 ?? B8 4C` to `C9`, and overlays the staged `TL.COM`. This lets MemMan see
-the firmware-reduced `HIMEM`. UART installs still run `TL.COM` directly.
+MemMan warm boot and before `TL.COM`. It prepares compatible Pico/Pico+
+firmware state and hands off to `TL.COM`. UART installs still run `TL.COM`
+directly.
 `MP.COM` remains transient and runs after `TL.COM` to apply
 the selected listener port, including the default 6603; its compact hexadecimal
 command is private to the install chain.
 
 Later BASIC-to-DOS transitions are handled by the already resident agent, not
-by `TU.COM`. Its `H.CRUN` hook recognizes exact `_SYSTEM` and `CALL SYSTEM`
-lines, aborts the active UNAPI TCP handle before Nextor reclaims cartridge
-storage, and suppresses later `H.TIMI` handlers during the transition.
+by `TU.COM`. After `_SYSTEM` or `CALL SYSTEM`, the configured listener is
+restored automatically.
 
 Keep files from one build together. Internal relocation templates under the
 build subdirectory are not deployable alternatives. The three MemMan utilities

@@ -104,10 +104,9 @@ MSXAI /DRIVER:UNAPI /PORT:43123
 
 The public command keeps the port decimal. During the first resident install,
 the loader first invokes transient `TU.COM` after the warm boot and before
-`TL.COM`. `TU.COM` stages and closes `TL.COM`, enumerates TCP/IP UNAPI, and
-overlays the staged loader. Its exact `F7 ?? B8 4C` Pico/Pico+ `H.TIMI` repair
-is signature-guarded and therefore remains a no-op for the UNAPINET fixture.
-UART installs bypass `TU.COM` and invoke `TL.COM` directly. The loader also
+`TL.COM` to prepare compatible Pico/Pico+ firmware state. This preparation is
+a no-op for the UNAPINET fixture. UART installs bypass `TU.COM` and invoke
+`TL.COM` directly. The loader also
 encodes the selected value as the private fixed-width `MP/HHHH` command;
 `MP.COM` runs after `TL.COM` and applies it through a versioned 16-byte MemMan
 request with `A=A7h`, `HL=request`. A7 v1 is the general safe-lifecycle ABI for

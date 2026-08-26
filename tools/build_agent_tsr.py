@@ -36,6 +36,8 @@ TSR_NAME = "MSXAI MCP1"
 BUILD_ORIGINS = (0x4024, 0x44B5, 0x4946)
 H_KEYI = 0xFD9A
 H_TIMI = 0xFD9F
+H_CHPU = 0xFDA4
+H_CHGE = 0xFDC2
 H_CRUN = 0xFF20
 TRANSPORT_TEMPLATE = 0xFE
 TRANSPORT_8251 = 0
@@ -48,6 +50,8 @@ REQUIRED_LABELS = (
     "active_transport_id",
     "resident_keyi_hook",
     "resident_timi_hook",
+    "resident_console_put_hook",
+    "resident_console_get_hook",
     "resident_basic_crunch_hook",
     "tsr_kill",
     "tsr_talk",
@@ -153,6 +157,10 @@ def _check_linked_images(images: Sequence[LinkedImage]) -> dict[str, int]:
         raise AgentTsrBuildError("assembly H_KEYI does not match 0xFD9A")
     if primary.labels.get("H_TIMI") != H_TIMI:
         raise AgentTsrBuildError("assembly H_TIMI does not match 0xFD9F")
+    if primary.labels.get("H_CHPU") != H_CHPU:
+        raise AgentTsrBuildError("assembly H_CHPU does not match 0xFDA4")
+    if primary.labels.get("H_CHGE") != H_CHGE:
+        raise AgentTsrBuildError("assembly H_CHGE does not match 0xFDC2")
     if primary.labels.get("H_CRUN") != H_CRUN:
         raise AgentTsrBuildError("assembly H_CRUN does not match 0xFF20")
     if not primary.data:
@@ -205,7 +213,8 @@ def _check_linked_images(images: Sequence[LinkedImage]) -> dict[str, int]:
     code_length = offsets["resident_end"]
     for name in (
             "active_transport_id", "resident_keyi_hook",
-            "resident_timi_hook", "resident_basic_crunch_hook",
+            "resident_timi_hook", "resident_console_put_hook",
+            "resident_console_get_hook", "resident_basic_crunch_hook",
             "tsr_kill", "tsr_talk"):
         if not 0 <= offsets[name] < code_length:
             raise AgentTsrBuildError(
@@ -296,6 +305,8 @@ def build_agent_tsr(
                 hooks=(
                     Hook(H_KEYI, offsets["resident_keyi_hook"]),
                     Hook(H_TIMI, offsets["resident_timi_hook"]),
+                    Hook(H_CHPU, offsets["resident_console_put_hook"]),
+                    Hook(H_CHGE, offsets["resident_console_get_hook"]),
                     Hook(H_CRUN, offsets["resident_basic_crunch_hook"]),
                 ),
                 record_size=128,

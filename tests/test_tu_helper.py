@@ -105,7 +105,7 @@ class TuHelperTest(unittest.TestCase):
         second = assemble_tu_helper()
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.sha256, second.sha256)
-        self.assertEqual(len(first.data), 749)
+        self.assertEqual(len(first.data), 983)
         self.assertLess(first.labels["tu_helper_end"], 0x4000)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -197,6 +197,10 @@ class TuHelperTest(unittest.TestCase):
         )[0]
         self.assertLess(
             entry.index("call require_dos2"),
+            entry.index("call resolve_memman_handler"),
+        )
+        self.assertLess(
+            entry.index("call resolve_memman_handler"),
             entry.index("call resolve_tl_path"),
         )
         self.assertLess(
@@ -233,7 +237,7 @@ class TuHelperTest(unittest.TestCase):
         self.assertIn("ld a,INVALID_HANDLE", stage)
         self.assertIn("ld (tl_handle),a", stage)
 
-    def test_source_enumerates_only_and_hardens_after_each_candidate(self):
+    def test_source_enumerates_hardens_and_relocates_each_candidate(self):
         source = (ROOT / "agent" / "msx_tu_helper.asm").read_text(
             encoding="utf-8")
         enumeration = source.split("enumerate_tcpip_unapi:", 1)[1].split(
@@ -250,9 +254,21 @@ class TuHelperTest(unittest.TestCase):
             candidate.index("call EXTBIO"),
             candidate.index("call harden_pico_htimi"),
         )
+        self.assertLess(
+            candidate.index("call harden_pico_htimi"),
+            candidate.index("call relocate_pico_private_block"),
+        )
         before_candidate = enumeration.split(
             "enumerate_candidate_extbio:", 1)[0]
-        self.assertIn("call prepare_pico_htimi_tail", before_candidate)
+        _assert_in_order = lambda *needles: self.assertEqual(
+            [before_candidate.index(needle) for needle in needles],
+            sorted(before_candidate.index(needle) for needle in needles),
+        )
+        _assert_in_order(
+            "ld hl,(HIMEM)",
+            "ld (pico_himem_before),hl",
+            "call prepare_pico_htimi_tail",
+        )
 
         preparer = source.split("prepare_pico_htimi_tail:", 1)[1].split(
             "prepare_pico_htimi_tail_end:", 1)[0]
@@ -270,8 +286,86 @@ class TuHelperTest(unittest.TestCase):
         self.assertIn("ld a,(H_TIMI+2)", hardener)
         self.assertIn("ld a,(H_TIMI+3)", hardener)
         self.assertIn("ld (H_TIMI+4),a", hardener)
-        self.assertNotIn("0FD3Eh", source)
-        self.assertNotIn("0FC4Ah", source)
+
+    def test_source_relocates_only_exact_pico_layout_into_memman_heap(self):
+        source = (ROOT / "agent" / "msx_tu_helper.asm").read_text(
+            encoding="utf-8")
+        entry = source.split("tu_helper_start:", 1)[1].split(
+            "; ---------------------------------------------------------------------------",
+            1,
+        )[0]
+        self.assertLess(
+            entry.index("call capture_pico_memory_baseline"),
+            entry.index("call enumerate_tcpip_unapi"),
+        )
+        self.assertLess(
+            entry.index("call enumerate_tcpip_unapi"),
+            entry.index("ld a,(pico_relocation_error)"),
+        )
+        self.assertLess(
+            entry.index("ld a,(pico_relocation_error)"),
+            entry.index("jp handoff_to_staged_tl"),
+        )
+
+        resolver = source.split("resolve_memman_handler:", 1)[1].split(
+            "resolve_memman_handler_end:", 1)[0]
+        self.assertIn("ld e,MEMMAN_INI_CHECK", resolver)
+        self.assertIn("call EXTBIO", resolver)
+        self.assertIn("cp 2", resolver)
+        self.assertIn("cp 4", resolver)
+        self.assertIn("cp 0C0h", resolver)
+        self.assertIn("ld (memman_function_handler),hl", resolver)
+
+        baseline = source.split("capture_pico_memory_baseline:", 1)[1].split(
+            "capture_pico_memory_baseline_end:", 1)[0]
+        self.assertIn("ld hl,(HIMEM)", baseline)
+        self.assertIn("ld (pico_himem_before),hl", baseline)
+        self.assertIn("ld (pico_relocation_applied),a", baseline)
+        self.assertIn("ld (pico_relocation_error),a", baseline)
+
+        relocation = source.split("relocate_pico_private_block:", 1)[1].split(
+            "relocate_pico_private_block_end:", 1)[0]
+        for check in (
+                "ld a,(pico_relocation_applied)",
+                "ld a,(H_TIMI)",
+                "cp CALLF_OPCODE",
+                "ld a,(H_TIMI+2)",
+                "cp PICO_TIMI_ENTRY_LOW",
+                "ld a,(H_TIMI+3)",
+                "cp PICO_TIMI_ENTRY_HIGH",
+                "ld hl,(pico_himem_before)",
+                "ld de,(HIMEM)",
+                "jr nz,relocate_pico_have_measured_length",
+                "jr z,relocate_pico_layout_failed",
+                "ld (pico_relocation_applied),a",
+                "ret",
+                "relocate_pico_have_measured_length:",
+                "cp PICO_WORK_MAX + 1",
+                "ld hl,(HIMEM)",
+                "inc hl",
+                "ld de,(PICO_WORK_POINTER)",
+                "ld de,MEMMAN_HEAP_ALLOC",
+                "call call_memman_function",
+                "ld hl,(PICO_WORK_POINTER)",
+                "ldir",
+                "ld (PICO_WORK_POINTER),hl",
+                "ld hl,(pico_himem_before)",
+                "ld (HIMEM),hl",
+                "ld (pico_relocation_applied),a"):
+            self.assertIn(check, relocation)
+        self.assertLess(
+            relocation.index("ld (PICO_WORK_POINTER),hl"),
+            relocation.index("ld (HIMEM),hl"),
+        )
+        self.assertIn("ld (pico_relocation_error),a", relocation)
+        self.assertNotIn("HIMSAV", source)
+
+        indirect = source.split("call_memman_function:", 1)[1].split(
+            "call_memman_function_end:", 1)[0]
+        self.assertEqual(
+            indirect,
+            "\n    ld ix,(memman_function_handler)\n    jp (ix)\n",
+        )
 
     def test_source_overlay_preserves_tail_and_uses_exact_tl_length(self):
         source = (ROOT / "agent" / "msx_tu_helper.asm").read_text(

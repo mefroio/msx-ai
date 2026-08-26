@@ -1,4 +1,4 @@
-MSX-AI AGENT 0.1.2
+MSX-AI AGENT 0.1.3
 ==================
 
 This package lets an MCP client control a physical MSX through a serial
@@ -46,13 +46,11 @@ MP.COM selects UNAPI. Its 1 KiB page-2 stack has low/high guards and leaves
 256 bytes below the caller SP. A6 is rejected; keep the suite at one version.
 
 On the first UNAPI install only, TU.COM runs after warm boot and before
-TL.COM. It loads and closes TL.COM, enumerates UNAPI, and sets the fifth byte
-of an exact Pico hook F7 ?? B8 4C to C9 before overlaying TL.COM. This lets
-MemMan see the firmware-reduced HIMEM. UART installs run TL.COM directly.
-MP.COM configures the UNAPI port after TL.COM.
+TL.COM to prepare compatible Pico/Pico+ firmware state. UART installs run
+TL.COM directly. MP.COM configures the UNAPI port after TL.COM.
 
-Later BASIC-to-DOS _SYSTEM or CALL SYSTEM uses the resident H.CRUN hook to
-abort TCP and suppress later H.TIMI handlers while Nextor takes control.
+After BASIC-to-DOS _SYSTEM or CALL SYSTEM, the resident restores the same
+listener automatically. No second MSXAI command is required.
 
 MONITOR MODE
 ------------

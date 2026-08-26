@@ -189,16 +189,12 @@ the MSX IPv4 address and the same port. Port 6603 is only the default; `/PORT`
 accepts a decimal port from 1 through 65534. UNAPI reserves 65535 as its
 random-port sentinel, which is unsuitable when the host must know the endpoint.
 On a first resident UNAPI install, the bundled transient `TU.COM` runs after
-the MemMan warm boot and before `TL.COM`. It stages and closes `TL.COM`,
-enumerates UNAPI, repairs the guarded Pico/Pico+ `H.TIMI` hook form, and hands
-off to `TL.COM`; this lets MemMan observe the cartridge's reduced `HIMEM` before
-installing the resident. UART installs run `TL.COM` directly. The bundled
-`MP.COM` still runs after `TL.COM` to apply the selected listener port,
-including the default 6603. Both helpers are private; users continue to enter
-`/PORT` in decimal and never invoke them directly.
-On later BASIC-to-DOS transitions, the resident `H.CRUN` hook recognizes exact
-`_SYSTEM` and `CALL SYSTEM` lines, aborts the active UNAPI TCP handle, and
-suppresses later `H.TIMI` handlers while Nextor takes over the cartridge.
+the MemMan warm boot and before `TL.COM` to prepare compatible Pico/Pico+
+firmware state. UART installs run `TL.COM` directly. The bundled `MP.COM` still
+runs after `TL.COM` to apply the selected listener port, including the default
+6603. Both helpers are private; users continue to enter `/PORT` in decimal and
+never invoke them directly. On later BASIC-to-DOS transitions, `_SYSTEM` and
+`CALL SYSTEM` restore the configured listener automatically.
 This capability-based path is intended for MSX Pico+ and original MSX Pico
 cartridges equipped with Wi-Fi.
 Start hardware validation with `/MONITOR`, which keeps listener lifecycle calls

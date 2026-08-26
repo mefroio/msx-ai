@@ -53,6 +53,8 @@ RES_BASE:       equ 08600h
 endif
 H_KEYI:         equ 0FD9Ah
 H_TIMI:         equ 0FD9Fh
+H_CHPU:         equ 0FDA4h
+H_CHGE:         equ 0FDC2h
 H_CRUN:         equ 0FF20h
 BASIC_BUF:      equ 0F55Eh
 MSXVER:         equ 0002Dh
@@ -1174,6 +1176,12 @@ hook_mapping_cooldown:
 ; keep it suspended for the rest of this resident instance.
 hook_system_suspended:
     db 0
+hook_prompt_candidate:
+    db 0
+hook_resume_pending:
+    db 0
+hook_resume_this_tick:
+    db 0
 hook_system_sp:
     dw 0
 hook_system_restore_error:
@@ -1239,6 +1247,9 @@ if MSXAI_TSR_BUILD
     ld (hook_mapping_state),a
     ld (hook_mapping_cooldown),a
     ld (hook_system_suspended),a
+    ld (hook_prompt_candidate),a
+    ld (hook_resume_pending),a
+    ld (hook_resume_this_tick),a
     ld (hook_system_restore_error),a
 endif
     xor a
@@ -1364,7 +1375,7 @@ resident_keyi_hook:
     ld (in_hook),a             ; close the guard before saving more context
     xor a
     ld (hook_kind),a
-    jr resident_hook_saved_af
+    jp resident_hook_saved_af
 
 resident_timi_hook:
     push af
@@ -1377,7 +1388,7 @@ resident_timi_hook:
     ld a,1
     ld (in_hook),a             ; nested hooks now take the minimal return path
     ld (hook_kind),a
-    jr resident_hook_saved_af
+    jp resident_hook_saved_af
 
 ; A nested MemMan hook must return before saving another context or replacing
 ; hook_dispatch_sp. MemMan receives QuitHook in A' bit 0: an exclusive H.KEYI
@@ -1408,6 +1419,97 @@ memman_nested_hook_continue:
     pop af
     ex af,af'
     xor a                      ; QuitHook=0: continue the hook chain
+    ex af,af'
+    ret
+
+; While `_SYSTEM` is latched, recognize the foreground boundary produced by
+; COMMAND2's normal prompt: its last CHPUT is `>`, followed by BIOS CHGET.
+; H.CHPU only publishes a candidate. H.CHGE performs the guarded foreground
+; UNAPI reopen and publishes a pending commit; neither hook calls DOS/parser.
+resident_console_put_hook:
+    push af
+    push bc
+    ld b,a                     ; preserve the CHPUT character
+    ld a,(in_hook)
+    or a
+    jr nz,resident_console_put_return
+    ld a,1
+    ld (in_hook),a
+    ld a,(hook_system_suspended)
+    or a
+    jr z,resident_console_put_leave
+    ld a,b
+    cp '>'
+    jr z,resident_console_put_candidate
+    xor a
+    ld (hook_prompt_candidate),a
+    jr resident_console_put_leave
+resident_console_put_candidate:
+    ld a,1
+    ld (hook_prompt_candidate),a
+resident_console_put_leave:
+    xor a
+    ld (in_hook),a
+resident_console_put_return:
+    pop bc
+    pop af
+    ex af,af'
+    xor a                      ; MemMan QuitHook=0: continue CHPUT
+    ex af,af'
+    ret
+
+resident_console_get_hook:
+    push af
+    ld a,(in_hook)
+    or a
+    jr nz,resident_console_get_return
+    ld a,1
+    ld (in_hook),a
+    ld a,(hook_system_suspended)
+    or a
+    jr z,resident_console_get_leave
+    ld a,(hook_prompt_candidate)
+    or a
+    jr z,resident_console_get_leave
+    push bc
+    push de
+    push hl
+    push ix
+    push iy
+    ex af,af'
+    push af
+    ex af,af'
+    exx
+    push bc
+    push de
+    push hl
+    exx
+    call resident_console_resume_unapi
+    or a
+    jr nz,resident_console_get_restore
+    ld a,1
+    ld (hook_resume_pending),a
+resident_console_get_restore:
+    exx
+    pop hl
+    pop de
+    pop bc
+    exx
+    ex af,af'
+    pop af
+    ex af,af'
+    pop iy
+    pop ix
+    pop hl
+    pop de
+    pop bc
+resident_console_get_leave:
+    xor a
+    ld (in_hook),a
+resident_console_get_return:
+    pop af
+    ex af,af'
+    xor a                      ; MemMan QuitHook=0: continue CHGET
     ex af,af'
     ret
 
@@ -1461,6 +1563,19 @@ hook_initial_chain_continue:
     ld a,1
 hook_chain_ready:
     ld (chain_keyi),a
+    ; The prompt detector only schedules the transition. This first independent
+    ; timer tick remains fully suspended and skips transport work; hook_done
+    ; commits the resume only after the persistent heap guards pass.
+    ld a,(hook_kind)
+    or a
+    jr z,hook_resume_not_pending
+    ld a,(hook_resume_pending)
+    or a
+    jr z,hook_resume_not_pending
+    ld a,1
+    ld (hook_resume_this_tick),a
+    jr hook_done
+hook_resume_not_pending:
     ld a,(hook_kind)
     or a
     call nz,keybuf_spool_drain
@@ -1508,6 +1623,19 @@ hook_done:
     ld a,1
     ld (tsr_heap_fault),a       ; fail closed on every later hook/TsrCall
 hook_heap_guards_ok:
+    ld a,(hook_resume_this_tick)
+    or a
+    jr z,hook_resume_commit_done
+    xor a
+    ld (hook_prompt_candidate),a
+    ld (hook_resume_pending),a
+    ld (hook_resume_this_tick),a
+    ld (hook_mapping_state),a
+    ld (hook_mapping_cooldown),a
+    ; Publish this last. The current tick already decided not to chain into the
+    ; Pico firmware; the next ticks relearn the stable foreground mapping.
+    ld (hook_system_suspended),a
+hook_resume_commit_done:
     ld sp,(hook_context_sp)
     xor a
     ld (in_hook),a
@@ -1544,9 +1672,10 @@ memman_hook_continue:
 ; has already advanced HL beyond BUF. Only the initial direct-mode call at BUF
 ; belongs to the line the user just submitted. Accept exact `_SYSTEM` and
 ; `CALL SYSTEM` forms there (case-insensitive, with optional surrounding
-; spaces), close the active UNAPI handle while BASIC's normal mapping is still
-; intact, then latch UNAPI off before Nextor starts its warm boot. The warm boot
-; detaches the hooks; a later installation starts fresh. Other transports never
+; spaces), then latch UNAPI calls and the later Pico H.TIMI handler off before
+; closing the listener on the foreground BASIC stack. At the next COMMAND2
+; prompt the console hook reopens that same port on the persistent heap stack;
+; H.TIMI releases the latch one guarded tick later. Other transports never
 ; enter this path.
 resident_basic_crunch_hook:
     push af
@@ -1630,6 +1759,12 @@ resident_basic_crunch_skip_trailing_space:
     jr resident_basic_crunch_skip_trailing_space
 
 resident_basic_crunch_match_complete:
+    xor a
+    ld (hook_prompt_candidate),a
+    ld (hook_resume_pending),a
+    ld (hook_resume_this_tick),a
+    ld (hook_mapping_state),a
+    ld (hook_mapping_cooldown),a
     ld a,1
     ld (hook_system_suspended),a
     call resident_basic_system_quiesce_unapi
@@ -1646,10 +1781,8 @@ resident_basic_crunch_hook_continue:
     ret
 
 ; Pico+ multiplexes TCP/IP UNAPI and Nextor storage through the same cartridge.
-; Merely stopping H.TIMI leaves the TCP handle live when Nextor re-enters its
-; driver. Abort and clear the transport before CRUNCH executes `_SYSTEM`.
-; UNAPI firmware can consume a large stack and may execute EI, so run it on the
-; guarded page-3 heap while in_hook keeps nested timer callbacks minimal.
+; Close the listener before the warm boot and reset stream ownership only after
+; ABORT succeeds. The relocated Pico work block itself remains in MemMan heap.
 resident_basic_system_quiesce_unapi:
     di
     ld (hook_system_sp),sp
@@ -1664,16 +1797,63 @@ resident_basic_system_heap_ready:
     call tsr_heap_fill_guards
     ld sp,(tsr_heap_stack_top)
     call transport_restore_foreground_retry
+    or a
+    jr nz,resident_basic_system_store_result
+    call transport_session_reset
+    call xfer_reconfigure_detach
+    xor a
+resident_basic_system_store_result:
     ld (hook_system_restore_error),a
     di
     call tsr_heap_guards_ok
     jr z,resident_basic_system_restore_stack
     ld a,1
     ld (tsr_heap_fault),a
+    ld a,0FFh
+    ld (hook_system_restore_error),a
 resident_basic_system_restore_stack:
     ld sp,(hook_system_sp)
     ei
+    ld a,(hook_system_restore_error)
     ret
+
+; H.CHGE runs in foreground immediately after COMMAND2 has printed its prompt.
+; Re-run cleanup in case the pre-boot ABORT was transient, then discover/open
+; the saved port. No blocking lifecycle call is ever made from H.TIMI.
+resident_console_resume_unapi:
+    di
+    ld (hook_system_sp),sp
+    call tsr_heap_guards_ok
+    jr z,resident_console_resume_heap_ready
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,0FFh
+    ld (hook_system_restore_error),a
+    jr resident_console_resume_restore_stack
+resident_console_resume_heap_ready:
+    call tsr_heap_fill_guards
+    ld sp,(tsr_heap_stack_top)
+    call transport_restore_foreground_retry
+    or a
+    jr nz,resident_console_resume_store_result
+    call transport_session_reset
+    call xfer_reconfigure_detach
+    call transport_init
+resident_console_resume_store_result:
+    ld (hook_system_restore_error),a
+    di
+    call tsr_heap_guards_ok
+    jr z,resident_console_resume_restore_stack
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,0FFh
+    ld (hook_system_restore_error),a
+resident_console_resume_restore_stack:
+    ld sp,(hook_system_sp)
+    ei
+    ld a,(hook_system_restore_error)
+    ret
+
 resident_basic_system_word:
     db "_SYSTEM"
 resident_basic_call_word:

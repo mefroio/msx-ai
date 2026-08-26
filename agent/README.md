@@ -186,24 +186,18 @@ The first installation follows this lifecycle:
 4. Read `MEMMAN.COM` into guarded free space at the top of the TPA, close its
    handle, and overlay it at `0100h` for the point-of-no-return handoff.
 5. After the warm boot, let UART installs invoke external `TL.COM` directly.
-   For a first UNAPI install, invoke `TU.COM` first: it loads and closes
-   `TL.COM`, enumerates TCP/IP UNAPI, normalizes the fifth byte of an exact
-   Pico/Pico+ `H.TIMI` hook signature `F7 ?? B8 4C` to `C9`, then overlays
-   `TL.COM` with the original TSR command tail. Invoke `MP.COM` after `TL.COM`
-   to apply the selected port, including the default 6603. It then returns to
-   DOS with only the selected TSR resident.
+   For a first UNAPI install, invoke `TU.COM` first to prepare compatible
+   Pico/Pico+ firmware state and hand off to `TL.COM`. Invoke `MP.COM` after
+   `TL.COM` to apply the selected port, including the default 6603. It then
+   returns to DOS with only the selected TSR resident.
 
-This post-warm-boot, pre-TL ordering ensures that MemMan sees the firmware's
-already reduced `HIMEM` before it integrates the resident hooks. `TU.COM`
-performs no DOS operation after UNAPI enumeration begins; it has already closed
-`TL.COM` before that side-effect window.
+Other UNAPI implementations remain on their normal path. `TU.COM` has already
+closed `TL.COM` before it begins firmware preparation.
 
-The later BASIC-to-DOS path is independent of this first-install preparation.
-Once the agent is resident, its `H.CRUN` hook recognizes exact direct-mode
-`_SYSTEM` and `CALL SYSTEM` lines. It aborts the active UNAPI TCP handle before
-Nextor reclaims cartridge storage, latches the transport off, and suppresses
-later `H.TIMI` handlers during the transition. UART transports do not enter
-this path.
+The later BASIC-to-DOS path is independent of first installation. Once the
+agent is resident, `_SYSTEM` and `CALL SYSTEM` return to DOS with the configured
+UNAPI listener restored automatically. UART transports retain their existing
+behavior.
 
 No executable or TSR is emitted, patched, renamed, deleted, or left behind by
 this lifecycle. Every component was already supplied as a final suite file.
@@ -227,8 +221,8 @@ newly selected interface.
 
 `MSXAI /UNINSTALL` discovers the named TSR, validates external `TK.COM`, stages
 it in free high TPA, and overlays it directly with that ID. MemMan detaches the
-registered `H.KEYI` guard and `H.TIMI` service hook before the agent's kill
-entry restores UART state. No uninstall helper is written or deleted.
+registered hooks before the agent's kill entry restores transport state. No
+uninstall helper is written or deleted.
 Repeating the command is safe and reports that the agent is not installed.
 UNAPI teardown retries a failed `TCP_ABORT` three times in foreground before
 the transient monitor exits or MemMan releases the TSR segment. MemMan cannot

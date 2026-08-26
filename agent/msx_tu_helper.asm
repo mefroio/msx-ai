@@ -19,13 +19,18 @@
 
 BDOS:                    equ 00005h
 EXTBIO:                  equ 0FFCAh
+MEMMAN_INI_CHECK:        equ 30
+MEMMAN_HEAP_ALLOC:       equ 70
 UNAPI_ARGUMENT:          equ 0F847h
 UNAPI_EXTBIO_MAGIC:      equ 02222h
 H_TIMI:                  equ 0FD9Fh
+HIMEM:                   equ 0FC4Ah
+PICO_WORK_POINTER:       equ 0FD3Eh
 CALLF_OPCODE:            equ 0F7h
 PICO_TIMI_ENTRY_LOW:     equ 0B8h
 PICO_TIMI_ENTRY_HIGH:    equ 04Ch
 RET_OPCODE:              equ 0C9h
+PICO_WORK_MAX:           equ 64
 
 DOS_OPEN:                equ 043h
 DOS_CLOSE:               equ 045h
@@ -64,6 +69,9 @@ tu_helper_start:
     call require_dos2
     or a
     jp nz,tu_abort
+    call resolve_memman_handler
+    or a
+    jp nz,tu_abort
     call resolve_tl_path
     or a
     jp nz,tu_abort
@@ -77,7 +85,11 @@ tu_helper_start:
     ; POINT OF NO RETURN.  There is no DOS or file operation after this call.
     ; Every A=1 request may lazily mutate the firmware hook state, so all
     ; recoverable preflight work and the CLOSE have completed first.
+    call capture_pico_memory_baseline
     call enumerate_tcpip_unapi
+    ld a,(pico_relocation_error)
+    or a
+    jp nz,tu_abort
     jp handoff_to_staged_tl
 
 
@@ -99,6 +111,35 @@ require_dos2:
 require_dos2_unavailable:
     ld a,ERR_BAD_VERSION
     ret
+
+; IniChk is the first MemMan request issued by this process. MemMan 2.4 returns
+; its directly callable page-3 function handler in HL; unlike 4002h inside a
+; mapped TSR segment, this address is valid from the foreground TU process.
+resolve_memman_handler:
+    xor a
+    ld d,'M'
+    ld e,MEMMAN_INI_CHECK
+    call EXTBIO
+    cp 'M'
+    jr nz,resolve_memman_handler_failed
+    ld a,d
+    cp 2
+    jr c,resolve_memman_handler_failed
+    jr nz,resolve_memman_version_ok
+    ld a,e
+    cp 4
+    jr c,resolve_memman_handler_failed
+resolve_memman_version_ok:
+    ld a,h
+    cp 0C0h
+    jr c,resolve_memman_handler_failed
+    ld (memman_function_handler),hl
+    xor a
+    ret
+resolve_memman_handler_failed:
+    ld a,ERR_INTERNAL
+    ret
+resolve_memman_handler_end:
 
 ; MSX-DOS 2 GET_ENV returns an empty ASCIIZ string for an undefined item.
 ; In that case use TL.COM in the current directory, matching MSXAI.COM.
@@ -324,6 +365,11 @@ enumerate_count_extbio:
 enumerate_tcpip_candidate_loop:
     call copy_tcpip_api_id
     ld de,UNAPI_EXTBIO_MAGIC
+    ; Measure each implementation independently. A previous UNAPI candidate
+    ; may reserve its own HIMEM bytes and those must never become part of the
+    ; exact Pico allocation moved below.
+    ld hl,(HIMEM)
+    ld (pico_himem_before),hl
     ; A normalized pre-TL hook starts with RET, so its fifth byte is inert.
     ; Pre-fill that inert byte before Pico can install its four-byte CALLF body;
     ; this closes the interrupt boundary between EXTBIO's RET and our DI.
@@ -334,6 +380,7 @@ enumerate_candidate_extbio:
     call EXTBIO
     di
     call harden_pico_htimi
+    call relocate_pico_private_block
 
     ld a,(implementation_index)
     inc a
@@ -370,9 +417,9 @@ copy_tcpip_api_id:
 ; Pico/Pico+ 2.12 writes only the four-byte CALLF body at FD9Fh..FDA2h.
 ; The five-byte hook contract also needs RET at FDA3h.  Repair that byte only
 ; when the exact firmware signature F7 <slot> B8 4C is present; the slot byte
-; is intentionally unconstrained.  The firmware's saved prior hook, HIMEM and
-; its private pointer block are left untouched.  On an already clean boot the
-; write is idempotent because FDA3h is C9h.
+; is intentionally unconstrained. On an already clean boot the write is
+; idempotent because FDA3h is C9h. A separate exact-layout step below may move
+; the firmware's private allocation into persistent MemMan heap.
 harden_pico_htimi:
     ld a,(H_TIMI)
     cp CALLF_OPCODE
@@ -387,6 +434,124 @@ harden_pico_htimi:
     ld (H_TIMI+4),a
     ret
 harden_pico_htimi_end:
+
+; Pico/Pico+ lowers HIMEM when it lazily installs TCP/IP UNAPI and places its
+; H.TIMI chain/state immediately above the new limit. Disk BASIC rebuilds its
+; own memory layout and can reuse that address. Move only an exact Pico block
+; into MemMan's persistent page-3 heap, atomically publish the new pointer, and
+; return the transient DOS bytes to HIMEM. The block intentionally remains a
+; one-time firmware allocation for the lifetime of MemMan, including after the
+; MSX-AI TSR is removed; the Pico H.TIMI handler continues to own it.
+capture_pico_memory_baseline:
+    ld hl,(HIMEM)
+    ld (pico_himem_before),hl
+    xor a
+    ld (pico_relocation_applied),a
+    ld (pico_relocation_error),a
+    ret
+capture_pico_memory_baseline_end:
+
+relocate_pico_private_block:
+    ld a,(pico_relocation_applied)
+    or a
+    ret nz
+    ld a,(H_TIMI)
+    cp CALLF_OPCODE
+    ret nz
+    ld a,(H_TIMI+2)
+    cp PICO_TIMI_ENTRY_LOW
+    ret nz
+    ld a,(H_TIMI+3)
+    cp PICO_TIMI_ENTRY_HIGH
+    ret nz
+
+    ; DE receives the positive amount reserved by this enumeration. Reject no
+    ; change, underflow, or an implausibly large firmware-private allocation.
+    ld hl,(pico_himem_before)
+    ld de,(HIMEM)
+    or a
+    sbc hl,de
+    ld a,h
+    or a
+    jr nz,relocate_pico_layout_failed
+    ld a,l
+    or a
+    jr nz,relocate_pico_have_measured_length
+
+    ; An exact Pico hook whose pointer still begins immediately above HIMEM
+    ; was initialized before this candidate query. Its allocation length can
+    ; no longer be measured safely, so reject the install instead of reporting
+    ; success and leaving BASIC able to reuse that block. A non-adjacent
+    ; pointer is compatible with an earlier successful persistent relocation.
+    ld hl,(HIMEM)
+    inc hl
+    ld de,(PICO_WORK_POINTER)
+    or a
+    sbc hl,de
+    jr z,relocate_pico_layout_failed
+    ld a,1
+    ld (pico_relocation_applied),a
+    ret
+
+relocate_pico_have_measured_length:
+    cp PICO_WORK_MAX + 1
+    jr nc,relocate_pico_layout_failed
+    ld (pico_work_length),a
+
+    ; The firmware pointer must identify exactly the first byte above its new
+    ; HIMEM. This prevents a near-signature or an already relocated block from
+    ; consuming another heap allocation.
+    ld hl,(HIMEM)
+    inc hl
+    ld de,(PICO_WORK_POINTER)
+    or a
+    sbc hl,de
+    jr nz,relocate_pico_layout_failed
+
+    ; HeapAlloc is called directly with interrupts disabled. MemMan guarantees
+    ; the returned address is permanently visible in page 3 until explicitly
+    ; released; this firmware-owned block is deliberately not released by TK.
+    ld a,(pico_work_length)
+    ld l,a
+    ld h,0
+    ld de,MEMMAN_HEAP_ALLOC
+    call call_memman_function
+    di
+    ld a,h
+    or l
+    jr z,relocate_pico_heap_failed
+    ld (pico_heap_pointer),hl
+
+    ex de,hl                    ; DE = persistent destination
+    ld hl,(PICO_WORK_POINTER)   ; HL = transient Pico block
+    ld a,(pico_work_length)
+    ld c,a
+    ld b,0
+    ldir
+    ld hl,(pico_heap_pointer)
+    ld (PICO_WORK_POINTER),hl
+    ld hl,(pico_himem_before)
+    ld (HIMEM),hl
+    ld a,1
+    ld (pico_relocation_applied),a
+    ret
+relocate_pico_heap_failed:
+    ld a,ERR_NO_MEMORY
+    ld (pico_relocation_error),a
+    ret
+relocate_pico_layout_failed:
+    ld a,ERR_INTERNAL
+    ld (pico_relocation_error),a
+    ret
+relocate_pico_private_block_end:
+
+; Z80 has no indirect CALL. The wrapper inherits the caller's return address,
+; loads the target through IX so the HeapAlloc size in HL remains intact, then
+; jumps to the page-3 entry returned by IniChk. MemMan RETs to the caller.
+call_memman_function:
+    ld ix,(memman_function_handler)
+    jp (ix)
+call_memman_function_end:
 
 
 ; ---------------------------------------------------------------------------
@@ -418,7 +583,8 @@ overlay_stub_size: equ overlay_stub_end-overlay_stub
 
 
 ; ---------------------------------------------------------------------------
-; Error exit.  This is reachable only before UNAPI enumeration begins.
+; Error exit. Before enumeration it reports preflight/I/O errors; afterwards it
+; can also reject a Pico layout that could not be moved into persistent heap.
 
 tu_abort:
     ld (last_error),a
@@ -460,6 +626,18 @@ dos2_available:
 implementation_remaining:
     db 0
 implementation_index:
+    db 0
+memman_function_handler:
+    dw 0
+pico_himem_before:
+    dw 0
+pico_heap_pointer:
+    dw 0
+pico_work_length:
+    db 0
+pico_relocation_applied:
+    db 0
+pico_relocation_error:
     db 0
 
 suite_home_env_name:

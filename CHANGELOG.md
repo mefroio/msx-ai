@@ -3,6 +3,14 @@
 This project follows Semantic Versioning. Published releases are identified by
 an annotated Git tag named `vMAJOR.MINOR.PATCH`.
 
+## 0.1.3 - 2026-08-26
+
+- Fixed loss of the Pico/Pico+ TCP/IP state across resident
+  `DOS -> BASIC -> DOS` transitions.
+- Restored the configured listener automatically when DOS returns, without a
+  second user command.
+- Validated repeated Pico+ transitions and added stricter build checks.
+
 ## 0.1.2 - 2026-08-26
 
 - Added the transient `TU.COM` first-install helper so Pico/Pico+ TCP/IP UNAPI

@@ -359,11 +359,9 @@ PATH A:\MSXAI;%PATH%
 
 The default MemMan resident returns to MSX-DOS. `MSXAIXF.COM` is its transient
 foreground file helper. On a first UNAPI installation only, `TU.COM` runs after
-MemMan's warm boot and before `TL.COM`: it loads and closes `TL.COM`, enumerates
-TCP/IP UNAPI, normalizes the fifth byte of an exact Pico/Pico+ hook signature
-`F7 ?? B8 4C` to `C9`, and then overlays `TL.COM`. This ordering lets MemMan see
-the firmware-reduced `HIMEM` before it installs the resident hooks. UART
-installations invoke `TL.COM` directly and never use `TU.COM`.
+MemMan's warm boot and before `TL.COM` to prepare compatible Pico/Pico+ firmware
+state safely. UART installations invoke `TL.COM` directly and never use
+`TU.COM`; other UNAPI implementations keep their normal installation path.
 `MP.COM` remains the one-shot helper that runs after `TL.COM` and applies the
 selected UNAPI port, including the default 6603 when `/PORT` is omitted. The
 public `/PORT` syntax remains decimal; the compact hexadecimal form passed to
@@ -381,9 +379,9 @@ fail closed. The other COM/TSR files are part of the same versioned suite.
 MSX-DOS 2 or Nextor and a memory mapper are required for resident mode.
 
 After that first installation, BASIC-to-DOS is a separate resident lifecycle.
-The agent's `H.CRUN` hook recognizes exact `_SYSTEM` and `CALL SYSTEM` lines,
-aborts the active UNAPI TCP handle before Nextor reclaims cartridge storage,
-and suppresses later `H.TIMI` handlers during the transition.
+When `_SYSTEM` or `CALL SYSTEM` returns to DOS, the resident and its configured
+UNAPI listener are restored automatically. No second invocation of `MSXAI` is
+required.
 
 ## MCP interface
 

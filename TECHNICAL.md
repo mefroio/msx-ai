@@ -595,19 +595,16 @@ lifecycle front end, then overlaid for its one action. UART installation lets
 external `TL.COM` load the selected TSR directly. On a first UNAPI installation
 only,
 external `TU.COM` first loads and closes `TL.COM`, enumerates TCP/IP UNAPI,
-normalizes the fifth byte of an exact Pico/Pico+ `H.TIMI` hook signature
-`F7 ?? B8 4C` to `C9`, and overlays the staged `TL.COM`; `MP.COM` still runs
-afterward. This post-warm-boot, pre-TL order makes MemMan observe the firmware's
-reduced `HIMEM` before it integrates hooks.
+prepares compatible Pico/Pico+ firmware state, and overlays the staged
+`TL.COM`; `MP.COM` still runs afterward. Other UNAPI implementations retain
+their normal installation behavior.
 No temporary loader or TSR file is created, and there is no installation-time
 `DEL` cleanup. The PackBits worker is loaded only while a protocol-X transfer
 is active and returns its TPA to DOS when it exits.
 
-A later BASIC-to-DOS transition uses a different mechanism after the resident
-exists. Its `H.CRUN` hook accepts exact direct-mode `_SYSTEM` and `CALL SYSTEM`
-lines, aborts the active UNAPI TCP handle before Nextor reclaims the cartridge,
-and suppresses the later `H.TIMI` chain during the transition. This behavior is
-not part of `TU.COM` or the first-install warm boot.
+A later BASIC-to-DOS transition is independent of first installation. After
+exact direct-mode `_SYSTEM` or `CALL SYSTEM`, the resident returns with its
+configured UNAPI listener restored automatically.
 
 Driver selection is explicit and case-insensitive:
 

@@ -43,6 +43,8 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
     def test_heap_contract_reserves_one_kib_between_two_guards(self):
         self.assertEqual(
             _equ_value(self.source, "MEMMAN_FUNCTION_HANDLER"), 0x4002)
+        self.assertEqual(_equ_value(self.source, "H_CHPU"), 0xFDA4)
+        self.assertEqual(_equ_value(self.source, "H_CHGE"), 0xFDC2)
         self.assertEqual(_equ_value(self.source, "H_CRUN"), 0xFF20)
         self.assertEqual(_equ_value(self.source, "BASIC_BUF"), 0xF55E)
         self.assertEqual(_equ_value(self.source, "HOOK_MAPPING_COOLDOWN"), 120)
@@ -342,6 +344,12 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "jr z,resident_basic_crunch_match_complete",
             "cp ' '",
             "resident_basic_crunch_match_complete:",
+            "xor a",
+            "ld (hook_prompt_candidate),a",
+            "ld (hook_resume_pending),a",
+            "ld (hook_resume_this_tick),a",
+            "ld (hook_mapping_state),a",
+            "ld (hook_mapping_cooldown),a",
             "ld a,1",
             "ld (hook_system_suspended),a",
             "call resident_basic_system_quiesce_unapi",
@@ -364,7 +372,6 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             'db "SYSTEM"',
         )
         self.assertNotIn("hook_system_match", command)
-        self.assertNotIn("ld (hook_mapping_cooldown),a", command)
         _assert_in_order(
             self,
             command,
@@ -376,19 +383,153 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ld (tsr_heap_fault),a",
             "ld a,0FFh",
             "ld (hook_system_restore_error),a",
+            "jr resident_basic_system_restore_stack",
             "resident_basic_system_heap_ready:",
             "call tsr_heap_fill_guards",
             "ld sp,(tsr_heap_stack_top)",
             "call transport_restore_foreground_retry",
+            "or a",
+            "jr nz,resident_basic_system_store_result",
+            "call transport_session_reset",
+            "call xfer_reconfigure_detach",
+            "xor a",
+            "resident_basic_system_store_result:",
             "ld (hook_system_restore_error),a",
             "di",
             "call tsr_heap_guards_ok",
+            "jr z,resident_basic_system_restore_stack",
+            "ld a,1",
             "ld (tsr_heap_fault),a",
+            "ld a,0FFh",
+            "ld (hook_system_restore_error),a",
             "resident_basic_system_restore_stack:",
             "ld sp,(hook_system_sp)",
             "ei",
+            "ld a,(hook_system_restore_error)",
             "ret",
         )
+
+    def test_console_prompt_reopens_unapi_before_guarded_timi_commit(self):
+        hooks = _section(
+            self.source,
+            "; ------------------------------------------------------------ BIOS hooks",
+            "else\nresident_keyi_hook:",
+        )
+        put_hook = _section(
+            hooks, "resident_console_put_hook:", "resident_console_get_hook:")
+        _assert_in_order(
+            self,
+            put_hook,
+            "push af",
+            "push bc",
+            "ld b,a",
+            "ld a,(in_hook)",
+            "ld a,(hook_system_suspended)",
+            "ld a,b",
+            "cp '>'",
+            "jr z,resident_console_put_candidate",
+            "ld (hook_prompt_candidate),a",
+            "resident_console_put_candidate:",
+            "ld a,1",
+            "ld (hook_prompt_candidate),a",
+            "ld (in_hook),a",
+            "pop bc",
+            "pop af",
+            "ex af,af'",
+            "xor a",
+            "ex af,af'",
+            "ret",
+        )
+        self.assertNotIn("call transport_", put_hook)
+
+        get_hook = _section(
+            hooks, "resident_console_get_hook:", "resident_hook_saved_af:")
+        _assert_in_order(
+            self,
+            get_hook,
+            "push af",
+            "ld a,(in_hook)",
+            "ld a,(hook_system_suspended)",
+            "ld a,(hook_prompt_candidate)",
+            "push bc",
+            "push de",
+            "push hl",
+            "push ix",
+            "push iy",
+            "call resident_console_resume_unapi",
+            "or a",
+            "jr nz,resident_console_get_restore",
+            "ld a,1",
+            "ld (hook_resume_pending),a",
+            "resident_console_get_restore:",
+            "pop iy",
+            "pop ix",
+            "pop hl",
+            "pop de",
+            "pop bc",
+            "ld (in_hook),a",
+            "pop af",
+            "ex af,af'",
+            "xor a",
+            "ex af,af'",
+            "ret",
+        )
+
+        resume = _section(
+            hooks,
+            "resident_console_resume_unapi:",
+            "resident_basic_system_word:",
+        )
+        _assert_in_order(
+            self,
+            resume,
+            "di",
+            "ld (hook_system_sp),sp",
+            "call tsr_heap_guards_ok",
+            "jr z,resident_console_resume_heap_ready",
+            "ld (tsr_heap_fault),a",
+            "jr resident_console_resume_restore_stack",
+            "resident_console_resume_heap_ready:",
+            "call tsr_heap_fill_guards",
+            "ld sp,(tsr_heap_stack_top)",
+            "call transport_restore_foreground_retry",
+            "or a",
+            "jr nz,resident_console_resume_store_result",
+            "call transport_session_reset",
+            "call xfer_reconfigure_detach",
+            "call transport_init",
+            "resident_console_resume_store_result:",
+            "ld (hook_system_restore_error),a",
+            "call tsr_heap_guards_ok",
+            "resident_console_resume_restore_stack:",
+            "ld sp,(hook_system_sp)",
+            "ei",
+            "ld a,(hook_system_restore_error)",
+            "ret",
+        )
+
+        dispatch = _section(
+            hooks, "resident_hook_saved_af:", "resident_basic_crunch_hook:")
+        _assert_in_order(
+            self,
+            dispatch,
+            "ld a,(hook_resume_pending)",
+            "ld a,1",
+            "ld (hook_resume_this_tick),a",
+            "jr hook_done",
+            "hook_done:",
+            "call transport_session_finalize",
+            "call tsr_heap_guards_ok",
+            "ld a,(hook_resume_this_tick)",
+            "xor a",
+            "ld (hook_prompt_candidate),a",
+            "ld (hook_resume_pending),a",
+            "ld (hook_resume_this_tick),a",
+            "ld (hook_mapping_state),a",
+            "ld (hook_mapping_cooldown),a",
+            "ld (hook_system_suspended),a",
+        )
+        self.assertNotIn("call transport_init", dispatch)
 
     def test_tsr_kill_restores_memman_sp_before_heap_release(self):
         kill = _section(

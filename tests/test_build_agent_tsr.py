@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 
 from tools.build_agent_tsr import (  # noqa: E402
     BUILD_ORIGINS,
+    H_CHGE,
+    H_CHPU,
     H_CRUN,
     H_KEYI,
     H_TIMI,
@@ -40,20 +42,24 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 "resident_start: equ $5135\n")
 
     def test_third_origin_label_drift_is_rejected(self):
-        def linked(origin, talk_offset=5):
+        def linked(origin, talk_offset=7):
             return LinkedImage(
                 origin,
                 b"\xfe" + bytes(9),
                 {
                     "H_KEYI": H_KEYI,
                     "H_TIMI": H_TIMI,
+                    "H_CHPU": H_CHPU,
+                    "H_CHGE": H_CHGE,
                     "H_CRUN": H_CRUN,
                     "resident_start": origin,
                     "active_transport_id": origin,
                     "resident_keyi_hook": origin + 1,
                     "resident_timi_hook": origin + 2,
-                    "resident_basic_crunch_hook": origin + 3,
-                    "tsr_kill": origin + 4,
+                    "resident_console_put_hook": origin + 3,
+                    "resident_console_get_hook": origin + 4,
+                    "resident_basic_crunch_hook": origin + 5,
+                    "tsr_kill": origin + 6,
                     "tsr_talk": origin + talk_offset,
                     "resident_end": origin + 8,
                     "tsr_init": origin + 8,
@@ -64,7 +70,7 @@ class AgentTsrBuilderTest(unittest.TestCase):
         images = (
             linked(BUILD_ORIGINS[0]),
             linked(BUILD_ORIGINS[1]),
-            linked(BUILD_ORIGINS[2], talk_offset=6),
+            linked(BUILD_ORIGINS[2], talk_offset=5),
         )
         with self.assertRaisesRegex(AgentTsrBuildError, "origin-invariant"):
             _check_linked_images(images)
@@ -96,13 +102,13 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 rel_length, 2 + 2 * len(first.relocation_offsets))
             hook_start = HEADER_SIZE + rel_length + fields[8] + fields[9]
             hook_length = struct.unpack_from("<H", first_data, hook_start)[0]
-            self.assertEqual(hook_length, 14)
+            self.assertEqual(hook_length, 22)
             hooks = tuple(
                 struct.unpack_from("<HH", first_data, hook_start + offset)
-                for offset in (2, 6, 10)
+                for offset in (2, 6, 10, 14, 18)
             )
             self.assertEqual(tuple(address for address, _ in hooks),
-                             (H_KEYI, H_TIMI, H_CRUN))
+                             (H_KEYI, H_TIMI, H_CHPU, H_CHGE, H_CRUN))
             for _, hook_handler in hooks:
                 self.assertGreaterEqual(hook_handler, fields[4])
                 self.assertLess(hook_handler, fields[4] + fields[8])
