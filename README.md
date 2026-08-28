@@ -244,9 +244,12 @@ Use this path when actual MSX hardware behavior is the subject of the session.
    listener lifecycle calls remain in foreground while it is idle. After
    `RUN`, data-path polling still occurs from `H.TIMI` and remains a hardware
    validation item. The Pico stack advertises `TCP_OPEN` as potentially
-   blocking; after a resident connection is lost, rerun the same
-   `MSXAI /DRIVER:UNAPI /PORT:...` command at DOS to clean up the old handle
-   and listen again outside `H.TIMI`.
+   blocking. The resident retries the listener at safe foreground boundaries.
+   To diagnose an intermittent resident connection, enable tracing with either
+   `MSXAI /DRIVER:UNAPI /PORT:6603 /TRACE` or `MSXAI 6603 /TRACE`. After
+   returning to DOS, save the captured information with
+   `MSXAI /DUMPTRACE A:\MSXAI.LOG`. The destination must be a new file;
+   dumping does not clear the resident trace.
 4. Before installing the resident, an optional `make unapi-probe` builds
    `work/agent/UNAPIPRB.COM`. Run `UNAPIPRB` or `UNAPIPRB 43123` to verify
    discovery, passive capability, the effective IP/port, and TCP state; quit

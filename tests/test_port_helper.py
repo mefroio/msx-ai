@@ -301,12 +301,12 @@ class PortHelperTest(unittest.TestCase):
         second = assemble_port_helper()
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.sha256, second.sha256)
-        self.assertEqual(len(first.data), 922)
+        self.assertEqual(len(first.data), 1062)
         self.assertLess(first.labels["port_helper_end"], 0x4000)
 
         loader = (ROOT / "agent" / "msx_memman_loader.asm").read_text(
             encoding="utf-8")
-        self.assertIn("MP_FILE_SIZE:            equ 0039Ah", loader)
+        self.assertIn("MP_FILE_SIZE:            equ 00426h", loader)
 
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "MP.COM"
@@ -529,8 +529,16 @@ class PortHelperTest(unittest.TestCase):
         runtime = transport.split("unapi_runtime_start:", 1)[1].split(
             "unapi_runtime_end:", 1)[0]
         self.assertNotIn("unapi_defer_first_open:", runtime)
+        self.assertIn("unapi_relisten_pending:\n    db 0", runtime)
+        self.assertIn("unapi_lifecycle_busy:\n    db 0", runtime)
         after_runtime = transport.split("unapi_runtime_end:", 1)[1]
         self.assertIn("unapi_defer_first_open:\n    db 0", after_runtime)
+        self.assertNotIn("unapi_relisten_pending", initialize)
+        self.assertNotIn("unapi_relisten_pending", preparation)
+
+        resident_initializer = core.split(
+            "resident_initialize:", 1)[1].split("resident_main:", 1)[0]
+        self.assertNotIn("unapi_relisten_pending", resident_initializer)
 
         resident = core.split("resident_initialize:", 1)[1].split(
             "tsr_memman_entry:", 1)[0]

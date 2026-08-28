@@ -29,6 +29,7 @@ MEMMAN_INICHK:             equ 30
 MEMMAN_GET_TSR_ID:         equ 62
 MEMMAN_TSR_CALL:           equ 63
 MSXAI_TALK_UNAPI_PORT:     equ 0A7h
+MSXAI_TALK_TRACE:          equ 0A8h
 MSXAI_TRANSPORT_UNAPI:     equ 2
 MSXAI_UNAPI_REQUEST_MAGIC: equ 0A75Ah
 MSXAI_UNAPI_REQUEST_VERSION: equ 1
@@ -38,6 +39,10 @@ MSXAI_UNAPI_GUARD_SIZE:    equ 16
 MSXAI_UNAPI_STACK_HEADROOM: equ 0100h
 MSXAI_UNAPI_LOW_GUARD:     equ 0A5h
 MSXAI_UNAPI_HIGH_GUARD:    equ 05Ah
+MSXAI_TRACE_REQUEST_MAGIC: equ 0A85Ah
+MSXAI_TRACE_REQUEST_VERSION: equ 1
+MSXAI_TRACE_REQUEST_SIZE:  equ 16
+MSXAI_TRACE_ACTION_ENABLE: equ 1
 
     org 0100h
 
@@ -56,8 +61,27 @@ port_helper_start:
     ; resident moves lifecycle work to this process's guarded page-2 stack and
     ; restores MemMan's own stack before returning.
     ld (memman_tsr_id),bc
+    ld a,(trace_requested)
+    or a
+    jr z,port_helper_trace_ready
+    ld bc,(memman_tsr_id)
+    ld hl,trace_request
+    ld a,MSXAI_TALK_TRACE
+    ld d,'M'
+    ld e,MEMMAN_TSR_CALL
+    call EXTBIO
+    di
+    or a
+    jr nz,port_helper_trace_error_ei
+    ld a,(trace_request_status)
+    or a
+    jr nz,port_helper_trace_error_ei
+port_helper_trace_ready:
+    ; A8 returns with DI like every resident TsrCall. TCP_OPEN must enter A7
+    ; with normal foreground interrupt state, matching the non-TRACE path.
+    ei
     call prepare_unapi_request
-    jr c,port_helper_reconfigure_error
+    jr c,port_helper_reconfigure_error_ei
     ld bc,(memman_tsr_id)
     ld hl,unapi_request
     ld a,MSXAI_TALK_UNAPI_PORT
@@ -94,6 +118,11 @@ port_helper_bad_argument:
     jr port_helper_fail
 port_helper_agent_missing:
     ld de,message_agent_missing
+    ld a,ERR_INTERNAL
+    jr port_helper_fail
+port_helper_trace_error_ei:
+    ei
+    ld de,message_trace_error
     ld a,ERR_INTERNAL
     jr port_helper_fail
 port_helper_reconfigure_error_ei:
@@ -137,6 +166,8 @@ require_dos2_unavailable:
 ; On success carry is clear and BC plus port_value contain 1..65534. No byte
 ; beyond the counted tail is inspected.
 parse_port_argument:
+    xor a
+    ld (trace_requested),a
     ld a,(COMMAND_TAIL)
     and 07Fh
     ld (port_remaining),a
@@ -282,8 +313,27 @@ parse_port_hex_loop:
     jr z,parse_port_hex_trailing
     cp 9
     jr z,parse_port_hex_trailing
+    ld a,(port_hex_digits)
+    or a
+    jr nz,parse_port_hex_normal_nibble
+    ld a,(hl)
+    and 0DFh
+    cp 'G'
+    jr c,parse_port_hex_normal_nibble
+    cp 'V' + 1
+    jr nc,parse_port_hex_normal_nibble
+    sub 'G'
+    ld (port_digit),a
+    ld a,1
+    ld (trace_requested),a
+    ld a,(port_digit)
+    or a
+    jr parse_port_hex_have_nibble
+parse_port_hex_normal_nibble:
+    ld a,(hl)
     call parse_port_hex_nibble
     jp c,parse_port_bad
+parse_port_hex_have_nibble:
     ld (port_digit),a
 
     push hl
@@ -532,6 +582,16 @@ unapi_request_target:
 unapi_request_reserved:
     db 0
 
+trace_request:
+    dw MSXAI_TRACE_REQUEST_MAGIC
+    db MSXAI_TRACE_REQUEST_VERSION
+    db MSXAI_TRACE_REQUEST_SIZE
+    db MSXAI_TRACE_ACTION_ENABLE
+trace_request_status:
+    db 0FFh
+    dw 0
+    ds MSXAI_TRACE_REQUEST_SIZE - 8,0
+
 unapi_request_stack_limit:
     dw 0
 unapi_request_sp_limit:
@@ -547,6 +607,8 @@ port_digit:
     db 0
 port_hex_digits:
     db 0
+trace_requested:
+    db 0
 exit_code:
     db 0
 
@@ -558,6 +620,8 @@ message_bad_version:
     db 13,10,"MP: MSX-DOS 2 is required.",13,10,"$"
 message_agent_missing:
     db 13,10,"MP: MemMan 2.4+ or MSXAI MCP1 not found.",13,10,"$"
+message_trace_error:
+    db 13,10,"MP: MSXAI resident trace enable failed.",13,10,"$"
 message_reconfigure_error:
     db 13,10,"MP: MSXAI UNAPI relisten failed.",13,10,"$"
 

@@ -288,7 +288,10 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertRegex(
             nested_timi,
             r"(?s)ld a,\(hook_system_suspended\).*or a.*"
-            r"jr z,memman_nested_hook_continue.*pop af.*ex af,af'.*"
+            r"jr nz,memman_nested_hook_quit.*"
+            r"ld a,\(unapi_lifecycle_busy\).*or a.*"
+            r"jr z,memman_nested_hook_continue.*"
+            r"memman_nested_hook_quit:.*pop af.*ex af,af'.*"
             r"ld a,1.*ex af,af'.*ret.*"
             r"memman_nested_hook_continue:.*pop af.*ex af,af'.*"
             r"xor a.*ex af,af'.*ret")
@@ -758,9 +761,19 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("ld (hl),003h", listener)
         self.assertIn("ld a,UNAPI_TCP_OPEN", listener)
         open_result = listener.split("ld a,UNAPI_TCP_OPEN", 1)[1]
+        before_valid, valid_open = open_result.split(
+            "unapi_open_listener_valid:", 1)
         self.assertIn("ld a,b\n    or a", open_result)
-        self.assertLess(open_result.index("ld a,UNAPI_ERR_NO_CONN"),
-                        open_result.index("ld (unapi_connection),a"))
+        self.assertIn("ld a,UNAPI_ERR_NO_CONN", before_valid)
+        self.assertNotIn("unapi_relisten_pending", before_valid)
+        self.assertRegex(
+            valid_open,
+            r"(?s)ld \(unapi_connection\),a\s+"
+            r"ld a,UNAPI_TCP_LISTEN\s+"
+            r"ld \(unapi_connection_state\),a\s+"
+            r"xor a\s+ld \(unapi_relisten_pending\),a")
+        self.assertEqual(
+            source.count("ld (unapi_relisten_pending),a"), 2)
 
         abort = source.split("unapi_abort_current:", 1)[1].split(
             "unapi_drop_connection:", 1)[0]
@@ -797,18 +810,40 @@ class ResidentAgentSourceTests(unittest.TestCase):
             "unapi_service:", 1)[0]
         self.assertIn("ld (unapi_cleanup_connection),a", drop)
         self.assertIn("ld (transport_session_lost),a", drop)
+        self.assertIn("ld (unapi_relisten_pending),a", drop)
         self.assertNotIn("call unapi_abort_current", drop)
         self.assertNotIn("call transport_session_reset", drop)
 
         relisten = source.split("unapi_service_relisten:", 1)[1].split(
             "unapi_service_have_connection:", 1)[0]
-        self.assertIn("ld a,(transport_session_lost)", relisten)
-        self.assertIn("ld a,(in_hook)", relisten)
+        relisten_guard = relisten.split(
+            "call unapi_relisten_foreground", 1)[0]
         self.assertRegex(
-            relisten,
-            r"(?s)ld a,\(in_hook\).*ret nz.*call unapi_abort_current\s+"
-            r"or a\s+jr nz,unapi_service_relisten_abort_failed\s+"
-            r"call unapi_reset_stream_state\s+call unapi_open_listener")
+            relisten_guard,
+            r"(?s)ld a,\(transport_session_lost\)\s+or a\s+ret nz.*"
+            r"ld a,\(in_hook\)\s+or a\s+ret nz\s*$")
+        for forbidden in (
+                "unapi_abort_current", "unapi_open_listener",
+                "unapi_relisten_foreground"):
+            self.assertNotIn(forbidden, relisten_guard)
+
+        foreground_relisten = source.split(
+            "unapi_relisten_foreground:", 1)[1].split(
+                "unapi_service_relisten_failed:", 1)[0]
+        self.assertRegex(
+            foreground_relisten,
+            r"(?s)ld a,1\s+ld \(unapi_lifecycle_busy\),a\s+.*?"
+            r"call unapi_abort_current\s+or a\s+"
+            r"jr nz,unapi_relisten_foreground_abort_failed\s+"
+            r"call unapi_reset_stream_state\s+"
+            r"call unapi_open_listener\s+"
+            r"jr unapi_relisten_foreground_finish.*"
+            r"unapi_relisten_foreground_finish:\s+di\s+xor a\s+"
+            r"ld \(unapi_lifecycle_busy\),a\s+.*?"
+            r"ld a,\(unapi_last_error\)\s+ret")
+        self.assertNotIn("transport_session_reset", foreground_relisten)
+        self.assertNotIn("xfer_reconfigure_detach", foreground_relisten)
+        self.assertNotIn("unapi_relisten_pending", foreground_relisten)
 
         stream_reset = source.split("unapi_reset_stream_state:", 1)[1].split(
             "; --------------------------------------------------------------- discovery", 1)[0]
@@ -822,7 +857,7 @@ class ResidentAgentSourceTests(unittest.TestCase):
         for preserved_field in (
                 "unapi_connection)", "unapi_cleanup_connection",
                 "unapi_initialized", "unapi_mode", "unapi_entry",
-                "unapi_open_blocking"):
+                "unapi_open_blocking", "unapi_relisten_pending"):
             self.assertNotIn(preserved_field, stream_reset)
 
         flush = source.split("unapi_flush:", 1)[1].split(

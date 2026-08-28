@@ -614,6 +614,9 @@ Driver selection is explicit and case-insensitive:
 | `MSXAI /DRIVER:16C550` | Install/reconfigure the default resident TSR for a generic 16C550 interface |
 | `MSXAI /DRIVER:UNAPI` | Install/reconfigure a passive TCP/IP UNAPI listener on the default port 6603 |
 | `MSXAI /DRIVER:UNAPI /PORT:43123` | Use a chosen TCP listener port from 1 through 65534 |
+| `MSXAI /DRIVER:UNAPI /PORT:43123 /TRACE` | Enable connection diagnostics for resident UNAPI |
+| `MSXAI 6603 /TRACE` | Use the compact resident UNAPI form with diagnostics enabled |
+| `MSXAI /DUMPTRACE A:\MSXAI.LOG` | Save the resident diagnostics to a new DOS file without clearing them |
 | `MSXAI /DRIVER:8251 /MONITOR` | Start the non-resident foreground monitor with the 8251 driver |
 | `MSXAI /DRIVER:16C550 /MONITOR` | Start the non-resident foreground monitor with the 16C550 driver |
 | `MSXAI /DRIVER:UNAPI /MONITOR` | Start the non-resident foreground monitor with TCP/IP UNAPI |
@@ -627,6 +630,10 @@ Exactly one `/DRIVER` is required for install or monitor mode. `/PORT` is
 valid only with `/DRIVER:UNAPI`; omitting it selects port 6603. The UNAPI value
 `FFFFh` means “choose a random local port”, so `/PORT:65535` is rejected: the
 host could not know which endpoint to connect to.
+`/TRACE` is restricted to resident UNAPI and cannot be combined with
+`/MONITOR` or `DEBUG`. `/DUMPTRACE` requires an installed matching resident,
+one new filename, and no other command-line options. It remains usable after
+the host TCP connection has fallen.
 `/UNINSTALL` must be used alone. Running the resident command again finds the
 existing named TSR and changes its selected driver through MemMan instead of
 installing a duplicate. Changing the live driver can disconnect the current
@@ -714,7 +721,8 @@ framed protocols, transport ABI, and driver implementation details.
 | Agent-side `call` and `run` | No | Yes |
 | Agent-side `stop` | No | Yes |
 | Slot and mapper selection | No | Yes, pages 0 and 1 |
-| On-screen `DEBUG` trace | No | Optional |
+| On-screen `DEBUG` output | No | Optional |
+| Resident `/TRACE` diagnostics | Optional for UNAPI | No |
 
 The resident reports execution state `running` while DOS or an application is
 active. The safe profile disables persistent manual `msx_agent_pause`; atomic memory

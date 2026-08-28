@@ -185,6 +185,11 @@ unapi_reset_stream_state:
     ld (unapi_io_pointer),hl
     ld (unapi_io_count),hl
     ld (unapi_pending_rx),hl
+if MSXAI_TSR_BUILD
+    dec a
+    ld (trace_last_tcp_result),a
+    ld (trace_last_tcp_state),a
+endif
     ret
 
 ; --------------------------------------------------------------- discovery --
@@ -358,6 +363,10 @@ unapi_mapped_dispatch:
 ; ----------------------------------------------------- connection lifecycle --
 
 unapi_open_listener:
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_OPEN_BEGIN
+    call trace_record
+endif
     ld (unapi_saved_sp),sp
     ld hl,0
     add hl,sp
@@ -390,29 +399,58 @@ unapi_open_listener:
     ld sp,(unapi_saved_sp)
     ld (unapi_last_error),a
     or a
-    ret nz
+    jr z,unapi_open_listener_result_ok
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_OPEN_END
+    call trace_record
+endif
+    ld a,(unapi_last_error)
+    ret
+unapi_open_listener_result_ok:
     ld a,b
     or a
     jr nz,unapi_open_listener_valid
     ld a,UNAPI_ERR_NO_CONN         ; success with handle zero is not usable
     ld (unapi_last_error),a
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_OPEN_END
+    call trace_record
+endif
+    ld a,(unapi_last_error)
     ret
 unapi_open_listener_valid:
     ld (unapi_connection),a
     ld a,UNAPI_TCP_LISTEN
     ld (unapi_connection_state),a
     xor a
+    ld (unapi_relisten_pending),a
     ld (unapi_retry_count),a
     ld (unapi_poll_skip),a
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_OPEN_END
+    call trace_record
+endif
+    xor a
     ret
 
 unapi_abort_current:
     ld a,(unapi_connection)
     or a
     jr z,unapi_abort_deferred
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_ABORT_BEGIN
+    call trace_record
+endif
+    ld a,(unapi_connection)
     ld b,a
     ld a,UNAPI_TCP_ABORT
     call unapi_call
+    ld (unapi_last_error),a
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_ABORT_END
+    call trace_record
+endif
+    ld a,(unapi_last_error)
     cp UNAPI_ERR_OK
     jr z,unapi_abort_current_clear
     cp UNAPI_ERR_NO_CONN
@@ -425,9 +463,20 @@ unapi_abort_deferred:
     ld a,(unapi_cleanup_connection)
     or a
     jr z,unapi_abort_complete
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_ABORT_BEGIN
+    call trace_record
+endif
+    ld a,(unapi_cleanup_connection)
     ld b,a
     ld a,UNAPI_TCP_ABORT
     call unapi_call
+    ld (unapi_last_error),a
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_ABORT_END
+    call trace_record
+endif
+    ld a,(unapi_last_error)
     cp UNAPI_ERR_OK
     jr z,unapi_abort_deferred_clear
     cp UNAPI_ERR_NO_CONN
@@ -451,14 +500,20 @@ unapi_drop_connection:
 unapi_drop_no_live_handle:
     xor a
     ld (unapi_connection),a
-    ld (unapi_connection_state),a
     ld (unapi_rx_count),a
     ld (unapi_rx_position),a
     ld (unapi_tx_count),a
     ld a,1
     ld (transport_session_lost),a
+    ld (unapi_relisten_pending),a
     ld a,UNAPI_RELISTEN_DELAY
     ld (unapi_retry_count),a
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_DROP
+    call trace_record
+endif
+    xor a
+    ld (unapi_connection_state),a
     ret
 
 unapi_service:
@@ -518,15 +573,40 @@ unapi_service_relisten:
     ld a,(in_hook)
     or a
     ret nz
-    call unapi_abort_current
-    or a
-    jr nz,unapi_service_relisten_abort_failed
-    call unapi_reset_stream_state
-    call unapi_open_listener
+    call unapi_relisten_foreground
     ret z
     jr unapi_service_relisten_failed
-unapi_service_relisten_abort_failed:
+
+; The caller must already be at a foreground stack checkpoint. Keep the
+; selected UNAPI implementation and transfer epoch intact: only retire the old
+; handle, reset its byte-stream state, and create a replacement listener.
+; During recovery, the pending flag clears only after TCP_OPEN returns a valid
+; handle; explicit teardown/reconfiguration clears the entire runtime epoch.
+unapi_relisten_foreground:
+    ld a,1
+    ld (unapi_lifecycle_busy),a
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_RECONFIG_BEGIN
+    call trace_record
+endif
+    call unapi_abort_current
+    or a
+    jr nz,unapi_relisten_foreground_abort_failed
+    call unapi_reset_stream_state
+    call unapi_open_listener
+    jr unapi_relisten_foreground_finish
+unapi_relisten_foreground_abort_failed:
     ld (unapi_last_error),a
+unapi_relisten_foreground_finish:
+    di
+    xor a
+    ld (unapi_lifecycle_busy),a
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_RECONFIG_END
+    call trace_record
+endif
+    ld a,(unapi_last_error)
+    ret
 unapi_service_relisten_failed:
     ld a,UNAPI_RELISTEN_DELAY
     ld (unapi_retry_count),a
@@ -549,10 +629,18 @@ unapi_service_poll:
     ld hl,0                         ; no page-1 information block
     ld a,UNAPI_TCP_STATE
     call unapi_call
+if MSXAI_TSR_BUILD
+    call trace_count_poll
+endif
     or a
     jr nz,unapi_service_state_error
+    ld (unapi_last_error),a
     ld a,b
     ld (unapi_connection_state),a
+if MSXAI_TSR_BUILD
+    xor a
+    call trace_record_tcp_state
+endif
     ld (unapi_pending_rx),hl
     ld a,b
     cp UNAPI_TCP_ESTABLISHED
@@ -570,6 +658,11 @@ unapi_service_poll:
     ret
 unapi_service_state_error:
     ld (unapi_last_error),a
+if MSXAI_TSR_BUILD
+    ld b,0FFh
+    call trace_record_tcp_state
+endif
+    ld a,(unapi_last_error)
     cp UNAPI_ERR_NO_CONN
     jr nz,unapi_service_return_error
     call unapi_drop_connection
@@ -727,6 +820,7 @@ unapi_flush_retry:
     ld (unapi_flush_retries),a
     jr nz,unapi_flush_retry
     ld a,UNAPI_ERR_BUFFER
+    ld (unapi_last_error),a
     push af
     call unapi_drop_connection
     pop af
@@ -834,6 +928,13 @@ unapi_receive_count_ready:
     ret
 unapi_receive_error:
     ld (unapi_last_error),a
+if MSXAI_TSR_BUILD
+    push af
+    ld a,(unapi_connection_state)
+    ld b,a
+    pop af
+    call trace_record_tcp_state
+endif
     ret
 
 ; ------------------------------------------------------------ private state --
@@ -858,6 +959,10 @@ unapi_cleanup_connection:
 unapi_connection_state:
     db 0
 unapi_open_blocking:
+    db 0
+unapi_relisten_pending:
+    db 0
+unapi_lifecycle_busy:
     db 0
 unapi_retry_count:
     db 0

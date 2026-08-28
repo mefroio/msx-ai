@@ -118,6 +118,9 @@ MSXAI /DRIVER:8251
 MSXAI /DRIVER:16C550
 MSXAI /DRIVER:UNAPI
 MSXAI /DRIVER:UNAPI /PORT:43123
+MSXAI /DRIVER:UNAPI /PORT:43123 /TRACE
+MSXAI 6603 /TRACE
+MSXAI /DUMPTRACE A:\MSXAI.LOG
 MSXAI /DRIVER:8251 /MONITOR
 MSXAI /DRIVER:16C550 /MONITOR
 MSXAI /DRIVER:UNAPI /MONITOR
@@ -152,6 +155,11 @@ private form. The `MSXAIXF /PUT` and `/GET` forms take the 32-hex-digit
 transfer ID staged by the host. `MSXAI.COM` has no file-transfer command; all
 DOS-file PUT and GET work is owned by `MSXAIXF.COM` and protocol X.
 
+`/TRACE` is accepted only for resident UNAPI mode and cannot be combined with
+`/MONITOR` or `DEBUG`. `/DUMPTRACE` is a standalone DOS command that takes one
+new filename, saves the currently captured diagnostics, and leaves them
+available for another dump.
+
 The startup banner reports the selected driver and runtime mode before control
 passes to MemMan or the foreground monitor.
 
@@ -169,6 +177,7 @@ passes to MemMan or the foreground monitor.
 | Direct call/run/stop | No | Yes |
 | Slot/mapper selection | No | Yes, pages 0 and 1 |
 | `DEBUG` | Rejected | Optional |
+| Resident `/TRACE` diagnostics | Optional for UNAPI | No |
 
 ### Default MemMan resident
 
@@ -414,7 +423,17 @@ This mode can:
 The foreground image at `0x8600` and above is protected from host writes. The
 fixed address is not used by the default MemMan lifecycle.
 
-## Debug tracing
+## Resident connection trace
+
+`/TRACE` records resident TCP/IP UNAPI connection diagnostics without drawing
+on the MSX screen. It remains available after the host connection is lost as
+long as the resident remains installed.
+
+At a DOS prompt, use `MSXAI /DUMPTRACE <new-file>` to save it. Dumping does not
+disable or clear tracing. A reset, power-off, or resident uninstall removes
+information that has not yet been dumped.
+
+## Foreground DEBUG output
 
 Debug is disabled by default. `DEBUG` prints each foreground protocol
 opcode as `[XX]`, where `XX` is the uppercase hexadecimal byte. A v3 TCP host
@@ -428,7 +447,7 @@ on a disposable runtime disk, then waits for an IPv4 MCP listener at
 `127.0.0.1:6603`. It leaves the agent at the DOS prompt for the user to start
 explicitly in resident mode or with `/MONITOR DEBUG`.
 
-Tracing is deliberately limited:
+`DEBUG` output is deliberately limited:
 
 - it is accepted only with `/MONITOR`;
 - it uses the foreground BDOS proxy for console output;

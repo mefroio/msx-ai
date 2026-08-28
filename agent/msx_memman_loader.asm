@@ -18,8 +18,11 @@
 ; patched, deleted, or left behind by either lifecycle.
 
 DOS_CLOSE:               equ 045h
+DOS_CREATE:              equ 044h
+DOS_ENSURE:              equ 046h
 DOS_OPEN:                equ 043h
 DOS_READ:                equ 048h
+DOS_WRITE:               equ 049h
 DOS_SEEK:                equ 04Ah
 DOS_TERM_ERROR:          equ 062h
 DOS_DEFAB:               equ 063h
@@ -27,6 +30,8 @@ DOS_GET_ENV:             equ 06Bh
 DOS_VERSION:             equ 06Fh
 
 OPEN_READ_ONLY:          equ 001h
+CREATE_WRITE_ONLY:       equ 002h
+CREATE_NEW:              equ 080h
 
 ERR_INTERNAL:            equ 0DFh
 ERR_NO_MEMORY:           equ 0DEh
@@ -62,7 +67,7 @@ DOS_PATH_SEPARATOR:      equ 05Ch
 MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
-MP_FILE_SIZE:            equ 0039Ah ; 922-byte guarded-stack port helper
+MP_FILE_SIZE:            equ 00426h ; 1062-byte guarded-stack trace/port helper
 TU_FILE_SIZE:            equ 003D7h ; 983-byte pre-TL UNAPI helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
@@ -448,7 +453,20 @@ suite_build_install_command_suffix:
     rrca
     rrca
     rrca
+    push af
+    ld a,(loader_trace_enabled)
+    or a
+    jr z,suite_build_install_command_high_plain
+    pop af
+    and 00Fh
+    add a,'G'                  ; G..V encodes TRACE plus high nibble 0..15
+    ld (de),a
+    inc de
+    jr suite_build_install_command_high_done
+suite_build_install_command_high_plain:
+    pop af
     call suite_build_install_command_hex_nibble
+suite_build_install_command_high_done:
     ld a,h
     call suite_build_install_command_hex_nibble
     ld a,l
@@ -780,6 +798,72 @@ memman_reconfigure_unapi_failed:
     ld a,0FFh
     ret
 
+; A8 never touches the selected transport. ENABLE is idempotent; SNAPSHOT
+; copies the resident export block into the page-zero buffer below.
+memman_enable_trace:
+    ld a,TSR_TRACE_ACTION_ENABLE
+    jr memman_trace_call
+
+memman_snapshot_trace:
+    ld a,TSR_TRACE_ACTION_SNAPSHOT
+memman_trace_call:
+    ld (memman_trace_action),a
+    ld (memman_trace_id),bc
+    ld (memman_trace_request_action),a
+    ld a,0FFh
+    ld (memman_trace_request_status),a
+    xor a
+    ld (memman_trace_request_length),a
+    ld (memman_trace_request_length + 1),a
+    ld bc,(memman_trace_id)
+    ld hl,memman_trace_request
+    ld a,TSR_TALK_TRACE
+    ld d,'M'
+    ld e,63                    ; TsrCall
+    call EXTBIO
+    di
+    or a
+    jr nz,memman_trace_call_failed
+    ld a,(memman_trace_request_status)
+    or a
+    jr nz,memman_trace_call_failed
+    ld a,(memman_trace_action)
+    cp TSR_TRACE_ACTION_SNAPSHOT
+    jr nz,memman_trace_call_ok
+    ld hl,(memman_trace_request_length)
+    ld de,TRACE_EXPORT_SIZE
+    or a
+    sbc hl,de
+    jr nz,memman_trace_call_failed
+    ld hl,(memman_trace_export)
+    ld de,TRACE_FORMAT_MAGIC
+    or a
+    sbc hl,de
+    jr nz,memman_trace_call_failed
+    ld a,(memman_trace_export + 2)
+    cp TRACE_FORMAT_VERSION
+    jr nz,memman_trace_call_failed
+    ld a,(memman_trace_export + 3)
+    cp TRACE_RECORD_SIZE
+    jr nz,memman_trace_call_failed
+    ld a,(memman_trace_export + 4)
+    cp TRACE_RECORD_CAPACITY
+    jr nz,memman_trace_call_failed
+    ld a,(memman_trace_export + TRACE_EXPORT_COUNT)
+    cp TRACE_RECORD_CAPACITY + 1
+    jr nc,memman_trace_call_failed
+    ld a,(memman_trace_export + TRACE_EXPORT_WRITE_INDEX)
+    cp TRACE_RECORD_CAPACITY
+    jr nc,memman_trace_call_failed
+memman_trace_call_ok:
+    ld bc,(memman_trace_id)
+    xor a
+    ret
+memman_trace_call_failed:
+    ld bc,(memman_trace_id)
+    ld a,0FFh
+    ret
+
 memman_prepare_unapi_request:
     ld hl,(loader_unapi_port)
     ld (memman_unapi_request_port),hl
@@ -921,6 +1005,461 @@ memman_unapi_request_stack_limit:
     dw 0
 memman_unapi_request_sp_limit:
     dw 0
+
+memman_trace_id:
+    dw 0
+memman_trace_action:
+    db 0
+memman_trace_request:
+    dw TSR_TRACE_REQUEST_MAGIC
+    db TSR_TRACE_REQUEST_VERSION
+    db TSR_TRACE_REQUEST_SIZE
+memman_trace_request_action:
+    db 0
+memman_trace_request_status:
+    db 0FFh
+memman_trace_request_length:
+    dw 0
+    ds TSR_TRACE_REQUEST_SIZE - 8,0
+memman_trace_export:
+    ds TRACE_EXPORT_SIZE,0
+memman_trace_export_end:
+
+; ---------------------------------------------------------------------------
+; /DUMPTRACE. The resident has already copied a coherent RAM snapshot into the
+; page-zero buffer above. All filesystem work and text formatting happen here,
+; in the transient DOS process.
+
+loader_dump_trace:
+    xor a
+    ld (dos2_available),a
+    ld a,INVALID_HANDLE
+    ld (trace_dump_handle),a
+    ld c,DOS_VERSION
+    call 00005h
+    or a
+    jp nz,loader_dump_trace_fail
+    ld a,b
+    cp 2
+    jr c,loader_dump_trace_bad_version
+    ld a,1
+    ld (dos2_available),a
+
+    call memman_find_agent
+    jr c,loader_dump_trace_no_agent
+    call memman_snapshot_trace
+    ei
+    or a
+    jr nz,loader_dump_trace_unavailable
+
+    ld de,(loader_trace_path)
+    ld a,CREATE_WRITE_ONLY
+    ld b,CREATE_NEW
+    ld c,DOS_CREATE
+    call 00005h
+    or a
+    jr nz,loader_dump_trace_fail
+    ld a,b
+    ld (trace_dump_handle),a
+    call trace_dump_write_all
+    ld (trace_dump_error),a
+    or a
+    jr nz,loader_dump_trace_close
+    ld a,(trace_dump_handle)
+    ld b,a
+    ld c,DOS_ENSURE
+    call 00005h
+    ld (trace_dump_error),a
+loader_dump_trace_close:
+    ld a,(trace_dump_handle)
+    cp INVALID_HANDLE
+    jr z,loader_dump_trace_closed
+    ld b,a
+    ld c,DOS_CLOSE
+    call 00005h
+    ld b,a
+    ld a,INVALID_HANDLE
+    ld (trace_dump_handle),a
+    ld a,(trace_dump_error)
+    or a
+    jr nz,loader_dump_trace_closed
+    ld a,b
+    ld (trace_dump_error),a
+loader_dump_trace_closed:
+    ld a,(trace_dump_error)
+    or a
+    jr nz,loader_dump_trace_fail
+    ld de,trace_dump_success_message
+    ld c,9
+    call 00005h
+    xor a
+    ld b,a
+    ld c,DOS_TERM_ERROR
+    call 00005h
+    jp 00000h
+
+loader_dump_trace_bad_version:
+    ld a,ERR_BAD_VERSION
+    jr loader_dump_trace_fail
+loader_dump_trace_no_agent:
+    ld de,trace_dump_no_agent_message
+    jr loader_dump_trace_named_fail
+loader_dump_trace_unavailable:
+    ld de,trace_dump_unavailable_message
+loader_dump_trace_named_fail:
+    ei
+    ld c,9
+    call 00005h
+    ld a,ERR_INTERNAL
+    jr loader_dump_trace_terminate
+loader_dump_trace_fail:
+    ld (trace_dump_error),a
+    ld de,trace_dump_error_message
+    ld c,9
+    call 00005h
+    ld a,(trace_dump_error)
+loader_dump_trace_terminate:
+    ld b,a
+    ld a,(dos2_available)
+    or a
+    jr z,loader_dump_trace_warm_boot
+    ld c,DOS_TERM_ERROR
+    call 00005h
+loader_dump_trace_warm_boot:
+    jp 00000h
+
+trace_dump_write_all:
+    call trace_line_reset
+    ld de,trace_text_title
+    call trace_line_append_string
+    call trace_line_finish_write
+    or a
+    ret nz
+
+    call trace_line_reset
+    ld de,trace_text_status_flags
+    call trace_line_append_string
+    ld a,(memman_trace_export + TRACE_EXPORT_FLAGS)
+    call trace_line_append_hex_byte
+    ld de,trace_text_count
+    call trace_line_append_string
+    ld a,(memman_trace_export + TRACE_EXPORT_COUNT)
+    call trace_line_append_hex_byte
+    ld de,trace_text_next
+    call trace_line_append_string
+    ld a,(memman_trace_export + TRACE_EXPORT_WRITE_INDEX)
+    call trace_line_append_hex_byte
+    ld de,trace_text_sequence
+    call trace_line_append_string
+    ld hl,(memman_trace_export + TRACE_EXPORT_SEQUENCE)
+    call trace_line_append_hex_word
+    call trace_line_finish_write
+    or a
+    ret nz
+
+    call trace_line_reset
+    ld de,trace_text_polls
+    call trace_line_append_string
+    ld hl,(memman_trace_export + TRACE_EXPORT_POLLS)
+    call trace_line_append_hex_word
+    ld de,trace_text_changes
+    call trace_line_append_string
+    ld hl,(memman_trace_export + TRACE_EXPORT_STATE_CHANGES)
+    call trace_line_append_hex_word
+    ld de,trace_text_timi
+    call trace_line_append_string
+    ld hl,(memman_trace_export + TRACE_EXPORT_TIMI)
+    call trace_line_append_hex_word
+    call trace_line_finish_write
+    or a
+    ret nz
+
+    ld a,(memman_trace_export + TRACE_EXPORT_FLAGS)
+    and TRACE_FLAG_INCIDENT
+    jr z,trace_dump_no_incident
+    call trace_line_reset
+    ld de,trace_text_first
+    call trace_line_append_string
+    ld hl,memman_trace_export + TRACE_EXPORT_SNAPSHOT
+    call trace_line_append_record
+    ld de,trace_text_snapshot_extra
+    call trace_line_append_string
+    ld hl,memman_trace_export + TRACE_EXPORT_SNAPSHOT + TRACE_RECORD_SIZE
+    ld b,TRACE_SNAPSHOT_SIZE - TRACE_RECORD_SIZE
+trace_dump_snapshot_extra_loop:
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    djnz trace_dump_snapshot_extra_loop
+    call trace_line_finish_write
+    or a
+    ret nz
+    jr trace_dump_records_begin
+trace_dump_no_incident:
+    call trace_line_reset
+    ld de,trace_text_first_none
+    call trace_line_append_string
+    call trace_line_finish_write
+    or a
+    ret nz
+
+trace_dump_records_begin:
+    ld a,(memman_trace_export + TRACE_EXPORT_COUNT)
+    ld (trace_dump_remaining),a
+    or a
+    ret z
+    cp TRACE_RECORD_CAPACITY
+    ld a,0
+    jr c,trace_dump_index_ready
+    ld a,(memman_trace_export + TRACE_EXPORT_WRITE_INDEX)
+trace_dump_index_ready:
+    ld (trace_dump_index),a
+    ld hl,(memman_trace_export + TRACE_EXPORT_SEQUENCE)
+    ld a,(trace_dump_remaining)
+    dec a
+    ld e,a
+    ld d,0
+    or a
+    sbc hl,de
+    ld (trace_dump_record_sequence),hl
+
+trace_dump_record_loop:
+    ld a,(trace_dump_index)
+    ld l,a
+    ld h,0
+    add hl,hl
+    add hl,hl
+    add hl,hl
+    ld de,memman_trace_export + TRACE_EXPORT_RECORDS
+    add hl,de
+    ld (trace_dump_record_pointer),hl
+    call trace_line_reset
+    ld de,trace_text_record_prefix
+    call trace_line_append_string
+    ld hl,(trace_dump_record_sequence)
+    call trace_line_append_hex_word
+    ld de,trace_text_record_separator
+    call trace_line_append_string
+    ld hl,(trace_dump_record_pointer)
+    call trace_line_append_record
+    call trace_line_finish_write
+    or a
+    ret nz
+
+    ld hl,(trace_dump_record_sequence)
+    inc hl
+    ld (trace_dump_record_sequence),hl
+    ld a,(trace_dump_index)
+    inc a
+    cp TRACE_RECORD_CAPACITY
+    jr c,trace_dump_record_store_index
+    xor a
+trace_dump_record_store_index:
+    ld (trace_dump_index),a
+    ld a,(trace_dump_remaining)
+    dec a
+    ld (trace_dump_remaining),a
+    jr nz,trace_dump_record_loop
+    xor a
+    ret
+
+; Input HL points to one 8-byte record.
+trace_line_append_record:
+    push hl
+    ld a,(hl)
+    call trace_line_append_event_name
+    pop hl
+    inc hl
+    ld de,trace_text_error
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_state
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_connection
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_cleanup
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_record_flags
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    ex de,hl
+    push hl
+    ld de,trace_text_jiffy
+    call trace_line_append_string
+    pop hl
+    call trace_line_append_hex_word
+    ret
+
+trace_line_append_event_name:
+    dec a
+    cp TRACE_EVENT_RECONFIG_END
+    jr nc,trace_line_event_unknown
+    add a,a
+    ld e,a
+    ld d,0
+    ld hl,trace_event_name_table
+    add hl,de
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    jp trace_line_append_string
+trace_line_event_unknown:
+    ld de,trace_event_unknown
+    jp trace_line_append_string
+
+trace_line_reset:
+    ld hl,trace_line_buffer
+    ld (trace_line_cursor),hl
+    ret
+
+trace_line_append_string:
+    ld a,(de)
+    or a
+    ret z
+    call trace_line_append_char
+    inc de
+    jr trace_line_append_string
+
+trace_line_append_char:
+    push hl
+    ld hl,(trace_line_cursor)
+    ld (hl),a
+    inc hl
+    ld (trace_line_cursor),hl
+    pop hl
+    ret
+
+trace_line_append_hex_word:
+    push af
+    ld a,h
+    call trace_line_append_hex_byte
+    ld a,l
+    call trace_line_append_hex_byte
+    pop af
+    ret
+
+trace_line_append_hex_byte:
+    push af
+    rrca
+    rrca
+    rrca
+    rrca
+    call trace_line_append_hex_nibble
+    pop af
+trace_line_append_hex_nibble:
+    and 00Fh
+    cp 10
+    jr c,trace_line_append_hex_decimal
+    add a,'A' - 10 - '0'
+trace_line_append_hex_decimal:
+    add a,'0'
+    jp trace_line_append_char
+
+trace_line_finish_write:
+    ld a,13
+    call trace_line_append_char
+    ld a,10
+    call trace_line_append_char
+    ld hl,(trace_line_cursor)
+    ld de,trace_line_buffer
+    or a
+    sbc hl,de
+    push hl
+    ld a,(trace_dump_handle)
+    ld b,a
+    ld c,DOS_WRITE
+    call 00005h
+    pop de
+    or a
+    ret nz
+    or a
+    sbc hl,de
+    ret z
+    ld a,ERR_INTERNAL
+    ret
+
+trace_event_name_table:
+    dw trace_event_enable,trace_event_state,trace_event_state_error
+    dw trace_event_drop,trace_event_dos,trace_event_basic
+    dw trace_event_open_begin,trace_event_open_end
+    dw trace_event_abort_begin,trace_event_abort_end
+    dw trace_event_system_suspend,trace_event_system_resume
+    dw trace_event_reconfig_begin,trace_event_reconfig_end
+trace_event_enable:          db "ENABLE",0
+trace_event_state:           db "STATE",0
+trace_event_state_error:     db "STATE_ERROR",0
+trace_event_drop:            db "DROP",0
+trace_event_dos:             db "DOS_RELISTEN",0
+trace_event_basic:           db "BASIC_RELISTEN",0
+trace_event_open_begin:      db "OPEN_BEGIN",0
+trace_event_open_end:        db "OPEN_END",0
+trace_event_abort_begin:     db "ABORT_BEGIN",0
+trace_event_abort_end:       db "ABORT_END",0
+trace_event_system_suspend:  db "SYSTEM_SUSPEND",0
+trace_event_system_resume:   db "SYSTEM_RESUME",0
+trace_event_reconfig_begin:  db "RECONFIG_BEGIN",0
+trace_event_reconfig_end:    db "RECONFIG_END",0
+trace_event_unknown:         db "UNKNOWN",0
+trace_text_title:            db "MSXAI TRACE V1",0
+trace_text_status_flags:     db "FLAGS=",0
+trace_text_count:            db " COUNT=",0
+trace_text_next:             db " NEXT=",0
+trace_text_sequence:         db " SEQ=",0
+trace_text_polls:            db "POLLS=",0
+trace_text_changes:          db " CHANGES=",0
+trace_text_timi:             db " TIMI=",0
+trace_text_first:            db "FIRST ",0
+trace_text_first_none:       db "FIRST NONE",0
+trace_text_snapshot_extra:   db " EXTRA=",0
+trace_text_record_prefix:    db "#",0
+trace_text_record_separator: db " ",0
+trace_text_error:            db " E=",0
+trace_text_state:            db " S=",0
+trace_text_connection:       db " C=",0
+trace_text_cleanup:          db " X=",0
+trace_text_record_flags:     db " F=",0
+trace_text_jiffy:            db " T=",0
+
+trace_dump_success_message:
+    db 13,10,"MSXAI trace written; resident log preserved.",13,10,"$"
+trace_dump_no_agent_message:
+    db 13,10,"MSXAI resident agent is not installed.",13,10,"$"
+trace_dump_unavailable_message:
+    db 13,10,"Resident trace unavailable; reinstall the matching suite.",13,10,"$"
+trace_dump_error_message:
+    db 13,10,"MSXAI trace write failed; use a new filename.",13,10,"$"
+trace_dump_handle:
+    db INVALID_HANDLE
+trace_dump_error:
+    db 0
+trace_dump_remaining:
+    db 0
+trace_dump_index:
+    db 0
+trace_dump_record_sequence:
+    dw 0
+trace_dump_record_pointer:
+    dw 0
+trace_line_cursor:
+    dw trace_line_buffer
+trace_line_buffer:
+    ds 96,0
 
 ; ---------------------------------------------------------------------------
 ; Mutable state and command/name templates.

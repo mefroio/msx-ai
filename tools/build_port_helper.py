@@ -39,6 +39,9 @@ REQUIRED_LABELS = (
     "unapi_request_connection",
     "unapi_request_target",
     "unapi_request_reserved",
+    "trace_request",
+    "trace_request_status",
+    "trace_requested",
     "port_value",
 )
 REQUIRED_CONSTANTS = {
@@ -48,6 +51,7 @@ REQUIRED_CONSTANTS = {
     "MEMMAN_GET_TSR_ID": 62,
     "MEMMAN_TSR_CALL": 63,
     "MSXAI_TALK_UNAPI_PORT": 0xA7,
+    "MSXAI_TALK_TRACE": 0xA8,
     "MSXAI_TRANSPORT_UNAPI": 2,
     "MSXAI_UNAPI_REQUEST_MAGIC": 0xA75A,
     "MSXAI_UNAPI_REQUEST_VERSION": 1,
@@ -57,6 +61,10 @@ REQUIRED_CONSTANTS = {
     "MSXAI_UNAPI_STACK_HEADROOM": 0x100,
     "MSXAI_UNAPI_LOW_GUARD": 0xA5,
     "MSXAI_UNAPI_HIGH_GUARD": 0x5A,
+    "MSXAI_TRACE_REQUEST_MAGIC": 0xA85A,
+    "MSXAI_TRACE_REQUEST_VERSION": 1,
+    "MSXAI_TRACE_REQUEST_SIZE": 16,
+    "MSXAI_TRACE_ACTION_ENABLE": 1,
 }
 REQUEST_FIELD_OFFSETS = {
     "unapi_request_port": 4,
@@ -186,6 +194,31 @@ def validate_port_helper_image(
     if request_data[reserved_offset] != 0:
         raise PortHelperBuildError(
             "MP.COM A7 request reserved byte is not zero")
+
+    trace_request = labels["trace_request"]
+    trace_size = labels["MSXAI_TRACE_REQUEST_SIZE"]
+    if not (ORIGIN <= trace_request and
+            trace_request + trace_size <= labels["port_helper_end"]):
+        raise PortHelperBuildError(
+            "MP.COM A8 trace request is not wholly inside page zero")
+    first = trace_request - ORIGIN
+    trace_data = data[first:first + trace_size]
+    expected_trace_header = bytes((
+        labels["MSXAI_TRACE_REQUEST_MAGIC"] & 0xFF,
+        labels["MSXAI_TRACE_REQUEST_MAGIC"] >> 8,
+        labels["MSXAI_TRACE_REQUEST_VERSION"],
+        trace_size,
+        labels["MSXAI_TRACE_ACTION_ENABLE"],
+    ))
+    if trace_data[:5] != expected_trace_header:
+        raise PortHelperBuildError(
+            "A8 request does not contain the pinned trace header and action")
+    if labels["trace_request_status"] - trace_request != 5:
+        raise PortHelperBuildError(
+            "trace_request_status is not at A8 request offset 5")
+    if trace_data[5] != 0xFF or any(trace_data[6:]):
+        raise PortHelperBuildError(
+            "A8 trace request output/reserved bytes are not initialized")
 
 
 def assemble_port_helper(

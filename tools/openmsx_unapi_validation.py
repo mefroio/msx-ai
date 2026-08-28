@@ -33,6 +33,8 @@ from typing import Callable, Iterator, Mapping, Sequence
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 RELEASE = "v0.9.7"
 RELEASE_URL = "https://github.com/antxiko/openMSXnet/releases/tag/v0.9.7"
@@ -40,6 +42,20 @@ RELEASE_DOWNLOAD_BASE = (
     "https://github.com/antxiko/openMSXnet/releases/download/v0.9.7"
 )
 DEFAULT_TEST_PORT = 43123
+DEFAULT_FAULT_CYCLES = 3
+STEADY_STATE_ROUND_TRIPS = 64
+TRACE_DUMP_NAMES = ("MSXAI.LOG", "MSXAI2.LOG")
+TRACE_FAILURE_DUMP_NAME = "MSXFAIL.LOG"
+TRACE_FLAG_ENABLED = 0x01
+TRACE_FLAG_INCIDENT = 0x02
+TRACE_FLAG_WRAPPED = 0x04
+TRACE_RECORD_CAPACITY = 16
+TRACE_EVENT_NAMES = frozenset({
+    "ENABLE", "STATE", "STATE_ERROR", "DROP", "DOS_RELISTEN",
+    "BASIC_RELISTEN", "OPEN_BEGIN", "OPEN_END", "ABORT_BEGIN",
+    "ABORT_END", "SYSTEM_SUSPEND", "SYSTEM_RESUME", "RECONFIG_BEGIN",
+    "RECONFIG_END",
+})
 MIN_TEST_PORT = 1
 # TCP/IP UNAPI reserves FFFFh as the random/local-port sentinel.
 MAX_TEST_PORT = 65534
@@ -108,7 +124,8 @@ CONTRACT_PATH = (
     "TCPIP_TCP_STATE establishment",
     "TCPIP_TCP_SEND agent-to-host bytes",
     "TCPIP_TCP_RCV host-to-agent bytes",
-    "foreground TCP abort and passive relisten after host disconnect",
+    "automatic H.CHGE foreground relisten after host disconnect",
+    "automatic BASIC H.CRUN foreground relisten after host disconnect",
 )
 MCP_TOOLS_EXERCISED = (
     "msx_agent_connect",
@@ -121,6 +138,14 @@ NOT_EMULATED = (
     "cartridge registers and bus timing",
     "interrupt and electrical behaviour of physical hardware",
     "Wi-Fi association, DHCP, and radio failure modes",
+)
+
+FAULT_SCENARIOS = (
+    "steady-state framed traffic",
+    "idle peer FIN followed by foreground recovery",
+    "RST queued immediately before a marked DOS command",
+    "temporary bidirectional blackhole followed by RST",
+    "premature reconnect during listener recovery",
 )
 
 MAX_ZIP_MEMBERS = 4096
@@ -579,13 +604,15 @@ def build_agent_package(settings: Settings, *,
     return artifacts
 
 
-def msx_install_commands(port: int) -> tuple[str, ...]:
+def msx_install_commands(port: int, *, trace: bool = False) -> tuple[str, ...]:
     port = validate_port(port)
+    install = (f"MSXAI {port} /TRACE" if trace else
+               f"MSXAI /DRIVER:UNAPI /PORT:{port}")
     return (
         f"SET MSXAI_HOME={SUITE_HOME}",
         f"PATH {SUITE_HOME};%PATH%",
         "UNAPINET",
-        f"MSXAI /DRIVER:UNAPI /PORT:{port}",
+        install,
     )
 
 
@@ -593,6 +620,202 @@ def _dos_entry_size(listing: str, name: str) -> int | None:
     match = re.search(
         rf"(?im)^\s*{re.escape(name)}\s+\S+\s+(\d+)\s*$", listing)
     return None if match is None else int(match.group(1))
+
+
+_TRACE_STATUS_LINE = re.compile(
+    r"^FLAGS=(?P<flags>[0-9A-F]{2}) "
+    r"COUNT=(?P<count>[0-9A-F]{2}) "
+    r"NEXT=(?P<next>[0-9A-F]{2}) "
+    r"SEQ=(?P<sequence>[0-9A-F]{4})$")
+_TRACE_COUNTER_LINE = re.compile(
+    r"^POLLS=(?P<polls>[0-9A-F]{4}) "
+    r"CHANGES=(?P<changes>[0-9A-F]{4}) "
+    r"TIMI=(?P<timi>[0-9A-F]{4})$")
+_TRACE_FIRST_LINE = re.compile(
+    r"^FIRST (?P<event>[A-Z_]+) "
+    r"E=(?P<error>[0-9A-F]{2}) S=(?P<state>[0-9A-F]{2}) "
+    r"C=(?P<active>[0-9A-F]{2}) X=(?P<cleanup>[0-9A-F]{2}) "
+    r"F=(?P<flags>[0-9A-F]{2}) T=(?P<jiffy>[0-9A-F]{4}) "
+    r"EXTRA=(?P<extra>(?:[0-9A-F]{2}){8})$")
+_TRACE_RECORD_LINE = re.compile(
+    r"^#(?P<sequence>[0-9A-F]{4}) (?P<event>[A-Z_]+) "
+    r"E=(?P<error>[0-9A-F]{2}) S=(?P<state>[0-9A-F]{2}) "
+    r"C=(?P<active>[0-9A-F]{2}) X=(?P<cleanup>[0-9A-F]{2}) "
+    r"F=(?P<flags>[0-9A-F]{2}) T=(?P<jiffy>[0-9A-F]{4})$")
+
+
+def _trace_record_from_match(match: re.Match[str]) -> dict[str, object]:
+    groups = match.groupdict()
+    record: dict[str, object] = {
+        "event": groups["event"],
+        "error": int(groups["error"], 16),
+        "state": int(groups["state"], 16),
+        "active": int(groups["active"], 16),
+        "cleanup": int(groups["cleanup"], 16),
+        "flags": int(groups["flags"], 16),
+        "jiffy": int(groups["jiffy"], 16),
+    }
+    if groups.get("sequence") is not None:
+        record["sequence"] = int(groups["sequence"], 16)
+    if groups.get("extra") is not None:
+        raw = groups["extra"]
+        record["extra"] = [
+            int(raw[index:index + 2], 16)
+            for index in range(0, len(raw), 2)
+        ]
+    return record
+
+
+def parse_resident_trace(text: str) -> dict[str, object]:
+    """Parse one textual `/DUMPTRACE` file without emulator state."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[-1]:
+        lines.pop()
+    if len(lines) < 4 or lines[0] != "MSXAI TRACE V1":
+        raise ValidationError("resident trace has no valid V1 header")
+    if any(not line for line in lines):
+        raise ValidationError("resident trace contains an unexpected blank line")
+
+    status = _TRACE_STATUS_LINE.fullmatch(lines[1])
+    counters = _TRACE_COUNTER_LINE.fullmatch(lines[2])
+    if status is None or counters is None:
+        raise ValidationError("resident trace status/counter line is malformed")
+
+    if lines[3] == "FIRST NONE":
+        first_incident = None
+    else:
+        first = _TRACE_FIRST_LINE.fullmatch(lines[3])
+        if first is None:
+            raise ValidationError("resident trace FIRST record is malformed")
+        first_incident = _trace_record_from_match(first)
+
+    records: list[dict[str, object]] = []
+    for line in lines[4:]:
+        match = _TRACE_RECORD_LINE.fullmatch(line)
+        if match is None:
+            raise ValidationError(f"resident trace record is malformed: {line}")
+        records.append(_trace_record_from_match(match))
+
+    return {
+        "flags": int(status.group("flags"), 16),
+        "count": int(status.group("count"), 16),
+        "next_index": int(status.group("next"), 16),
+        "sequence": int(status.group("sequence"), 16),
+        "polls": int(counters.group("polls"), 16),
+        "state_changes": int(counters.group("changes"), 16),
+        "timi": int(counters.group("timi"), 16),
+        "first_incident": first_incident,
+        "records": records,
+        "events": [record["event"] for record in records],
+    }
+
+
+def validate_resident_trace(trace: Mapping[str, object]) -> None:
+    """Enforce the fixed ring and first-incident invariants."""
+    flags = int(trace["flags"])
+    count = int(trace["count"])
+    next_index = int(trace["next_index"])
+    sequence = int(trace["sequence"])
+    first = trace["first_incident"]
+    records = list(trace["records"])
+
+    if flags & ~(TRACE_FLAG_ENABLED | TRACE_FLAG_INCIDENT |
+                 TRACE_FLAG_WRAPPED):
+        raise ValidationError(f"resident trace has unknown flags: {flags:02X}")
+    if not flags & TRACE_FLAG_ENABLED:
+        raise ValidationError("resident trace is not marked enabled")
+    if not 0 <= count <= TRACE_RECORD_CAPACITY:
+        raise ValidationError(f"resident trace count is invalid: {count}")
+    if len(records) != count:
+        raise ValidationError(
+            f"resident trace COUNT={count} but contains {len(records)} records")
+    if not 0 <= next_index < TRACE_RECORD_CAPACITY:
+        raise ValidationError(
+            f"resident trace NEXT index is invalid: {next_index}")
+    if next_index != sequence % TRACE_RECORD_CAPACITY:
+        raise ValidationError(
+            f"resident trace NEXT={next_index} is inconsistent with SEQ={sequence}")
+    if flags & TRACE_FLAG_WRAPPED and count != TRACE_RECORD_CAPACITY:
+        raise ValidationError("resident trace WRAPPED flag requires a full ring")
+    if bool(flags & TRACE_FLAG_INCIDENT) != (first is not None):
+        raise ValidationError(
+            "resident trace INCIDENT flag disagrees with the FIRST record")
+    if first is not None:
+        event = str(first["event"])
+        if event not in ("STATE_ERROR", "DROP", "OPEN_END", "ABORT_END"):
+            raise ValidationError(
+                f"resident trace FIRST event is not an incident: {event}")
+        if event != "DROP" and int(first["error"]) == 0:
+            raise ValidationError(
+                f"resident trace FIRST {event} has no error code")
+
+    if records:
+        expected_first = (sequence - count + 1) & 0xFFFF
+        expected = [
+            (expected_first + index) & 0xFFFF for index in range(count)
+        ]
+        observed = [int(record["sequence"]) for record in records]
+        if observed != expected:
+            raise ValidationError(
+                "resident trace record sequence is not chronological: "
+                f"expected {expected}, found {observed}")
+    elif sequence != 0:
+        raise ValidationError(
+            "resident trace has a nonzero sequence without records")
+
+    previous: tuple[int, int] | None = None
+    for record in records:
+        if record["event"] not in TRACE_EVENT_NAMES:
+            raise ValidationError(
+                f"resident trace contains unknown event {record['event']}")
+        if record["event"] not in ("STATE", "STATE_ERROR"):
+            previous = None
+            continue
+        current = (int(record["error"]), int(record["state"]))
+        if current == previous:
+            raise ValidationError(
+                "resident trace contains an adjacent duplicate TCP state")
+        previous = current
+
+
+def _dos_partition_offset(disk: pathlib.Path) -> int:
+    """Return the first MBR partition byte offset, or zero for a raw disk."""
+    with disk.open("rb") as source:
+        sector = source.read(512)
+    if len(sector) != 512 or sector[510:512] != b"\x55\xAA":
+        return 0
+    for index in range(4):
+        entry = sector[446 + index * 16:462 + index * 16]
+        start = int.from_bytes(entry[8:12], "little")
+        sectors = int.from_bytes(entry[12:16], "little")
+        if entry[4] and start and sectors:
+            return start * 512
+    return 0
+
+
+def _extract_dos_file(disk: pathlib.Path, dos_name: str,
+                      target: pathlib.Path) -> None:
+    """Read a closed FAT image through mtools without modifying it."""
+    mcopy = shutil.which("mcopy")
+    if mcopy is None:
+        raise PrerequisiteError(
+            "trace validation requires mcopy (mtools) to inspect the closed "
+            "disposable DOS disk")
+    if re.fullmatch(r"[A-Z0-9_]{1,8}(?:\.[A-Z0-9]{1,3})?", dos_name) is None:
+        raise ValueError(f"invalid DOS 8.3 trace filename: {dos_name}")
+    offset = _dos_partition_offset(disk)
+    image = str(disk) + (f"@@{offset}" if offset else "")
+    environment = os.environ.copy()
+    environment["MTOOLS_SKIP_CHECK"] = "1"
+    result = subprocess.run(
+        [mcopy, "-n", "-i", image, f"::{dos_name}", str(target)],
+        capture_output=True, text=True, timeout=30, env=environment,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "no mcopy output").strip()
+        raise ValidationError(
+            f"could not extract {dos_name} from the trace disk: {detail}")
 
 
 def _import_suite(machine: object,
@@ -630,6 +853,292 @@ def _dos_prompt_visible(screen: str) -> bool:
     # screen modes, so a real prompt may begin after one or more spaces.
     return re.search(
         r"(?im)^[ \t]*[A-Z]:\\[^\r\n]*>\s*$", screen) is not None
+
+
+def _wait_dos_prompt(machine: object, timeout: float = 15.0) -> str:
+    """Advance emulated time until COMMAND2 exposes a DOS prompt."""
+    deadline = time.monotonic() + timeout
+    screen = machine.screen_text()
+    while not _dos_prompt_visible(screen) and time.monotonic() < deadline:
+        machine.advance(0.1)
+        screen = machine.screen_text()
+    if not _dos_prompt_visible(screen):
+        raise ValidationError(
+            f"MSX did not reach a DOS prompt within {timeout:.1f}s:\n{screen}")
+    return screen
+
+
+def _wait_dos_command_completion(machine: object, command: str,
+                                 before: str,
+                                 timeout: float = 15.0) -> str:
+    """Require fresh command text and a following prompt, not a stale prompt."""
+    command_line = re.compile(
+        rf"(?im)^[ \t]*[A-Z]:\\[^\r\n]*>[ \t]*"
+        rf"{re.escape(command)}[ \t]*$")
+    before_count = len(command_line.findall(before))
+    deadline = time.monotonic() + timeout
+    screen = before
+    while time.monotonic() < deadline:
+        machine.advance(0.1)
+        screen = machine.screen_text()
+        if (len(command_line.findall(screen)) > before_count and
+                _dos_prompt_visible(screen)):
+            return screen
+    raise ValidationError(
+        f"MSX command {command!r} did not produce a fresh command/prompt "
+        f"boundary within {timeout:.1f}s:\n{screen}")
+
+
+def _trace_dump_success_visible(screen: str) -> bool:
+    compact = re.sub(r"\s+", "", screen).casefold()
+    return "msxaitracewritten;residentlogpreserved." in compact
+
+
+def _capture_failed_install_trace(machine: object, disk: pathlib.Path,
+                                  runtime: pathlib.Path) -> dict[str, object]:
+    """Dump the already-enabled ring after first-install A7 fails."""
+    command = rf"MSXAI /DUMPTRACE A:\{TRACE_FAILURE_DUMP_NAME}"
+    before = machine.screen_text()
+    machine.type_line(command)
+    screen = _wait_dos_command_completion(machine, command, before, timeout=30.0)
+    if not _trace_dump_success_visible(screen):
+        raise ValidationError(
+            "could not capture the resident ring after install failure:\n" +
+            screen)
+    machine.cmd("set power off")
+    target = runtime / TRACE_FAILURE_DUMP_NAME.lower()
+    _extract_dos_file(disk, TRACE_FAILURE_DUMP_NAME, target)
+    parsed = parse_resident_trace(target.read_text(encoding="ascii"))
+    validate_resident_trace(parsed)
+    return parsed
+
+
+def _exercise_resident_trace(machine: object, disk: pathlib.Path,
+                             runtime: pathlib.Path) -> dict[str, object]:
+    """Return BASIC to DOS, dump twice, and validate resident evidence."""
+    reset_before, reset_events_before = _reset_vector_hits(machine)
+    before_system = machine.screen_text()
+    if re.search(r"(?im)^\s*Ok\s*$", before_system) is None:
+        raise ValidationError(
+            "trace validation expected the public MCP exercise to finish at "
+            "the BASIC prompt:\n" + before_system)
+
+    machine.type_line("_SYSTEM")
+    system_screen = _wait_dos_prompt(machine, timeout=30.0)
+    reset_after_system, reset_events_after_system = _reset_vector_hits(machine)
+    if reset_after_system != reset_before + 1:
+        raise ValidationError(
+            "BASIC -> DOS did not execute exactly one intentional _SYSTEM "
+            "warm-boot boundary: " + reset_events_after_system)
+
+    dump_commands = tuple(
+        rf"MSXAI /DUMPTRACE A:\{name}" for name in TRACE_DUMP_NAMES)
+    for command in dump_commands:
+        before = machine.screen_text()
+        machine.type_line(command)
+        screen = _wait_dos_command_completion(
+            machine, command, before, timeout=30.0)
+        _assert_command_screen(command, screen, prompt=True)
+        if not _trace_dump_success_visible(screen):
+            raise ValidationError(
+                f"{command} returned to DOS without its success marker:\n"
+                + screen)
+
+    reset_after_dump, reset_events_after_dump = _reset_vector_hits(machine)
+    expected_after_dump = reset_after_system + len(dump_commands)
+    if reset_after_dump != expected_after_dump:
+        raise ValidationError(
+            "trace commands did not each use exactly one normal CP/M warm-"
+            "boot return boundary: " +
+            reset_events_after_dump)
+
+    # Power-off flushes Nextor's FAT state before either diskmanipulator or
+    # mtools inspects the disposable image. The one openMSX process remains
+    # the sole emulator instance for the entire validation.
+    machine.cmd("set power off")
+    machine.cmd("diskmanipulator chdir hda1 /")
+    listing = machine.cmd("diskmanipulator dir hda1")
+    sizes: dict[str, int] = {}
+    traces: list[dict[str, object]] = []
+    for name in TRACE_DUMP_NAMES:
+        size = _dos_entry_size(listing, name)
+        if size is None or size <= 0:
+            raise ValidationError(
+                f"{name} was not committed to the disposable DOS disk")
+        sizes[name] = size
+        target = runtime / name.lower()
+        _extract_dos_file(disk, name, target)
+        try:
+            content = target.read_text(encoding="ascii")
+        except (OSError, UnicodeError) as exc:
+            raise ValidationError(
+                f"could not read extracted resident trace {name}: {exc}") \
+                from exc
+        parsed = parse_resident_trace(content)
+        validate_resident_trace(parsed)
+        traces.append(parsed)
+
+    first, second = traces
+    if first["first_incident"] != second["first_incident"]:
+        raise ValidationError(
+            "the resident trace lost or replaced its frozen FIRST incident")
+    sequence_delta = (
+        int(second["sequence"]) - int(first["sequence"])) & 0xFFFF
+    if sequence_delta >= 0x8000:
+        raise ValidationError(
+            "the resident trace sequence moved backwards or was reset")
+    first_by_sequence = {
+        int(record["sequence"]): record for record in first["records"]
+    }
+    second_by_sequence = {
+        int(record["sequence"]): record for record in second["records"]
+    }
+    overlap = set(first_by_sequence) & set(second_by_sequence)
+    expected_overlap = min(
+        len(first_by_sequence),
+        max(0, TRACE_RECORD_CAPACITY - sequence_delta),
+    )
+    if len(overlap) < expected_overlap:
+        raise ValidationError(
+            "the second resident trace dump lost records that still fit in "
+            "the ring")
+    for sequence in overlap:
+        if first_by_sequence[sequence] != second_by_sequence[sequence]:
+            raise ValidationError(
+                f"resident trace record {sequence:04X} changed between dumps")
+
+    first_incident = second["first_incident"]
+    if first_incident is None or first_incident["event"] != "DROP":
+        raise ValidationError(
+            "the deterministic MCP disconnect did not freeze a DROP incident")
+    events = list(second["events"])
+    for required in ("SYSTEM_SUSPEND", "SYSTEM_RESUME"):
+        if required not in events:
+            raise ValidationError(
+                f"resident trace did not retain required event {required}")
+
+    return {
+        "resident_trace_enabled": True,
+        "resident_trace": second,
+        "resident_trace_dump_commands": list(dump_commands),
+        "resident_trace_dump_sizes": sizes,
+        "resident_log_preserved": True,
+        "resident_trace_events_between_dumps": sequence_delta,
+        "resident_trace_overlapping_records": len(overlap),
+        "basic_to_dos_via_system": True,
+        "reset_vector_hits_before_system": reset_before,
+        "system_warm_boot_vector_hits": reset_after_system - reset_before,
+        "dump_command_warm_boot_vector_hits":
+            reset_after_dump - reset_after_system,
+        "reset_vector_hits_after_dump": reset_after_dump,
+        "reset_vector_events_before_system": reset_events_before,
+        "system_screen_reached_dos": _dos_prompt_visible(system_screen),
+    }
+
+
+def _install_reset_vector_trace(machine: object) -> None:
+    """Count executions at 0000h after the resident has been installed."""
+    machine.cmd(r'''
+namespace eval msxaifaultreset {
+    variable armed 0
+    variable hits {}
+    proc mark {} {
+        variable armed
+        if {!$armed} {return}
+        variable hits
+        lappend hits [list [machine_info time] [format %04X [reg PC]] \
+            [format %04X [reg SP]] [format %04X [reg AF]]]
+        if {[llength $hits] > 32} {set hits [lrange $hits end-31 end]}
+    }
+}
+set msxaifaultreset::bp [debug set_bp 0x0000 \
+    {$msxaifaultreset::armed} {msxaifaultreset::mark}]
+set msxaifaultreset::hits {}
+set msxaifaultreset::armed 1
+''')
+
+
+def _reset_vector_hits(machine: object) -> tuple[int, str]:
+    raw = machine.cmd("set msxaifaultreset::hits")
+    count = int(machine.cmd("llength $msxaifaultreset::hits"))
+    return count, raw
+
+
+def _install_unapi_io_trace(machine: object) -> None:
+    """Trace lifecycle commands sent to the emulated UNAPI bridge."""
+    machine.cmd(r'''
+namespace eval msxaiunapitrace {
+    variable events {}
+    variable phase setup
+    variable opens 0
+    variable states 0
+    variable aborts 0
+    proc mark {} {
+        variable events
+        variable phase
+        variable opens
+        variable states
+        variable aborts
+        set value $::wp_last_value
+        if {$value == 3} {incr opens}
+        if {$value == 7} {incr states}
+        if {$value == 8} {incr aborts}
+        # STATE is intentionally counted but not retained: the resident polls
+        # it thousands of times and would evict the lifecycle evidence.
+        if {$value == 3 || $value == 8} {
+            lappend events [list [machine_info time] $phase $value \
+                [format %04X [reg PC]] [format %04X [reg SP]]]
+            if {[llength $events] > 512} {
+                set events [lrange $events end-511 end]
+            }
+        }
+    }
+}
+set msxaiunapitrace::wp [debug set_watchpoint write_io 0x28 {} \
+    {msxaiunapitrace::mark}]
+''')
+
+
+def _set_unapi_trace_phase(machine: object, phase: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", phase):
+        raise ValueError(f"invalid UNAPI trace phase {phase!r}")
+    machine.cmd(f"set msxaiunapitrace::phase {phase}")
+
+
+def _unapi_io_trace_report(machine: object) -> dict[str, object]:
+    return {
+        "tcp_open_commands": int(machine.cmd("set msxaiunapitrace::opens")),
+        "tcp_state_commands": int(machine.cmd("set msxaiunapitrace::states")),
+        "tcp_abort_commands": int(machine.cmd("set msxaiunapitrace::aborts")),
+        "retained_event_count": int(
+            machine.cmd("llength $msxaiunapitrace::events")),
+        "events_tcl": machine.cmd("set msxaiunapitrace::events"),
+    }
+
+
+def _machine_health(machine: object, previous_time: float,
+                    reset_count: int, phase: str) -> dict[str, object]:
+    """Assert that a network fault did not reboot or kill the emulator."""
+    if machine.proc is None or machine.proc.poll() is not None:
+        raise ValidationError(f"openMSX exited during {phase}")
+    power = machine.cmd("set power").strip().lower()
+    if power not in ("on", "true", "1"):
+        raise ValidationError(f"MSX power changed to {power!r} during {phase}")
+    emulator_time = float(machine.cmd("machine_info time"))
+    if emulator_time <= previous_time:
+        raise ValidationError(
+            f"machine time did not progress during {phase}: "
+            f"{previous_time:.6f} -> {emulator_time:.6f}")
+    observed_resets, reset_events = _reset_vector_hits(machine)
+    if observed_resets != reset_count:
+        raise ValidationError(
+            f"MSX executed the reset vector during {phase}: {reset_events}")
+    return {
+        "power": "on",
+        "emulator_time": emulator_time,
+        "reset_vector_hits": observed_resets,
+        "openmsx_process_alive": True,
+    }
 
 
 def _assert_command_screen(command: str, screen: str, *, prompt: bool) -> None:
@@ -925,25 +1434,51 @@ async def _exercise_public_mcp_async(
                             "RCV path is not transparent")
 
                     set_phase(
-                        "public-MCP disconnect and foreground passive relisten")
+                        "public-MCP disconnect and automatic foreground relisten")
                     await _mcp_disconnect(client)
                     connected = False
                     machine.cmd("set throttle off")
                     machine.advance(3)
-                    # Lifecycle calls are deliberately not issued from H.TIMI:
-                    # Pico/Pico+ advertises TCP_OPEN as potentially blocking. A
-                    # same-driver TsrCall is the safe foreground relisten path.
-                    machine.type_line(commands[3])
-                    machine.advance(3)
-                    screen = machine.screen_text()
-                    grace = 15
-                    while not _dos_prompt_visible(screen) and grace > 0:
-                        machine.advance(1)
-                        grace -= 1
-                        screen = machine.screen_text()
-                    _assert_command_screen(commands[3], screen, prompt=True)
+                    # H.TIMI detects the closed stream but deliberately cannot
+                    # issue a potentially blocking TCP_OPEN. Prove the listener
+                    # is still closed before supplying any foreground input.
+                    h_timi_lifecycle_deferred = False
+                    try:
+                        await _mcp_connect(
+                            client, settings.host, settings.port, 1.0)
+                    except ValidationError:
+                        h_timi_lifecycle_deferred = True
+                    else:
+                        connected = True
+                        raise ValidationError(
+                            "UNAPI listener reopened from H.TIMI before a "
+                            "safe foreground boundary")
 
+                    # A single ordinary character releases the CHGET that was
+                    # already waiting and enters another CHGET without printing
+                    # a new prompt.  Prove that H.CHGE alone is not sufficient:
+                    # only the one-shot H.CHPU('>') prompt token may authorize
+                    # the blocking lifecycle operation.
                     machine.cmd("set throttle on")
+                    machine.type("V")
+                    machine.advance(1)
+                    bare_chget_lifecycle_deferred = False
+                    try:
+                        await _mcp_connect(
+                            client, settings.host, settings.port, 1.0)
+                    except ValidationError:
+                        bare_chget_lifecycle_deferred = True
+                    else:
+                        connected = True
+                        raise ValidationError(
+                            "UNAPI listener reopened from a bare H.CHGE "
+                            "without a new COMMAND2 prompt")
+
+                    # Complete VER and press Return. COMMAND2 prints its next
+                    # prompt; H.CHPU arms the one-shot token and the following
+                    # H.CHGE consumes it. No MSXAI command or resident
+                    # reconfiguration is involved.
+                    machine.type_line("ER")
                     set_phase("second public-MCP host-to-MSX TCP handshake")
                     await _mcp_connect(
                         client, settings.host, settings.port, settings.timeout)
@@ -951,6 +1486,56 @@ async def _exercise_public_mcp_async(
                     second_status = await _mcp_status(client)
                     _assert_agent_identity(second_status)
                     second = _agent_snapshot(second_status)
+                    _assert_command_screen(
+                        "automatic foreground relisten",
+                        machine.screen_text(), prompt=True)
+                    await _mcp_memory_read(
+                        client, MEMORY_TEST_ADDRESS, 16)
+
+                    # Keep the second socket alive while COMMAND2 enters BASIC
+                    # so the loss is first observed at the BASIC prompt. A
+                    # direct non-SYSTEM line reaches H.CRUN at BASIC_BUF and is
+                    # the safe BASIC foreground boundary for the same relisten.
+                    set_phase("enter BASIC while second MCP session remains live")
+                    machine.type_line("BASIC")
+                    machine.cmd("set throttle off")
+                    machine.advance(3)
+                    _assert_agent_identity(await _mcp_status(client))
+                    await _mcp_disconnect(client)
+                    connected = False
+                    machine.advance(3)
+
+                    basic_idle_lifecycle_deferred = False
+                    try:
+                        await _mcp_connect(
+                            client, settings.host, settings.port, 1.0)
+                    except ValidationError:
+                        basic_idle_lifecycle_deferred = True
+                    else:
+                        connected = True
+                        raise ValidationError(
+                            "UNAPI listener reopened from H.TIMI while BASIC "
+                            "was idle at its prompt")
+
+                    set_phase("automatic BASIC H.CRUN foreground relisten")
+                    machine.cmd("set throttle on")
+                    machine.type_line("PRINT 1")
+                    machine.cmd("set throttle off")
+                    machine.advance(2)
+                    basic_screen = machine.screen_text()
+                    if re.search(
+                            r"(?ims)^\s*PRINT 1\s*$.*^\s*1\s*$.*^\s*Ok\s*$",
+                            basic_screen) is None:
+                        raise ValidationError(
+                            "BASIC did not finish PRINT 1 and return to Ok "
+                            "after H.CRUN relisten:\n" + basic_screen)
+                    machine.cmd("set throttle on")
+                    await _mcp_connect(
+                        client, settings.host, settings.port, settings.timeout)
+                    connected = True
+                    third_status = await _mcp_status(client)
+                    _assert_agent_identity(third_status)
+                    third = _agent_snapshot(third_status)
                     await _mcp_memory_read(
                         client, MEMORY_TEST_ADDRESS, 16)
                     await _mcp_disconnect(client)
@@ -962,6 +1547,13 @@ async def _exercise_public_mcp_async(
                         "host_control_path": "public MCP tools over STDIO",
                         "first_connection": first,
                         "second_connection": second,
+                        "third_connection": third,
+                        "h_timi_lifecycle_deferred":
+                            h_timi_lifecycle_deferred,
+                        "bare_chget_lifecycle_deferred":
+                            bare_chget_lifecycle_deferred,
+                        "basic_idle_lifecycle_deferred":
+                            basic_idle_lifecycle_deferred,
                         "memory_compare": {
                             "address": MEMORY_TEST_ADDRESS,
                             "length": 64,
@@ -1002,10 +1594,324 @@ def _exercise_public_mcp(
     )
 
 
+async def _forget_faulted_mcp_session(client: object) -> None:
+    """Drop host-side protocol state after the proxy has severed its socket."""
+    with contextlib.suppress(Exception):
+        await _mcp_call(
+            client, "msx_agent_disconnect", read_timeout=5.0)
+
+
+def _foreground_dos_recovery(machine: object, command: str = "VER") -> str:
+    """Generate one ordinary COMMAND2 foreground boundary."""
+    machine.cmd("set throttle off")
+    before = machine.screen_text()
+    machine.type_line(command)
+    screen = _wait_dos_command_completion(machine, command, before)
+    machine.cmd("set throttle on")
+    _assert_command_screen(command, screen, prompt=True)
+    return screen
+
+
+async def _exercise_fault_matrix_async(
+        machine: object, settings: Settings,
+        set_phase: Callable[[str], None], mcp_stderr: pathlib.Path,
+        cycles: int) -> dict[str, object]:
+    """Inject repeatable host-side TCP faults into one emulated MSX."""
+    from mcp.client import Client  # pylint: disable=import-outside-toplevel
+    from mcp.client.stdio import (  # pylint: disable=import-outside-toplevel
+        StdioServerParameters,
+        stdio_client,
+    )
+    from tools.tcp_fault_proxy import (  # pylint: disable=import-outside-toplevel
+        TCPFaultProxy,
+    )
+
+    if isinstance(cycles, bool) or not isinstance(cycles, int) or cycles <= 0:
+        raise ValueError("fault cycles must be a positive integer")
+
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "server", "--transport", "stdio", "--log-level", "error"],
+        cwd=settings.root,
+        env=os.environ.copy(),
+    )
+    events: list[dict[str, object]] = []
+    reset_count, _reset_events = _reset_vector_hits(machine)
+    previous_time = float(machine.cmd("machine_info time"))
+
+    with TCPFaultProxy(settings.host, settings.port) as proxy:
+        proxy_host, proxy_port = proxy.endpoint
+        with mcp_stderr.open("w+", encoding="utf-8") as error_log:
+            client = Client(
+                stdio_client(parameters, errlog=error_log),
+                mode="auto",
+                read_timeout_seconds=max(15.0, settings.timeout + 10.0),
+                cache=None,
+            )
+            connected = False
+            try:
+                async with client:
+                    set_phase("fault matrix initial proxied MCP handshake")
+                    _set_unapi_trace_phase(machine, "initial-handshake")
+                    await _mcp_connect(
+                        client, proxy_host, proxy_port, settings.timeout)
+                    connected = True
+                    first_status = await _mcp_status(client)
+                    _assert_agent_identity(first_status)
+                    first = _agent_snapshot(first_status)
+
+                    set_phase("steady-state framed traffic before fault injection")
+                    _set_unapi_trace_phase(machine, "steady-state")
+                    for index in range(STEADY_STATE_ROUND_TRIPS):
+                        address = MEMORY_TEST_ADDRESS + ((index * 17) & 0xFF)
+                        via_agent = await _mcp_memory_read(client, address, 16)
+                        via_debugger = _openmsx_memory(machine, address, 16)
+                        if via_agent != via_debugger:
+                            raise ValidationError(
+                                f"steady-state RAM mismatch at {address:04X}h "
+                                f"on round trip {index + 1}")
+                    health = _machine_health(
+                        machine, previous_time, reset_count,
+                        "steady-state framed traffic")
+                    previous_time = float(health["emulator_time"])
+                    events.append({
+                        "scenario": "steady_state",
+                        "round_trips": STEADY_STATE_ROUND_TRIPS,
+                        "recovered": True,
+                        "health": health,
+                    })
+
+                    for cycle in range(1, cycles + 1):
+                        set_phase(f"fault cycle {cycle}: FIN at idle DOS prompt")
+                        _set_unapi_trace_phase(machine, f"cycle-{cycle}-idle-fin")
+                        before = proxy.wait_for_session()
+                        cut = proxy.cut("fin")
+                        connected = False
+                        await _forget_faulted_mcp_session(client)
+                        machine.cmd("set throttle off")
+                        machine.advance(3)
+                        health = _machine_health(
+                            machine, previous_time, reset_count,
+                            f"fault cycle {cycle} idle FIN")
+                        previous_time = float(health["emulator_time"])
+                        recovery_command = f"ECHO FIN{cycle:02d}"
+                        _foreground_dos_recovery(
+                            machine, recovery_command)
+                        await _mcp_connect(
+                            client, proxy_host, proxy_port, settings.timeout)
+                        connected = True
+                        status = await _mcp_status(client)
+                        _assert_agent_identity(status)
+                        await _mcp_memory_read(
+                            client, MEMORY_TEST_ADDRESS, 16)
+                        events.append({
+                            "cycle": cycle,
+                            "scenario": "dos_idle_fin",
+                            "proxy_session": before.number,
+                            "fault": cut.fault,
+                            "bytes_before_cut": {
+                                "client_to_target": cut.client_to_target,
+                                "target_to_client": cut.target_to_client,
+                            },
+                            "foreground": recovery_command,
+                            "recovered": True,
+                            "health": health,
+                        })
+
+                        set_phase(
+                            f"fault cycle {cycle}: RST queued before marked command")
+                        _set_unapi_trace_phase(
+                            machine, f"cycle-{cycle}-queued-rst")
+                        queued_command = f"ECHO RST{cycle:02d}"
+                        machine.cmd("set pause on")
+                        before_screen = machine.screen_text()
+                        try:
+                            machine.type_line(queued_command)
+                            before = proxy.wait_for_session()
+                            cut = proxy.cut("rst")
+                            connected = False
+                            await _forget_faulted_mcp_session(client)
+                        finally:
+                            machine.cmd("set pause off")
+                        machine.cmd("set throttle off")
+                        screen = _wait_dos_command_completion(
+                            machine, queued_command, before_screen)
+                        machine.cmd("set throttle on")
+                        _assert_command_screen(
+                            queued_command, screen, prompt=True)
+                        health = _machine_health(
+                            machine, previous_time, reset_count,
+                            f"fault cycle {cycle} queued-command RST")
+                        previous_time = float(health["emulator_time"])
+                        await _mcp_connect(
+                            client, proxy_host, proxy_port, settings.timeout)
+                        connected = True
+                        status = await _mcp_status(client)
+                        _assert_agent_identity(status)
+                        await _mcp_memory_read(
+                            client, MEMORY_TEST_ADDRESS, 16)
+                        events.append({
+                            "cycle": cycle,
+                            "scenario": "rst_before_queued_command",
+                            "proxy_session": before.number,
+                            "fault": cut.fault,
+                            "foreground":
+                                f"{queued_command} already queued while paused",
+                            "recovered": True,
+                            "health": health,
+                        })
+
+                        set_phase(
+                            f"fault cycle {cycle}: blackhole then RST")
+                        _set_unapi_trace_phase(
+                            machine, f"cycle-{cycle}-blackhole-rst")
+                        before = proxy.wait_for_session()
+                        silence = proxy.cut("blackhole")
+                        machine.cmd("set throttle off")
+                        machine.advance(3)
+                        silent_health = _machine_health(
+                            machine, previous_time, reset_count,
+                            f"fault cycle {cycle} blackhole")
+                        previous_time = float(silent_health["emulator_time"])
+                        if not proxy.wait_for_session(
+                                after=before.number - 1).connected:
+                            raise ValidationError(
+                                "blackholed proxy session closed unexpectedly")
+                        cut = proxy.cut("rst")
+                        connected = False
+                        await _forget_faulted_mcp_session(client)
+                        machine.advance(3)
+                        recovery_command = f"ECHO BLK{cycle:02d}"
+                        _foreground_dos_recovery(
+                            machine, recovery_command)
+                        await _mcp_connect(
+                            client, proxy_host, proxy_port, settings.timeout)
+                        connected = True
+                        status = await _mcp_status(client)
+                        _assert_agent_identity(status)
+                        await _mcp_memory_read(
+                            client, MEMORY_TEST_ADDRESS, 16)
+                        health = _machine_health(
+                            machine, previous_time, reset_count,
+                            f"fault cycle {cycle} post-blackhole recovery")
+                        previous_time = float(health["emulator_time"])
+                        events.append({
+                            "cycle": cycle,
+                            "scenario": "blackhole_then_rst",
+                            "proxy_session": before.number,
+                            "blackhole_observed_open": silence.connected,
+                            "terminal_fault": cut.fault,
+                            "foreground": recovery_command,
+                            "recovered": True,
+                            "health_during_silence": silent_health,
+                            "health": health,
+                        })
+
+                    set_phase("premature MCP reconnect while recovery is pending")
+                    _set_unapi_trace_phase(machine, "premature-reconnect")
+                    before = proxy.wait_for_session()
+                    proxy.cut("rst")
+                    connected = False
+                    await _forget_faulted_mcp_session(client)
+                    machine.cmd("set throttle off")
+                    machine.advance(0.2)
+                    premature_result = "connected"
+                    try:
+                        await _mcp_connect(
+                            client, proxy_host, proxy_port, 1.0)
+                    except ValidationError as exc:
+                        premature_result = f"failed: {exc}"
+                        await _forget_faulted_mcp_session(client)
+                    else:
+                        connected = True
+                        raise ValidationError(
+                            "premature MCP reconnect succeeded before any "
+                            "foreground recovery boundary")
+                    if not connected:
+                        recovery_command = "ECHO PREMATURE"
+                        _foreground_dos_recovery(
+                            machine, recovery_command)
+                        await _mcp_connect(
+                            client, proxy_host, proxy_port, settings.timeout)
+                        connected = True
+                    status = await _mcp_status(client)
+                    _assert_agent_identity(status)
+                    await _mcp_memory_read(client, MEMORY_TEST_ADDRESS, 16)
+                    health = _machine_health(
+                        machine, previous_time, reset_count,
+                        "premature reconnect recovery")
+                    events.append({
+                        "scenario": "premature_reconnect",
+                        "proxy_session": before.number,
+                        "first_attempt": premature_result,
+                        "recovered": True,
+                        "health": health,
+                    })
+                    await _mcp_disconnect(client)
+                    connected = False
+
+                    return {
+                        "host_control_path":
+                            "public MCP tools through deterministic TCP proxy",
+                        "first_connection": first,
+                        "fault_cycles": cycles,
+                        "fault_scenarios": list(FAULT_SCENARIOS),
+                        "fault_matrix": events,
+                        "proxy_endpoint": [proxy_host, proxy_port],
+                        "proxy_sessions": [
+                            dataclasses.asdict(item) for item in proxy.history
+                        ],
+                        "reset_vector_hits": _reset_vector_hits(machine)[0],
+                        "unapi_io_trace": _unapi_io_trace_report(machine),
+                    }
+            except Exception as exc:
+                error_log.flush()
+                error_log.seek(0)
+                stderr = error_log.read().strip()
+                suffix = f"\nMCP server stderr:\n{stderr}" if stderr else ""
+                if isinstance(exc, ValidationError):
+                    raise ValidationError(str(exc) + suffix) from exc
+                raise ValidationError(
+                    f"fault matrix MCP session failed: "
+                    f"{_exception_tree(exc)}{suffix}") from exc
+            finally:
+                if connected:
+                    with contextlib.suppress(Exception):
+                        await _mcp_call(
+                            client, "msx_agent_disconnect", read_timeout=5.0)
+
+
+def _exercise_fault_matrix(
+        machine: object, settings: Settings,
+        set_phase: Callable[[str], None], mcp_stderr: pathlib.Path,
+        cycles: int) -> dict[str, object]:
+    import anyio  # pylint: disable=import-outside-toplevel
+
+    return anyio.run(
+        _exercise_fault_matrix_async,
+        machine, settings, set_phase, mcp_stderr, cycles,
+    )
+
+
 def run_validation(settings: Settings, *,
                    runner: Callable[..., subprocess.CompletedProcess[str]] =
-                   subprocess.run) -> dict[str, object]:
+                   subprocess.run,
+                   fault_cycles: int = 0,
+                   trace_validation: bool = False) -> dict[str, object]:
     """Run discovery, passive TCP, send/receive, close, and relisten E2E."""
+    if (isinstance(fault_cycles, bool) or not isinstance(fault_cycles, int) or
+            fault_cycles < 0):
+        raise ValueError("fault_cycles must be a non-negative integer")
+    if not isinstance(trace_validation, bool):
+        raise TypeError("trace_validation must be a boolean")
+    if trace_validation and fault_cycles:
+        raise ValueError(
+            "trace_validation and fault_cycles are separate single-instance "
+            "validation modes")
+    if trace_validation and settings.keep_open:
+        raise ValueError(
+            "trace validation powers off to inspect the FAT image and cannot "
+            "be combined with keep_open")
     validate_local_prerequisites(settings)
     canonical = build_agent_package(settings, runner=runner)
     machine = None
@@ -1077,6 +1983,15 @@ def run_validation(settings: Settings, *,
 
                 phase = "import MSX-AI and UNAPINET.COM onto disposable disk"
                 _import_suite(machine, runtime_artifacts)
+                if trace_validation:
+                    machine.cmd("diskmanipulator chdir hda1 /")
+                    root_listing = machine.cmd("diskmanipulator dir hda1")
+                    for name in (*TRACE_DUMP_NAMES, TRACE_FAILURE_DUMP_NAME):
+                        if _dos_entry_size(root_listing, name) is not None:
+                            machine.cmd(
+                                f"diskmanipulator delete hda1 {name}")
+                            root_listing = machine.cmd(
+                                "diskmanipulator dir hda1")
                 machine.power_on()
                 machine.advance(14)
                 initial_screen = machine.screen_text()
@@ -1085,7 +2000,8 @@ def run_validation(settings: Settings, *,
                         "Nextor/MSX-DOS did not reach a prompt after boot:\n"
                         + initial_screen)
 
-                commands = msx_install_commands(settings.port)
+                commands = msx_install_commands(
+                    settings.port, trace=trace_validation)
                 phase = "configure MSXAI_HOME and PATH"
                 for command in commands[:2]:
                     machine.type_line(command)
@@ -1106,15 +2022,41 @@ def run_validation(settings: Settings, *,
                     machine.advance(1)
                     grace -= 1
                     screen = machine.screen_text()
-                _assert_command_screen(commands[3], screen, prompt=True)
+                try:
+                    _assert_command_screen(commands[3], screen, prompt=True)
+                except ValidationError as install_error:
+                    if not trace_validation:
+                        raise
+                    phase = "capture resident trace after first-install failure"
+                    failed_trace = _capture_failed_install_trace(
+                        machine, disk, runtime)
+                    raise ValidationError(
+                        f"{install_error}\nresident trace after failure:\n" +
+                        json.dumps(failed_trace, indent=2, sort_keys=True)) \
+                        from install_error
+
+                _install_reset_vector_trace(machine)
+                _install_unapi_io_trace(machine)
 
                 def set_phase(value: str) -> None:
                     nonlocal phase
                     phase = value
 
-                mcp_report = _exercise_public_mcp(
-                    machine, settings, commands, set_phase,
-                    runtime / "mcp-stderr.log")
+                if fault_cycles:
+                    phase = "initialize deterministic TCP fault matrix"
+                    mcp_report = _exercise_fault_matrix(
+                        machine, settings, set_phase,
+                        runtime / "mcp-fault-stderr.log", fault_cycles)
+                else:
+                    mcp_report = _exercise_public_mcp(
+                        machine, settings, commands, set_phase,
+                        runtime / "mcp-stderr.log")
+
+                trace_report: dict[str, object] = {}
+                if trace_validation:
+                    phase = "return BASIC to DOS and validate resident trace"
+                    trace_report = _exercise_resident_trace(
+                        machine, disk, runtime)
 
                 if settings.keep_open:
                     print(
@@ -1125,7 +2067,7 @@ def run_validation(settings: Settings, *,
                     if machine.proc is not None:
                         machine.proc.wait()
 
-                return {
+                result = {
                     "ok": True,
                     "release": RELEASE,
                     "asset": distribution.asset_name,
@@ -1135,13 +2077,27 @@ def run_validation(settings: Settings, *,
                     "commands": list(commands),
                     "mapper_profile": mapper_profile,
                     **mcp_report,
-                    "foreground_relisten_after_host_close": True,
+                    **trace_report,
                     "contract_path_exercised": list(CONTRACT_PATH),
                     "pinned_get_capab_block1_hl":
                         f"0x{PINNED_GET_CAPAB_BLOCK1_HL:04X}",
                     "pico_firmware_emulated": False,
                     "not_emulated": list(NOT_EMULATED),
                 }
+                if fault_cycles:
+                    result.update({
+                        "fault_injection": True,
+                        "fault_scenarios_exercised": list(FAULT_SCENARIOS),
+                    })
+                else:
+                    result.update({
+                        "automatic_foreground_relisten_after_console_input":
+                            True,
+                        "automatic_basic_h_crun_relisten": True,
+                    })
+                if trace_validation:
+                    result["resident_trace_validation"] = True
+                return result
             except Exception as exc:
                 if isinstance(exc, HarnessError):
                     message = str(exc)
@@ -1196,7 +2152,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Preflight or run the pinned openMSXnet v0.9.7 TCP/IP UNAPI "
             "validation; no downloads or global installs are performed."))
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("preflight", "run"):
+    for name in ("preflight", "run", "faults", "trace"):
         command = subparsers.add_parser(name)
         command.add_argument(
             "--archive", default=_env("MSX_AI_UNAPINET_ARCHIVE"),
@@ -1230,6 +2186,11 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--keep-open", action="store_true",
             help="leave the visible emulator running until its window closes")
+        if name == "faults":
+            command.add_argument(
+                "--cycles", type=int, default=DEFAULT_FAULT_CYCLES,
+                help=("number of FIN/RST/blackhole cycles in the single "
+                      f"openMSX instance (default: {DEFAULT_FAULT_CYCLES})"))
     return parser
 
 
@@ -1242,7 +2203,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = preflight(settings)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0 if result["ready"] else 2
-        result = run_validation(settings)
+        if namespace.command == "faults":
+            result = run_validation(settings, fault_cycles=namespace.cycles)
+        elif namespace.command == "trace":
+            result = run_validation(settings, trace_validation=True)
+        else:
+            result = run_validation(settings)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except HarnessError as exc:

@@ -105,6 +105,7 @@ TSR_TALK_CONFIG: equ 0A5h
 ; versioned page-zero request with a caller-owned 1 KiB lifecycle stack.
 TSR_TALK_UNAPI_PORT_LEGACY: equ 0A6h
 TSR_TALK_UNAPI_PORT: equ 0A7h
+TSR_TALK_TRACE: equ 0A8h
 TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah
 TSR_UNAPI_REQUEST_VERSION: equ 1
 TSR_UNAPI_REQUEST_SIZE: equ 16
@@ -117,6 +118,47 @@ TSR_UNAPI_REQUEST_TRANSPORT: equ 12
 TSR_UNAPI_REQUEST_CONNECTION: equ 13
 TSR_UNAPI_REQUEST_TARGET: equ 14
 TSR_UNAPI_REQUEST_RESERVED: equ 15
+TSR_TRACE_REQUEST_MAGIC: equ 0A85Ah
+TSR_TRACE_REQUEST_VERSION: equ 1
+TSR_TRACE_REQUEST_SIZE: equ 16
+TSR_TRACE_REQUEST_ACTION: equ 4
+TSR_TRACE_REQUEST_STATUS: equ 5
+TSR_TRACE_REQUEST_LENGTH: equ 6
+TSR_TRACE_ACTION_ENABLE: equ 1
+TSR_TRACE_ACTION_SNAPSHOT: equ 2
+TRACE_FORMAT_MAGIC: equ 0A84Dh       ; private little-endian trace signature
+TRACE_FORMAT_VERSION: equ 1
+TRACE_RECORD_SIZE: equ 8
+TRACE_RECORD_CAPACITY: equ 16
+TRACE_HEADER_SIZE: equ 16
+TRACE_SNAPSHOT_SIZE: equ 16
+TRACE_EXPORT_SIZE: equ TRACE_HEADER_SIZE + TRACE_SNAPSHOT_SIZE + TRACE_RECORD_SIZE * TRACE_RECORD_CAPACITY
+TRACE_EXPORT_COUNT: equ 5
+TRACE_EXPORT_WRITE_INDEX: equ 6
+TRACE_EXPORT_FLAGS: equ 7
+TRACE_EXPORT_SEQUENCE: equ 8
+TRACE_EXPORT_POLLS: equ 10
+TRACE_EXPORT_STATE_CHANGES: equ 12
+TRACE_EXPORT_TIMI: equ 14
+TRACE_EXPORT_SNAPSHOT: equ TRACE_HEADER_SIZE
+TRACE_EXPORT_RECORDS: equ TRACE_HEADER_SIZE + TRACE_SNAPSHOT_SIZE
+TRACE_FLAG_ENABLED: equ 1
+TRACE_FLAG_INCIDENT: equ 2
+TRACE_FLAG_WRAPPED: equ 4
+TRACE_EVENT_ENABLE: equ 1
+TRACE_EVENT_STATE: equ 2
+TRACE_EVENT_STATE_ERROR: equ 3
+TRACE_EVENT_DROP: equ 4
+TRACE_EVENT_DOS_RELISTEN: equ 5
+TRACE_EVENT_BASIC_RELISTEN: equ 6
+TRACE_EVENT_OPEN_BEGIN: equ 7
+TRACE_EVENT_OPEN_END: equ 8
+TRACE_EVENT_ABORT_BEGIN: equ 9
+TRACE_EVENT_ABORT_END: equ 10
+TRACE_EVENT_SYSTEM_SUSPEND: equ 11
+TRACE_EVENT_SYSTEM_RESUME: equ 12
+TRACE_EVENT_RECONFIG_BEGIN: equ 13
+TRACE_EVENT_RECONFIG_END: equ 14
 TSR_UNAPI_STACK_MINIMUM: equ 0400h
 TSR_UNAPI_STACK_GUARD_SIZE: equ 16
 TSR_UNAPI_STACK_LOW_GUARD: equ 0A5h
@@ -149,6 +191,7 @@ RUNTIME_RESIDENT: equ 0
 RUNTIME_MONITOR:  equ 1
 LOADER_ACTION_INSTALL: equ 0
 LOADER_ACTION_UNINSTALL: equ 1
+LOADER_ACTION_DUMPTRACE: equ 2
 TRANSPORT_FLAG_KEYI_EXCLUSIVE: equ 1
 TRANSPORT_FLAG_TIMI_ONLY:      equ 2
 TRANSPORT_FLAG_FRAME_WAKE_ACK: equ 4
@@ -205,6 +248,10 @@ installer:
     call loader_parse_command_line
     jp c,loader_usage_exit
 
+    ld a,(loader_action)
+    cp LOADER_ACTION_DUMPTRACE
+    jp z,loader_dump_trace
+
     ld de,install_banner
     ld c,9
     call 0005h
@@ -230,6 +277,13 @@ install_banner_transport_ready:
 install_banner_mode_ready:
     ld c,9
     call 0005h
+    ld a,(loader_trace_enabled)
+    or a
+    jr z,install_banner_trace_done
+    ld de,trace_on_banner
+    ld c,9
+    call 0005h
+install_banner_trace_done:
     ld a,(loader_debug_enabled)
     or a
     jr z,install_banner_done
@@ -410,6 +464,16 @@ install_no_room:
 loader_install_resident:
     call memman_find_agent
     jr c,loader_install_resident_new
+    ld a,(loader_trace_enabled)
+    or a
+    jr z,loader_install_resident_reconfigure
+    call memman_enable_trace
+    or a
+    jr nz,loader_resident_trace_error
+    ; A8 returns with DI; restore the foreground state before A7 may invoke a
+    ; blocking software or cartridge TCP/IP implementation.
+    ei
+loader_install_resident_reconfigure:
     ; A7 returns after restoring MemMan with DI.
     call memman_reconfigure_agent
     ld b,a
@@ -447,6 +511,10 @@ loader_resident_not_installed:
 loader_resident_call_error:
     ld de,resident_call_error_message
     jr loader_resident_message_exit
+loader_resident_trace_error:
+    ei
+    ld de,resident_trace_error_message
+    jr loader_resident_message_exit
 loader_memman_incompatible:
     ld de,memman_incompatible_message
 loader_resident_message_exit:
@@ -472,6 +540,8 @@ uninstall_mode_banner:
     db "Action: uninstall resident agent",13,10,"$"
 debug_on_banner:
     db "On-screen command trace: DEBUG",13,10,"$"
+trace_on_banner:
+    db "Resident TCP trace: enabled",13,10,"$"
 no_room_message:
     db "Not enough upper TPA space for the resident agent",13,10,"$"
 already_message:
@@ -480,6 +550,8 @@ not_installed_message:
     db "Resident agent is not installed",13,10,"$"
 resident_call_error_message:
     db "Resident agent rejected the transport selection",13,10,"$"
+resident_trace_error_message:
+    db "Resident trace unavailable; reinstall the matching suite",13,10,"$"
 memman_incompatible_message:
     db "MemMan 2.4 or newer is required",13,10,"$"
 inconsistent_message:
@@ -492,9 +564,11 @@ usage_message:
     db "Usage:",13,10
     db "  MSXAI /DRIVER:8251 [/MONITOR] [DEBUG]",13,10
     db "  MSXAI /DRIVER:16C550 [/MONITOR] [DEBUG]",13,10
-    db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/MONITOR] [DEBUG]",13,10
+    db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/TRACE | /MONITOR [DEBUG]]",13,10
+    db "  MSXAI <1..65534> [/TRACE]",13,10
+    db "  MSXAI /DUMPTRACE <file>",13,10
     db "  MSXAI /UNINSTALL",13,10
-    db "DEBUG is intentionally restricted to /MONITOR.",13,10,"$"
+    db "DEBUG is restricted to /MONITOR; /TRACE to resident UNAPI.",13,10,"$"
 driver_required_message:
     db "Select exactly one /DRIVER:8251, /DRIVER:16C550, or /DRIVER:UNAPI",13,10,"$"
 transport_init_error_message:
@@ -503,8 +577,12 @@ port_requires_unapi_message:
     db "/PORT requires /DRIVER:UNAPI and a value from 1 through 65534",13,10,"$"
 debug_requires_monitor_message:
     db "DEBUG requires /MONITOR",13,10,"$"
+trace_requires_resident_unapi_message:
+    db "/TRACE requires resident /DRIVER:UNAPI",13,10,"$"
+dumptrace_syntax_message:
+    db "/DUMPTRACE requires one DOS filename and no other options",13,10,"$"
 uninstall_syntax_message:
-    db "/UNINSTALL cannot be combined with driver, monitor, or debug options",13,10,"$"
+    db "/UNINSTALL cannot be combined with other options",13,10,"$"
 unknown_option_message:
     db "Unknown command-line option",13,10,"$"
 loader_transport_id:
@@ -513,8 +591,12 @@ loader_runtime_mode:
     db RUNTIME_RESIDENT
 loader_debug_enabled:
     db 0
+loader_trace_enabled:
+    db 0
 loader_action:
     db LOADER_ACTION_INSTALL
+loader_trace_path:
+    dw 0
 loader_command_buffer:
     ds 128,0
 
@@ -524,8 +606,11 @@ loader_parse_command_line:
     xor a
     ld (loader_runtime_mode),a
     ld (loader_debug_enabled),a
+    ld (loader_trace_enabled),a
     ld (loader_action),a
     ld (loader_port_seen),a
+    ld (loader_trace_path),a
+    ld (loader_trace_path + 1),a
     ld hl,6603
     ld (loader_unapi_port),hl
 
@@ -572,24 +657,54 @@ loader_parse_token_loop:
     jr z,loader_parse_8251
     ld de,option_driver_16c550
     call loader_token_equals
-    jr z,loader_parse_16c550
+    jp z,loader_parse_16c550
     ld de,option_driver_unapi
     call loader_token_equals
-    jr z,loader_parse_unapi
+    jp z,loader_parse_unapi
     ld de,option_port_prefix
     call loader_token_has_prefix
-    jr z,loader_parse_port
+    jp z,loader_parse_port
     ld de,option_monitor
     call loader_token_equals
     jp z,loader_parse_monitor
     ld de,option_debug
     call loader_token_equals
     jp z,loader_parse_debug
+    ld de,option_trace
+    call loader_token_equals
+    jp z,loader_parse_trace
+    ld de,option_dumptrace
+    call loader_token_equals
+    jp z,loader_parse_dumptrace
     ld de,option_uninstall
     call loader_token_equals
     jp z,loader_parse_uninstall
+    ; The compact public form `MSXAI 6603` selects UNAPI implicitly. It shares
+    ; the exact decimal parser and range checks used by /PORT:.
+    ld a,(hl)
+    cp '0'
+    jr c,loader_parse_unknown
+    cp '9' + 1
+    jp c,loader_parse_implicit_unapi_port
+loader_parse_unknown:
     ld de,unknown_option_message
     jp loader_parse_error
+
+loader_parse_implicit_unapi_port:
+    ld a,(loader_transport_id)
+    cp 0FFh
+    jp nz,loader_parse_driver_error
+    ld a,(loader_port_seen)
+    or a
+    jp nz,loader_parse_port_error
+    ld a,UNAPI_ID
+    ld (loader_transport_id),a
+    ld a,1
+    ld (loader_port_seen),a
+    ld bc,0
+    xor a
+    ld (loader_port_digit_count),a
+    jp loader_parse_port_digits
 
 loader_parse_8251:
     ld a,(loader_transport_id)
@@ -707,6 +822,36 @@ loader_parse_debug:
     ld (loader_debug_enabled),a
     call loader_skip_token
     jp loader_parse_token_loop
+loader_parse_trace:
+    ld a,(loader_trace_enabled)
+    or a
+    jp nz,loader_parse_trace_error
+    ld a,1
+    ld (loader_trace_enabled),a
+    call loader_skip_token
+    jp loader_parse_token_loop
+loader_parse_dumptrace:
+    ld a,(loader_action)
+    or a
+    jp nz,loader_parse_dumptrace_error
+    ld a,LOADER_ACTION_DUMPTRACE
+    ld (loader_action),a
+    call loader_skip_token
+    call loader_skip_spaces
+    ld a,(hl)
+    or a
+    jp z,loader_parse_dumptrace_error
+    ld (loader_trace_path),hl
+loader_parse_dumptrace_path_loop:
+    ld a,(hl)
+    or a
+    jr z,loader_parse_tokens_done
+    cp ' '
+    jp z,loader_parse_dumptrace_error
+    cp 9
+    jp z,loader_parse_dumptrace_error
+    inc hl
+    jr loader_parse_dumptrace_path_loop
 loader_parse_uninstall:
     ld a,(loader_action)
     or a
@@ -718,6 +863,8 @@ loader_parse_uninstall:
 
 loader_parse_tokens_done:
     ld a,(loader_action)
+    cp LOADER_ACTION_DUMPTRACE
+    jr z,loader_parse_dumptrace_done
     cp LOADER_ACTION_UNINSTALL
     jr z,loader_parse_uninstall_done
     ld a,(loader_transport_id)
@@ -730,6 +877,16 @@ loader_parse_tokens_done:
     cp UNAPI_ID
     jr nz,loader_parse_port_error
 loader_parse_port_driver_ok:
+    ld a,(loader_trace_enabled)
+    or a
+    jr z,loader_parse_debug_check
+    ld a,(loader_runtime_mode)
+    or a
+    jr nz,loader_parse_trace_error
+    ld a,(loader_transport_id)
+    cp UNAPI_ID
+    jr nz,loader_parse_trace_error
+loader_parse_debug_check:
     ld a,(loader_debug_enabled)
     or a
     jr z,loader_parse_ok
@@ -750,6 +907,30 @@ loader_parse_uninstall_done:
     ld a,(loader_debug_enabled)
     or a
     jr nz,loader_parse_uninstall_error
+    ld a,(loader_trace_enabled)
+    or a
+    jr nz,loader_parse_uninstall_error
+    jr loader_parse_ok
+loader_parse_dumptrace_done:
+    ld hl,(loader_trace_path)
+    ld a,h
+    or l
+    jr z,loader_parse_dumptrace_error
+    ld a,(loader_port_seen)
+    or a
+    jr nz,loader_parse_dumptrace_error
+    ld a,(loader_transport_id)
+    cp 0FFh
+    jr nz,loader_parse_dumptrace_error
+    ld a,(loader_runtime_mode)
+    or a
+    jr nz,loader_parse_dumptrace_error
+    ld a,(loader_debug_enabled)
+    or a
+    jr nz,loader_parse_dumptrace_error
+    ld a,(loader_trace_enabled)
+    or a
+    jr nz,loader_parse_dumptrace_error
 loader_parse_ok:
     or a
     ret
@@ -764,6 +945,12 @@ loader_parse_port_error:
     jr loader_parse_error
 loader_parse_debug_error:
     ld de,debug_requires_monitor_message
+    jr loader_parse_error
+loader_parse_trace_error:
+    ld de,trace_requires_resident_unapi_message
+    jr loader_parse_error
+loader_parse_dumptrace_error:
+    ld de,dumptrace_syntax_message
     jr loader_parse_error
 loader_parse_uninstall_error:
     ld de,uninstall_syntax_message
@@ -887,6 +1074,10 @@ option_monitor:
     db "/MONITOR",0
 option_debug:
     db "DEBUG",0
+option_trace:
+    db "/TRACE",0
+option_dumptrace:
+    db "/DUMPTRACE",0
 option_uninstall:
     db "/UNINSTALL",0
 loader_old_bdos:
@@ -1161,6 +1352,40 @@ tsr_config_unapi_error:
     db 0
 tsr_config_previous_in_hook:
     db 0
+; /TRACE exports this fixed, versioned block through TsrCall A8. Hooks append
+; only compact RAM records; no trace path performs DOS or filesystem I/O.
+trace_export_begin:
+trace_magic:
+    dw TRACE_FORMAT_MAGIC
+trace_format_version:
+    db TRACE_FORMAT_VERSION
+trace_record_size:
+    db TRACE_RECORD_SIZE
+trace_record_capacity:
+    db TRACE_RECORD_CAPACITY
+trace_record_count:
+    db 0
+trace_write_index:
+    db 0
+trace_flags:
+    db 0
+trace_sequence:
+    dw 0
+trace_poll_count:
+    dw 0
+trace_state_change_count:
+    dw 0
+trace_timi_count:
+    dw 0
+trace_failure_snapshot:
+    ds TRACE_SNAPSHOT_SIZE,0
+trace_records:
+    ds TRACE_RECORD_SIZE * TRACE_RECORD_CAPACITY,0
+trace_export_end:
+trace_last_tcp_result:
+    db 0FFh
+trace_last_tcp_state:
+    db 0FFh
 ; A TCP/IP UNAPI implementation can share cartridge hardware with the active
 ; Nextor disk driver. H.TIMI must not re-enter that firmware while a foreground
 ; page-0 slot transaction or an extended BASIC command is in flight.
@@ -1208,6 +1433,8 @@ tsr_unapi_result:
     db 0FFh
 tsr_unapi_status:
     db TSR_UNAPI_STATUS_ABI
+tsr_trace_request_pointer:
+    dw 0
 endif
 
 resident_initialize:
@@ -1220,6 +1447,9 @@ resident_initialize:
     ld hl,resident_start
     ld a,h
     ld (resident_page),a
+if MSXAI_TSR_BUILD
+    call trace_reset
+endif
     ; Under MSX-DOS page 0 is RAM, so read the version byte from the actual
     ; Main-ROM slot rather than from CPU address 002Dh.
     ld a,(EXPTBL)
@@ -1379,6 +1609,7 @@ resident_keyi_hook:
 
 resident_timi_hook:
     push af
+    call trace_count_timi
     ld a,(in_hook)
     or a
     jr nz,memman_nested_timi_return
@@ -1394,14 +1625,13 @@ resident_timi_hook:
 ; hook_dispatch_sp. MemMan receives QuitHook in A' bit 0: an exclusive H.KEYI
 ; is suppressed, while H.TIMI normally chains unless _SYSTEM is latched.
 memman_nested_keyi_return:
+    ld a,(unapi_lifecycle_busy)
+    or a
+    jr nz,memman_nested_hook_quit
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_KEYI_EXCLUSIVE
     jr z,memman_nested_hook_continue
-    pop af
-    ex af,af'
-    ld a,1                     ; QuitHook=1: suppress exclusive H.KEYI
-    ex af,af'
-    ret
+    jr memman_nested_hook_quit
 memman_nested_timi_return:
     ; Once H.CRUN has latched an exact _SYSTEM, do not let an EI inside the
     ; foreground TCP abort reach Pico's later H.TIMI handler. H.KEYI still
@@ -1409,10 +1639,16 @@ memman_nested_timi_return:
     ; is clear.
     ld a,(hook_system_suspended)
     or a
+    jr nz,memman_nested_hook_quit
+    ; A Pico/Pico+ UNAPI call may execute EI internally. Do not chain that
+    ; nested interrupt back into the same cartridge while ABORT/OPEN is live.
+    ld a,(unapi_lifecycle_busy)
+    or a
     jr z,memman_nested_hook_continue
+memman_nested_hook_quit:
     pop af
     ex af,af'
-    ld a,1                     ; QuitHook=1: stop later H.TIMI handlers
+    ld a,1                     ; QuitHook=1: suppress the remaining hook chain
     ex af,af'
     ret
 memman_nested_hook_continue:
@@ -1422,10 +1658,10 @@ memman_nested_hook_continue:
     ex af,af'
     ret
 
-; While `_SYSTEM` is latched, recognize the foreground boundary produced by
-; COMMAND2's normal prompt: its last CHPUT is `>`, followed by BIOS CHGET.
-; H.CHPU only publishes a candidate. H.CHGE performs the guarded foreground
-; UNAPI reopen and publishes a pending commit; neither hook calls DOS/parser.
+; H.CHPU recognizes the COMMAND2 prompt used to finish a `_SYSTEM` transition
+; or authorize one ordinary UNAPI relisten. H.CHGE consumes that foreground
+; token. Blocking UNAPI lifecycle calls never run from H.TIMI; neither console
+; hook calls DOS or the framed parser.
 resident_console_put_hook:
     push af
     push bc
@@ -1437,7 +1673,11 @@ resident_console_put_hook:
     ld (in_hook),a
     ld a,(hook_system_suspended)
     or a
-    jr z,resident_console_put_leave
+    jr nz,resident_console_put_track_prompt
+    ld a,(active_transport_id)
+    cp UNAPI_ID
+    jr nz,resident_console_put_leave
+resident_console_put_track_prompt:
     ld a,b
     cp '>'
     jr z,resident_console_put_candidate
@@ -1467,10 +1707,32 @@ resident_console_get_hook:
     ld (in_hook),a
     ld a,(hook_system_suspended)
     or a
-    jr z,resident_console_get_leave
+    jr z,resident_console_get_check_relisten
     ld a,(hook_prompt_candidate)
     or a
     jr z,resident_console_get_leave
+    jr resident_console_get_save_context
+resident_console_get_check_relisten:
+    ld a,(active_transport_id)
+    cp UNAPI_ID
+    jr nz,resident_console_get_leave
+    ; BIOS/MemMan enters H.CHGE with interrupts disabled even for COMMAND2.
+    ; The one-shot '>' token is therefore the portable proof that this CHGET
+    ; follows a DOS prompt rather than occurring inside an arbitrary caller.
+    ld a,(hook_prompt_candidate)
+    or a
+    jr z,resident_console_get_leave
+    xor a
+    ld (hook_prompt_candidate),a
+    ld a,(unapi_relisten_pending)
+    or a
+    jr z,resident_console_get_leave
+    ; The old parser must have unwound through hook_done before a new peer can
+    ; enter the byte stream. A later CHGET will retry if this boundary is early.
+    ld a,(transport_session_lost)
+    or a
+    jr nz,resident_console_get_leave
+resident_console_get_save_context:
     push bc
     push de
     push hl
@@ -1484,9 +1746,23 @@ resident_console_get_hook:
     push de
     push hl
     exx
+    ld a,(hook_system_suspended)
+    or a
+    jr z,resident_console_get_relisten
+    ld a,TRACE_EVENT_SYSTEM_RESUME
+    call trace_record
     call resident_console_resume_unapi
+    jr resident_console_get_reopen_done
+resident_console_get_relisten:
+    ld a,TRACE_EVENT_DOS_RELISTEN
+    call trace_record
+    call resident_console_relisten_unapi
+resident_console_get_reopen_done:
     or a
     jr nz,resident_console_get_restore
+    ld a,(hook_system_suspended)
+    or a
+    jr z,resident_console_get_restore
     ld a,1
     ld (hook_resume_pending),a
 resident_console_get_restore:
@@ -1688,14 +1964,14 @@ resident_basic_crunch_hook:
     ld (in_hook),a              ; nested timer hooks take the minimal chain path
     ld a,(active_transport_id)
     cp UNAPI_ID
-    jr nz,resident_basic_crunch_hook_continue
+    jp nz,resident_basic_crunch_hook_continue
 
     ld a,h
     cp 0F5h                     ; high BASIC_BUF
-    jr nz,resident_basic_crunch_hook_continue
+    jp nz,resident_basic_crunch_hook_continue
     ld a,l
     cp 05Eh                     ; low BASIC_BUF
-    jr nz,resident_basic_crunch_hook_continue
+    jp nz,resident_basic_crunch_hook_continue
     ld hl,BASIC_BUF
 resident_basic_crunch_skip_leading_space:
     ld a,(hl)
@@ -1715,10 +1991,10 @@ resident_basic_crunch_match_start:
     ld de,resident_basic_call_word
     ld b,4
     call resident_basic_crunch_match_word
-    jr nz,resident_basic_crunch_hook_continue
+    jr nz,resident_basic_crunch_maybe_relisten
     ld a,(hl)
     cp ' '
-    jr nz,resident_basic_crunch_hook_continue
+    jr nz,resident_basic_crunch_maybe_relisten
 resident_basic_crunch_skip_call_space:
     inc hl
     ld a,(hl)
@@ -1727,14 +2003,14 @@ resident_basic_crunch_skip_call_space:
     ld de,resident_basic_call_system_word
     ld b,6
     call resident_basic_crunch_match_word
-    jr nz,resident_basic_crunch_hook_continue
+    jr nz,resident_basic_crunch_maybe_relisten
     jr resident_basic_crunch_skip_trailing_space
 
 resident_basic_crunch_match_extension:
     ld de,resident_basic_system_word
     ld b,7
     call resident_basic_crunch_match_word
-    jr nz,resident_basic_crunch_hook_continue
+    jr nz,resident_basic_crunch_maybe_relisten
     jr resident_basic_crunch_skip_trailing_space
 
 resident_basic_crunch_match_word:
@@ -1754,9 +2030,47 @@ resident_basic_crunch_skip_trailing_space:
     or a
     jr z,resident_basic_crunch_match_complete
     cp ' '
-    jr nz,resident_basic_crunch_hook_continue
+    jr nz,resident_basic_crunch_maybe_relisten
     inc hl
     jr resident_basic_crunch_skip_trailing_space
+
+; A direct BASIC line is an unambiguous foreground boundary. Exact SYSTEM
+; forms above retain priority and quiesce the cartridge; any other line may
+; replace a listener whose previous parser has already unwound.
+resident_basic_crunch_maybe_relisten:
+    ld a,(unapi_relisten_pending)
+    or a
+    jr z,resident_basic_crunch_hook_continue
+    ld a,(transport_session_lost)
+    or a
+    jr nz,resident_basic_crunch_hook_continue
+    ; Unlike the exact SYSTEM path, this hook returns to the current BASIC
+    ; interpreter. Preserve every register that ROM/mapped UNAPI dispatch may
+    ; use as call metadata, not only H.CRUN's historical main-register frame.
+    push ix
+    push iy
+    ex af,af'
+    push af
+    ex af,af'
+    exx
+    push bc
+    push de
+    push hl
+    exx
+    ld a,TRACE_EVENT_BASIC_RELISTEN
+    call trace_record
+    call resident_console_relisten_unapi
+    exx
+    pop hl
+    pop de
+    pop bc
+    exx
+    ex af,af'
+    pop af
+    ex af,af'
+    pop iy
+    pop ix
+    jr resident_basic_crunch_hook_continue
 
 resident_basic_crunch_match_complete:
     xor a
@@ -1767,6 +2081,8 @@ resident_basic_crunch_match_complete:
     ld (hook_mapping_cooldown),a
     ld a,1
     ld (hook_system_suspended),a
+    ld a,TRACE_EVENT_SYSTEM_SUSPEND
+    call trace_record
     call resident_basic_system_quiesce_unapi
 resident_basic_crunch_hook_continue:
     pop af
@@ -1817,9 +2133,27 @@ resident_basic_system_restore_stack:
     ld a,(hook_system_restore_error)
     ret
 
-; H.CHGE runs in foreground immediately after COMMAND2 has printed its prompt.
-; Re-run cleanup in case the pre-boot ABORT was transient, then discover/open
-; the saved port. No blocking lifecycle call is ever made from H.TIMI.
+; An ordinary lost socket keeps the selected UNAPI implementation and transfer
+; checkpoint. H.CHGE supplies the foreground stack boundary required to retire
+; the stale handle and create a replacement listener without rerunning MSXAI.
+resident_console_relisten_unapi:
+    di
+    ld (hook_system_sp),sp
+    call tsr_heap_guards_ok
+    jr z,resident_console_relisten_heap_ready
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,0FFh
+    jr resident_console_resume_store_result
+resident_console_relisten_heap_ready:
+    call tsr_heap_fill_guards
+    ld sp,(tsr_heap_stack_top)
+    call unapi_relisten_foreground
+    jr resident_console_resume_store_result
+
+; H.CHGE runs in foreground immediately after COMMAND2 has printed its prompt
+; following `_SYSTEM`. Re-run cleanup in case the pre-boot ABORT was transient,
+; then discover/open the saved port. No blocking lifecycle call runs in H.TIMI.
 resident_console_resume_unapi:
     di
     ld (hook_system_sp),sp
@@ -6143,6 +6477,293 @@ tsr_heap_guards_missing:
     or a
     ret
 
+; Resetting/enabling is a foreground A8 operation. The hot hook path only
+; appends fixed RAM records and increments counters.
+trace_reset:
+    push af
+    push bc
+    push de
+    push hl
+    xor a
+    ld hl,trace_record_count
+    ld de,trace_record_count + 1
+    ld bc,trace_export_end - trace_record_count - 1
+    ld (hl),a
+    ldir
+    dec a
+    ld (trace_last_tcp_result),a
+    ld (trace_last_tcp_state),a
+    pop hl
+    pop de
+    pop bc
+    pop af
+    ret
+
+trace_enable:
+    push af
+    ld a,(trace_flags)
+    and TRACE_FLAG_ENABLED
+    jr nz,trace_enable_done
+    call trace_reset
+    ld a,TRACE_FLAG_ENABLED
+    ld (trace_flags),a
+    ld a,TRACE_EVENT_ENABLE
+    call trace_record
+trace_enable_done:
+    pop af
+    ret
+
+trace_count_timi:
+    push af
+    push hl
+    ld a,(trace_flags)
+    and TRACE_FLAG_ENABLED
+    jr z,trace_count_timi_done
+    ld hl,(trace_timi_count)
+    inc hl
+    ld (trace_timi_count),hl
+trace_count_timi_done:
+    pop hl
+    pop af
+    ret
+
+trace_count_poll:
+    push af
+    push hl
+    ld a,(trace_flags)
+    and TRACE_FLAG_ENABLED
+    jr z,trace_count_poll_done
+    ld hl,(trace_poll_count)
+    inc hl
+    ld (trace_poll_count),hl
+trace_count_poll_done:
+    pop hl
+    pop af
+    ret
+
+trace_record_tcp_state:
+    push af
+    push bc
+    push hl
+    ld c,a
+    ld a,(trace_last_tcp_result)
+    cp c
+    jr nz,trace_record_tcp_state_changed
+    ld a,(trace_last_tcp_state)
+    cp b
+    jr z,trace_record_tcp_state_done
+trace_record_tcp_state_changed:
+    ld a,c
+    ld (trace_last_tcp_result),a
+    ld a,b
+    ld (trace_last_tcp_state),a
+    ld hl,(trace_state_change_count)
+    inc hl
+    ld (trace_state_change_count),hl
+    ld a,c
+    or a
+    ld a,TRACE_EVENT_STATE
+    jr z,trace_record_tcp_state_event_ready
+    ld a,TRACE_EVENT_STATE_ERROR
+trace_record_tcp_state_event_ready:
+    call trace_record
+trace_record_tcp_state_done:
+    pop hl
+    pop bc
+    pop af
+    ret
+
+; Input A=event. All registers and flags are preserved. Each record is:
+; event,error,state,active,cleanup,flags,jiffy-lo,jiffy-hi.
+trace_record:
+    push af
+    push bc
+    push de
+    push hl
+    ld c,a
+    ld a,(trace_flags)
+    and TRACE_FLAG_ENABLED
+    jp z,trace_record_done
+
+    ld a,(trace_write_index)
+    ld l,a
+    ld h,0
+    add hl,hl
+    add hl,hl
+    add hl,hl
+    ld de,trace_records
+    add hl,de
+    push hl
+    ld (hl),c
+    inc hl
+    ld a,(unapi_last_error)
+    ld (hl),a
+    inc hl
+    ld a,(unapi_connection_state)
+    ld (hl),a
+    inc hl
+    ld a,(unapi_connection)
+    ld (hl),a
+    inc hl
+    ld a,(unapi_cleanup_connection)
+    ld (hl),a
+    inc hl
+    ld b,0
+    ld a,(unapi_relisten_pending)
+    or a
+    jr z,trace_record_flag_lifecycle
+    set 0,b
+trace_record_flag_lifecycle:
+    ld a,(unapi_lifecycle_busy)
+    or a
+    jr z,trace_record_flag_session
+    set 1,b
+trace_record_flag_session:
+    ld a,(transport_session_lost)
+    or a
+    jr z,trace_record_flag_hook
+    set 2,b
+trace_record_flag_hook:
+    ld a,(in_hook)
+    or a
+    jr z,trace_record_flag_system
+    set 3,b
+trace_record_flag_system:
+    ld a,(hook_system_suspended)
+    or a
+    jr z,trace_record_flag_kind
+    set 4,b
+trace_record_flag_kind:
+    ld a,(hook_kind)
+    or a
+    jr z,trace_record_flag_heap
+    set 5,b
+trace_record_flag_heap:
+    ld a,(tsr_heap_fault)
+    or a
+    jr z,trace_record_flag_prompt
+    set 6,b
+trace_record_flag_prompt:
+    ld a,(hook_prompt_candidate)
+    or a
+    jr z,trace_record_flags_ready
+    set 7,b
+trace_record_flags_ready:
+    ld (hl),b
+    inc hl
+    ld de,(CPU_JIFFY)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    pop de                       ; start of the just-written record
+
+    ld hl,(trace_sequence)
+    inc hl
+    ld (trace_sequence),hl
+    ld a,(trace_record_count)
+    cp TRACE_RECORD_CAPACITY
+    jr nc,trace_record_full
+    inc a
+    ld (trace_record_count),a
+    jr trace_record_advance
+trace_record_full:
+    ld a,(trace_flags)
+    or TRACE_FLAG_WRAPPED
+    ld (trace_flags),a
+trace_record_advance:
+    ld a,(trace_write_index)
+    inc a
+    cp TRACE_RECORD_CAPACITY
+    jr c,trace_record_store_index
+    xor a
+trace_record_store_index:
+    ld (trace_write_index),a
+
+    ld a,c
+    cp TRACE_EVENT_DROP
+    jr z,trace_record_freeze
+    cp TRACE_EVENT_STATE_ERROR
+    jr z,trace_record_freeze
+    cp TRACE_EVENT_OPEN_END
+    jr z,trace_record_freeze_if_error
+    cp TRACE_EVENT_ABORT_END
+    jr nz,trace_record_done
+trace_record_freeze_if_error:
+    ld a,(unapi_last_error)
+    or a
+    jr z,trace_record_done
+trace_record_freeze:
+    call trace_freeze_first_failure
+trace_record_done:
+    pop hl
+    pop de
+    pop bc
+    pop af
+    ret
+
+; Input DE points to the incident record. Preserve the first incident until
+; the next cold install; enabling an already enabled trace is deliberately a no-op.
+trace_freeze_first_failure:
+    push af
+    push bc
+    push de
+    push hl
+    ld a,(trace_flags)
+    and TRACE_FLAG_INCIDENT
+    jr nz,trace_freeze_first_failure_done
+    ld a,(trace_flags)
+    or TRACE_FLAG_INCIDENT
+    ld (trace_flags),a
+    ex de,hl
+    ld de,trace_failure_snapshot
+    ld bc,TRACE_RECORD_SIZE
+    ldir
+    ld hl,trace_failure_snapshot + TRACE_RECORD_SIZE
+    ld a,(unapi_retry_count)
+    ld (hl),a
+    inc hl
+    ld a,(unapi_poll_skip)
+    ld (hl),a
+    inc hl
+    ld a,(unapi_rx_count)
+    ld (hl),a
+    inc hl
+    ld a,(unapi_tx_count)
+    ld (hl),a
+    inc hl
+    ld a,(hook_system_restore_error)
+    ld (hl),a
+    inc hl
+    ld b,0
+    ld a,(unapi_initialized)
+    or a
+    jr z,trace_freeze_flag_blocking
+    set 0,b
+trace_freeze_flag_blocking:
+    ld a,(unapi_open_blocking)
+    or a
+    jr z,trace_freeze_flag_resume
+    set 1,b
+trace_freeze_flag_resume:
+    ld a,(hook_resume_pending)
+    or a
+    jr z,trace_freeze_flags_ready
+    set 2,b
+trace_freeze_flags_ready:
+    ld (hl),b
+    inc hl
+    ld a,(hook_mapping_state)
+    ld (hl),a
+    inc hl
+    ld a,(active_transport_id)
+    ld (hl),a
+trace_freeze_first_failure_done:
+    pop hl
+    pop de
+    pop bc
+    pop af
+    ret
+
 ; TsrKill calls this only after MemMan has detached both registered hooks.
 tsr_kill:
     di
@@ -6182,6 +6803,8 @@ tsr_talk:
     jp z,tsr_talk_unsupported
     cp TSR_TALK_UNAPI_PORT
     jp z,tsr_talk_unapi_port
+    cp TSR_TALK_TRACE
+    jp z,tsr_talk_trace
     cp TSR_TALK_XFER_CLAIM
     jp z,tsr_talk_xfer_claim
     cp TSR_TALK_XFER_READY
@@ -6203,6 +6826,82 @@ tsr_talk:
     cp TSR_TALK_XFER_PUMP
     jp z,tsr_talk_xfer_pump
     jp tsr_talk_unsupported
+
+; Private trace ABI. ENABLE is idempotent and SNAPSHOT copies the complete
+; fixed export block immediately after the 16-byte page-zero request. No
+; transport, heap, BIOS, or DOS call is made here.
+tsr_talk_trace:
+    ld a,(in_hook)
+    or a
+    jp nz,tsr_talk_unsupported
+    ld a,h
+    or a
+    jp z,tsr_talk_unsupported
+    ld bc,TSR_TRACE_REQUEST_SIZE
+    call tsr_talk_page0_range
+    jp c,tsr_talk_unsupported
+    ld (tsr_trace_request_pointer),hl
+    ld a,(hl)
+    cp TSR_TRACE_REQUEST_MAGIC & 0FFh
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp TSR_TRACE_REQUEST_MAGIC >> 8
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp TSR_TRACE_REQUEST_VERSION
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp TSR_TRACE_REQUEST_SIZE
+    jp nz,tsr_talk_unsupported
+    inc hl
+    ld a,(hl)
+    cp TSR_TRACE_ACTION_ENABLE
+    jr z,tsr_talk_trace_enable
+    cp TSR_TRACE_ACTION_SNAPSHOT
+    jp nz,tsr_talk_unsupported
+
+    ld hl,(tsr_trace_request_pointer)
+    ld bc,TSR_TRACE_REQUEST_SIZE + TRACE_EXPORT_SIZE
+    call tsr_talk_page0_range
+    jp c,tsr_talk_unsupported
+    di
+    ld a,1
+    ld (in_hook),a
+    ld hl,trace_export_begin
+    ld de,(tsr_trace_request_pointer)
+    ld bc,TSR_TRACE_REQUEST_SIZE
+    ex de,hl
+    add hl,bc
+    ex de,hl
+    ld bc,TRACE_EXPORT_SIZE
+    ldir
+    ld hl,TRACE_EXPORT_SIZE
+    jr tsr_talk_trace_finish
+
+tsr_talk_trace_enable:
+    di
+    ld a,1
+    ld (in_hook),a
+    call trace_enable
+    ld hl,0
+tsr_talk_trace_finish:
+    push hl
+    ld hl,(tsr_trace_request_pointer)
+    ld de,TSR_TRACE_REQUEST_STATUS
+    add hl,de
+    xor a
+    ld (hl),a
+    inc hl
+    pop de
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    xor a
+    ld (in_hook),a
+    ret
 
 tsr_talk_config:
     ld a,(in_hook)

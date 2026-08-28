@@ -64,6 +64,22 @@ is required:
 Monitor mode stays in the foreground. Press Ctrl+Stop to request exit.
 DEBUG is accepted only with /MONITOR.
 
+RESIDENT TRACE
+--------------
+
+Use /TRACE only with the resident UNAPI mode:
+
+   MSXAI /DRIVER:UNAPI /PORT:6603 /TRACE
+   MSXAI 6603 /TRACE
+
+/TRACE is separate from /MONITOR DEBUG and does not draw on the MSX screen.
+If the connection falls, return to DOS and save the diagnostic information:
+
+   MSXAI /DUMPTRACE A:\MSXAI.LOG
+
+/DUMPTRACE must be used alone and the destination file must not already
+exist. Dumping preserves the resident trace for another dump.
+
 REMOVAL AND UPDATE
 ------------------
 

@@ -171,7 +171,27 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "jr nz,memman_nested_timi_return",
             "ld a,(tsr_heap_fault)",
             "jr nz,memman_nested_timi_return",
+            "ld a,1",
             "ld (in_hook),a",
+        )
+
+        nested = _section(
+            hooks, "memman_nested_keyi_return:",
+            "; H.CHPU recognizes the COMMAND2 prompt")
+        _assert_in_order(
+            self,
+            nested,
+            "ld a,(unapi_lifecycle_busy)",
+            "jr nz,memman_nested_hook_quit",
+            "memman_nested_timi_return:",
+            "ld a,(hook_system_suspended)",
+            "jr nz,memman_nested_hook_quit",
+            "ld a,(unapi_lifecycle_busy)",
+            "jr z,memman_nested_hook_continue",
+            "memman_nested_hook_quit:",
+            "ld a,1",
+            "memman_nested_hook_continue:",
+            "xor a",
         )
 
         dispatch = _section(
@@ -190,6 +210,10 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ld (hook_dispatch_sp),sp",
             "call transport_service",
         )
+        for forbidden in (
+                "unapi_relisten_foreground", "unapi_open_listener",
+                "unapi_abort_current", "transport_restore_foreground_retry"):
+            self.assertNotIn(forbidden, dispatch)
 
         unwind = _section(hooks, "hook_done:", "memman_hook_continue:")
         _assert_in_order(
@@ -308,7 +332,7 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ld (in_hook),a",
             "ld a,(active_transport_id)",
             "cp UNAPI_ID",
-            "jr nz,resident_basic_crunch_hook_continue",
+            "jp nz,resident_basic_crunch_hook_continue",
             "ld a,h",
             "cp 0F5h",
             "ld a,l",
@@ -322,7 +346,7 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ld de,resident_basic_call_word",
             "ld b,4",
             "call resident_basic_crunch_match_word",
-            "jr nz,resident_basic_crunch_hook_continue",
+            "jr nz,resident_basic_crunch_maybe_relisten",
             "cp ' '",
             "resident_basic_crunch_skip_call_space:",
             "ld de,resident_basic_call_system_word",
@@ -343,6 +367,33 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "or a",
             "jr z,resident_basic_crunch_match_complete",
             "cp ' '",
+            "resident_basic_crunch_maybe_relisten:",
+            "ld a,(unapi_relisten_pending)",
+            "jr z,resident_basic_crunch_hook_continue",
+            "ld a,(transport_session_lost)",
+            "jr nz,resident_basic_crunch_hook_continue",
+            "push ix",
+            "push iy",
+            "ex af,af'",
+            "push af",
+            "ex af,af'",
+            "exx",
+            "push bc",
+            "push de",
+            "push hl",
+            "exx",
+            "call resident_console_relisten_unapi",
+            "exx",
+            "pop hl",
+            "pop de",
+            "pop bc",
+            "exx",
+            "ex af,af'",
+            "pop af",
+            "ex af,af'",
+            "pop iy",
+            "pop ix",
+            "jr resident_basic_crunch_hook_continue",
             "resident_basic_crunch_match_complete:",
             "xor a",
             "ld (hook_prompt_candidate),a",
@@ -425,6 +476,10 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ld b,a",
             "ld a,(in_hook)",
             "ld a,(hook_system_suspended)",
+            "jr nz,resident_console_put_track_prompt",
+            "ld a,(active_transport_id)",
+            "cp UNAPI_ID",
+            "resident_console_put_track_prompt:",
             "ld a,b",
             "cp '>'",
             "jr z,resident_console_put_candidate",
@@ -451,14 +506,29 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ld a,(in_hook)",
             "ld a,(hook_system_suspended)",
             "ld a,(hook_prompt_candidate)",
+            "jr resident_console_get_save_context",
+            "resident_console_get_check_relisten:",
+            "ld a,(active_transport_id)",
+            "cp UNAPI_ID",
+            "ld a,(hook_prompt_candidate)",
+            "xor a",
+            "ld (hook_prompt_candidate),a",
+            "ld a,(unapi_relisten_pending)",
+            "ld a,(transport_session_lost)",
+            "resident_console_get_save_context:",
             "push bc",
             "push de",
             "push hl",
             "push ix",
             "push iy",
             "call resident_console_resume_unapi",
+            "resident_console_get_relisten:",
+            "call resident_console_relisten_unapi",
+            "resident_console_get_reopen_done:",
             "or a",
             "jr nz,resident_console_get_restore",
+            "ld a,(hook_system_suspended)",
+            "jr z,resident_console_get_restore",
             "ld a,1",
             "ld (hook_resume_pending),a",
             "resident_console_get_restore:",
@@ -474,6 +544,46 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ex af,af'",
             "ret",
         )
+
+        ordinary_relisten_gate = _section(
+            hooks,
+            "resident_console_get_check_relisten:",
+            "resident_console_get_save_context:",
+        )
+        self.assertRegex(
+            ordinary_relisten_gate,
+            r"(?s)ld a,\(active_transport_id\)\s+"
+            r"cp UNAPI_ID\s+jr nz,resident_console_get_leave.*"
+            r"ld a,\(hook_prompt_candidate\)\s+or a\s+"
+            r"jr z,resident_console_get_leave\s+xor a\s+"
+            r"ld \(hook_prompt_candidate\),a\s+"
+            r"ld a,\(unapi_relisten_pending\)",
+        )
+        self.assertNotIn("ld a,i", ordinary_relisten_gate)
+
+        relisten = _section(
+            hooks,
+            "resident_console_relisten_unapi:",
+            "resident_console_resume_unapi:",
+        )
+        _assert_in_order(
+            self,
+            relisten,
+            "di",
+            "ld (hook_system_sp),sp",
+            "call tsr_heap_guards_ok",
+            "jr z,resident_console_relisten_heap_ready",
+            "ld (tsr_heap_fault),a",
+            "jr resident_console_resume_store_result",
+            "resident_console_relisten_heap_ready:",
+            "call tsr_heap_fill_guards",
+            "ld sp,(tsr_heap_stack_top)",
+            "call unapi_relisten_foreground",
+            "jr resident_console_resume_store_result",
+        )
+        self.assertNotIn("call transport_restore", relisten)
+        self.assertNotIn("call transport_init", relisten)
+        self.assertNotIn("call xfer_reconfigure_detach", relisten)
 
         resume = _section(
             hooks,
