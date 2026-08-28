@@ -44,17 +44,19 @@ RELEASE_DOWNLOAD_BASE = (
 DEFAULT_TEST_PORT = 43123
 DEFAULT_FAULT_CYCLES = 3
 STEADY_STATE_ROUND_TRIPS = 64
+AUTO_RELISTEN_WAIT_SECONDS = 3.0
+AUTO_RELISTEN_STABILITY_SECONDS = 1.0
 TRACE_DUMP_NAMES = ("MSXAI.LOG", "MSXAI2.LOG")
 TRACE_FAILURE_DUMP_NAME = "MSXFAIL.LOG"
 TRACE_FLAG_ENABLED = 0x01
 TRACE_FLAG_INCIDENT = 0x02
 TRACE_FLAG_WRAPPED = 0x04
-TRACE_RECORD_CAPACITY = 16
+TRACE_RECORD_CAPACITY = 20
 TRACE_EVENT_NAMES = frozenset({
     "ENABLE", "STATE", "STATE_ERROR", "DROP", "DOS_RELISTEN",
     "BASIC_RELISTEN", "OPEN_BEGIN", "OPEN_END", "ABORT_BEGIN",
     "ABORT_END", "SYSTEM_SUSPEND", "SYSTEM_RESUME", "RECONFIG_BEGIN",
-    "RECONFIG_END",
+    "RECONFIG_END", "AUTO_RELISTEN",
 })
 MIN_TEST_PORT = 1
 # TCP/IP UNAPI reserves FFFFh as the random/local-port sentinel.
@@ -124,9 +126,10 @@ CONTRACT_PATH = (
     "TCPIP_TCP_STATE establishment",
     "TCPIP_TCP_SEND agent-to-host bytes",
     "TCPIP_TCP_RCV host-to-agent bytes",
-    "automatic H.CHGE foreground relisten after host disconnect",
-    "automatic BASIC H.CRUN foreground relisten after host disconnect",
+    "automatic guarded H.TIMI relisten after host disconnect",
+    "automatic guarded H.TIMI relisten while a BASIC program is running",
 )
+FAULT_CONTRACT_PATH = CONTRACT_PATH[:-1]
 MCP_TOOLS_EXERCISED = (
     "msx_agent_connect",
     "msx_agent_status",
@@ -142,10 +145,9 @@ NOT_EMULATED = (
 
 FAULT_SCENARIOS = (
     "steady-state framed traffic",
-    "idle peer FIN followed by foreground recovery",
-    "RST queued immediately before a marked DOS command",
-    "temporary bidirectional blackhole followed by RST",
-    "premature reconnect during listener recovery",
+    "idle peer FIN followed by zero-input automatic relisten",
+    "idle peer RST followed by zero-input automatic relisten",
+    "temporary bidirectional blackhole left established until RST",
 )
 
 MAX_ZIP_MEMBERS = 4096
@@ -233,6 +235,18 @@ def _arg_port(text: str) -> int:
         return validate_port(text)
     except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _arg_fault_cycles(text: str) -> int:
+    try:
+        cycles = int(text, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "fault cycles must be a positive integer") from exc
+    if cycles <= 0:
+        raise argparse.ArgumentTypeError(
+            "fault cycles must be a positive integer")
+    return cycles
 
 
 def asset_name_for(platform_name: str | None = None,
@@ -580,28 +594,68 @@ def preflight(settings: Settings, *, platform_name: str | None = None,
     return report
 
 
-def build_agent_package(settings: Settings, *,
+def build_agent_package(settings: Settings, *, development_trace: bool = False,
                         runner: Callable[..., subprocess.CompletedProcess[str]] =
                         subprocess.run) -> tuple[pathlib.Path, ...]:
+    target = "agent-trace" if development_trace else "agent"
     try:
         result = runner(
-            [settings.make, "agent"], cwd=settings.root,
+            [settings.make, target], cwd=settings.root,
             capture_output=True, text=True)
     except OSError as exc:
         raise PrerequisiteError(
-            f"could not run canonical `make agent`: {exc}") from exc
+            f"could not run `make {target}`: {exc}") from exc
     if result.returncode != 0:
         output = result.stderr or result.stdout or "<no build output>"
         raise PrerequisiteError(
-            "canonical `make agent` failed:\n" + output.strip())
-    artifact_root = settings.root / "work" / "agent"
+            f"`make {target}` failed:\n" + output.strip())
+    artifact_root = settings.root / (
+        "work/agent-trace" if development_trace else "work/agent")
     artifacts = tuple(artifact_root / name for name in AGENT_PACKAGE_NAMES)
     missing = [str(path) for path in artifacts
                if not path.is_file() or path.stat().st_size == 0]
     if missing:
         raise PrerequisiteError(
-            "canonical agent build is incomplete: " + ", ".join(missing))
+            f"{target} build is incomplete: " + ", ".join(missing))
     return artifacts
+
+
+def _test_only_relisten_symbol_addresses(
+        settings: Settings, *, development_trace: bool = False,
+        ) -> dict[str, int]:
+    """Resolve resident labels used only to certify the UNAPINET fixture.
+
+    Production deliberately certifies only TU's Pico/Pico+ private-work-area
+    prefix.  UNAPINET cannot present that certificate, so this emulator-only
+    harness patches the resulting boolean while the MemMan segment is mapped.
+    """
+    from tools.build_agent_tsr import (  # pylint: disable=import-outside-toplevel,protected-access
+        BUILD_ORIGINS,
+        _assemble,
+    )
+
+    assembler = os.environ.get("Z80ASM", "z80asm")
+    with tempfile.TemporaryDirectory(
+            prefix="msx-ai-unapi-labels-") as directory:
+        image = _assemble(
+            settings.root, pathlib.Path(directory), assembler,
+            BUILD_ORIGINS[0], development_trace=development_trace)
+    required = (
+        "resident_start", "resident_timi_hook",
+        "unapi_service_relisten_certificate_ready",
+        "unapi_hook_relisten_certified", "unapi_relisten_pending",
+        "unapi_retry_count", "transport_session_lost",
+        "unapi_connection", "unapi_connection_state",
+        "unapi_lifecycle_busy", "unapi_busy", "unapi_last_error",
+        "runtime_mode", "hook_kind", "hook_system_suspended",
+        "tsr_heap_fault", "in_hook",
+    )
+    missing = [name for name in required if name not in image.labels]
+    if missing:
+        raise PrerequisiteError(
+            "resident assembly is missing test-harness labels: " +
+            ", ".join(missing))
+    return {name: int(image.labels[name]) for name in required}
 
 
 def msx_install_commands(port: int, *, trace: bool = False) -> tuple[str, ...]:
@@ -793,14 +847,20 @@ def _dos_partition_offset(disk: pathlib.Path) -> int:
     return 0
 
 
-def _extract_dos_file(disk: pathlib.Path, dos_name: str,
-                      target: pathlib.Path) -> None:
-    """Read a closed FAT image through mtools without modifying it."""
+def _require_mcopy() -> str:
+    """Return the mtools extractor required by resident trace validation."""
     mcopy = shutil.which("mcopy")
     if mcopy is None:
         raise PrerequisiteError(
             "trace validation requires mcopy (mtools) to inspect the closed "
             "disposable DOS disk")
+    return mcopy
+
+
+def _extract_dos_file(disk: pathlib.Path, dos_name: str,
+                      target: pathlib.Path) -> None:
+    """Read a closed FAT image through mtools without modifying it."""
+    mcopy = _require_mcopy()
     if re.fullmatch(r"[A-Z0-9_]{1,8}(?:\.[A-Z0-9]{1,3})?", dos_name) is None:
         raise ValueError(f"invalid DOS 8.3 trace filename: {dos_name}")
     offset = _dos_partition_offset(disk)
@@ -894,6 +954,18 @@ def _trace_dump_success_visible(screen: str) -> bool:
     return "msxaitracewritten;residentlogpreserved." in compact
 
 
+def _trace_sequence_delta(first: int, second: int) -> int:
+    """Require the second trace snapshot to advance monotonically."""
+    delta = (int(second) - int(first)) & 0xFFFF
+    if delta == 0:
+        raise ValidationError(
+            "the second resident trace dump did not advance the sequence")
+    if delta >= 0x8000:
+        raise ValidationError(
+            "the resident trace sequence moved backwards or was reset")
+    return delta
+
+
 def _capture_failed_install_trace(machine: object, disk: pathlib.Path,
                                   runtime: pathlib.Path) -> dict[str, object]:
     """Dump the already-enabled ring after first-install A7 fails."""
@@ -982,11 +1054,8 @@ def _exercise_resident_trace(machine: object, disk: pathlib.Path,
     if first["first_incident"] != second["first_incident"]:
         raise ValidationError(
             "the resident trace lost or replaced its frozen FIRST incident")
-    sequence_delta = (
-        int(second["sequence"]) - int(first["sequence"])) & 0xFFFF
-    if sequence_delta >= 0x8000:
-        raise ValidationError(
-            "the resident trace sequence moved backwards or was reset")
+    sequence_delta = _trace_sequence_delta(
+        int(first["sequence"]), int(second["sequence"]))
     first_by_sequence = {
         int(record["sequence"]): record for record in first["records"]
     }
@@ -1012,7 +1081,7 @@ def _exercise_resident_trace(machine: object, disk: pathlib.Path,
         raise ValidationError(
             "the deterministic MCP disconnect did not freeze a DROP incident")
     events = list(second["events"])
-    for required in ("SYSTEM_SUSPEND", "SYSTEM_RESUME"):
+    for required in ("AUTO_RELISTEN", "SYSTEM_SUSPEND", "SYSTEM_RESUME"):
         if required not in events:
             raise ValidationError(
                 f"resident trace did not retain required event {required}")
@@ -1364,6 +1433,15 @@ def _failure_diagnostics(machine: object | None, phase: str,
             }
         except Exception as exc:
             diagnostics["mapper_diagnostics_error"] = str(exc)
+        try:
+            diagnostics["unapi_io_trace"] = _unapi_io_trace_report(machine)
+        except Exception as exc:
+            diagnostics["unapi_io_trace_error"] = str(exc)
+        try:
+            diagnostics["resident_hook_observer"] = (
+                _resident_hook_observer_report(machine))
+        except Exception as exc:
+            diagnostics["resident_hook_observer_error"] = str(exc)
         output_tail = getattr(machine, "_output_tail", "")
         if output_tail:
             diagnostics["openmsx_output_tail"] = output_tail[-4000:]
@@ -1373,6 +1451,7 @@ def _failure_diagnostics(machine: object | None, phase: str,
 async def _exercise_public_mcp_async(
         machine: object, settings: Settings, commands: Sequence[str],
         set_phase: Callable[[str], None], mcp_stderr: pathlib.Path,
+        relisten_symbols: Mapping[str, int],
         ) -> dict[str, object]:
     """Exercise both connections through the standards-based MCP runtime."""
     from mcp.client import Client  # pylint: disable=import-outside-toplevel
@@ -1419,6 +1498,8 @@ async def _exercise_public_mcp_async(
                     first_status = await _mcp_status(client)
                     _assert_agent_identity(first_status)
                     first = _agent_snapshot(first_status)
+                    test_certificate = _enable_test_only_hook_relisten(
+                        machine, first_status, relisten_symbols)
 
                     set_phase("public-MCP bidirectional SEND/RCV transaction")
                     via_agent = await _mcp_memory_read(
@@ -1433,52 +1514,14 @@ async def _exercise_public_mcp_async(
                             "openMSX debugger bytes at C000h; TCPIP_TCP_SEND/"
                             "RCV path is not transparent")
 
+                    reset_count, _reset_events = _reset_vector_hits(machine)
+                    previous_time = float(machine.cmd("machine_info time"))
+                    lifecycle_before = _unapi_lifecycle_counts(machine)
                     set_phase(
-                        "public-MCP disconnect and automatic foreground relisten")
+                        "public-MCP disconnect and zero-input H.TIMI relisten")
                     await _mcp_disconnect(client)
                     connected = False
-                    machine.cmd("set throttle off")
-                    machine.advance(3)
-                    # H.TIMI detects the closed stream but deliberately cannot
-                    # issue a potentially blocking TCP_OPEN. Prove the listener
-                    # is still closed before supplying any foreground input.
-                    h_timi_lifecycle_deferred = False
-                    try:
-                        await _mcp_connect(
-                            client, settings.host, settings.port, 1.0)
-                    except ValidationError:
-                        h_timi_lifecycle_deferred = True
-                    else:
-                        connected = True
-                        raise ValidationError(
-                            "UNAPI listener reopened from H.TIMI before a "
-                            "safe foreground boundary")
-
-                    # A single ordinary character releases the CHGET that was
-                    # already waiting and enters another CHGET without printing
-                    # a new prompt.  Prove that H.CHGE alone is not sufficient:
-                    # only the one-shot H.CHPU('>') prompt token may authorize
-                    # the blocking lifecycle operation.
-                    machine.cmd("set throttle on")
-                    machine.type("V")
-                    machine.advance(1)
-                    bare_chget_lifecycle_deferred = False
-                    try:
-                        await _mcp_connect(
-                            client, settings.host, settings.port, 1.0)
-                    except ValidationError:
-                        bare_chget_lifecycle_deferred = True
-                    else:
-                        connected = True
-                        raise ValidationError(
-                            "UNAPI listener reopened from a bare H.CHGE "
-                            "without a new COMMAND2 prompt")
-
-                    # Complete VER and press Return. COMMAND2 prints its next
-                    # prompt; H.CHPU arms the one-shot token and the following
-                    # H.CHGE consumes it. No MSXAI command or resident
-                    # reconfiguration is involved.
-                    machine.type_line("ER")
+                    _advance_h_timi_without_input(machine)
                     set_phase("second public-MCP host-to-MSX TCP handshake")
                     await _mcp_connect(
                         client, settings.host, settings.port, settings.timeout)
@@ -1486,50 +1529,37 @@ async def _exercise_public_mcp_async(
                     second_status = await _mcp_status(client)
                     _assert_agent_identity(second_status)
                     second = _agent_snapshot(second_status)
-                    _assert_command_screen(
-                        "automatic foreground relisten",
-                        machine.screen_text(), prompt=True)
                     await _mcp_memory_read(
                         client, MEMORY_TEST_ADDRESS, 16)
+                    _advance_h_timi_without_input(
+                        machine, AUTO_RELISTEN_STABILITY_SECONDS)
+                    dos_lifecycle = _assert_single_auto_relisten(
+                        lifecycle_before, _unapi_lifecycle_counts(machine),
+                        "public-MCP DOS FIN recovery")
+                    dos_health = _machine_health(
+                        machine, previous_time, reset_count,
+                        "public-MCP DOS FIN recovery")
+                    previous_time = float(dos_health["emulator_time"])
 
-                    # Keep the second socket alive while COMMAND2 enters BASIC
-                    # so the loss is first observed at the BASIC prompt. A
-                    # direct non-SYSTEM line reaches H.CRUN at BASIC_BUF and is
-                    # the safe BASIC foreground boundary for the same relisten.
-                    set_phase("enter BASIC while second MCP session remains live")
+                    # Keep the second socket alive while BASIC starts a tight
+                    # program. No prompt, CHGET, H.CRUN, or keyboard boundary is
+                    # available after RUN, so recovery here specifically proves
+                    # the guarded timer-side lifecycle path.
+                    set_phase("enter a running BASIC loop with MCP connected")
                     machine.type_line("BASIC")
                     machine.cmd("set throttle off")
-                    machine.advance(3)
+                    machine.advance(1)
+                    machine.type_line("10 GOTO 10")
+                    machine.advance(0.5)
+                    machine.type_line("RUN")
+                    machine.advance(1)
+                    machine.cmd("set throttle on")
                     _assert_agent_identity(await _mcp_status(client))
+                    lifecycle_before = _unapi_lifecycle_counts(machine)
                     await _mcp_disconnect(client)
                     connected = False
-                    machine.advance(3)
-
-                    basic_idle_lifecycle_deferred = False
-                    try:
-                        await _mcp_connect(
-                            client, settings.host, settings.port, 1.0)
-                    except ValidationError:
-                        basic_idle_lifecycle_deferred = True
-                    else:
-                        connected = True
-                        raise ValidationError(
-                            "UNAPI listener reopened from H.TIMI while BASIC "
-                            "was idle at its prompt")
-
-                    set_phase("automatic BASIC H.CRUN foreground relisten")
-                    machine.cmd("set throttle on")
-                    machine.type_line("PRINT 1")
-                    machine.cmd("set throttle off")
-                    machine.advance(2)
-                    basic_screen = machine.screen_text()
-                    if re.search(
-                            r"(?ims)^\s*PRINT 1\s*$.*^\s*1\s*$.*^\s*Ok\s*$",
-                            basic_screen) is None:
-                        raise ValidationError(
-                            "BASIC did not finish PRINT 1 and return to Ok "
-                            "after H.CRUN relisten:\n" + basic_screen)
-                    machine.cmd("set throttle on")
+                    _advance_h_timi_without_input(machine)
+                    set_phase("zero-input MCP reconnect during BASIC loop")
                     await _mcp_connect(
                         client, settings.host, settings.port, settings.timeout)
                     connected = True
@@ -1538,6 +1568,32 @@ async def _exercise_public_mcp_async(
                     third = _agent_snapshot(third_status)
                     await _mcp_memory_read(
                         client, MEMORY_TEST_ADDRESS, 16)
+                    _advance_h_timi_without_input(
+                        machine, AUTO_RELISTEN_STABILITY_SECONDS)
+                    basic_lifecycle = _assert_single_auto_relisten(
+                        lifecycle_before, _unapi_lifecycle_counts(machine),
+                        "running BASIC loop FIN recovery")
+                    basic_health = _machine_health(
+                        machine, previous_time, reset_count,
+                        "running BASIC loop FIN recovery")
+
+                    # Only after reconnection and stability have been proved may
+                    # the harness stop its controlled loop for the optional
+                    # BASIC -> DOS trace exercise that follows.
+                    machine.press("CTRL+STOP")
+                    _advance_h_timi_without_input(machine, 1.0)
+                    basic_screen = machine.screen_text()
+                    if re.search(r"(?im)^\s*Ok\s*$", basic_screen) is None:
+                        raise ValidationError(
+                            "CTRL+STOP did not return the controlled BASIC loop "
+                            "to its prompt after automatic relisten:\n" +
+                            basic_screen)
+                    hook_observer = _resident_hook_observer_report(machine)
+                    if hook_observer["gate_writes"] != 2:
+                        raise ValidationError(
+                            "UNAPINET test gate did not authorize exactly the "
+                            "two proved automatic relistens: " +
+                            repr(hook_observer))
                     await _mcp_disconnect(client)
                     connected = False
 
@@ -1545,15 +1601,19 @@ async def _exercise_public_mcp_async(
                         "mcp_protocol": protocol,
                         "mcp_tools_exercised": list(MCP_TOOLS_EXERCISED),
                         "host_control_path": "public MCP tools over STDIO",
+                        "test_only_hook_relisten_certificate":
+                            test_certificate,
+                        "test_only_hook_relisten_observer": hook_observer,
                         "first_connection": first,
                         "second_connection": second,
                         "third_connection": third,
-                        "h_timi_lifecycle_deferred":
-                            h_timi_lifecycle_deferred,
-                        "bare_chget_lifecycle_deferred":
-                            bare_chget_lifecycle_deferred,
-                        "basic_idle_lifecycle_deferred":
-                            basic_idle_lifecycle_deferred,
+                        "automatic_dos_h_timi_relisten": True,
+                        "automatic_basic_loop_h_timi_relisten": True,
+                        "machine_input_after_disconnect": False,
+                        "dos_relisten_lifecycle": dos_lifecycle,
+                        "basic_loop_relisten_lifecycle": basic_lifecycle,
+                        "dos_relisten_health": dos_health,
+                        "basic_loop_relisten_health": basic_health,
                         "memory_compare": {
                             "address": MEMORY_TEST_ADDRESS,
                             "length": 64,
@@ -1585,12 +1645,14 @@ async def _exercise_public_mcp_async(
 def _exercise_public_mcp(
         machine: object, settings: Settings, commands: Sequence[str],
         set_phase: Callable[[str], None], mcp_stderr: pathlib.Path,
+        relisten_symbols: Mapping[str, int],
         ) -> dict[str, object]:
     import anyio  # pylint: disable=import-outside-toplevel
 
     return anyio.run(
         _exercise_public_mcp_async,
         machine, settings, commands, set_phase, mcp_stderr,
+        relisten_symbols,
     )
 
 
@@ -1601,21 +1663,178 @@ async def _forget_faulted_mcp_session(client: object) -> None:
             client, "msx_agent_disconnect", read_timeout=5.0)
 
 
-def _foreground_dos_recovery(machine: object, command: str = "VER") -> str:
-    """Generate one ordinary COMMAND2 foreground boundary."""
+def _advance_h_timi_without_input(
+        machine: object, seconds: float = AUTO_RELISTEN_WAIT_SECONDS) -> None:
+    """Run a bounded emulated-time window without injecting machine input."""
+    if seconds <= 0:
+        raise ValueError("H.TIMI advance must be positive")
     machine.cmd("set throttle off")
-    before = machine.screen_text()
-    machine.type_line(command)
-    screen = _wait_dos_command_completion(machine, command, before)
+    machine.advance(seconds)
     machine.cmd("set throttle on")
-    _assert_command_screen(command, screen, prompt=True)
-    return screen
+
+
+def _enable_test_only_hook_relisten(
+        machine: object, status: Mapping[str, object],
+        symbols: Mapping[str, int]) -> dict[str, object]:
+    """Certify only the UNAPINET fixture at a mapped resident-hook boundary."""
+    resident_base = status.get("resident_base")
+    resident_entry = status.get("resident_entry")
+    linked_start = int(symbols["resident_start"])
+    expected_page = linked_start & 0xFF00
+    if resident_base != expected_page:
+        raise ValidationError(
+            "resident handshake base does not match the linked test image: "
+            f"{resident_base!r} != 0x{expected_page:04X}")
+    if not isinstance(resident_entry, int):
+        raise ValidationError(
+            "resident handshake omitted its exact relocated entry address")
+    delta = resident_entry - linked_start
+    runtime_symbols = {
+        name: int(address) + delta for name, address in symbols.items()
+    }
+    if (runtime_symbols["resident_start"] != resident_entry or
+            any(not 0x4000 <= address < 0x8000
+                for address in runtime_symbols.values())):
+        raise ValidationError(
+            "resident handshake produced an invalid page-1 relocation delta: "
+            f"entry=0x{resident_entry:04X}, delta={delta:+d}")
+    hook = runtime_symbols["resident_timi_hook"]
+    certificate_gate = runtime_symbols[
+        "unapi_service_relisten_certificate_ready"]
+    certificate = runtime_symbols["unapi_hook_relisten_certified"]
+    observed_names = (
+        "unapi_hook_relisten_certified", "unapi_relisten_pending",
+        "unapi_retry_count", "transport_session_lost",
+        "unapi_connection", "unapi_connection_state",
+        "unapi_lifecycle_busy", "unapi_busy", "unapi_last_error",
+        "runtime_mode", "hook_kind", "hook_system_suspended",
+        "tsr_heap_fault", "in_hook",
+    )
+    observed_reads = " ".join(
+            f"[debug read memory {runtime_symbols[name]}]"
+            for name in observed_names)
+    machine.cmd(f'''
+namespace eval msxaitestcert {{
+    variable armed 1
+    variable hits 0
+    variable writes 0
+    variable gate_writes 0
+    variable observed 0
+    variable last {{}}
+    variable transitions {{}}
+    variable certificate {certificate}
+    proc mark {{}} {{
+        variable armed
+        variable hits
+        variable writes
+        variable observed
+        variable last
+        variable transitions
+        variable certificate
+        if {{$armed}} {{
+            debug write memory $certificate 1
+            incr writes
+            set armed 0
+        }}
+        set observed [debug read memory $certificate]
+        set current [list {observed_reads}]
+        if {{$current ne $last}} {{
+            lappend transitions [list [machine_info time] $current]
+            if {{[llength $transitions] > 128}} {{
+                set transitions [lrange $transitions end-127 end]
+            }}
+            set last $current
+        }}
+        incr hits
+    }}
+    proc authorize {{}} {{
+        variable gate_writes
+        variable certificate
+        debug write memory $certificate 1
+        incr gate_writes
+    }}
+}}
+set msxaitestcert::bp [debug set_bp {hook} {{}} {{msxaitestcert::mark}}]
+set msxaitestcert::gate_bp [debug set_bp {certificate_gate} {{}} \
+    {{msxaitestcert::authorize}}]
+''')
+    _advance_h_timi_without_input(machine, 0.25)
+    hits = int(machine.cmd("set msxaitestcert::hits"))
+    writes = int(machine.cmd("set msxaitestcert::writes"))
+    observed = int(machine.cmd("set msxaitestcert::observed"))
+    if hits < 1 or writes != 1 or observed != 1:
+        raise ValidationError(
+            "test-only UNAPINET relisten certification was not applied at "
+            f"the mapped resident H.TIMI boundary: hits={hits}, "
+            f"writes={writes}, observed={observed}")
+    return {
+        "scope": "UNAPINET/openMSX harness only",
+        "production_gate_weakened": False,
+        "resident_timi_hook": f"0x{hook:04X}",
+        "certificate_address": f"0x{certificate:04X}",
+        "certificate_gate": f"0x{certificate_gate:04X}",
+        "resident_entry": f"0x{resident_entry:04X}",
+        "runtime_relocation_delta": delta,
+        "mapped_hook_writes": writes,
+        "mapped_hook_observations": hits,
+        "observer_fields": list(observed_names),
+    }
+
+
+def _resident_hook_observer_report(machine: object) -> dict[str, object]:
+    """Return the live mapped-hook state retained by the emulator fixture."""
+    return {
+        "hits": int(machine.cmd("set msxaitestcert::hits")),
+        "writes": int(machine.cmd("set msxaitestcert::writes")),
+        "gate_writes": int(
+            machine.cmd("set msxaitestcert::gate_writes")),
+        "certificate_observed": int(
+            machine.cmd("set msxaitestcert::observed")),
+        "last_values_tcl": machine.cmd("set msxaitestcert::last"),
+        "transitions_tcl": machine.cmd(
+            "set msxaitestcert::transitions"),
+    }
+
+
+def _unapi_lifecycle_counts(machine: object) -> dict[str, int]:
+    """Snapshot lifecycle commands without copying the large retained trace."""
+    report = _unapi_io_trace_report(machine)
+    return {
+        "tcp_open_commands": int(report["tcp_open_commands"]),
+        "tcp_abort_commands": int(report["tcp_abort_commands"]),
+    }
+
+
+def _assert_single_auto_relisten(
+        before: Mapping[str, int], after: Mapping[str, int],
+        phase: str) -> dict[str, int]:
+    """Require one ABORT/OPEN pair and reject retry/open storms."""
+    delta = {
+        name: int(after[name]) - int(before[name])
+        for name in ("tcp_abort_commands", "tcp_open_commands")
+    }
+    if delta != {"tcp_abort_commands": 1, "tcp_open_commands": 1}:
+        raise ValidationError(
+            f"{phase} did not perform exactly one automatic TCP_ABORT/TCP_OPEN "
+            f"lifecycle: before={dict(before)!r}, after={dict(after)!r}, "
+            f"delta={delta!r}")
+    return delta
+
+
+def _assert_blackhole_lifecycle_unchanged(
+        before: Mapping[str, int], after: Mapping[str, int], phase: str) -> None:
+    """A forwarding blackhole must not masquerade as a detected TCP close."""
+    if dict(before) != dict(after):
+        raise ValidationError(
+            f"{phase} unexpectedly changed the listener lifecycle while "
+            f"TCP_STATE remained established: before={dict(before)!r}, "
+            f"after={dict(after)!r}")
 
 
 async def _exercise_fault_matrix_async(
         machine: object, settings: Settings,
         set_phase: Callable[[str], None], mcp_stderr: pathlib.Path,
-        cycles: int) -> dict[str, object]:
+        cycles: int, relisten_symbols: Mapping[str, int]) -> dict[str, object]:
     """Inject repeatable host-side TCP faults into one emulated MSX."""
     from mcp.client import Client  # pylint: disable=import-outside-toplevel
     from mcp.client.stdio import (  # pylint: disable=import-outside-toplevel
@@ -1659,6 +1878,8 @@ async def _exercise_fault_matrix_async(
                     first_status = await _mcp_status(client)
                     _assert_agent_identity(first_status)
                     first = _agent_snapshot(first_status)
+                    test_certificate = _enable_test_only_hook_relisten(
+                        machine, first_status, relisten_symbols)
 
                     set_phase("steady-state framed traffic before fault injection")
                     _set_unapi_trace_phase(machine, "steady-state")
@@ -1684,19 +1905,12 @@ async def _exercise_fault_matrix_async(
                     for cycle in range(1, cycles + 1):
                         set_phase(f"fault cycle {cycle}: FIN at idle DOS prompt")
                         _set_unapi_trace_phase(machine, f"cycle-{cycle}-idle-fin")
+                        lifecycle_before = _unapi_lifecycle_counts(machine)
                         before = proxy.wait_for_session()
                         cut = proxy.cut("fin")
                         connected = False
                         await _forget_faulted_mcp_session(client)
-                        machine.cmd("set throttle off")
-                        machine.advance(3)
-                        health = _machine_health(
-                            machine, previous_time, reset_count,
-                            f"fault cycle {cycle} idle FIN")
-                        previous_time = float(health["emulator_time"])
-                        recovery_command = f"ECHO FIN{cycle:02d}"
-                        _foreground_dos_recovery(
-                            machine, recovery_command)
+                        _advance_h_timi_without_input(machine)
                         await _mcp_connect(
                             client, proxy_host, proxy_port, settings.timeout)
                         connected = True
@@ -1704,6 +1918,15 @@ async def _exercise_fault_matrix_async(
                         _assert_agent_identity(status)
                         await _mcp_memory_read(
                             client, MEMORY_TEST_ADDRESS, 16)
+                        _advance_h_timi_without_input(
+                            machine, AUTO_RELISTEN_STABILITY_SECONDS)
+                        lifecycle = _assert_single_auto_relisten(
+                            lifecycle_before, _unapi_lifecycle_counts(machine),
+                            f"fault cycle {cycle} idle FIN")
+                        health = _machine_health(
+                            machine, previous_time, reset_count,
+                            f"fault cycle {cycle} idle FIN")
+                        previous_time = float(health["emulator_time"])
                         events.append({
                             "cycle": cycle,
                             "scenario": "dos_idle_fin",
@@ -1713,36 +1936,21 @@ async def _exercise_fault_matrix_async(
                                 "client_to_target": cut.client_to_target,
                                 "target_to_client": cut.target_to_client,
                             },
-                            "foreground": recovery_command,
+                            "machine_input_after_fault": False,
+                            "automatic_lifecycle": lifecycle,
                             "recovered": True,
                             "health": health,
                         })
 
-                        set_phase(
-                            f"fault cycle {cycle}: RST queued before marked command")
+                        set_phase(f"fault cycle {cycle}: RST at idle DOS prompt")
                         _set_unapi_trace_phase(
-                            machine, f"cycle-{cycle}-queued-rst")
-                        queued_command = f"ECHO RST{cycle:02d}"
-                        machine.cmd("set pause on")
-                        before_screen = machine.screen_text()
-                        try:
-                            machine.type_line(queued_command)
-                            before = proxy.wait_for_session()
-                            cut = proxy.cut("rst")
-                            connected = False
-                            await _forget_faulted_mcp_session(client)
-                        finally:
-                            machine.cmd("set pause off")
-                        machine.cmd("set throttle off")
-                        screen = _wait_dos_command_completion(
-                            machine, queued_command, before_screen)
-                        machine.cmd("set throttle on")
-                        _assert_command_screen(
-                            queued_command, screen, prompt=True)
-                        health = _machine_health(
-                            machine, previous_time, reset_count,
-                            f"fault cycle {cycle} queued-command RST")
-                        previous_time = float(health["emulator_time"])
+                            machine, f"cycle-{cycle}-idle-rst")
+                        lifecycle_before = _unapi_lifecycle_counts(machine)
+                        before = proxy.wait_for_session()
+                        cut = proxy.cut("rst")
+                        connected = False
+                        await _forget_faulted_mcp_session(client)
+                        _advance_h_timi_without_input(machine)
                         await _mcp_connect(
                             client, proxy_host, proxy_port, settings.timeout)
                         connected = True
@@ -1750,13 +1958,22 @@ async def _exercise_fault_matrix_async(
                         _assert_agent_identity(status)
                         await _mcp_memory_read(
                             client, MEMORY_TEST_ADDRESS, 16)
+                        _advance_h_timi_without_input(
+                            machine, AUTO_RELISTEN_STABILITY_SECONDS)
+                        lifecycle = _assert_single_auto_relisten(
+                            lifecycle_before, _unapi_lifecycle_counts(machine),
+                            f"fault cycle {cycle} idle RST")
+                        health = _machine_health(
+                            machine, previous_time, reset_count,
+                            f"fault cycle {cycle} idle RST")
+                        previous_time = float(health["emulator_time"])
                         events.append({
                             "cycle": cycle,
-                            "scenario": "rst_before_queued_command",
+                            "scenario": "dos_idle_rst",
                             "proxy_session": before.number,
                             "fault": cut.fault,
-                            "foreground":
-                                f"{queued_command} already queued while paused",
+                            "machine_input_after_fault": False,
+                            "automatic_lifecycle": lifecycle,
                             "recovered": True,
                             "health": health,
                         })
@@ -1765,14 +1982,17 @@ async def _exercise_fault_matrix_async(
                             f"fault cycle {cycle}: blackhole then RST")
                         _set_unapi_trace_phase(
                             machine, f"cycle-{cycle}-blackhole-rst")
+                        lifecycle_before = _unapi_lifecycle_counts(machine)
                         before = proxy.wait_for_session()
                         silence = proxy.cut("blackhole")
-                        machine.cmd("set throttle off")
-                        machine.advance(3)
+                        _advance_h_timi_without_input(machine)
                         silent_health = _machine_health(
                             machine, previous_time, reset_count,
                             f"fault cycle {cycle} blackhole")
                         previous_time = float(silent_health["emulator_time"])
+                        _assert_blackhole_lifecycle_unchanged(
+                            lifecycle_before, _unapi_lifecycle_counts(machine),
+                            f"fault cycle {cycle} pure blackhole")
                         if not proxy.wait_for_session(
                                 after=before.number - 1).connected:
                             raise ValidationError(
@@ -1780,10 +2000,7 @@ async def _exercise_fault_matrix_async(
                         cut = proxy.cut("rst")
                         connected = False
                         await _forget_faulted_mcp_session(client)
-                        machine.advance(3)
-                        recovery_command = f"ECHO BLK{cycle:02d}"
-                        _foreground_dos_recovery(
-                            machine, recovery_command)
+                        _advance_h_timi_without_input(machine)
                         await _mcp_connect(
                             client, proxy_host, proxy_port, settings.timeout)
                         connected = True
@@ -1791,6 +2008,11 @@ async def _exercise_fault_matrix_async(
                         _assert_agent_identity(status)
                         await _mcp_memory_read(
                             client, MEMORY_TEST_ADDRESS, 16)
+                        _advance_h_timi_without_input(
+                            machine, AUTO_RELISTEN_STABILITY_SECONDS)
+                        lifecycle = _assert_single_auto_relisten(
+                            lifecycle_before, _unapi_lifecycle_counts(machine),
+                            f"fault cycle {cycle} blackhole terminal RST")
                         health = _machine_health(
                             machine, previous_time, reset_count,
                             f"fault cycle {cycle} post-blackhole recovery")
@@ -1800,59 +2022,31 @@ async def _exercise_fault_matrix_async(
                             "scenario": "blackhole_then_rst",
                             "proxy_session": before.number,
                             "blackhole_observed_open": silence.connected,
+                            "blackhole_detected_before_rst": False,
                             "terminal_fault": cut.fault,
-                            "foreground": recovery_command,
+                            "machine_input_after_fault": False,
+                            "automatic_lifecycle": lifecycle,
                             "recovered": True,
                             "health_during_silence": silent_health,
                             "health": health,
                         })
 
-                    set_phase("premature MCP reconnect while recovery is pending")
-                    _set_unapi_trace_phase(machine, "premature-reconnect")
-                    before = proxy.wait_for_session()
-                    proxy.cut("rst")
-                    connected = False
-                    await _forget_faulted_mcp_session(client)
-                    machine.cmd("set throttle off")
-                    machine.advance(0.2)
-                    premature_result = "connected"
-                    try:
-                        await _mcp_connect(
-                            client, proxy_host, proxy_port, 1.0)
-                    except ValidationError as exc:
-                        premature_result = f"failed: {exc}"
-                        await _forget_faulted_mcp_session(client)
-                    else:
-                        connected = True
+                    hook_observer = _resident_hook_observer_report(machine)
+                    expected_gate_writes = 3 * cycles
+                    if hook_observer["gate_writes"] != expected_gate_writes:
                         raise ValidationError(
-                            "premature MCP reconnect succeeded before any "
-                            "foreground recovery boundary")
-                    if not connected:
-                        recovery_command = "ECHO PREMATURE"
-                        _foreground_dos_recovery(
-                            machine, recovery_command)
-                        await _mcp_connect(
-                            client, proxy_host, proxy_port, settings.timeout)
-                        connected = True
-                    status = await _mcp_status(client)
-                    _assert_agent_identity(status)
-                    await _mcp_memory_read(client, MEMORY_TEST_ADDRESS, 16)
-                    health = _machine_health(
-                        machine, previous_time, reset_count,
-                        "premature reconnect recovery")
-                    events.append({
-                        "scenario": "premature_reconnect",
-                        "proxy_session": before.number,
-                        "first_attempt": premature_result,
-                        "recovered": True,
-                        "health": health,
-                    })
+                            "UNAPINET test gate authorization count differs "
+                            f"from {expected_gate_writes} automatic fault "
+                            "recoveries: " + repr(hook_observer))
                     await _mcp_disconnect(client)
                     connected = False
 
                     return {
                         "host_control_path":
                             "public MCP tools through deterministic TCP proxy",
+                        "test_only_hook_relisten_certificate":
+                            test_certificate,
+                        "test_only_hook_relisten_observer": hook_observer,
                         "first_connection": first,
                         "fault_cycles": cycles,
                         "fault_scenarios": list(FAULT_SCENARIOS),
@@ -1884,12 +2078,13 @@ async def _exercise_fault_matrix_async(
 def _exercise_fault_matrix(
         machine: object, settings: Settings,
         set_phase: Callable[[str], None], mcp_stderr: pathlib.Path,
-        cycles: int) -> dict[str, object]:
+        cycles: int, relisten_symbols: Mapping[str, int]) -> dict[str, object]:
     import anyio  # pylint: disable=import-outside-toplevel
 
     return anyio.run(
         _exercise_fault_matrix_async,
         machine, settings, set_phase, mcp_stderr, cycles,
+        relisten_symbols,
     )
 
 
@@ -1912,8 +2107,13 @@ def run_validation(settings: Settings, *,
         raise ValueError(
             "trace validation powers off to inspect the FAT image and cannot "
             "be combined with keep_open")
+    if trace_validation:
+        _require_mcopy()
     validate_local_prerequisites(settings)
-    canonical = build_agent_package(settings, runner=runner)
+    canonical = build_agent_package(
+        settings, development_trace=trace_validation, runner=runner)
+    relisten_symbols = _test_only_relisten_symbol_addresses(
+        settings, development_trace=trace_validation)
     machine = None
     phase = "prepare pinned distribution"
     with prepared_distribution(settings) as distribution:
@@ -2046,11 +2246,12 @@ def run_validation(settings: Settings, *,
                     phase = "initialize deterministic TCP fault matrix"
                     mcp_report = _exercise_fault_matrix(
                         machine, settings, set_phase,
-                        runtime / "mcp-fault-stderr.log", fault_cycles)
+                        runtime / "mcp-fault-stderr.log", fault_cycles,
+                        relisten_symbols)
                 else:
                     mcp_report = _exercise_public_mcp(
                         machine, settings, commands, set_phase,
-                        runtime / "mcp-stderr.log")
+                        runtime / "mcp-stderr.log", relisten_symbols)
 
                 trace_report: dict[str, object] = {}
                 if trace_validation:
@@ -2078,7 +2279,9 @@ def run_validation(settings: Settings, *,
                     "mapper_profile": mapper_profile,
                     **mcp_report,
                     **trace_report,
-                    "contract_path_exercised": list(CONTRACT_PATH),
+                    "contract_path_exercised": list(
+                        FAULT_CONTRACT_PATH if fault_cycles
+                        else CONTRACT_PATH),
                     "pinned_get_capab_block1_hl":
                         f"0x{PINNED_GET_CAPAB_BLOCK1_HL:04X}",
                     "pico_firmware_emulated": False,
@@ -2091,9 +2294,8 @@ def run_validation(settings: Settings, *,
                     })
                 else:
                     result.update({
-                        "automatic_foreground_relisten_after_console_input":
-                            True,
-                        "automatic_basic_h_crun_relisten": True,
+                        "automatic_h_timi_relisten_without_machine_input": True,
+                        "automatic_basic_loop_h_timi_relisten": True,
                     })
                 if trace_validation:
                     result["resident_trace_validation"] = True
@@ -2188,7 +2390,8 @@ def build_parser() -> argparse.ArgumentParser:
             help="leave the visible emulator running until its window closes")
         if name == "faults":
             command.add_argument(
-                "--cycles", type=int, default=DEFAULT_FAULT_CYCLES,
+                "--cycles", type=_arg_fault_cycles,
+                default=DEFAULT_FAULT_CYCLES,
                 help=("number of FIN/RST/blackhole cycles in the single "
                       f"openMSX instance (default: {DEFAULT_FAULT_CYCLES})"))
     return parser

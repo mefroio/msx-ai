@@ -40,7 +40,7 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
     def _resident_trace_fixture() -> str:
         return "\r\n".join((
             "MSXAI TRACE V1",
-            "FLAGS=03 COUNT=08 NEXT=08 SEQ=0008",
+            "FLAGS=03 COUNT=09 NEXT=09 SEQ=0009",
             "POLLS=0010 CHANGES=0002 TIMI=0100",
             "FIRST DROP E=00 S=00 C=00 X=01 F=2D T=0105 "
             "EXTRA=1E00000000030202",
@@ -50,15 +50,16 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             "#0004 STATE E=00 S=01 C=01 X=00 F=28 T=0004",
             "#0005 STATE E=00 S=04 C=01 X=00 F=28 T=0005",
             "#0006 DROP E=00 S=00 C=00 X=01 F=2D T=0006",
-            "#0007 SYSTEM_SUSPEND E=00 S=00 C=00 X=01 F=39 T=0007",
-            "#0008 SYSTEM_RESUME E=00 S=00 C=00 X=01 F=39 T=0008",
+            "#0007 AUTO_RELISTEN E=00 S=00 C=00 X=01 F=29 T=0007",
+            "#0008 SYSTEM_SUSPEND E=00 S=00 C=00 X=01 F=39 T=0008",
+            "#0009 SYSTEM_RESUME E=00 S=00 C=00 X=01 F=39 T=0009",
             "",
         ))
 
     @staticmethod
     def _wrapped_resident_trace_fixture(*, next_index: int = 2) -> str:
         sequences = [
-            (0xFFF3 + index) & 0xFFFF for index in range(16)
+            (0xFFEF + index) & 0xFFFF for index in range(20)
         ]
         records = [
             f"#{sequence:04X} "
@@ -68,7 +69,7 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
         ]
         return "\n".join((
             "MSXAI TRACE V1",
-            f"FLAGS=07 COUNT=10 NEXT={next_index:02X} SEQ=0002",
+            f"FLAGS=07 COUNT=14 NEXT={next_index:02X} SEQ=0002",
             "POLLS=FFFF CHANGES=0010 TIMI=FFFF",
             "FIRST DROP E=00 S=00 C=00 X=01 F=2D T=0105 "
             "EXTRA=1E00000000030202",
@@ -172,6 +173,28 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             harness.msx_install_commands(65535)
 
+    def test_trace_build_uses_isolated_development_target_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            settings = mock.Mock(spec=harness.Settings)
+            settings.make = "test-make"
+            settings.root = root
+
+            def build(command, **_kwargs):
+                self.assertEqual(command, ["test-make", "agent-trace"])
+                artifact_root = root / "work" / "agent-trace"
+                artifact_root.mkdir(parents=True)
+                for name in harness.AGENT_PACKAGE_NAMES:
+                    (artifact_root / name).write_bytes(b"development")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            artifacts = harness.build_agent_package(
+                settings, development_trace=True, runner=build)
+            self.assertEqual(
+                {path.parent for path in artifacts},
+                {root / "work" / "agent-trace"})
+            self.assertFalse((root / "work" / "agent").exists())
+
     def test_trace_install_uses_compact_resident_cli_without_changing_setup(self):
         normal = harness.msx_install_commands(43123)
         traced = harness.msx_install_commands(43123, trace=True)
@@ -240,9 +263,9 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
     def test_resident_trace_parser_decodes_crlf_records_and_snapshot(self):
         trace = harness.parse_resident_trace(self._resident_trace_fixture())
         self.assertEqual(trace["flags"], 0x03)
-        self.assertEqual(trace["count"], 8)
-        self.assertEqual(trace["next_index"], 8)
-        self.assertEqual(trace["sequence"], 8)
+        self.assertEqual(trace["count"], 9)
+        self.assertEqual(trace["next_index"], 9)
+        self.assertEqual(trace["sequence"], 9)
         self.assertEqual(trace["polls"], 0x10)
         self.assertEqual(trace["state_changes"], 2)
         self.assertEqual(trace["timi"], 0x100)
@@ -256,11 +279,11 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             "jiffy": 0x0105,
             "extra": [0x1E, 0, 0, 0, 0, 3, 2, 2],
         })
-        self.assertEqual(len(trace["records"]), 8)
+        self.assertEqual(len(trace["records"]), 9)
         self.assertEqual(
             trace["events"],
             ["ENABLE", "OPEN_BEGIN", "OPEN_END", "STATE", "STATE",
-             "DROP", "SYSTEM_SUSPEND", "SYSTEM_RESUME"])
+             "DROP", "AUTO_RELISTEN", "SYSTEM_SUSPEND", "SYSTEM_RESUME"])
         harness.validate_resident_trace(trace)
 
     def test_resident_trace_parser_rejects_truncated_or_malformed_text(self):
@@ -272,8 +295,8 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             valid.replace("FLAGS=03", "FLAGS=0g"),
             valid.replace("POLLS=0010", "POLLS=010"),
             valid.replace("FIRST DROP", "FIRST drop"),
-            valid.replace("#0008 SYSTEM_RESUME", ""),
-            valid.replace("COUNT=08", "COUNT=08\n"),
+            valid.replace("#0009 SYSTEM_RESUME", ""),
+            valid.replace("COUNT=09", "COUNT=09\n"),
         )
         for text in malformed:
             with self.subTest(text=text[:40]):
@@ -285,7 +308,7 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             self._wrapped_resident_trace_fixture())
         self.assertEqual(
             [record["sequence"] for record in trace["records"]],
-            list(range(0xFFF3, 0x10000)) + [0, 1, 2])
+            list(range(0xFFEF, 0x10000)) + [0, 1, 2])
         harness.validate_resident_trace(trace)
 
     def test_resident_trace_validator_rejects_ring_and_incident_corruption(self):
@@ -293,9 +316,9 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
         corruptions = (
             ("unknown flags", valid.replace("FLAGS=03", "FLAGS=0B")),
             ("not enabled", valid.replace("FLAGS=03", "FLAGS=02")),
-            ("count mismatch", valid.replace("COUNT=08", "COUNT=09")),
-            ("invalid next", valid.replace("NEXT=08", "NEXT=10")),
-            ("inconsistent next", valid.replace("NEXT=08", "NEXT=07")),
+            ("count mismatch", valid.replace("COUNT=09", "COUNT=0A")),
+            ("invalid next", valid.replace("NEXT=09", "NEXT=14")),
+            ("inconsistent next", valid.replace("NEXT=09", "NEXT=08")),
             ("wrapped partial", valid.replace("FLAGS=03", "FLAGS=07")),
             ("incident mismatch", valid.replace("FLAGS=03", "FLAGS=01")),
             ("non-incident first", valid.replace("FIRST DROP", "FIRST STATE")),
@@ -330,6 +353,16 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
                 harness.ValidationError, "event|MYSTERY"):
             harness.validate_resident_trace(trace)
 
+    def test_trace_sequence_requires_forward_progress(self):
+        self.assertEqual(harness._trace_sequence_delta(7, 10), 3)
+        self.assertEqual(harness._trace_sequence_delta(0xFFFF, 0), 1)
+        with self.assertRaisesRegex(
+                harness.ValidationError, "did not advance"):
+            harness._trace_sequence_delta(9, 9)
+        with self.assertRaisesRegex(
+                harness.ValidationError, "backwards|reset"):
+            harness._trace_sequence_delta(10, 9)
+
     def test_trace_subcommand_dispatches_without_opening_emulator(self):
         namespace = harness.build_parser().parse_args(["trace"])
         self.assertEqual(namespace.command, "trace")
@@ -360,6 +393,17 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "keep_open"):
             harness.run_validation(settings, trace_validation=True)
 
+    def test_trace_requires_mcopy_before_other_prerequisites(self):
+        settings = mock.Mock(spec=harness.Settings)
+        settings.keep_open = False
+        with (mock.patch.object(harness.shutil, "which", return_value=None),
+              mock.patch.object(
+                  harness, "validate_local_prerequisites") as prerequisites):
+            with self.assertRaisesRegex(
+                    harness.PrerequisiteError, "mcopy"):
+                harness.run_validation(settings, trace_validation=True)
+        prerequisites.assert_not_called()
+
     def test_fault_parser_defaults_to_three_cycles(self):
         namespace = harness.build_parser().parse_args(["faults"])
         self.assertEqual(namespace.command, "faults")
@@ -367,6 +411,14 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
         namespace = harness.build_parser().parse_args(
             ["faults", "--cycles", "7"])
         self.assertEqual(namespace.cycles, 7)
+
+    def test_fault_parser_requires_positive_cycles(self):
+        parser = harness.build_parser()
+        for value in ("0", "-1", "not-a-number"):
+            with self.subTest(value=value):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(["faults", "--cycles", value])
 
     def test_fault_run_rejects_invalid_cycle_count_before_prerequisites(self):
         settings = mock.Mock(spec=harness.Settings)
@@ -420,6 +472,18 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             harness.PINNED_GET_CAPAB_BLOCK1_HL &
             harness.PASSIVE_UNSPECIFIED_REMOTE_BIT)
 
+    def test_fault_contract_omits_basic_only(self):
+        self.assertEqual(
+            harness.FAULT_CONTRACT_PATH, harness.CONTRACT_PATH[:-1])
+        self.assertNotIn(
+            "basic", "\n".join(harness.FAULT_CONTRACT_PATH).lower())
+        self.assertIn("basic", "\n".join(harness.CONTRACT_PATH).lower())
+        source = pathlib.Path(harness.__file__).read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"FAULT_CONTRACT_PATH if fault_cycles\s+else CONTRACT_PATH",
+        )
+
     def test_e2e_uses_public_mcp_instead_of_direct_realmsx(self):
         source = pathlib.Path(harness.__file__).read_text(encoding="utf-8")
         self.assertNotIn("from msx_real import RealMSX", source)
@@ -428,45 +492,51 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             self.assertIn(tool_name, source)
 
         reconnect = source.split(
-            '"public-MCP disconnect and automatic foreground relisten"',
+            '"public-MCP disconnect and zero-input H.TIMI relisten"',
             1,
         )[1].split("return {", 1)[0]
         dos_reconnect, basic_reconnect = reconnect.split(
-            '"enter BASIC while second MCP session remains live"', 1)
-        type_lines = [
-            line.strip() for line in dos_reconnect.splitlines()
-            if "machine.type_line(" in line
-        ]
-        self.assertEqual(type_lines, ['machine.type_line("ER")'])
-        self.assertIn('machine.type("V")', reconnect)
+            '"enter a running BASIC loop with MCP connected"', 1)
+        for forbidden in (
+                "machine.type(", "machine.type_line(", "machine.press(",
+                "_foreground_dos_recovery"):
+            self.assertNotIn(forbidden, dos_reconnect)
         self.assertEqual(source.count("machine.type_line(commands[3])"), 1)
-        self.assertEqual(dos_reconnect.count("await _mcp_connect("), 3)
-        self.assertEqual(dos_reconnect.count("except ValidationError:"), 2)
-        self.assertIn("h_timi_lifecycle_deferred = True", dos_reconnect)
-        self.assertIn(
-            "bare_chget_lifecycle_deferred = True", dos_reconnect)
-        self.assertLess(
-            dos_reconnect.index("await _mcp_connect("),
-            dos_reconnect.index('machine.type("V")'),
-        )
-        self.assertLess(
-            dos_reconnect.index('machine.type("V")'),
-            dos_reconnect.index('machine.type_line("ER")'),
-        )
-        self.assertLess(
-            dos_reconnect.index('machine.type_line("ER")'),
-            dos_reconnect.rindex("await _mcp_connect("),
-        )
-        self.assertLess(
-            dos_reconnect.index("await _mcp_connect("),
-            dos_reconnect.index("except ValidationError:"),
-        )
+        self.assertEqual(dos_reconnect.count("await _mcp_connect("), 1)
+        self.assertIn("_advance_h_timi_without_input(machine)", dos_reconnect)
+        self.assertIn("_assert_single_auto_relisten(", dos_reconnect)
+        self.assertNotIn("h_timi_lifecycle_deferred", source)
+        self.assertNotIn("bare_chget_lifecycle_deferred", source)
+        self.assertNotIn("basic_idle_lifecycle_deferred", source)
+        self.assertNotIn("def _foreground_dos_recovery", source)
+
         self.assertIn('machine.type_line("BASIC")', basic_reconnect)
-        self.assertIn('machine.type_line("PRINT 1")', basic_reconnect)
-        self.assertIn("BASIC did not finish PRINT 1", basic_reconnect)
-        self.assertEqual(basic_reconnect.count("await _mcp_connect("), 2)
+        self.assertIn('machine.type_line("10 GOTO 10")', basic_reconnect)
+        self.assertIn('machine.type_line("RUN")', basic_reconnect)
+        after_basic_disconnect = basic_reconnect.split(
+            "await _mcp_disconnect(client)", 1)[1].split(
+                'set_phase("zero-input MCP reconnect during BASIC loop")',
+                1)[0]
+        for forbidden in (
+                "machine.type(", "machine.type_line(", "machine.press(",
+                "_foreground_dos_recovery"):
+            self.assertNotIn(forbidden, after_basic_disconnect)
         self.assertIn(
-            "basic_idle_lifecycle_deferred = True", basic_reconnect)
+            'set_phase("zero-input MCP reconnect during BASIC loop")',
+            basic_reconnect)
+        self.assertIn("await _mcp_connect(", basic_reconnect)
+        self.assertIn("_enable_test_only_hook_relisten(", source)
+        self.assertIn('"production_gate_weakened": False', source)
+
+        fault_matrix = source.split(
+            "async def _exercise_fault_matrix_async", 1)[1].split(
+                "def _exercise_fault_matrix", 1)[0]
+        self.assertNotIn("machine.type_line(", fault_matrix)
+        self.assertNotIn("machine.type(", fault_matrix)
+        self.assertNotIn("machine.press(", fault_matrix)
+        self.assertNotIn("_foreground_dos_recovery", fault_matrix)
+        self.assertGreaterEqual(
+            fault_matrix.count('"machine_input_after_fault": False'), 3)
 
     def test_screen_check_accepts_passive_banner_and_rejects_real_errors(self):
         harness._assert_command_screen(
@@ -612,7 +682,7 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
     "set MSX_RUN_UNAPI_INTEGRATION=1 and supply pinned v0.9.7 assets",
 )
 class OpenMSXUNAPIIntegrationTest(unittest.TestCase):
-    def test_discovery_passive_tcp_and_automatic_console_relisten(self):
+    def test_discovery_passive_tcp_and_zero_input_h_timi_relisten(self):
         parser = harness.build_parser()
         namespace = parser.parse_args(["run"])
         try:
@@ -637,12 +707,22 @@ class OpenMSXUNAPIIntegrationTest(unittest.TestCase):
             result["second_connection"]["agent_transport"], "tcpip-unapi")
         self.assertEqual(
             result["third_connection"]["agent_transport"], "tcpip-unapi")
+        self.assertTrue(result["automatic_dos_h_timi_relisten"])
+        self.assertTrue(result["automatic_basic_loop_h_timi_relisten"])
         self.assertTrue(
-            result["automatic_foreground_relisten_after_console_input"])
-        self.assertTrue(result["h_timi_lifecycle_deferred"])
-        self.assertTrue(result["bare_chget_lifecycle_deferred"])
-        self.assertTrue(result["basic_idle_lifecycle_deferred"])
-        self.assertTrue(result["automatic_basic_h_crun_relisten"])
+            result["automatic_h_timi_relisten_without_machine_input"])
+        self.assertFalse(result["machine_input_after_disconnect"])
+        self.assertEqual(result["dos_relisten_lifecycle"], {
+            "tcp_abort_commands": 1,
+            "tcp_open_commands": 1,
+        })
+        self.assertEqual(result["basic_loop_relisten_lifecycle"], {
+            "tcp_abort_commands": 1,
+            "tcp_open_commands": 1,
+        })
+        self.assertFalse(
+            result["test_only_hook_relisten_certificate"]
+            ["production_gate_weakened"])
         self.assertTrue(
             result["memory_compare"]["matched_openmsx_debugger"])
         self.assertFalse(result["pico_firmware_emulated"])

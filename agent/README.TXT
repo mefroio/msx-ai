@@ -40,6 +40,11 @@ required.
 The default mode installs the agent as a MemMan resident and returns to DOS.
 This is the recommended mode for file transfers and DOS applications.
 
+If a resident TCP connection is lost, the listener reopens silently. The host
+can connect again to the same IP address and port without typing a command or
+pressing a key on the MSX. This was validated on a physical HOTBIT 1.0 with an
+MSX Pico+ cartridge.
+
 MemMan A7 v1 is the safe lifecycle request for targets 0, 1, and 2. Offset
 14 selects 8251, 16C550, or UNAPI; offset 15 is reserved and stays zero.
 MP.COM selects UNAPI. Its 1 KiB page-2 stack has low/high guards and leaves
@@ -63,22 +68,6 @@ is required:
 
 Monitor mode stays in the foreground. Press Ctrl+Stop to request exit.
 DEBUG is accepted only with /MONITOR.
-
-RESIDENT TRACE
---------------
-
-Use /TRACE only with the resident UNAPI mode:
-
-   MSXAI /DRIVER:UNAPI /PORT:6603 /TRACE
-   MSXAI 6603 /TRACE
-
-/TRACE is separate from /MONITOR DEBUG and does not draw on the MSX screen.
-If the connection falls, return to DOS and save the diagnostic information:
-
-   MSXAI /DUMPTRACE A:\MSXAI.LOG
-
-/DUMPTRACE must be used alone and the destination file must not already
-exist. Dumping preserves the resident trace for another dump.
 
 REMOVAL AND UPDATE
 ------------------

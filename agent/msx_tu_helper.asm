@@ -31,6 +31,12 @@ PICO_TIMI_ENTRY_LOW:     equ 0B8h
 PICO_TIMI_ENTRY_HIGH:    equ 04Ch
 RET_OPCODE:              equ 0C9h
 PICO_WORK_MAX:           equ 64
+PICO_CERT_SIZE:          equ 4
+PICO_CERT_MIN_POINTER:   equ 0C004h
+PICO_CERT_TAG_M:         equ 04Dh
+PICO_CERT_TAG_A:         equ 041h
+PICO_CERT_LOW:           equ 0A5h
+PICO_CERT_HIGH:          equ 05Ah
 
 DOS_OPEN:                equ 043h
 DOS_CLOSE:               equ 045h
@@ -482,13 +488,17 @@ relocate_pico_private_block:
     ; was initialized before this candidate query. Its allocation length can
     ; no longer be measured safely, so reject the install instead of reporting
     ; success and leaving BASIC able to reuse that block. A non-adjacent
-    ; pointer is compatible with an earlier successful persistent relocation.
+    ; pointer is compatible only with an earlier successful persistent
+    ; relocation by this TU generation.  Validate the private certificate so
+    ; an old untagged relocation cannot be silently accepted in the same boot.
     ld hl,(HIMEM)
     inc hl
     ld de,(PICO_WORK_POINTER)
     or a
     sbc hl,de
     jr z,relocate_pico_layout_failed
+    call validate_pico_relocation_certificate
+    jr nz,relocate_pico_layout_failed
     ld a,1
     ld (pico_relocation_applied),a
     ret
@@ -511,7 +521,12 @@ relocate_pico_have_measured_length:
     ; HeapAlloc is called directly with interrupts disabled. MemMan guarantees
     ; the returned address is permanently visible in page 3 until explicitly
     ; released; this firmware-owned block is deliberately not released by TK.
+    ; The four private bytes immediately before the firmware-visible block are
+    ; a durable certificate that only this exact Pico/Pico+ relocation path can
+    ; publish. The resident never infers hook safety from a product name or a
+    ; generic UNAPI capability bit.
     ld a,(pico_work_length)
+    add a,PICO_CERT_SIZE
     ld l,a
     ld h,0
     ld de,MEMMAN_HEAP_ALLOC
@@ -520,6 +535,14 @@ relocate_pico_have_measured_length:
     ld a,h
     or l
     jr z,relocate_pico_heap_failed
+    ld (hl),PICO_CERT_TAG_M
+    inc hl
+    ld (hl),PICO_CERT_TAG_A
+    inc hl
+    ld (hl),PICO_CERT_LOW
+    inc hl
+    ld (hl),PICO_CERT_HIGH
+    inc hl
     ld (pico_heap_pointer),hl
 
     ex de,hl                    ; DE = persistent destination
@@ -544,6 +567,34 @@ relocate_pico_layout_failed:
     ld (pico_relocation_error),a
     ret
 relocate_pico_private_block_end:
+
+; Return Z only when FD3Eh points beyond TU's exact four-byte page-3
+; certificate.  This is the idempotent second-run path; it must never infer a
+; previous relocation from a non-adjacent pointer alone.
+validate_pico_relocation_certificate:
+    ld hl,(PICO_WORK_POINTER)
+    ld de,PICO_CERT_MIN_POINTER
+    or a
+    sbc hl,de
+    ret c
+    ld hl,(PICO_WORK_POINTER)
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_HIGH
+    ret nz
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_LOW
+    ret nz
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_TAG_A
+    ret nz
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_TAG_M
+    ret
+validate_pico_relocation_certificate_end:
 
 ; Z80 has no indirect CALL. The wrapper inherits the caller's return address,
 ; loads the target through IX so the HeapAlloc size in HL remains intact, then

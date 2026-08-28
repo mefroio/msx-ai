@@ -143,7 +143,8 @@ class ResidentAgentSourceTests(unittest.TestCase):
         hello = self.source.split("frame_cmd_hello:", 1)[1].split(
             "frame_cmd_status:", 1)[0]
         self.assertIn("call current_features", hello)
-        self.assertIn("ld hl,15", hello)
+        self.assertIn("ld a,(resident_low)", hello)
+        self.assertIn("ld hl,16", hello)
 
         features = self.source.split("current_features:", 1)[1].split(
             "cmd_status:", 1)[0]
@@ -738,6 +739,8 @@ class ResidentAgentSourceTests(unittest.TestCase):
         source = UNAPI_TRANSPORT.read_text(encoding="utf-8")
         self.assertRegex(source, r"(?m)^UNAPI_ID:\s+equ\s+2\s*$")
         self.assertRegex(
+            source, r"(?m)^UNAPI_RELISTEN_DELAY:\s+equ\s+30\s*$")
+        self.assertRegex(
             source,
             r"(?m)^UNAPI_FLAGS:\s+equ\s+TRANSPORT_FLAG_TIMI_ONLY\s+\|\s+"
             r"TRANSPORT_FLAG_FRAME_WAKE_ACK\s*$")
@@ -750,9 +753,28 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("bit 5,l", discovery)
         self.assertIn("and 008h", discovery)
         self.assertIn("ld (unapi_open_blocking),a", discovery)
+        self.assertIn("call unapi_certify_hook_relisten", discovery)
         self.assertIn("cp 0C0h", discovery)
         self.assertIn("call CALSLT", discovery)
         self.assertIn("unapi_mapped_dispatch:", discovery)
+
+        certification = source.split(
+            "unapi_certify_hook_relisten:", 1)[1].split(
+                "unapi_copy_api_id:", 1)[0]
+        self.assertRegex(
+            certification,
+            r"(?s)xor a\s+"
+            r"ld \(unapi_hook_relisten_certified\),a\s+"
+            r"ld a,\(unapi_implementation_count\)\s+cp 1\s+ret nz\s+"
+            r"ld a,\(unapi_open_blocking\)\s+or a\s+ret z\s+"
+            r"ld hl,\(PICO_WORK_POINTER\)\s+"
+            r"ld de,PICO_CERT_MIN_POINTER\s+or a\s+sbc hl,de\s+ret c\s+"
+            r"ld hl,\(PICO_WORK_POINTER\)\s+"
+            r"dec hl\s+ld a,\(hl\)\s+cp PICO_CERT_HIGH\s+ret nz\s+"
+            r"dec hl\s+ld a,\(hl\)\s+cp PICO_CERT_LOW\s+ret nz\s+"
+            r"dec hl\s+ld a,\(hl\)\s+cp PICO_CERT_TAG_A\s+ret nz\s+"
+            r"dec hl\s+ld a,\(hl\)\s+cp PICO_CERT_TAG_M\s+ret nz\s+"
+            r"ld a,1\s+ld \(unapi_hook_relisten_certified\),a\s+ret")
 
         listener = source.split("unapi_open_listener:", 1)[1].split(
             "unapi_abort_current:", 1)[0]
@@ -811,39 +833,84 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("ld (unapi_cleanup_connection),a", drop)
         self.assertIn("ld (transport_session_lost),a", drop)
         self.assertIn("ld (unapi_relisten_pending),a", drop)
+        self.assertIn("ld a,UNAPI_RELISTEN_DELAY", drop)
+        self.assertIn("ld (unapi_retry_count),a", drop)
         self.assertNotIn("call unapi_abort_current", drop)
         self.assertNotIn("call transport_session_reset", drop)
 
-        relisten = source.split("unapi_service_relisten:", 1)[1].split(
-            "unapi_service_have_connection:", 1)[0]
-        relisten_guard = relisten.split(
-            "call unapi_relisten_foreground", 1)[0]
+        retry_wait = source.split(
+            "unapi_service_after_wait:", 1)[1].split(
+                "unapi_service_relisten:", 1)[0]
         self.assertRegex(
-            relisten_guard,
-            r"(?s)ld a,\(transport_session_lost\)\s+or a\s+ret nz.*"
-            r"ld a,\(in_hook\)\s+or a\s+ret nz\s*$")
-        for forbidden in (
-                "unapi_abort_current", "unapi_open_listener",
-                "unapi_relisten_foreground"):
-            self.assertNotIn(forbidden, relisten_guard)
+            retry_wait,
+            r"(?s)ld a,\(unapi_connection\)\s+or a\s+"
+            r"jr nz,unapi_service_have_connection\s+"
+            r"ld a,\(unapi_retry_count\)\s+or a\s+"
+            r"jr z,unapi_service_relisten\s+dec a\s+"
+            r"ld \(unapi_retry_count\),a\s+xor a\s+ret")
 
-        foreground_relisten = source.split(
-            "unapi_relisten_foreground:", 1)[1].split(
+        relisten = source.split("unapi_service_relisten:", 1)[1].split(
+            "unapi_relisten_checkpoint:", 1)[0]
+        self.assertRegex(
+            relisten,
+            r"(?s)ld a,\(transport_session_lost\)\s+or a\s+ret nz.*"
+            r"ld a,\(in_hook\)\s+or a\s+"
+            r"jr z,unapi_service_relisten_checkpoint\s+"
+            r"if MSXAI_TSR_BUILD.*?"
+            r"ld a,\(unapi_relisten_pending\)\s+or a\s+ret z\s+"
+            r"ld a,\(runtime_mode\)\s+cp RUNTIME_RESIDENT\s+ret nz\s+"
+            r"ld a,\(hook_kind\)\s+or a\s+ret z.*"
+            r"ld a,\(hook_system_suspended\)\s+or a\s+ret nz\s+"
+            r"ld a,\(tsr_heap_fault\)\s+or a\s+ret nz.*?"
+            r"call unapi_certify_hook_relisten\s+"
+            r"unapi_service_relisten_certificate_ready:\s+"
+            r"ld a,\(unapi_hook_relisten_certified\)\s+or a\s+ret z.*"
+            r"ld a,\(unapi_lifecycle_busy\)\s+or a\s+ret nz\s+"
+            r"ld a,TRACE_EVENT_AUTO_RELISTEN\s+call trace_record\s+"
+            r"else\s+ret\s+endif\s+"
+            r"unapi_service_relisten_checkpoint:\s+"
+            r"call unapi_relisten_checkpoint\s+ret z\s+"
+            r"jr unapi_service_relisten_failed")
+
+        # An in-hook generic UNAPI instance fails the certification gate and
+        # keeps the existing foreground fallback. Outside a hook, the same
+        # checkpoint remains available to the monitor and DOS/BASIC hooks.
+        self.assertLess(
+            relisten.index("jr z,unapi_service_relisten_checkpoint"),
+            relisten.index("ld a,(unapi_hook_relisten_certified)"))
+        certification_gate = relisten.index(
+            "ld a,(unapi_hook_relisten_certified)")
+        self.assertLess(
+            certification_gate,
+            relisten.index("ret z", certification_gate),
+        )
+
+        checkpoint = source.split(
+            "unapi_relisten_checkpoint:", 1)[1].split(
                 "unapi_service_relisten_failed:", 1)[0]
         self.assertRegex(
-            foreground_relisten,
+            checkpoint,
             r"(?s)ld a,1\s+ld \(unapi_lifecycle_busy\),a\s+.*?"
             r"call unapi_abort_current\s+or a\s+"
-            r"jr nz,unapi_relisten_foreground_abort_failed\s+"
+            r"jr nz,unapi_relisten_checkpoint_abort_failed\s+"
             r"call unapi_reset_stream_state\s+"
             r"call unapi_open_listener\s+"
-            r"jr unapi_relisten_foreground_finish.*"
-            r"unapi_relisten_foreground_finish:\s+di\s+xor a\s+"
+            r"jr unapi_relisten_checkpoint_finish.*"
+            r"unapi_relisten_checkpoint_finish:\s+di\s+xor a\s+"
             r"ld \(unapi_lifecycle_busy\),a\s+.*?"
             r"ld a,\(unapi_last_error\)\s+ret")
-        self.assertNotIn("transport_session_reset", foreground_relisten)
-        self.assertNotIn("xfer_reconfigure_detach", foreground_relisten)
-        self.assertNotIn("unapi_relisten_pending", foreground_relisten)
+        self.assertNotIn("transport_session_reset", checkpoint)
+        self.assertNotIn("xfer_reconfigure_detach", checkpoint)
+        self.assertNotIn("unapi_relisten_pending", checkpoint)
+
+        relisten_failed = source.split(
+            "unapi_service_relisten_failed:", 1)[1].split(
+                "unapi_service_have_connection:", 1)[0]
+        self.assertRegex(
+            relisten_failed,
+            r"(?s)ld a,UNAPI_RELISTEN_DELAY\s+"
+            r"ld \(unapi_retry_count\),a\s+"
+            r"ld a,\(unapi_last_error\)\s+ret")
 
         stream_reset = source.split("unapi_reset_stream_state:", 1)[1].split(
             "; --------------------------------------------------------------- discovery", 1)[0]

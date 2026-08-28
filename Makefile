@@ -26,6 +26,18 @@ AGENT_TSR_METADATA := $(AGENT_BUILD_DIR)/MSXAI_TSR.INC
 AGENT_TSR_8251 := work/agent/MCP8251.TSR
 AGENT_TSR_16C550 := work/agent/MCP16550.TSR
 AGENT_TSR_UNAPI := work/agent/MCPUNAPI.TSR
+AGENT_TRACE_SRC := agent/msx_agent_trace.asm
+AGENT_TRACE_DIR := work/agent-trace
+AGENT_TRACE_COM := $(AGENT_TRACE_DIR)/MSXAI.COM
+AGENT_TRACE_XFER_COM := $(AGENT_TRACE_DIR)/MSXAIXF.COM
+AGENT_TRACE_PORT_COM := $(AGENT_TRACE_DIR)/MP.COM
+AGENT_TRACE_TU_COM := $(AGENT_TRACE_DIR)/TU.COM
+AGENT_TRACE_BUILD_DIR := $(AGENT_TRACE_DIR)/build
+AGENT_TRACE_TSR := $(AGENT_TRACE_BUILD_DIR)/MSXAI.TSR
+AGENT_TRACE_TSR_METADATA := $(AGENT_TRACE_BUILD_DIR)/MSXAI_TSR.INC
+AGENT_TRACE_TSR_8251 := $(AGENT_TRACE_DIR)/MCP8251.TSR
+AGENT_TRACE_TSR_16C550 := $(AGENT_TRACE_DIR)/MCP16550.TSR
+AGENT_TRACE_TSR_UNAPI := $(AGENT_TRACE_DIR)/MCPUNAPI.TSR
 MEMMAN_VENDOR_DIR := work/agent
 MEMMAN_VENDOR := $(MEMMAN_VENDOR_DIR)/MEMMAN.COM \
 	$(MEMMAN_VENDOR_DIR)/TL.COM \
@@ -40,7 +52,8 @@ MSX_DOS_BENCH_COM_MAX := 36760
 # images load at 0100h, the helper file itself must end no later than 3FFFh.
 MSX_XFER_PAGE0_COM_MAX := 16128
 
-.PHONY: agent agent-prerequisites agent-tsr memman-assets port-helper tu-helper unapi-probe \
+.PHONY: agent agent-prerequisites agent-tsr agent-trace agent-trace-prerequisites \
+	agent-trace-tsr agent-trace-memman port-helper tu-helper unapi-probe \
 	unapi-emulation-preflight test test-integration test-unapi-emulation \
 	release-check publish-check release-assets
 
@@ -57,6 +70,33 @@ agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM) $(AGENT_PORT_COM) $(AG
 	@test -s $(MEMMAN_VENDOR_DIR)/TK.COM
 
 agent-prerequisites: memman-assets agent-tsr
+
+agent-trace: agent-trace-prerequisites $(AGENT_TRACE_COM) \
+		$(AGENT_TRACE_XFER_COM) $(AGENT_TRACE_PORT_COM) $(AGENT_TRACE_TU_COM)
+	@test -s $(AGENT_TRACE_COM)
+	@test -s $(AGENT_TRACE_XFER_COM)
+	@test -s $(AGENT_TRACE_PORT_COM)
+	@test -s $(AGENT_TRACE_TU_COM)
+	@test -s $(AGENT_TRACE_TSR_8251)
+	@test -s $(AGENT_TRACE_TSR_16C550)
+	@test -s $(AGENT_TRACE_TSR_UNAPI)
+	@test -s $(AGENT_TRACE_DIR)/MEMMAN.COM
+	@test -s $(AGENT_TRACE_DIR)/TL.COM
+	@test -s $(AGENT_TRACE_DIR)/TK.COM
+
+agent-trace-prerequisites: agent-trace-memman agent-trace-tsr
+
+agent-trace-memman:
+	"$(PYTHON)" tools/materialize_memman.py --output-dir $(AGENT_TRACE_DIR)
+
+agent-trace-tsr: server/_version.py tools/build_version_include.py
+	"$(PYTHON)" tools/build_agent_tsr.py --assembler "$(Z80ASM)" \
+		--development-trace \
+		--output $(AGENT_TRACE_TSR) \
+		--metadata-output $(AGENT_TRACE_TSR_METADATA) \
+		--8251-output $(AGENT_TRACE_TSR_8251) \
+		--16c550-output $(AGENT_TRACE_TSR_16C550) \
+		--unapi-output $(AGENT_TRACE_TSR_UNAPI)
 
 memman-assets:
 	"$(PYTHON)" tools/materialize_memman.py --output-dir $(MEMMAN_VENDOR_DIR)
@@ -93,15 +133,30 @@ $(UNAPI_PROBE_COM): $(UNAPI_PROBE_SRC) tools/build_unapi_probe.py
 # is assembled into the loader's external-suite validation, while the verified
 # utilities and fixed-driver TSRs are deployable files in the same package.
 $(AGENT_COM): agent-prerequisites $(AGENT_PORT_COM) $(AGENT_TU_COM)
-$(AGENT_COM): $(AGENT_SRC) $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) $(AGENT_VERSION_INCLUDE) $(AGENT_TRANSPORTS)
+$(AGENT_TRACE_COM): agent-trace-prerequisites $(AGENT_TRACE_PORT_COM) $(AGENT_TRACE_TU_COM)
+$(AGENT_COM): AGENT_MAIN_SOURCE := $(AGENT_SRC)
+$(AGENT_TRACE_COM): AGENT_MAIN_SOURCE := $(AGENT_TRACE_SRC)
+$(AGENT_COM): $(AGENT_SRC)
+$(AGENT_TRACE_COM): $(AGENT_TRACE_SRC)
+$(AGENT_COM) $(AGENT_TRACE_COM): $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) $(AGENT_VERSION_INCLUDE) $(AGENT_TRANSPORTS)
 	mkdir -p $(dir $@)
-	$(Z80ASM) $< -o $@
+	$(Z80ASM) $(AGENT_MAIN_SOURCE) -o $@
 	"$(PYTHON)" tools/check_msx_com_size.py $@ $(MSX_DOS_BENCH_COM_MAX)
 
-$(AGENT_XFER_COM): $(AGENT_XFER_SRC) $(AGENT_XFER_ENGINE) $(AGENT_XFER_PROTOCOL)
+$(AGENT_XFER_COM): $(AGENT_XFER_SRC)
+$(AGENT_TRACE_XFER_COM): $(AGENT_XFER_SRC)
+$(AGENT_XFER_COM) $(AGENT_TRACE_XFER_COM): $(AGENT_XFER_ENGINE) $(AGENT_XFER_PROTOCOL)
 	mkdir -p $(dir $@)
-	$(Z80ASM) $< -o $@
+	$(Z80ASM) $(AGENT_XFER_SRC) -o $@
 	"$(PYTHON)" tools/check_msx_com_size.py $@ $(MSX_XFER_PAGE0_COM_MAX)
+
+$(AGENT_TRACE_PORT_COM): $(AGENT_PORT_SRC) tools/build_port_helper.py
+	"$(PYTHON)" tools/build_port_helper.py --assembler "$(Z80ASM)" \
+		--source $(AGENT_PORT_SRC) --output $(AGENT_TRACE_PORT_COM)
+
+$(AGENT_TRACE_TU_COM): $(AGENT_TU_SRC) tools/build_tu_helper.py
+	"$(PYTHON)" tools/build_tu_helper.py --assembler "$(Z80ASM)" \
+		--source $(AGENT_TU_SRC) --output $(AGENT_TRACE_TU_COM)
 
 test:
 	"$(PYTHON)" -m unittest discover -s tests -v

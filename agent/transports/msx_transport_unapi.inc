@@ -28,6 +28,17 @@ UNAPI_RELISTEN_DELAY:         equ 30
 UNAPI_POLL_DIVIDER:           equ 4
 UNAPI_FLUSH_RETRIES:          equ 16
 
+; TU publishes this marker only after recognizing and persistently relocating
+; the exact Pico/Pico+ H.TIMI work block. It identifies the one implementation
+; selected for controlled physical validation of guarded timer-side TCP_OPEN.
+PICO_WORK_POINTER:            equ 0FD3Eh
+PICO_CERT_SIZE:               equ 4
+PICO_CERT_TAG_M:              equ 04Dh
+PICO_CERT_TAG_A:              equ 041h
+PICO_CERT_LOW:                equ 0A5h
+PICO_CERT_HIGH:               equ 05Ah
+PICO_CERT_MIN_POINTER:        equ 0C000h + PICO_CERT_SIZE
+
 UNAPI_MODE_NONE:              equ 0
 UNAPI_MODE_DIRECT:            equ 1       ; entry outside page 1 (bit 15 set)
 UNAPI_MODE_ROM:               equ 2       ; page-1 ROM/non-mapped RAM via CALSLT
@@ -237,6 +248,7 @@ unapi_discover_loop:
     ld a,d
     and 008h                        ; feature bit 11: TCP_OPEN may block
     ld (unapi_open_blocking),a
+    call unapi_certify_hook_relisten
     xor a
     ret
 
@@ -256,6 +268,45 @@ unapi_discover_next:
     ret nz
 unapi_discover_not_found:
     ld a,UNAPI_INIT_NOT_FOUND
+    ret
+
+; Return with a persistent boolean in unapi_hook_relisten_certified. Requiring
+; one implementation, Pico's blocking-OPEN feature, a page-3 work pointer and
+; TU's private four-byte prefix keeps generic TCP/IP UNAPI implementations on
+; the existing foreground relisten path.
+unapi_certify_hook_relisten:
+    xor a
+    ld (unapi_hook_relisten_certified),a
+    ld a,(unapi_implementation_count)
+    cp 1
+    ret nz
+    ld a,(unapi_open_blocking)
+    or a
+    ret z
+    ld hl,(PICO_WORK_POINTER)
+    ld de,PICO_CERT_MIN_POINTER
+    or a
+    sbc hl,de
+    ret c
+    ld hl,(PICO_WORK_POINTER)
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_HIGH
+    ret nz
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_LOW
+    ret nz
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_TAG_A
+    ret nz
+    dec hl
+    ld a,(hl)
+    cp PICO_CERT_TAG_M
+    ret nz
+    ld a,1
+    ld (unapi_hook_relisten_certified),a
     ret
 
 unapi_copy_api_id:
@@ -567,22 +618,60 @@ unapi_service_relisten:
     ld a,(transport_session_lost)
     or a
     ret nz                           ; old parser stack has not unwound yet
-    ; Lifecycle calls are foreground-only for generic UNAPI implementations.
-    ; Pico/Pico+ explicitly reports blocking OPEN, and even an implementation
-    ; that clears that feature bit does not promise interrupt reentrancy.
+    ; A resident has no universal foreground callback while DOS, BASIC, or a
+    ; game is busy. For a Pico/Pico+ instance certified by TU, H.TIMI is the
+    ; automatic recovery checkpoint. The MemMan hook has already saved the
+    ; interrupted context, switched to the guarded page-3 heap stack, verified
+    ; the foreground mapping, and closed nested entry with in_hook.
     ld a,(in_hook)
     or a
+    jr z,unapi_service_relisten_checkpoint
+if MSXAI_TSR_BUILD
+    ; The resident install deliberately defers its first TCP_OPEN until MP.COM
+    ; supplies the requested port.  Only a listener lost after that foreground
+    ; initialization is eligible for timer-side recovery.
+    ld a,(unapi_relisten_pending)
+    or a
+    ret z
+    ld a,(runtime_mode)
+    cp RUNTIME_RESIDENT
     ret nz
-    call unapi_relisten_foreground
+    ld a,(hook_kind)
+    or a
+    ret z                            ; H.KEYI is not a lifecycle checkpoint
+    ld a,(hook_system_suspended)
+    or a
+    ret nz
+    ld a,(tsr_heap_fault)
+    or a
+    ret nz
+    ; Revalidate the private page-3 certificate for every automatic attempt;
+    ; a stale cached boolean can never authorize lifecycle work after FD3Eh or
+    ; its persistent work block has changed.
+    call unapi_certify_hook_relisten
+unapi_service_relisten_certificate_ready:
+    ld a,(unapi_hook_relisten_certified)
+    or a
+    ret z                            ; generic UNAPI keeps foreground fallback
+    ld a,(unapi_lifecycle_busy)
+    or a
+    ret nz
+    ld a,TRACE_EVENT_AUTO_RELISTEN
+    call trace_record
+else
+    ret
+endif
+unapi_service_relisten_checkpoint:
+    call unapi_relisten_checkpoint
     ret z
     jr unapi_service_relisten_failed
 
-; The caller must already be at a foreground stack checkpoint. Keep the
-; selected UNAPI implementation and transfer epoch intact: only retire the old
-; handle, reset its byte-stream state, and create a replacement listener.
-; During recovery, the pending flag clears only after TCP_OPEN returns a valid
-; handle; explicit teardown/reconfiguration clears the entire runtime epoch.
-unapi_relisten_foreground:
+; The caller must already own a guarded stack checkpoint: the monitor loop, a
+; DOS/BASIC foreground hook, or the certified resident H.TIMI heap stack above.
+; Keep the selected UNAPI implementation and transfer epoch intact: only retire
+; the old handle, reset its byte-stream state, and create a replacement
+; listener. The pending flag clears only after TCP_OPEN returns a valid handle.
+unapi_relisten_checkpoint:
     ld a,1
     ld (unapi_lifecycle_busy),a
 if MSXAI_TSR_BUILD
@@ -591,13 +680,13 @@ if MSXAI_TSR_BUILD
 endif
     call unapi_abort_current
     or a
-    jr nz,unapi_relisten_foreground_abort_failed
+    jr nz,unapi_relisten_checkpoint_abort_failed
     call unapi_reset_stream_state
     call unapi_open_listener
-    jr unapi_relisten_foreground_finish
-unapi_relisten_foreground_abort_failed:
+    jr unapi_relisten_checkpoint_finish
+unapi_relisten_checkpoint_abort_failed:
     ld (unapi_last_error),a
-unapi_relisten_foreground_finish:
+unapi_relisten_checkpoint_finish:
     di
     xor a
     ld (unapi_lifecycle_busy),a
@@ -959,6 +1048,8 @@ unapi_cleanup_connection:
 unapi_connection_state:
     db 0
 unapi_open_blocking:
+    db 0
+unapi_hook_relisten_certified:
     db 0
 unapi_relisten_pending:
     db 0

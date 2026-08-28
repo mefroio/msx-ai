@@ -129,7 +129,9 @@ TSR_TRACE_ACTION_SNAPSHOT: equ 2
 TRACE_FORMAT_MAGIC: equ 0A84Dh       ; private little-endian trace signature
 TRACE_FORMAT_VERSION: equ 1
 TRACE_RECORD_SIZE: equ 8
-TRACE_RECORD_CAPACITY: equ 16
+; Keep enough history for one automatic relisten followed by a BASIC-to-DOS
+; transition. Both lifecycles together can exceed the original 16 records.
+TRACE_RECORD_CAPACITY: equ 20
 TRACE_HEADER_SIZE: equ 16
 TRACE_SNAPSHOT_SIZE: equ 16
 TRACE_EXPORT_SIZE: equ TRACE_HEADER_SIZE + TRACE_SNAPSHOT_SIZE + TRACE_RECORD_SIZE * TRACE_RECORD_CAPACITY
@@ -159,6 +161,7 @@ TRACE_EVENT_SYSTEM_SUSPEND: equ 11
 TRACE_EVENT_SYSTEM_RESUME: equ 12
 TRACE_EVENT_RECONFIG_BEGIN: equ 13
 TRACE_EVENT_RECONFIG_END: equ 14
+TRACE_EVENT_AUTO_RELISTEN: equ 15
 TSR_UNAPI_STACK_MINIMUM: equ 0400h
 TSR_UNAPI_STACK_GUARD_SIZE: equ 16
 TSR_UNAPI_STACK_LOW_GUARD: equ 0A5h
@@ -564,11 +567,18 @@ usage_message:
     db "Usage:",13,10
     db "  MSXAI /DRIVER:8251 [/MONITOR] [DEBUG]",13,10
     db "  MSXAI /DRIVER:16C550 [/MONITOR] [DEBUG]",13,10
+if MSXAI_DEVELOPMENT_TRACE
     db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/TRACE | /MONITOR [DEBUG]]",13,10
     db "  MSXAI <1..65534> [/TRACE]",13,10
     db "  MSXAI /DUMPTRACE <file>",13,10
     db "  MSXAI /UNINSTALL",13,10
     db "DEBUG is restricted to /MONITOR; /TRACE to resident UNAPI.",13,10,"$"
+else
+    db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/MONITOR [DEBUG]]",13,10
+    db "  MSXAI <1..65534>",13,10
+    db "  MSXAI /UNINSTALL",13,10
+    db "DEBUG is restricted to /MONITOR.",13,10,"$"
+endif
 driver_required_message:
     db "Select exactly one /DRIVER:8251, /DRIVER:16C550, or /DRIVER:UNAPI",13,10,"$"
 transport_init_error_message:
@@ -672,10 +682,18 @@ loader_parse_token_loop:
     jp z,loader_parse_debug
     ld de,option_trace
     call loader_token_equals
+if MSXAI_DEVELOPMENT_TRACE
     jp z,loader_parse_trace
+else
+    jp z,loader_parse_unknown
+endif
     ld de,option_dumptrace
     call loader_token_equals
+if MSXAI_DEVELOPMENT_TRACE
     jp z,loader_parse_dumptrace
+else
+    jp z,loader_parse_unknown
+endif
     ld de,option_uninstall
     call loader_token_equals
     jp z,loader_parse_uninstall
@@ -1135,6 +1153,8 @@ active_transport_id:
     db 0FEh                     ; build-time template; packaged TSRs patch 0/1/2
 resident_page:
     db 0
+resident_low:
+    db 0
 else
     db 0,0,0,0,0,0             ; replaced with original CP/M metadata
 bdos_proxy:
@@ -1143,6 +1163,8 @@ bdos_proxy:
 active_transport_id:
     db 0FFh
 resident_page:
+    db 0
+resident_low:
     db 0
 
 old_bdos:
@@ -1447,6 +1469,8 @@ resident_initialize:
     ld hl,resident_start
     ld a,h
     ld (resident_page),a
+    ld a,l
+    ld (resident_low),a
 if MSXAI_TSR_BUILD
     call trace_reset
 endif
@@ -2148,7 +2172,7 @@ resident_console_relisten_unapi:
 resident_console_relisten_heap_ready:
     call tsr_heap_fill_guards
     ld sp,(tsr_heap_stack_top)
-    call unapi_relisten_foreground
+    call unapi_relisten_checkpoint
     jr resident_console_resume_store_result
 
 ; H.CHGE runs in foreground immediately after COMMAND2 has printed its prompt
@@ -3699,7 +3723,10 @@ frame_cmd_hello:
     inc hl
     call current_features
     ld (hl),a
-    ld hl,15
+    inc hl
+    ld a,(resident_low)
+    ld (hl),a
+    ld hl,16
     ld (frame_response_length),hl
     xor a
     ld (frame_response_status),a
@@ -6804,7 +6831,11 @@ tsr_talk:
     cp TSR_TALK_UNAPI_PORT
     jp z,tsr_talk_unapi_port
     cp TSR_TALK_TRACE
+if MSXAI_DEVELOPMENT_TRACE
     jp z,tsr_talk_trace
+else
+    jp z,tsr_talk_unsupported
+endif
     cp TSR_TALK_XFER_CLAIM
     jp z,tsr_talk_xfer_claim
     cp TSR_TALK_XFER_READY

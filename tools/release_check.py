@@ -141,6 +141,7 @@ _SDIST_REQUIRED_FILES = {
     "agent/README.TXT",
     "agent/msx_agent.asm",
     "agent/msx_agent_core.asm",
+    "agent/msx_agent_trace.asm",
     "agent/msx_agent_tsr.asm",
     "agent/msx_memman_loader.asm",
     "agent/msx_port_helper.asm",

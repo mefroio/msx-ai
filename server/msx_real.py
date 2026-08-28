@@ -281,6 +281,7 @@ class RealMSX:
         self.capabilities = 0
         self.feature_bits = 0
         self.resident_base = None
+        self.resident_entry = None
         self.vram_size = VRAM_SIZE
         self.vram_banks = VRAM_SIZE // VRAM_BANK_SIZE
         self.vdp_generation = None
@@ -443,6 +444,7 @@ class RealMSX:
         self.capabilities = 0
         self.feature_bits = 0
         self.resident_base = None
+        self.resident_entry = None
         self.vram_size = VRAM_SIZE
         self.vram_banks = VRAM_SIZE // VRAM_BANK_SIZE
         self.vdp_generation = None
@@ -773,6 +775,7 @@ class RealMSX:
         self.protocol_version = version
         self.capabilities = capabilities
         self.resident_base = page << 8
+        self.resident_entry = None
         if capabilities & 0x20:
             bootstrap_features = self._query_bootstrap_features()
             bootstrap_safe = bool(
@@ -819,6 +822,7 @@ class RealMSX:
                              if capabilities & bit],
             "capability_bits": capabilities,
             "resident_base": self.resident_base,
+            "resident_entry": self.resident_entry,
             "network_transport": self.network_transport,
             "network_role": self.network_role,
             "local_endpoint": self.local_endpoint,
@@ -942,6 +946,8 @@ class RealMSX:
             (None if self.runtime_mode_id is None
              else f"unknown-{self.runtime_mode_id}"))
         self.feature_bits = reply[14] if len(reply) >= 15 else 0
+        self.resident_entry = (
+            self.resident_base | reply[15] if len(reply) >= 16 else None)
         if self.bootstrap_features_known:
             safety_mask = FEATURE_FRAME_WAKE_ACK | FEATURE_TIMI_POLL_SAFE
             bootstrap_safety = self.bootstrap_feature_bits & safety_mask
@@ -988,6 +994,7 @@ class RealMSX:
                              if capabilities & bit],
             "capability_bits": capabilities,
             "resident_base": self.resident_base,
+            "resident_entry": self.resident_entry,
             "transport": self.agent_transport,
             "agent_transport": self.agent_transport,
             "agent_transport_id": self.agent_transport_id,

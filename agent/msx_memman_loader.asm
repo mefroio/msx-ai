@@ -68,12 +68,16 @@ MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
 MP_FILE_SIZE:            equ 00426h ; 1062-byte guarded-stack trace/port helper
-TU_FILE_SIZE:            equ 003D7h ; 983-byte pre-TL UNAPI helper
+TU_FILE_SIZE:            equ 0040Bh ; 1035-byte pre-TL UNAPI helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
 ; Once MEMMAN.COM starts, the old loader image and trampoline are disposable.
 OVERLAY_STACK_HEADROOM:  equ 00080h
+if MSXAI_DEVELOPMENT_TRACE
+include 'work/agent-trace/build/MSXAI_TSR.INC'
+else
 include 'work/agent/build/MSXAI_TSR.INC'
+endif
 
 if MSXAI_MAIN_BUILD
 ; Both entry points consume the current process.  On success MEMMAN.COM takes
@@ -1308,7 +1312,7 @@ trace_line_append_record:
 
 trace_line_append_event_name:
     dec a
-    cp TRACE_EVENT_RECONFIG_END
+    cp TRACE_EVENT_AUTO_RELISTEN
     jr nc,trace_line_event_unknown
     add a,a
     ld e,a
@@ -1401,6 +1405,7 @@ trace_event_name_table:
     dw trace_event_abort_begin,trace_event_abort_end
     dw trace_event_system_suspend,trace_event_system_resume
     dw trace_event_reconfig_begin,trace_event_reconfig_end
+    dw trace_event_auto_relisten
 trace_event_enable:          db "ENABLE",0
 trace_event_state:           db "STATE",0
 trace_event_state_error:     db "STATE_ERROR",0
@@ -1415,6 +1420,7 @@ trace_event_system_suspend:  db "SYSTEM_SUSPEND",0
 trace_event_system_resume:   db "SYSTEM_RESUME",0
 trace_event_reconfig_begin:  db "RECONFIG_BEGIN",0
 trace_event_reconfig_end:    db "RECONFIG_END",0
+trace_event_auto_relisten:   db "AUTO_RELISTEN",0
 trace_event_unknown:         db "UNKNOWN",0
 trace_text_title:            db "MSXAI TRACE V1",0
 trace_text_status_flags:     db "FLAGS=",0

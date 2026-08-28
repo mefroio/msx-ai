@@ -3,6 +3,13 @@
 This project follows Semantic Versioning. Published releases are identified by
 an annotated Git tag named `vMAJOR.MINOR.PATCH`.
 
+## 0.1.4 - 2026-08-28
+
+- Added silent automatic recovery of the resident UNAPI listener after a host
+  disconnect, allowing the host to reconnect without a command or key press on
+  the MSX.
+- Validated the recovery on a physical HOTBIT 1.0 with an MSX Pico+ cartridge.
+
 ## 0.1.3 - 2026-08-26
 
 - Fixed loss of the Pico/Pico+ TCP/IP state across resident

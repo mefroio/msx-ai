@@ -177,6 +177,10 @@ STATUS_OUTPUT_SCHEMA: dict[str, Any] = {
                 "resident_base": {
                     "type": "integer", "minimum": 0, "maximum": 65535,
                 },
+                "resident_entry": {
+                    "type": ["integer", "null"],
+                    "minimum": 0, "maximum": 65535,
+                },
                 "transport": {"type": ["string", "null"]},
                 "agent_transport": {"type": ["string", "null"]},
                 "agent_transport_id": {

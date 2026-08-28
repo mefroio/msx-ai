@@ -10,6 +10,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "agent" / "msx_agent_core.asm"
 MEMMAN_LOADER = ROOT / "agent" / "msx_memman_loader.asm"
 PORT_HELPER = ROOT / "agent" / "msx_port_helper.asm"
+PUBLIC_WRAPPER = ROOT / "agent" / "msx_agent.asm"
+TRACE_WRAPPER = ROOT / "agent" / "msx_agent_trace.asm"
 UNAPI_TRANSPORT = ROOT / "agent" / "transports" / "msx_transport_unapi.inc"
 
 
@@ -65,9 +67,19 @@ class ResidentTraceSourceTests(unittest.TestCase):
         self.assertRegex(
             dispatch,
             r"(?s)ld de,option_trace\s+call loader_token_equals\s+"
-            r"jp z,loader_parse_trace.*"
+            r"if MSXAI_DEVELOPMENT_TRACE\s+"
+            r"jp z,loader_parse_trace\s+else\s+"
+            r"jp z,loader_parse_unknown\s+endif.*"
             r"ld de,option_dumptrace\s+call loader_token_equals\s+"
-            r"jp z,loader_parse_dumptrace")
+            r"if MSXAI_DEVELOPMENT_TRACE\s+"
+            r"jp z,loader_parse_dumptrace\s+else\s+"
+            r"jp z,loader_parse_unknown\s+endif")
+        self.assertIn(
+            "MSXAI_DEVELOPMENT_TRACE: equ 0",
+            PUBLIC_WRAPPER.read_text(encoding="utf-8"))
+        self.assertIn(
+            "MSXAI_DEVELOPMENT_TRACE: equ 1",
+            TRACE_WRAPPER.read_text(encoding="utf-8"))
         implicit = _section(
             self.source, "loader_parse_implicit_unapi_port:",
             "loader_parse_8251:")
@@ -118,10 +130,10 @@ class ResidentTraceSourceTests(unittest.TestCase):
         capacity = _equ_literal(self.source, "TRACE_RECORD_CAPACITY")
         header_size = _equ_literal(self.source, "TRACE_HEADER_SIZE")
         snapshot_size = _equ_literal(self.source, "TRACE_SNAPSHOT_SIZE")
-        self.assertEqual((record_size, capacity), (8, 16))
+        self.assertEqual((record_size, capacity), (8, 20))
         self.assertEqual((header_size, snapshot_size), (16, 16))
         self.assertEqual(
-            header_size + snapshot_size + record_size * capacity, 160)
+            header_size + snapshot_size + record_size * capacity, 192)
 
         layout = _section(
             self.source, "trace_export_begin:", "trace_export_end:")
@@ -142,13 +154,14 @@ class ResidentTraceSourceTests(unittest.TestCase):
             self.source.index("resident_end:"))
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
-    def test_assembled_resident_trace_block_is_exactly_160_bytes(self):
+    def test_assembled_resident_trace_block_is_exactly_192_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = pathlib.Path(directory)
             wrapper = temporary / "trace_layout.asm"
             binary = temporary / "trace_layout.bin"
             wrapper.write_text(
                 "MSXAI_TSR_BUILD: equ 1\n"
+                "MSXAI_DEVELOPMENT_TRACE: equ 1\n"
                 "TRANSPORT_STATE_SIZE: equ 5\n"
                 "TSR_BUILD_BASE: equ 04024h\n"
                 "include 'agent/msx_agent_core.asm'\n",
@@ -176,7 +189,7 @@ class ResidentTraceSourceTests(unittest.TestCase):
             begin = labels["trace_export_begin"]
             self.assertEqual(labels["trace_failure_snapshot"] - begin, 16)
             self.assertEqual(labels["trace_records"] - begin, 32)
-            self.assertEqual(labels["trace_export_end"] - begin, 160)
+            self.assertEqual(labels["trace_export_end"] - begin, 192)
             self.assertLessEqual(
                 labels["trace_export_end"], labels["resident_end"])
 
@@ -241,6 +254,7 @@ class ResidentTraceSourceTests(unittest.TestCase):
             "TRACE_EVENT_SYSTEM_RESUME",
             "TRACE_EVENT_RECONFIG_BEGIN",
             "TRACE_EVENT_RECONFIG_END",
+            "TRACE_EVENT_AUTO_RELISTEN",
         )
         for event in events:
             with self.subTest(event=event):
@@ -260,11 +274,33 @@ class ResidentTraceSourceTests(unittest.TestCase):
             drop.index("TRACE_EVENT_DROP"))
         for lifecycle in (
                 "unapi_open_listener:", "unapi_abort_current:",
-                "unapi_drop_connection:", "unapi_relisten_foreground:"):
+                "unapi_drop_connection:", "unapi_relisten_checkpoint:"):
             with self.subTest(lifecycle=lifecycle):
                 self.assertIn(lifecycle, self.unapi)
                 tail = self.unapi.split(lifecycle, 1)[1]
                 self.assertIn("TRACE_EVENT_", tail[:2500])
+
+        self.assertEqual(
+            _equ_literal(self.source, "TRACE_EVENT_AUTO_RELISTEN"), 15)
+        auto = _section(
+            self.unapi, "unapi_service_relisten:",
+            "unapi_service_relisten_checkpoint:")
+        self.assertRegex(
+            auto,
+            r"(?s)ld a,TRACE_EVENT_AUTO_RELISTEN\s+"
+            r"call trace_record")
+
+        event_formatter = _section(
+            self.loader, "trace_line_append_event_name:",
+            "trace_line_reset:")
+        self.assertIn("cp TRACE_EVENT_AUTO_RELISTEN", event_formatter)
+        event_names = _section(
+            self.loader, "trace_event_name_table:",
+            "trace_event_unknown:")
+        self.assertIn("dw trace_event_auto_relisten", event_names)
+        self.assertIn(
+            'trace_event_auto_relisten:   db "AUTO_RELISTEN",0',
+            event_names)
 
     def test_a7_stays_v1_and_a8_enable_precedes_reconfiguration(self):
         self.assertEqual(
@@ -281,7 +317,10 @@ class ResidentTraceSourceTests(unittest.TestCase):
             self.source, "tsr_talk:", "tsr_talk_config:")
         self.assertRegex(
             dispatch,
-            r"(?s)cp TSR_TALK_TRACE\s+jp z,tsr_talk_trace")
+            r"(?s)cp TSR_TALK_TRACE\s+"
+            r"if MSXAI_DEVELOPMENT_TRACE\s+"
+            r"jp z,tsr_talk_trace\s+else\s+"
+            r"jp z,tsr_talk_unsupported\s+endif")
         talk = _label_window(self.source, "tsr_talk_trace")
         self.assertIn("TSR_TRACE_ACTION_ENABLE", talk)
         self.assertIn("TSR_TRACE_ACTION_SNAPSHOT", talk)

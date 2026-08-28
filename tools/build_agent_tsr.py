@@ -100,10 +100,11 @@ def parse_labels(text: str) -> dict[str, int]:
     return labels
 
 
-def _wrapper(origin: int) -> str:
+def _wrapper(origin: int, development_trace: bool = False) -> str:
     return (
         "; Generated temporarily by tools/build_agent_tsr.py.\n"
         "MSXAI_TSR_BUILD: equ 1\n"
+        f"MSXAI_DEVELOPMENT_TRACE: equ {int(development_trace)}\n"
         "TRANSPORT_STATE_SIZE: equ 5\n"
         f"TSR_BUILD_BASE: equ 0{origin:04X}h\n"
         "include 'agent/msx_agent_core.asm'\n"
@@ -112,11 +113,13 @@ def _wrapper(origin: int) -> str:
 
 def _assemble(
         repository: pathlib.Path, temporary_dir: pathlib.Path,
-        assembler: str, origin: int
+        assembler: str, origin: int, development_trace: bool = False,
 ) -> LinkedImage:
     wrapper = temporary_dir / f"msxai_tsr_{origin:04x}.asm"
     binary = temporary_dir / f"msxai_tsr_{origin:04x}.bin"
-    wrapper.write_text(_wrapper(origin), encoding="ascii")
+    wrapper.write_text(
+        _wrapper(origin, development_trace=development_trace),
+        encoding="ascii")
     try:
         process = subprocess.run(
             [assembler, "-L", str(wrapper), "-o", str(binary)],
@@ -264,6 +267,7 @@ def build_agent_tsr(
         driver_8251_output: pathlib.Path | None = None,
         driver_16c550_output: pathlib.Path | None = None,
         driver_unapi_output: pathlib.Path | None = None,
+        development_trace: bool = False,
 ) -> AgentTsrOutputs:
     """Build, cross-check, and emit the template plus fixed-driver TSRs."""
 
@@ -272,7 +276,9 @@ def build_agent_tsr(
     with tempfile.TemporaryDirectory(prefix="msxai-tsr-") as directory:
         temporary_dir = pathlib.Path(directory)
         images = tuple(
-            _assemble(repository, temporary_dir, assembler, origin)
+            _assemble(
+                repository, temporary_dir, assembler, origin,
+                development_trace=development_trace)
             for origin in BUILD_ORIGINS)
 
     offsets = _check_linked_images(images)
@@ -386,6 +392,9 @@ def _parser() -> argparse.ArgumentParser:
         default=REPOSITORY / "work" / "agent" / "MCPUNAPI.TSR")
     parser.add_argument(
         "--assembler", default=os.environ.get("Z80ASM", "z80asm"))
+    parser.add_argument(
+        "--development-trace", action="store_true",
+        help="expose the private TRACE/DUMPTRACE development interfaces")
     return parser
 
 
@@ -395,7 +404,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         outputs = build_agent_tsr(
             args.repository, args.output, args.metadata_output,
             args.assembler, args.driver_8251_output,
-            args.driver_16c550_output, args.driver_unapi_output)
+            args.driver_16c550_output, args.driver_unapi_output,
+            development_trace=args.development_trace)
     except (AgentTsrBuildError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

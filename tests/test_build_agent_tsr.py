@@ -24,6 +24,7 @@ from tools.build_agent_tsr import (  # noqa: E402
     AgentTsrBuildError,
     LinkedImage,
     _check_linked_images,
+    _wrapper,
     build_agent_tsr,
     parse_labels,
 )
@@ -31,6 +32,12 @@ from tools.build_memman_tsr import HEADER, HEADER_SIZE, MAGIC  # noqa: E402
 
 
 class AgentTsrBuilderTest(unittest.TestCase):
+    def test_public_and_development_wrappers_gate_private_trace(self):
+        public = _wrapper(BUILD_ORIGINS[0])
+        development = _wrapper(BUILD_ORIGINS[0], development_trace=True)
+        self.assertIn("MSXAI_DEVELOPMENT_TRACE: equ 0", public)
+        self.assertIn("MSXAI_DEVELOPMENT_TRACE: equ 1", development)
+
     def test_parses_z80asm_label_stream_and_rejects_duplicates(self):
         self.assertEqual(
             parse_labels("noise\nresident_start:\tequ $4024\n"),
@@ -150,6 +157,34 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 first.driver_16c550_path.read_bytes(), driver_16c550)
             self.assertEqual(
                 first.driver_unapi_path.read_bytes(), driver_unapi)
+
+            trace_root = temporary / "trace"
+            traced = build_agent_tsr(
+                ROOT,
+                trace_root / "MSXAI.TSR",
+                trace_root / "MSXAI_TSR.INC",
+                development_trace=True,
+            )
+            self.assertEqual(traced.size, first.size)
+            self.assertEqual(traced.relocation_offsets, first.relocation_offsets)
+            self.assertEqual(
+                traced.metadata_path.read_bytes(), first_metadata)
+            traced_data = traced.tsr_path.read_bytes()
+            differing = [
+                index for index, values in enumerate(
+                    zip(first_data, traced_data, strict=True))
+                if len(set(values)) != 1
+            ]
+            # The resident layout stays identical. Only the relocated operand
+            # of `JP Z` at private TsrCall A8 changes: public goes to the
+            # unsupported handler, development goes to the trace handler.
+            self.assertEqual(len(differing), 2)
+            self.assertEqual(differing[1], differing[0] + 1)
+            self.assertEqual(first_data[differing[0] - 1], 0xCA)
+            self.assertEqual(traced_data[differing[0] - 1], 0xCA)
+            # The separate development build must not mutate public outputs.
+            self.assertEqual(output.read_bytes(), first_data)
+            self.assertEqual(first.driver_unapi_path.read_bytes(), driver_unapi)
 
 
 if __name__ == "__main__":

@@ -1507,6 +1507,7 @@ def _status_for(target):
             "capabilities": [name for bit, name in CAPABILITY_NAMES.items()
                              if m.capabilities & bit],
             "resident_base": m.resident_base,
+            "resident_entry": getattr(m, "resident_entry", None),
             # Keep the legacy field while making the independent link and
             # MSX-side hardware layers explicit for new clients.
             "transport": getattr(m, "agent_transport", None),

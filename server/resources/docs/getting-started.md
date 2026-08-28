@@ -197,17 +197,16 @@ never invoke them directly. On later BASIC-to-DOS transitions, `_SYSTEM` and
 `CALL SYSTEM` restore the configured listener automatically.
 This capability-based path is intended for MSX Pico+ and original MSX Pico
 cartridges equipped with Wi-Fi.
-Start hardware validation with `/MONITOR`, which keeps listener lifecycle calls
-in foreground while idle. After `RUN`, data-path polling still executes from
-`H.TIMI` and requires physical validation. The Pico stack advertises potentially
-blocking `TCP_OPEN`; after a resident socket is lost, rerun the same
-`/DRIVER:UNAPI /PORT:...` command from DOS to clean the old handle and relisten
-safely outside `H.TIMI`.
-Before the hardware arrives, the opt-in
+After a resident socket is lost, the listener reopens silently. The host can
+reconnect to the same IP address and port without a command or key press on the
+MSX. This behavior has been validated on a physical HOTBIT 1.0 with an MSX Pico+
+cartridge. `/MONITOR` remains available for foreground diagnostics.
+The opt-in
 `tools/openmsx_unapi_validation.py` harness can validate the same TCP/IP UNAPI
 contract with a matched openMSXnet/UNAPINET pair. It covers discovery, passive
-TCP on a custom port, bidirectional traffic, and foreground relisten, but does
-not emulate Pico firmware, Wi-Fi, cartridge registers, or physical timing.
+TCP on a custom port, bidirectional traffic, and automatic listener recovery
+without machine input, but does not emulate Pico firmware, Wi-Fi, cartridge
+registers, bus behavior, or physical timing.
 After negotiation, call
 `msx_agent_status` and verify the runtime mode, transport, and feature list before
 performing writes.

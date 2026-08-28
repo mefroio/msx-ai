@@ -300,6 +300,7 @@ class FakeV3Resident:
                 response_payload += self.vram_size.to_bytes(3, "little")
                 response_payload += bytes([self.runtime_mode])
                 response_payload += bytes([self._feature_bits()])
+                response_payload += bytes([0x24])
         elif opcode == "q":
             response_payload = bytes([self.state, 3])
         elif opcode == "D" and self.cpu_snapshot_feature:
@@ -460,6 +461,7 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(self.info["network_transport"], "custom-stream")
         self.assertEqual(self.info["network_role"], "attached")
         self.assertEqual(self.info["resident_base"], 0xC800)
+        self.assertEqual(self.info["resident_entry"], 0xC824)
         self.assertEqual(self.info["vram_size"], 0x20000)
         self.assertEqual(self.info["vram_banks"], 8)
         self.assertEqual(self.info["runtime_mode"], "foreground-monitor")

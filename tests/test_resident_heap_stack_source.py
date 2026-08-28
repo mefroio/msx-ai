@@ -8,6 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "agent" / "msx_agent_core.asm"
+UNAPI_TRANSPORT = ROOT / "agent" / "transports" / "msx_transport_unapi.inc"
 sys.path.insert(0, str(ROOT))
 
 
@@ -39,6 +40,7 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = CORE.read_text(encoding="utf-8")
+        cls.unapi = UNAPI_TRANSPORT.read_text(encoding="utf-8")
 
     def test_heap_contract_reserves_one_kib_between_two_guards(self):
         self.assertEqual(
@@ -210,10 +212,61 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "ld (hook_dispatch_sp),sp",
             "call transport_service",
         )
-        for forbidden in (
-                "unapi_relisten_foreground", "unapi_open_listener",
-                "unapi_abort_current", "transport_restore_foreground_retry"):
-            self.assertNotIn(forbidden, dispatch)
+        # transport_service may reach lifecycle only after the resident H.TIMI
+        # entry above has moved to the guarded heap stack. The UNAPI-specific
+        # path then proves that the old parser unwound and applies every
+        # implementation/context guard before ABORT or OPEN.
+        relisten = _section(
+            self.unapi,
+            "unapi_service_relisten:",
+            "unapi_relisten_checkpoint:",
+        )
+        _assert_in_order(
+            self,
+            relisten,
+            "ld a,(transport_session_lost)",
+            "ret nz",
+            "ld a,(in_hook)",
+            "jr z,unapi_service_relisten_checkpoint",
+            "ld a,(runtime_mode)",
+            "cp RUNTIME_RESIDENT",
+            "ret nz",
+            "ld a,(hook_kind)",
+            "ret z",
+            "ld a,(hook_system_suspended)",
+            "ret nz",
+            "ld a,(tsr_heap_fault)",
+            "ret nz",
+            "ld a,(unapi_hook_relisten_certified)",
+            "ret z",
+            "ld a,(unapi_lifecycle_busy)",
+            "ret nz",
+            "ld a,TRACE_EVENT_AUTO_RELISTEN",
+            "call trace_record",
+            "unapi_service_relisten_checkpoint:",
+            "call unapi_relisten_checkpoint",
+        )
+
+        checkpoint = _section(
+            self.unapi,
+            "unapi_relisten_checkpoint:",
+            "unapi_service_relisten_failed:",
+        )
+        _assert_in_order(
+            self,
+            checkpoint,
+            "ld a,1",
+            "ld (unapi_lifecycle_busy),a",
+            "call unapi_abort_current",
+            "jr nz,unapi_relisten_checkpoint_abort_failed",
+            "call unapi_reset_stream_state",
+            "call unapi_open_listener",
+            "unapi_relisten_checkpoint_finish:",
+            "di",
+            "xor a",
+            "ld (unapi_lifecycle_busy),a",
+        )
+        self.assertNotIn("call transport_restore_foreground_retry", checkpoint)
 
         unwind = _section(hooks, "hook_done:", "memman_hook_continue:")
         _assert_in_order(
@@ -578,7 +631,7 @@ class ResidentHeapStackSourceTests(unittest.TestCase):
             "resident_console_relisten_heap_ready:",
             "call tsr_heap_fill_guards",
             "ld sp,(tsr_heap_stack_top)",
-            "call unapi_relisten_foreground",
+            "call unapi_relisten_checkpoint",
             "jr resident_console_resume_store_result",
         )
         self.assertNotIn("call transport_restore", relisten)

@@ -172,6 +172,9 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
     def test_positive_sdist_content_policy_requires_release_sources(self):
         self.assertIn(
             "tests/test_port_helper.py", release_check._SDIST_REQUIRED_FILES)
+        self.assertIn(
+            "agent/msx_agent_trace.asm",
+            release_check._SDIST_REQUIRED_FILES)
         names = [f"msx_ai-0.6.0/{name}"
                  for name in release_check._SDIST_REQUIRED_FILES]
         release_check._assert_sdist_contents(names)

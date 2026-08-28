@@ -130,9 +130,10 @@ returned through MCP.
 
 The first connection must report `agent_transport_id=2`,
 `agent_transport=tcpip-unapi`, and runtime mode `resident`. The harness closes
-that connection, reaches a safe foreground boundary, and connects again to the
-same port. It also checks the BASIC-to-DOS transition and automatic listener
-recovery without reinstalling the resident.
+that connection, advances emulated time without machine input, and connects
+again to the same port. It repeats the disconnect and reconnection while a
+BASIC program is running, then checks the BASIC-to-DOS transition without
+reinstalling the resident.
 
 The fixture adds the pinned `ram512k` extension at slot 1.1. Its 512 KiB is
 deterministic test headroom for Nextor, the UNAPINET TSR, MemMan, and
@@ -146,31 +147,12 @@ The observable end-to-end path covers:
 - `TCP_OPEN` on the selected port;
 - `TCP_STATE` while establishing the connection;
 - `TCP_SEND` and `TCP_RCV` during the handshake, status, and MCP memory read;
-- host disconnect followed by automatic foreground listener recovery.
+- host disconnect followed by automatic resident listener recovery without
+  machine input.
 
-It does not trace each bridge call individually. It also does not validate
-Pico/Pico+ firmware, cartridge registers, bus timing, physical interrupts,
-Wi-Fi association, DHCP, or radio behaviour. Those remain physical-hardware
-validation gates.
-
-## Resident trace validation
-
-The `trace` command runs the same single-emulator validation with resident
-diagnostics enabled:
-
-```sh
-python3 tools/openmsx_unapi_validation.py trace \
-  --archive /path/to/openmsx-macos-arm64.zip \
-  --unapinet-com /path/to/UNAPINET.COM \
-  --dos-hdd work/system-disks/msxdos.dsk \
-  --openmsx-home .openmsx-home \
-  --port 43123
-```
-
-It exercises the public MCP connection, a disconnect and reconnection, and a
-BASIC-to-DOS transition. It then creates two diagnostic files with
-`MSXAI /DUMPTRACE`, validates their format, and proves that the earlier history
-and first incident remain intact while later events advance the trace.
+It does not validate Pico/Pico+ firmware, cartridge registers, bus timing,
+physical interrupts, Wi-Fi association, DHCP, or radio behaviour. Those remain
+physical-hardware validation gates.
 
 ## Automated tests
 

@@ -48,9 +48,9 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertRegex(
             self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+00426h")
         self.assertRegex(
-            self.source, r"(?m)^TU_FILE_SIZE:\s+equ\s+003D7h")
+            self.source, r"(?m)^TU_FILE_SIZE:\s+equ\s+0040Bh")
         self.assertIn("1062-byte guarded-stack trace/port helper", self.source)
-        self.assertIn("983-byte pre-TL UNAPI helper", self.source)
+        self.assertIn("1035-byte pre-TL UNAPI helper", self.source)
 
     def test_resident_lifecycle_creates_no_temporary_files(self):
         lifecycle = self.source.split(

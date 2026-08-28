@@ -1,4 +1,4 @@
-MSX-AI AGENT 0.1.3
+MSX-AI AGENT 0.1.4
 ==================
 
 This package lets an MCP client control a physical MSX through a serial
@@ -39,6 +39,11 @@ required.
 
 The default mode installs the agent as a MemMan resident and returns to DOS.
 This is the recommended mode for file transfers and DOS applications.
+
+If a resident TCP connection is lost, the listener reopens silently. The host
+can connect again to the same IP address and port without typing a command or
+pressing a key on the MSX. This was validated on a physical HOTBIT 1.0 with an
+MSX Pico+ cartridge.
 
 MemMan A7 v1 is the safe lifecycle request for targets 0, 1, and 2. Offset
 14 selects 8251, 16C550, or UNAPI; offset 15 is reserved and stays zero.

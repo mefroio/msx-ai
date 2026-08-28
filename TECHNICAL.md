@@ -614,9 +614,6 @@ Driver selection is explicit and case-insensitive:
 | `MSXAI /DRIVER:16C550` | Install/reconfigure the default resident TSR for a generic 16C550 interface |
 | `MSXAI /DRIVER:UNAPI` | Install/reconfigure a passive TCP/IP UNAPI listener on the default port 6603 |
 | `MSXAI /DRIVER:UNAPI /PORT:43123` | Use a chosen TCP listener port from 1 through 65534 |
-| `MSXAI /DRIVER:UNAPI /PORT:43123 /TRACE` | Enable connection diagnostics for resident UNAPI |
-| `MSXAI 6603 /TRACE` | Use the compact resident UNAPI form with diagnostics enabled |
-| `MSXAI /DUMPTRACE A:\MSXAI.LOG` | Save the resident diagnostics to a new DOS file without clearing them |
 | `MSXAI /DRIVER:8251 /MONITOR` | Start the non-resident foreground monitor with the 8251 driver |
 | `MSXAI /DRIVER:16C550 /MONITOR` | Start the non-resident foreground monitor with the 16C550 driver |
 | `MSXAI /DRIVER:UNAPI /MONITOR` | Start the non-resident foreground monitor with TCP/IP UNAPI |
@@ -630,10 +627,6 @@ Exactly one `/DRIVER` is required for install or monitor mode. `/PORT` is
 valid only with `/DRIVER:UNAPI`; omitting it selects port 6603. The UNAPI value
 `FFFFh` means “choose a random local port”, so `/PORT:65535` is rejected: the
 host could not know which endpoint to connect to.
-`/TRACE` is restricted to resident UNAPI and cannot be combined with
-`/MONITOR` or `DEBUG`. `/DUMPTRACE` requires an installed matching resident,
-one new filename, and no other command-line options. It remains usable after
-the host TCP connection has fallen.
 `/UNINSTALL` must be used alone. Running the resident command again finds the
 existing named TSR and changes its selected driver through MemMan instead of
 installing a duplicate. Changing the live driver can disconnect the current
@@ -722,7 +715,6 @@ framed protocols, transport ABI, and driver implementation details.
 | Agent-side `stop` | No | Yes |
 | Slot and mapper selection | No | Yes, pages 0 and 1 |
 | On-screen `DEBUG` output | No | Optional |
-| Resident `/TRACE` diagnostics | Optional for UNAPI | No |
 
 The resident reports execution state `running` while DOS or an application is
 active. The safe profile disables persistent manual `msx_agent_pause`; atomic memory
@@ -829,16 +821,13 @@ local port with an unspecified remote peer. The MSX therefore listens and the
 host uses `msx_agent_connect`. The driver configures neither the access point
 nor the cartridge firmware. On Pico/Pico+, Wi-Fi must already have been
 configured through the cartridge's existing menu. Connection loss first
-unwinds the old stream parser and preserves resumable transfer state. Lifecycle
-calls are then made only in foreground: `/MONITOR` relistens from its main loop;
-for a resident Pico session, rerun the same `/DRIVER:UNAPI /PORT:...` command at
-the DOS prompt. The foreground TsrCall uses the guarded A7 v1 lifecycle request
-with target `2`, avoiding both Pico's potentially blocking `TCP_OPEN` and
-`TCP_ABORT` paths inside `H.TIMI` and MemMan's small dispatcher stack.
-Foreground monitor exit and MemMan uninstall retry a failed `TCP_ABORT` three
-times. If the implementation still refuses every abort, the image must be
-released without a trustworthy cleanup acknowledgement; reset the adapter's
-TCP/IP stack or the cartridge before starting another session.
+ends the old session while preserving resumable transfer state. The resident
+listener then reopens silently, and the host can reconnect to the same IP
+address and port without a command or key press on the MSX. This behavior has
+been validated on a physical HOTBIT 1.0 with an MSX Pico+ cartridge. The
+foreground monitor also relistens automatically. If an implementation cannot
+restore its listener, reset its TCP/IP stack or the cartridge before starting
+another session.
 
 A cartridge ROM supplies firmware bytes only. By itself it does not emulate the
 16C550 register file, FIFO and timing, RTS/CTS behavior, the Pico/Pico+ Wi-Fi
@@ -847,8 +836,9 @@ register interface, or either transparent TCP peer. The opt-in
 matched openMSXnet v0.9.7 `UnapiNet` bridge and `UNAPINET.COM` to validate the
 observable TCP/IP UNAPI contract end to end. That proves EXTBIO/RAM-helper
 discovery, the passive listener on a custom port, bidirectional agent traffic,
-disconnect, and foreground relisten; it does not claim to execute Pico firmware or model
-physical bus, interrupt, radio, or timing behavior.
+disconnect, and automatic listener recovery without machine input. It does not
+claim to execute Pico firmware or model physical bus, interrupt, radio, or
+timing behavior.
 
 ## Protocol v3
 
@@ -1632,9 +1622,10 @@ separately aggregated openMSX configuration resources remain GPL-2.0-only.
   software does not maintain BIOS shadows.
 - SCREEN 9 is not implemented.
 - Generic bank-switched cartridge mappers are not implemented.
-- Physical TCP/IP UNAPI operation on Pico/Pico+ remains pending hardware
-  validation. In particular, resident calls run cooperatively from `H.TIMI`
-  and must be measured with the cartridge's real UNAPI implementation.
+- Automatic resident TCP/IP UNAPI listener recovery has been validated on a
+  physical HOTBIT 1.0 with an MSX Pico+ cartridge. Other machines, firmware
+  versions, failure modes, and sustained performance remain hardware-specific
+  validation targets.
 - Actual BaDCaT SMD hardware validation is pending.
 - The current 16C550 profile assumes base port `80h`, a 1.8432 MHz UART clock,
   a 16-byte FIFO, and working MCR AFE. Other mappings or chip variants require

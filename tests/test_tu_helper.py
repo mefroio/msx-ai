@@ -105,7 +105,7 @@ class TuHelperTest(unittest.TestCase):
         second = assemble_tu_helper()
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.sha256, second.sha256)
-        self.assertEqual(len(first.data), 983)
+        self.assertEqual(len(first.data), 1035)
         self.assertLess(first.labels["tu_helper_end"], 0x4000)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -146,6 +146,26 @@ class TuHelperTest(unittest.TestCase):
         mutated = bytearray(image.data)
         mutated[stub] ^= 1
         with self.assertRaisesRegex(TuHelperBuildError, "overlay stub"):
+            validate_tu_helper_image(bytes(mutated), image.labels)
+
+        certificate = bytes((
+            0x36, image.labels["PICO_CERT_TAG_M"], 0x23,
+            0x36, image.labels["PICO_CERT_TAG_A"], 0x23,
+            0x36, image.labels["PICO_CERT_LOW"], 0x23,
+            0x36, image.labels["PICO_CERT_HIGH"], 0x23,
+        ))
+        certificate_offset = image.data.index(certificate)
+        mutated = bytearray(image.data)
+        mutated[certificate_offset + 1] ^= 1
+        with self.assertRaisesRegex(TuHelperBuildError, "certif"):
+            validate_tu_helper_image(bytes(mutated), image.labels)
+
+        previous_certificate = (
+            image.labels["validate_pico_relocation_certificate"] - ORIGIN)
+        mutated = bytearray(image.data)
+        mutated[previous_certificate + 1] ^= 1
+        with self.assertRaisesRegex(
+                TuHelperBuildError, "previous Pico relocation certificate"):
             validate_tu_helper_image(bytes(mutated), image.labels)
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
@@ -337,15 +357,22 @@ class TuHelperTest(unittest.TestCase):
                 "ld de,(HIMEM)",
                 "jr nz,relocate_pico_have_measured_length",
                 "jr z,relocate_pico_layout_failed",
+                "call validate_pico_relocation_certificate",
+                "jr nz,relocate_pico_layout_failed",
                 "ld (pico_relocation_applied),a",
                 "ret",
                 "relocate_pico_have_measured_length:",
                 "cp PICO_WORK_MAX + 1",
+                "add a,PICO_CERT_SIZE",
+                "ld (hl),PICO_CERT_TAG_M",
+                "ld (hl),PICO_CERT_TAG_A",
                 "ld hl,(HIMEM)",
                 "inc hl",
                 "ld de,(PICO_WORK_POINTER)",
                 "ld de,MEMMAN_HEAP_ALLOC",
                 "call call_memman_function",
+                "ld (hl),PICO_CERT_LOW",
+                "ld (hl),PICO_CERT_HIGH",
                 "ld hl,(PICO_WORK_POINTER)",
                 "ldir",
                 "ld (PICO_WORK_POINTER),hl",
@@ -354,11 +381,39 @@ class TuHelperTest(unittest.TestCase):
                 "ld (pico_relocation_applied),a"):
             self.assertIn(check, relocation)
         self.assertLess(
+            relocation.index("ld (hl),PICO_CERT_TAG_M"),
+            relocation.index("ld (hl),PICO_CERT_TAG_A"),
+        )
+        self.assertLess(
+            relocation.index("ld (hl),PICO_CERT_TAG_A"),
+            relocation.index("ld (hl),PICO_CERT_LOW"),
+        )
+        self.assertLess(
+            relocation.index("ld (hl),PICO_CERT_LOW"),
+            relocation.index("ld (hl),PICO_CERT_HIGH"),
+        )
+        self.assertLess(
+            relocation.index("ld (hl),PICO_CERT_HIGH"),
+            relocation.index("ld (pico_heap_pointer),hl"),
+        )
+        self.assertLess(
             relocation.index("ld (PICO_WORK_POINTER),hl"),
             relocation.index("ld (HIMEM),hl"),
         )
         self.assertIn("ld (pico_relocation_error),a", relocation)
         self.assertNotIn("HIMSAV", source)
+
+        previous_certificate = source.split(
+            "validate_pico_relocation_certificate:", 1)[1].split(
+            "validate_pico_relocation_certificate_end:", 1)[0]
+        for check in (
+                "ld hl,(PICO_WORK_POINTER)",
+                "ld de,PICO_CERT_MIN_POINTER",
+                "cp PICO_CERT_HIGH",
+                "cp PICO_CERT_LOW",
+                "cp PICO_CERT_TAG_A",
+                "cp PICO_CERT_TAG_M"):
+            self.assertIn(check, previous_certificate)
 
         indirect = source.split("call_memman_function:", 1)[1].split(
             "call_memman_function_end:", 1)[0]

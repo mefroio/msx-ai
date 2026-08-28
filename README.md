@@ -240,21 +240,15 @@ Use this path when actual MSX hardware behavior is the subject of the session.
    UNAPI reserves `65535` (`FFFFh`) as a random-port sentinel, so it cannot be
    selected as a predictable listener endpoint.
    Call `msx_agent_connect` with the MSX's IPv4 address and the same port.
-   For the first physical test, `/MONITOR` is the conservative choice because
-   listener lifecycle calls remain in foreground while it is idle. After
-   `RUN`, data-path polling still occurs from `H.TIMI` and remains a hardware
-   validation item. The Pico stack advertises `TCP_OPEN` as potentially
-   blocking. The resident retries the listener at safe foreground boundaries.
-   To diagnose an intermittent resident connection, enable tracing with either
-   `MSXAI /DRIVER:UNAPI /PORT:6603 /TRACE` or `MSXAI 6603 /TRACE`. After
-   returning to DOS, save the captured information with
-   `MSXAI /DUMPTRACE A:\MSXAI.LOG`. The destination must be a new file;
-   dumping does not clear the resident trace.
+   After a resident connection is lost, the listener reopens silently. The host
+   can reconnect to the same IP address and port without a command or key press
+   on the MSX. This behavior has been validated on a physical HOTBIT 1.0 with an
+   MSX Pico+ cartridge. `/MONITOR` remains available for foreground diagnostics.
 4. Before installing the resident, an optional `make unapi-probe` builds
    `work/agent/UNAPIPRB.COM`. Run `UNAPIPRB` or `UNAPIPRB 43123` to verify
    discovery, passive capability, the effective IP/port, and TCP state; quit
    the probe before starting `MSXAI` on that port.
-5. Before the cartridge arrives, the opt-in
+5. The opt-in
    [openMSX UNAPI validation](docs/openmsx-unapi-validation.md) exercises the
    same EXTBIO, passive-listener, bidirectional-stream, and relisten contract
    with a matched openMSXnet/UNAPINET pair. It is a contract emulator, not Pico/Pico+
@@ -446,9 +440,10 @@ msx_docs_search(query="resident screenshot safety")
   sandbox. Absolute paths remain available to explicit MCP calls with the same
   permissions as the server process; use an appropriately restricted account
   and working directory.
-- ROMs and bootable disk images are not distributed. Physical Pico/Pico+ UNAPI
-  and BaDCaT SMD validation, including measured performance, remain pending
-  until the corresponding hardware tests.
+- ROMs and bootable disk images are not distributed. Automatic resident UNAPI
+  listener recovery has been validated on a physical HOTBIT 1.0 with an MSX
+  Pico+ cartridge. Other physical configurations, measured performance, and
+  BaDCaT SMD remain separate hardware-validation targets.
 
 ## Development and validation
 

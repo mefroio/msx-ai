@@ -53,6 +53,8 @@ REQUIRED_LABELS = (
     "relocate_pico_heap_failed",
     "relocate_pico_layout_failed",
     "relocate_pico_private_block_end",
+    "validate_pico_relocation_certificate",
+    "validate_pico_relocation_certificate_end",
     "call_memman_function",
     "call_memman_function_end",
     "handoff_to_staged_tl",
@@ -96,6 +98,12 @@ REQUIRED_CONSTANTS = {
     "PICO_TIMI_ENTRY_HIGH": 0x4C,
     "RET_OPCODE": 0xC9,
     "PICO_WORK_MAX": 64,
+    "PICO_CERT_SIZE": 4,
+    "PICO_CERT_MIN_POINTER": 0xC004,
+    "PICO_CERT_TAG_M": 0x4D,
+    "PICO_CERT_TAG_A": 0x41,
+    "PICO_CERT_LOW": 0xA5,
+    "PICO_CERT_HIGH": 0x5A,
     "ERR_INTERNAL": 0xDF,
     "ERR_NO_MEMORY": 0xDE,
     "DOS_OPEN": 0x43,
@@ -401,12 +409,37 @@ def validate_tu_helper_image(
     if fallback_target != labels["relocate_pico_layout_failed"]:
         raise TuHelperBuildError(
             "unmeasurable adjacent Pico allocation does not fail closed")
+    previous_certificate_call = (
+        _call(labels["validate_pico_relocation_certificate"])
+        + bytes((0x20,))
+    )
+    certificate_call_offset = fallback_branch + 2
+    if relocation[
+        certificate_call_offset:
+        certificate_call_offset + len(previous_certificate_call)
+    ] != previous_certificate_call:
+        raise TuHelperBuildError(
+            "non-adjacent zero-delta Pico layout must validate its previous "
+            "relocation certificate")
+    certificate_branch = (
+        certificate_call_offset + len(previous_certificate_call) - 1)
+    certificate_displacement = relocation[certificate_branch + 1]
+    if certificate_displacement >= 0x80:
+        certificate_displacement -= 0x100
+    certificate_failure_target = (
+        labels["relocate_pico_private_block"] + certificate_branch + 2
+        + certificate_displacement
+    ) & 0xFFFF
+    if certificate_failure_target != labels["relocate_pico_layout_failed"]:
+        raise TuHelperBuildError(
+            "invalid previous Pico relocation certificate does not fail "
+            "closed")
     already_relocated = (
         bytes((0x3E, 0x01))
         + _store_a(labels["pico_relocation_applied"])
         + bytes((0xC9,))
     )
-    already_offset = fallback_branch + 2
+    already_offset = certificate_branch + 2
     if relocation[
         already_offset:already_offset + len(already_relocated)
     ] != already_relocated:
@@ -414,8 +447,27 @@ def validate_tu_helper_image(
             "non-adjacent zero-delta Pico layout must be latched as already "
             "relocated")
 
+    previous_certificate = _slice(
+        data, labels,
+        "validate_pico_relocation_certificate",
+        "validate_pico_relocation_certificate_end")
+    expected_previous_certificate = (
+        _load_hl(labels["PICO_WORK_POINTER"])
+        + bytes((0x11,)) + _word(labels["PICO_CERT_MIN_POINTER"])
+        + bytes.fromhex("b7 ed 52 d8")
+        + _load_hl(labels["PICO_WORK_POINTER"])
+        + bytes((0x2B, 0x7E, 0xFE, labels["PICO_CERT_HIGH"], 0xC0,
+                 0x2B, 0x7E, 0xFE, labels["PICO_CERT_LOW"], 0xC0,
+                 0x2B, 0x7E, 0xFE, labels["PICO_CERT_TAG_A"], 0xC0,
+                 0x2B, 0x7E, 0xFE, labels["PICO_CERT_TAG_M"], 0xC9))
+    )
+    if previous_certificate != expected_previous_certificate:
+        raise TuHelperBuildError(
+            "previous Pico relocation certificate validator is not exact")
+
     allocation_request = (
         _load_a(labels["pico_work_length"])
+        + bytes((0xC6, labels["PICO_CERT_SIZE"]))
         + bytes.fromhex("6f 26 00 11")
         + _word(labels["MEMMAN_HEAP_ALLOC"])
         + _call(labels["call_memman_function"])
@@ -423,7 +475,7 @@ def validate_tu_helper_image(
     if relocation.count(allocation_request) != 1:
         raise TuHelperBuildError(
             "Pico relocation must issue exactly one MemMan HeapAlloc with "
-            "the measured private-block length")
+            "the measured private-block length plus its certificate")
     allocation = relocation.index(allocation_request)
     after_allocation = allocation + len(allocation_request)
 
@@ -448,11 +500,17 @@ def validate_tu_helper_image(
         raise TuHelperBuildError(
             "zero HeapAlloc result does not branch to the explicit failure")
 
-    # Pin the successful transaction. The allocated address is saved before
-    # the copy; the complete block is copied before FD3E is published; only
-    # then may the old bytes be returned by restoring HIMEM.
+    # Pin the successful transaction. The private M A A5 5A certificate is written
+    # at the allocation base and HL is advanced past it before the resulting
+    # firmware-visible pointer is saved. The complete block is copied before
+    # FD3E is published; only then may the old bytes be returned by restoring
+    # HIMEM.
     relocation_success = (
-        _store_hl(labels["pico_heap_pointer"])
+        bytes((0x36, labels["PICO_CERT_TAG_M"], 0x23,
+               0x36, labels["PICO_CERT_TAG_A"], 0x23,
+               0x36, labels["PICO_CERT_LOW"], 0x23,
+               0x36, labels["PICO_CERT_HIGH"], 0x23))
+        + _store_hl(labels["pico_heap_pointer"])
         + bytes((0xEB,))
         + _load_hl(labels["PICO_WORK_POINTER"])
         + _load_a(labels["pico_work_length"])
@@ -470,8 +528,8 @@ def validate_tu_helper_image(
         success_start:success_start + len(relocation_success)
     ] != relocation_success:
         raise TuHelperBuildError(
-            "Pico relocation must allocate, copy, publish FD3E, and restore "
-            "HIMEM in that order")
+            "Pico relocation must certify the allocation, copy the work "
+            "block, publish FD3E, and restore HIMEM in that order")
 
     def require_layout_failure_branch(
         prefix: bytes, opcode: int, description: str

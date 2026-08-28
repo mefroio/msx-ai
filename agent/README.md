@@ -118,9 +118,6 @@ MSXAI /DRIVER:8251
 MSXAI /DRIVER:16C550
 MSXAI /DRIVER:UNAPI
 MSXAI /DRIVER:UNAPI /PORT:43123
-MSXAI /DRIVER:UNAPI /PORT:43123 /TRACE
-MSXAI 6603 /TRACE
-MSXAI /DUMPTRACE A:\MSXAI.LOG
 MSXAI /DRIVER:8251 /MONITOR
 MSXAI /DRIVER:16C550 /MONITOR
 MSXAI /DRIVER:UNAPI /MONITOR
@@ -155,11 +152,6 @@ private form. The `MSXAIXF /PUT` and `/GET` forms take the 32-hex-digit
 transfer ID staged by the host. `MSXAI.COM` has no file-transfer command; all
 DOS-file PUT and GET work is owned by `MSXAIXF.COM` and protocol X.
 
-`/TRACE` is accepted only for resident UNAPI mode and cannot be combined with
-`/MONITOR` or `DEBUG`. `/DUMPTRACE` is a standalone DOS command that takes one
-new filename, saves the currently captured diagnostics, and leaves them
-available for another dump.
-
 The startup banner reports the selected driver and runtime mode before control
 passes to MemMan or the foreground monitor.
 
@@ -177,7 +169,6 @@ passes to MemMan or the foreground monitor.
 | Direct call/run/stop | No | Yes |
 | Slot/mapper selection | No | Yes, pages 0 and 1 |
 | `DEBUG` | Rejected | Optional |
-| Resident `/TRACE` diagnostics | Optional for UNAPI | No |
 
 ### Default MemMan resident
 
@@ -422,16 +413,6 @@ This mode can:
 
 The foreground image at `0x8600` and above is protected from host writes. The
 fixed address is not used by the default MemMan lifecycle.
-
-## Resident connection trace
-
-`/TRACE` records resident TCP/IP UNAPI connection diagnostics without drawing
-on the MSX screen. It remains available after the host connection is lost as
-long as the resident remains installed.
-
-At a DOS prompt, use `MSXAI /DUMPTRACE <new-file>` to save it. Dumping does not
-disable or clear tracing. A reset, power-off, or resident uninstall removes
-information that has not yet been dumped.
 
 ## Foreground DEBUG output
 
@@ -938,19 +919,12 @@ the original MSX Pico, while remaining usable by another compliant TCP/IP
 UNAPI implementation. The cartridge must already be associated with the Wi-Fi
 network; the agent neither changes firmware nor configures credentials.
 
-The Pico stack reports TCP/IP UNAPI feature bit 11, meaning `TCP_OPEN` may
-block. Therefore connection lifecycle calls are foreground-only: `/MONITOR`
-automatically cleans the old handle and relistens from its main loop; after a
-resident connection is lost, run the same
-`MSXAI /DRIVER:UNAPI /PORT:<port>` command again at a DOS prompt. That TsrCall
-uses the versioned `A7h` v1 request with target `2` and its guarded,
-caller-owned 1 KiB page-2 stack to perform `TCP_ABORT` plus `TCP_OPEN` without
-trapping the interrupted program inside `H.TIMI` or consuming MemMan's
-internal stack. Implementations may still enable interrupts or wait internally
-during `TCP_STATE`, `TCP_SEND`, or `TCP_RCV`; the resident prevents its own
-nested entry, but exact hook latency, throughput, and long-frame operation
-remain physical-hardware validation items. Start physical validation with
-`/MONITOR`, then test resident mode after the foreground path is stable.
+After a resident connection is lost, the listener reopens silently. The host
+can reconnect to the same IP address and port without a command or key press on
+the MSX. This behavior has been validated on a physical HOTBIT 1.0 with an MSX
+Pico+ cartridge. `/MONITOR` also relistens automatically. Exact latency,
+throughput, long-frame behavior, and other physical configurations remain
+hardware-specific validation items.
 
 ### Adding another transport
 
@@ -1004,8 +978,9 @@ make test-unapi-emulation
 
 This second path uses a real TCP/IP UNAPI implementation inside openMSX and
 checks a custom passive port, host connection, SEND/RCV, disconnect, and
-foreground relisten. It does not emulate the Pico/Pico+ firmware, Wi-Fi radio,
-cartridge registers, or physical timing.
+automatic listener recovery without machine input. It does not emulate the
+Pico/Pico+ firmware, Wi-Fi radio, cartridge registers, bus behavior, or physical
+timing.
 
 The integration suite owns at most one openMSX process at a time. It validates:
 
