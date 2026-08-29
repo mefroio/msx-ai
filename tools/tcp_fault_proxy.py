@@ -203,16 +203,26 @@ class TCPFaultProxy:
                 if not data:
                     self._finish(session, "peer-close")
                     return
-                try:
-                    destination.sendall(data)
-                except OSError:
+                # Sending and accounting must be atomic with respect to cut().
+                # Once the peer can observe these bytes, an immediate RST must
+                # not snapshot the session before its counters are advanced.
+                forward_failed = False
+                with self._condition:
+                    if (self._stopping or session.blackholed or
+                            session.closed_at is not None):
+                        break
+                    try:
+                        destination.sendall(data)
+                    except OSError:
+                        forward_failed = True
+                    else:
+                        if source is session.client:
+                            session.client_to_target += len(data)
+                        else:
+                            session.target_to_client += len(data)
+                if forward_failed:
                     self._finish(session, "forward-error", reset=True)
                     return
-                with self._condition:
-                    if source is session.client:
-                        session.client_to_target += len(data)
-                    else:
-                        session.target_to_client += len(data)
         self._finish(session, "proxy-close")
 
     @staticmethod

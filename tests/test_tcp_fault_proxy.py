@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import socket
 import threading
-import time
 import unittest
 
 from tools.tcp_fault_proxy import TCPFaultProxy
@@ -88,10 +87,9 @@ class TCPFaultProxyTests(unittest.TestCase):
         session = self.proxy.wait_for_session()
         stream.sendall(b"payload")
         self.assertEqual(stream.recv(7), b"payload")
-        self.proxy.cut("rst")
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline and not self.proxy.history:
-            time.sleep(0.01)
+        cut = self.proxy.cut("rst")
+        self.assertGreaterEqual(cut.client_to_target, 7)
+        self.assertGreaterEqual(cut.target_to_client, 7)
         history = self.proxy.history
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0].number, session.number)
