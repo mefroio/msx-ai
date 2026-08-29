@@ -25,6 +25,11 @@ LABEL_LINE = re.compile(
 REQUIRED_CONSTANTS = {
     "UART_DIVISOR_57600": 2,
     "UART_DIVISOR_115200": 1,
+    "DEFAULT_LISTENER_PORT": 6603,
+    "LISTENER_PREFIX_LENGTH": 10,
+    "LISTENER_PORT_CAPACITY": 6,
+    "LISTENER_COMMAND_CAPACITY": 16,
+    "COMMAND_BUFFER_CAPACITY": 128,
     "UART_DATA": 0x80,
     "UART_IER": 0x81,
     "UART_FCR": 0x82,
@@ -48,10 +53,10 @@ COMMANDS = {
     "command_b57600": b"ATQ1B57600\0",
     "command_b115200": b"ATQ1B115200\0",
     "command_i2": b"ATI2\0",
-    "command_listener_open": b"ATQ0S41=0A6603\0",
     "command_stream_commit": b"ATHS41=1Q1\0",
     "command_visible": b"ATQ0V1E1R1F0\0",
 }
+LISTENER_COMMAND_PREFIX = b"ATQ0S41=0A\0"
 INITIAL_COMMANDS = (
     "command_n0",
     "command_s62_0",
@@ -73,6 +78,7 @@ REQUIRED_LABELS = (
     "badinit_start",
     "badinit_end",
     "parse_command_line",
+    "build_listener_command",
     "find_resident_agent",
     "uart_init_57600",
     "uart_set_baud",
@@ -88,7 +94,14 @@ REQUIRED_LABELS = (
     "response_buffer",
     "response_buffer_end",
     "selected_divisor",
+    "selected_port",
     "current_divisor",
+    "command_listener_prefix",
+    "command_listener_open",
+    "command_listener_port_text",
+    "command_listener_open_end",
+    "command_buffer",
+    "command_buffer_end",
     "initial_command_table",
     "listener_command_table",
     *COMMANDS,
@@ -194,6 +207,66 @@ def validate_badcat_init_image(
         if data[offset:offset + 1] != bytes((2,)):
             raise BadcatInitBuildError(
                 f"{name} must initialize to the safe 57600-baud divisor 2")
+
+    selected_port = _offset(labels, "selected_port")
+    expected_port = labels["DEFAULT_LISTENER_PORT"].to_bytes(2, "little")
+    if data[selected_port:selected_port + 2] != expected_port:
+        raise BadcatInitBuildError(
+            "selected_port must initialize to the default TCP port 6603")
+
+    listener_start = labels["command_listener_open"]
+    listener_port_text = labels["command_listener_port_text"]
+    listener_end = labels["command_listener_open_end"]
+    if not (
+        ORIGIN <= listener_start <= listener_port_text <= listener_end
+        <= ORIGIN + len(data)
+    ):
+        raise BadcatInitBuildError(
+            "dynamic listener command buffer is outside the COM image")
+    if (listener_end - listener_start
+            != labels["LISTENER_COMMAND_CAPACITY"]):
+        raise BadcatInitBuildError(
+            "command_listener_open must reserve exactly 16 bytes")
+    if (listener_port_text - listener_start
+            != labels["LISTENER_PREFIX_LENGTH"]):
+        raise BadcatInitBuildError(
+            "command_listener_port_text must follow the 10-byte prefix")
+    if (listener_end - listener_port_text
+            != labels["LISTENER_PORT_CAPACITY"]):
+        raise BadcatInitBuildError(
+            "command_listener_port_text must reserve exactly 6 bytes")
+    listener_offset = listener_start - ORIGIN
+    listener_size = listener_end - listener_start
+    if data[listener_offset:listener_offset + listener_size] != bytes(
+            listener_size):
+        raise BadcatInitBuildError(
+            "dynamic listener command buffer must initialize to zero")
+
+    command_buffer_start = labels["command_buffer"]
+    command_buffer_end = labels["command_buffer_end"]
+    if not (
+        ORIGIN <= command_buffer_start <= command_buffer_end
+        <= ORIGIN + len(data)
+    ):
+        raise BadcatInitBuildError(
+            "command_buffer is outside the COM image")
+    if (command_buffer_end - command_buffer_start
+            != labels["COMMAND_BUFFER_CAPACITY"]):
+        raise BadcatInitBuildError(
+            "command_buffer must reserve exactly 128 bytes")
+    command_buffer_offset = command_buffer_start - ORIGIN
+    command_buffer_size = command_buffer_end - command_buffer_start
+    if data[command_buffer_offset:
+            command_buffer_offset + command_buffer_size] != bytes(
+                command_buffer_size):
+        raise BadcatInitBuildError(
+            "command_buffer must initialize to zero")
+    actual_prefix = _read_c_string(
+        data, labels, "command_listener_prefix")
+    if actual_prefix != LISTENER_COMMAND_PREFIX:
+        raise BadcatInitBuildError(
+            f"command_listener_prefix is {actual_prefix!r}, "
+            f"expected {LISTENER_COMMAND_PREFIX!r}")
 
     for name, expected in COMMANDS.items():
         actual = _read_c_string(data, labels, name)

@@ -44,8 +44,8 @@ This is the recommended mode for file transfers and DOS applications.
 
 If a resident TCP connection is lost, the listener reopens silently. The host
 can connect again to the same IP address and port without typing a command or
-pressing a key on the MSX. This was validated on a physical HOTBIT 1.0 with an
-MSX Pico+ cartridge.
+pressing a key on the MSX. This was validated on a physical HOTBIT 1.0 with
+an MSX Pico+ cartridge.
 
 MemMan A7 v2 is the safe lifecycle request for targets 0, 1, and 2. Offset
 14 selects 8251, 16C550, or UNAPI. Offset 15 selects divisor 2 (57600) or
@@ -75,7 +75,16 @@ For a temporary 115200-baud line, use the matching options:
    BADINIT /115200
    MSXAI /DRIVER:16C550 /115200
 
-BADINIT opens TCP port 6603 only in the current modem session. It never
+To select another runtime listener port, use:
+
+   BADINIT /PORT:43123
+
+/PORT:<decimal> accepts 1 through 65535 and may appear before or after one
+/57600 or /115200 option. Duplicate port or baud options are invalid. Port
+6603 is the default. ZiModem accepts 65535; UNAPI treats it as the random-port
+sentinel and rejects it. Use the selected port with msx_agent_connect.
+
+BADINIT sends ATQ0S41=0A<port> only for the current modem session. It never
 saves, reloads, resets, factory-resets, or changes register S60. It does not
 send even S60=0 because that deletes saved listeners. Existing saved modem
 settings return after a power cycle. BADINIT refuses to run while the MSXAI

@@ -627,20 +627,27 @@ Driver selection is explicit and case-insensitive:
 | `MSXAI /DRIVER:16C550 /MONITOR` | Start the non-resident foreground monitor with the 16C550 driver |
 | `MSXAI /DRIVER:UNAPI /MONITOR` | Start the non-resident foreground monitor with TCP/IP UNAPI |
 | `MSXAI /DRIVER:8251 /MONITOR DEBUG` | Start the foreground monitor with visible command tracing |
-| `BADINIT` or `BADINIT /57600` | Initialize a BaDCaT listener on port 6603 at the safe default 57600-baud line rate |
-| `BADINIT /115200` | Initialize the same listener and temporarily select a 115200-baud line rate |
+| `BADINIT` or `BADINIT /57600` | Initialize a BaDCaT listener on the default port 6603 at the safe default 57600-baud line rate |
+| `BADINIT /115200` | Initialize the default listener and temporarily select a 115200-baud line rate |
+| `BADINIT /PORT:43123 /115200` | Initialize a runtime-only BaDCaT listener on a chosen port from 1 through 65535; the port and baud options may appear in either order |
 | `MSXAI /UNINSTALL` | Remove the named resident TSR safely through MemMan |
 | `MSXAIXF /PUT <32-hex-transfer-id>` | Run the foreground worker for a staged file-transfer-v2 upload |
 | `MSXAIXF /GET <32-hex-transfer-id>` | Run the foreground worker for a staged file-transfer-v2 download |
 | `MSXAI /?` or `MSXAI /HELP` | Display command-line help |
 
-Exactly one `/DRIVER` is required for install or monitor mode. `/PORT` is
-valid only with `/DRIVER:UNAPI`; omitting it selects port 6603. The UNAPI value
-`FFFFh` means “choose a random local port”, so `/PORT:65535` is rejected: the
-host could not know which endpoint to connect to.
-`/57600` and `/115200` are mutually exclusive and valid only with
+Exactly one `/DRIVER` is required for install or monitor mode. On `MSXAI`,
+`/PORT` is valid only with `/DRIVER:UNAPI`; omitting it selects port 6603. The
+UNAPI value `FFFFh` means “choose a random local port”, so `/PORT:65535` is
+rejected for that driver: the host could not know which endpoint to connect to.
+`BADINIT` has a separate `/PORT:<1..65535>` option for the ZiModem listener;
+65535 is valid there because ZiModem does not assign it the UNAPI sentinel
+meaning. Its port option may appear before or after at most one of `/57600` and
+`/115200`; duplicate port or baud options are rejected.
+On `MSXAI`, `/57600` and `/115200` are mutually exclusive and valid only with
 `/DRIVER:16C550`; omitting both selects 57600. The same default and explicit
 speed forms apply to `BADINIT`, and its selected speed must match `MSXAI`.
+Omitting `BADINIT /PORT` selects 6603. The selected port is runtime-only and
+must match the port passed to `msx_agent_connect`.
 `/UNINSTALL` must be used alone. Running the resident command again finds the
 existing named TSR and changes its selected driver through MemMan instead of
 installing a duplicate. Changing the live driver can disconnect the current
@@ -718,9 +725,10 @@ promise.
 ### Safe BaDCaT listener initialization
 
 Keep the modem's saved serial baseline at 57600 baud and keep the host
-disconnected from TCP port 6603 throughout initialization. A live host can make
-the modem enter stream mode before setup is complete. If the MSX-AI TSR is
-resident, remove it before touching the UART:
+disconnected from the selected TCP port throughout initialization (6603 when
+`/PORT` is omitted). A live host can make the modem enter stream mode before
+setup is complete. If the MSX-AI TSR is resident, remove it before touching the
+UART:
 
 ~~~~text
 MSXAI /UNINSTALL
@@ -730,6 +738,19 @@ MSXAI /DRIVER:16C550
 
 The explicit default forms are `BADINIT /57600` and
 `MSXAI /DRIVER:16C550 /57600`.
+
+To select another listener port for the current modem session, add
+`/PORT:<1..65535>` before or after the optional baud argument. For example,
+these two `BADINIT` forms are equivalent:
+
+~~~~text
+BADINIT /PORT:43123 /115200
+BADINIT /115200 /PORT:43123
+~~~~
+
+Only one port option and one baud option are accepted; duplicate options are
+invalid. Port 65535 is valid for the ZiModem listener even though the separate
+UNAPI transport rejects it as its random-port sentinel.
 
 For the opt-in faster line, both commands must match:
 
@@ -744,12 +765,12 @@ probes the saved 57600-baud baseline first, uses `ATN0` only in the current
 runtime session, and makes no persistent configuration change. In particular,
 this procedure must never include a firmware-save operation, modem reset,
 factory-default operation, or an `S60` write. It first sends
-`ATQ0S41=0A6603` and requires `OK`, so listener-creation errors remain visible
-while automatic stream entry is disabled. It then sends the final, silent
-`ATHS41=1Q1`: `H` drops premature clients, `S41=1` enables auto-stream, and
-`Q1` suppresses the result only after those operations. Only after matching
+`ATQ0S41=0A<port>` and requires `OK`, so listener-creation errors remain
+visible while automatic stream entry is disabled. It then sends the final,
+silent `ATHS41=1Q1`: `H` drops premature clients, `S41=1` enables auto-stream,
+and `Q1` suppresses the result only after those operations. Only after matching
 `MSXAI` is running should the host call `msx_agent_connect` with the BaDCaT
-IPv4 address and port 6603.
+IPv4 address and the same selected port.
 
 The UART is configured in the same safe order as BaDCaT's reference code: RTS
 is inactive while the FIFO, divisor, and 8N1 format are established, then

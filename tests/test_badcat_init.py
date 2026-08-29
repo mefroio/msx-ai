@@ -11,6 +11,7 @@ from tools.build_badcat_init import (  # noqa: E402
     COMMANDS,
     FORBIDDEN_COMMAND_FRAGMENTS,
     INITIAL_COMMANDS,
+    LISTENER_COMMAND_PREFIX,
     LISTENER_COMMANDS,
     ORIGIN,
     PAGE_1_START,
@@ -64,6 +65,9 @@ class _ParserMachine:
         if 0x81 + len(tail) < ORIGIN:
             self.memory[0x81 + len(tail)] = 13
         self.labels = image.labels
+        self.command_buffer_canary = 0xA5
+        self.memory[self.labels["command_buffer_end"]] = (
+            self.command_buffer_canary)
         self.a = self.b = self.c = self.d = self.e = 0
         self.h = self.l = self.f = 0
         self.pc = image.labels["parse_command_line"]
@@ -89,6 +93,15 @@ class _ParserMachine:
     def de(self, value):
         value &= 0xFFFF
         self.d, self.e = value >> 8, value & 0xFF
+
+    @property
+    def bc(self):
+        return self.b << 8 | self.c
+
+    @bc.setter
+    def bc(self, value):
+        value &= 0xFFFF
+        self.b, self.c = value >> 8, value & 0xFF
 
     def fetch(self):
         value = self.memory[self.pc]
@@ -146,18 +159,35 @@ class _ParserMachine:
             self.a = self.memory[self.fetch_word()]
         elif opcode == 0x32:  # LD (nn),A
             self.memory[self.fetch_word()] = self.a
+        elif opcode == 0x2A:  # LD HL,(nn)
+            source = self.fetch_word()
+            self.hl = self.memory[source] | self.memory[source + 1] << 8
+        elif opcode == 0x22:  # LD (nn),HL
+            destination = self.fetch_word()
+            self.memory[destination] = self.l
+            self.memory[destination + 1] = self.h
         elif opcode == 0x21:  # LD HL,nn
             self.hl = self.fetch_word()
+        elif opcode == 0x01:  # LD BC,nn
+            self.bc = self.fetch_word()
         elif opcode == 0x11:  # LD DE,nn
             self.de = self.fetch_word()
+        elif opcode == 0x16:  # LD D,n
+            self.d = self.fetch()
         elif opcode == 0x3E:  # LD A,n
             self.a = self.fetch()
         elif opcode == 0x06:  # LD B,n
             self.b = self.fetch()
         elif opcode == 0x0E:  # LD C,n
             self.c = self.fetch()
+        elif opcode == 0x4F:  # LD C,A
+            self.c = self.a
         elif opcode == 0x47:  # LD B,A
             self.b = self.a
+        elif opcode == 0x44:  # LD B,H
+            self.b = self.h
+        elif opcode == 0x4D:  # LD C,L
+            self.c = self.l
         elif opcode == 0x78:  # LD A,B
             self.a = self.b
         elif opcode == 0x79:  # LD A,C
@@ -166,6 +196,20 @@ class _ParserMachine:
             self.a = self.memory[self.hl]
         elif opcode == 0x1A:  # LD A,(DE)
             self.a = self.memory[self.de]
+        elif opcode == 0x5F:  # LD E,A
+            self.e = self.a
+        elif opcode == 0x7B:  # LD A,E
+            self.a = self.e
+        elif opcode == 0x60:  # LD H,B
+            self.h = self.b
+        elif opcode == 0x69:  # LD L,C
+            self.l = self.c
+        elif opcode == 0x54:  # LD D,H
+            self.d = self.h
+        elif opcode == 0x5D:  # LD E,L
+            self.e = self.l
+        elif opcode == 0x7D:  # LD A,L
+            self.a = self.l
         elif opcode == 0x12:  # LD (DE),A
             self.memory[self.de] = self.a
         elif opcode == 0x23:  # INC HL
@@ -174,14 +218,46 @@ class _ParserMachine:
             self.de += 1
         elif opcode == 0x0C:  # INC C
             self.c = self.increment(self.c)
+        elif opcode == 0x3C:  # INC A
+            self.a = self.increment(self.a)
         elif opcode == 0x05:  # DEC B
             self.b = self.decrement(self.b)
+        elif opcode == 0x29:  # ADD HL,HL
+            result = self.hl * 2
+            self.f = ((self.f & Z_FLAG)
+                      | (C_FLAG if result > 0xFFFF else 0))
+            self.hl = result
+        elif opcode == 0x19:  # ADD HL,DE
+            result = self.hl + self.de
+            self.f = ((self.f & Z_FLAG)
+                      | (C_FLAG if result > 0xFFFF else 0))
+            self.hl = result
+        elif opcode == 0x09:  # ADD HL,BC
+            result = self.hl + self.bc
+            self.f = ((self.f & Z_FLAG)
+                      | (C_FLAG if result > 0xFFFF else 0))
+            self.hl = result
         elif opcode == 0xFE:  # CP n
             self.compare(self.fetch())
+        elif opcode == 0xB9:  # CP C
+            self.compare(self.c)
         elif opcode == 0xBE:  # CP (HL)
             self.compare(self.memory[self.hl])
         elif opcode == 0xE6:  # AND n
             self.logic(self.a & self.fetch())
+        elif opcode == 0xD6:  # SUB n
+            value = self.fetch()
+            result = self.a - value
+            self.a = result & 0xFF
+            self.f = ((Z_FLAG if self.a == 0 else 0)
+                      | (C_FLAG if result < 0 else 0))
+        elif opcode == 0xC6:  # ADD A,n
+            result = self.a + self.fetch()
+            self.a = result & 0xFF
+            self.f = ((Z_FLAG if self.a == 0 else 0)
+                      | (C_FLAG if result > 0xFF else 0))
+        elif opcode == 0xB1:  # OR C
+            self.logic(self.a | self.c)
         elif opcode == 0xB7:  # OR A
             self.logic(self.a)
         elif opcode == 0xAF:  # XOR A
@@ -198,10 +274,40 @@ class _ParserMachine:
             self.relative(not self.f & C_FLAG)
         elif opcode == 0x38:  # JR C
             self.relative(bool(self.f & C_FLAG))
+        elif opcode == 0xC3:  # JP nn
+            self.pc = self.fetch_word()
+        elif opcode == 0xC2:  # JP NZ,nn
+            target = self.fetch_word()
+            if not self.f & Z_FLAG:
+                self.pc = target
+        elif opcode == 0xCA:  # JP Z,nn
+            target = self.fetch_word()
+            if self.f & Z_FLAG:
+                self.pc = target
+        elif opcode == 0xD2:  # JP NC,nn
+            target = self.fetch_word()
+            if not self.f & C_FLAG:
+                self.pc = target
+        elif opcode == 0xDA:  # JP C,nn
+            target = self.fetch_word()
+            if self.f & C_FLAG:
+                self.pc = target
         elif opcode == 0xCD:  # CALL nn
             target = self.fetch_word()
             self.push(self.pc)
             self.pc = target
+        elif opcode == 0xE5:  # PUSH HL
+            self.push(self.hl)
+        elif opcode == 0xE1:  # POP HL
+            self.hl = self.pop()
+        elif opcode == 0xD5:  # PUSH DE
+            self.push(self.de)
+        elif opcode == 0xD1:  # POP DE
+            self.de = self.pop()
+        elif opcode == 0xC5:  # PUSH BC
+            self.push(self.bc)
+        elif opcode == 0xC1:  # POP BC
+            self.bc = self.pop()
         elif opcode == 0xC8:  # RET Z
             if self.f & Z_FLAG:
                 self.pc = self.pop()
@@ -210,17 +316,53 @@ class _ParserMachine:
                 self.pc = self.pop()
         elif opcode == 0xC9:  # RET
             self.pc = self.pop()
+        elif opcode == 0xED:
+            extension = self.fetch()
+            if extension == 0x43:  # LD (nn),BC
+                destination = self.fetch_word()
+                self.memory[destination] = self.c
+                self.memory[destination + 1] = self.b
+            elif extension == 0x42:  # SBC HL,BC
+                result = self.hl - self.bc - bool(self.f & C_FLAG)
+                self.hl = result
+                self.f = ((Z_FLAG if self.hl == 0 else 0)
+                          | (C_FLAG if result < 0 else 0))
+            else:
+                raise AssertionError(
+                    f"unsupported parser opcode at {address:04X}: "
+                    f"ED {extension:02X}")
         else:
             raise AssertionError(
                 f"unsupported parser opcode at {address:04X}: {opcode:02X}")
 
     def run(self):
-        for _ in range(4096):
+        for _ in range(12000):
             if self.pc == self.sentinel:
                 selected = self.memory[self.labels["selected_divisor"]]
-                return bool(self.f & C_FLAG), selected
+                port_address = self.labels["selected_port"]
+                port = (self.memory[port_address]
+                        | self.memory[port_address + 1] << 8)
+                start = self.labels["command_listener_open"]
+                end = self.labels["command_listener_open_end"]
+                encoded = bytes(self.memory[start:end])
+                terminator = encoded.find(b"\0")
+                command = None if terminator < 0 else encoded[:terminator].decode(
+                    "ascii")
+                guard = bytes(self.memory[end:end + len(COMMANDS[
+                    "command_stream_commit"])])
+                self.assert_listener_guard(guard)
+                if (self.memory[self.labels["command_buffer_end"]]
+                        != self.command_buffer_canary):
+                    raise AssertionError(
+                        "command-tail parser crossed its 128-byte buffer")
+                return bool(self.f & C_FLAG), selected, port, command
             self.step()
         raise AssertionError("BADINIT option parser did not return")
+
+    def assert_listener_guard(self, actual):
+        image_expected = COMMANDS["command_stream_commit"]
+        if actual != image_expected:
+            raise AssertionError("listener command builder crossed its buffer")
 
 
 class _ResidentProbeMachine:
@@ -376,6 +518,11 @@ class BadcatInitBuilderTest(unittest.TestCase):
             - first.labels["response_buffer"],
             512,
         )
+        self.assertEqual(
+            first.labels["command_buffer_end"]
+            - first.labels["command_buffer"],
+            128,
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "nested" / "BADINIT.COM"
@@ -393,6 +540,33 @@ class BadcatInitBuilderTest(unittest.TestCase):
         mutated = bytearray(image.data)
         mutated[image.labels["selected_divisor"] - ORIGIN] = 1
         with self.assertRaisesRegex(BadcatInitBuildError, "selected_divisor"):
+            validate_badcat_init_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        port = image.labels["selected_port"] - ORIGIN
+        mutated[port:port + 2] = (7000).to_bytes(2, "little")
+        with self.assertRaisesRegex(BadcatInitBuildError, "selected_port"):
+            validate_badcat_init_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        listener = image.labels["command_listener_open"] - ORIGIN
+        mutated[listener] = 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "must initialize to zero"):
+            validate_badcat_init_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        command_buffer = image.labels["command_buffer"] - ORIGIN
+        mutated[command_buffer] = 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "command_buffer must initialize"):
+            validate_badcat_init_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        prefix = image.labels["command_listener_prefix"] - ORIGIN
+        mutated[prefix] = ord("X")
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "command_listener_prefix"):
             validate_badcat_init_image(bytes(mutated), image.labels)
 
         mutated = bytearray(image.data)
@@ -417,6 +591,24 @@ class BadcatInitBuilderTest(unittest.TestCase):
         with self.assertRaisesRegex(
                 BadcatInitBuildError, "UART_DIVISOR_57600"):
             validate_badcat_init_image(image.data, wrong_constants)
+
+        wrong_layout = dict(image.labels)
+        wrong_layout["command_listener_open_end"] -= 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "reserve exactly 16"):
+            validate_badcat_init_image(image.data, wrong_layout)
+
+        wrong_layout = dict(image.labels)
+        wrong_layout["command_listener_port_text"] += 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "10-byte prefix"):
+            validate_badcat_init_image(image.data, wrong_layout)
+
+        wrong_layout = dict(image.labels)
+        wrong_layout["command_buffer_end"] -= 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "reserve exactly 128"):
+            validate_badcat_init_image(image.data, wrong_layout)
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
     def test_binary_pins_nonpersistent_transcript_and_atomic_listener(self):
@@ -445,7 +637,20 @@ class BadcatInitBuilderTest(unittest.TestCase):
         self.assertEqual(
             commands["command_b115200"], "ATQ1B115200")
         self.assertEqual(
-            commands["command_listener_open"], "ATQ0S41=0A6603")
+            _read_c_string(image, "command_listener_prefix"),
+            LISTENER_COMMAND_PREFIX.rstrip(b"\0").decode("ascii"),
+        )
+        listener_start = image.labels["command_listener_open"]
+        listener_end = image.labels["command_listener_open_end"]
+        self.assertEqual(listener_end - listener_start, 16)
+        self.assertEqual(
+            image.labels["command_listener_port_text"] - listener_start,
+            10,
+        )
+        self.assertEqual(
+            image.data[listener_start - ORIGIN:listener_end - ORIGIN],
+            bytes(16),
+        )
         self.assertEqual(
             commands["command_stream_commit"], "ATHS41=1Q1")
         self.assertNotIn(b"ATQ1\0", image.data)
@@ -462,13 +667,14 @@ class BadcatInitBuilderTest(unittest.TestCase):
         ]
 
         def cold_start_transcript(command_tail):
-            failed, divisor = _ParserMachine(image, command_tail).run()
+            failed, divisor, _port, listener_command = _ParserMachine(
+                image, command_tail).run()
             self.assertFalse(failed)
             transcript = list(common)
             if divisor == 1:
                 transcript.extend(("ATQ1B115200", "ATQ0V1E0R1F0"))
             transcript.extend(
-                ("ATI2", "ATQ0S41=0A6603", "ATHS41=1Q1"))
+                ("ATI2", listener_command, "ATHS41=1Q1"))
             return transcript
 
         expected_57600 = common + [
@@ -481,27 +687,74 @@ class BadcatInitBuilderTest(unittest.TestCase):
             + ["ATQ1B115200", "ATQ0V1E0R1F0", "ATI2",
                "ATQ0S41=0A6603", "ATHS41=1Q1"],
         )
+        self.assertEqual(
+            cold_start_transcript("/PORT:7000 /115200"),
+            common
+            + ["ATQ1B115200", "ATQ0V1E0R1F0", "ATI2",
+               "ATQ0S41=0A7000", "ATHS41=1Q1"],
+        )
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
-    def test_actual_option_parser_defaults_to_divisor_two_and_is_strict(self):
+    def test_actual_option_parser_builds_strict_dynamic_listener(self):
         image = _real_image()
-        cases = {
-            "": (False, 2),
-            "   \t": (False, 2),
-            "/57600": (False, 2),
-            " \t/57600\t ": (False, 2),
-            "/115200": (False, 1),
-            "  /115200   ": (False, 1),
-            "/57500": (True, 2),
-            "/9600": (True, 2),
-            "/115200 /57600": (True, 2),
-            "/115200X": (True, 2),
-            "115200": (True, 2),
-            "1234567890123456": (True, 2),
+        valid_cases = {
+            "": (False, 2, 6603, "ATQ0S41=0A6603"),
+            "   \t": (False, 2, 6603, "ATQ0S41=0A6603"),
+            "/57600": (False, 2, 6603, "ATQ0S41=0A6603"),
+            " \t/57600\t ": (False, 2, 6603, "ATQ0S41=0A6603"),
+            "/115200": (False, 1, 6603, "ATQ0S41=0A6603"),
+            "  /115200   ": (False, 1, 6603, "ATQ0S41=0A6603"),
+            "/PORT:1": (False, 2, 1, "ATQ0S41=0A1"),
+            "/PORT:00001": (False, 2, 1, "ATQ0S41=0A1"),
+            "/port:9": (False, 2, 9, "ATQ0S41=0A9"),
+            "/PORT:10": (False, 2, 10, "ATQ0S41=0A10"),
+            "/PORT:99": (False, 2, 99, "ATQ0S41=0A99"),
+            "/PORT:100": (False, 2, 100, "ATQ0S41=0A100"),
+            "/PORT:999": (False, 2, 999, "ATQ0S41=0A999"),
+            "/PORT:1000": (False, 2, 1000, "ATQ0S41=0A1000"),
+            "/PORT:9999": (False, 2, 9999, "ATQ0S41=0A9999"),
+            "/PORT:10000": (False, 2, 10000, "ATQ0S41=0A10000"),
+            "/PORT:65535": (False, 2, 65535, "ATQ0S41=0A65535"),
+            "/115200 /PORT:7000": (
+                False, 1, 7000, "ATQ0S41=0A7000"),
+            "/PORT:7000 /115200": (
+                False, 1, 7000, "ATQ0S41=0A7000"),
+            "/57600\t/PORT:7000": (
+                False, 2, 7000, "ATQ0S41=0A7000"),
         }
-        for tail, expected in cases.items():
+        for tail, expected in valid_cases.items():
             with self.subTest(tail=tail):
                 self.assertEqual(_ParserMachine(image, tail).run(), expected)
+
+        invalid_cases = (
+            "/57500",
+            "/9600",
+            "/115200 /57600",
+            "/57600 /57600",
+            "/115200 /115200",
+            "/PORT:1 /PORT:2",
+            "/PORT:1 /PORT:1",
+            "/115200X",
+            "115200",
+            "/PORT:",
+            "/PORT:0",
+            "/PORT:00000",
+            "/PORT:+1",
+            "/PORT:-1",
+            "/PORT:0X10",
+            "/PORT:12X",
+            "/PORT:65536",
+            "/PORT:70000",
+            "/PORT:000001",
+            "/PORT:123456",
+            "/PORT=6603",
+            "/PORT:1 EXTRA",
+            "1234567890123456",
+            "X" * 127,
+        )
+        for tail in invalid_cases:
+            with self.subTest(tail=tail):
+                self.assertTrue(_ParserMachine(image, tail).run()[0])
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
     def test_actual_resident_guard_requires_memman_24_and_exact_tsr(self):
@@ -542,6 +795,10 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
     def test_resident_guard_runs_before_any_uart_initialization(self):
         entry = self.section("badinit_start:", "parse_command_line:")
         self.assertLess(
+            entry.index("call parse_command_line"),
+            entry.index("call find_resident_agent"),
+        )
+        self.assertLess(
             entry.index("call find_resident_agent"),
             entry.index("call uart_init_57600"),
         )
@@ -549,6 +806,24 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
         self.assertIn("ld e,MEMMAN_INICHK", probe)
         self.assertIn("ld e,MEMMAN_GET_TSR_ID", probe)
         self.assertIn("ld hl,memman_tsr_name", probe)
+
+    def test_dynamic_listener_command_is_bounded_and_built_before_uart(self):
+        parser = self.section("parse_command_line:", "strings_equal:")
+        self.assertIn("jp z,build_listener_command", parser)
+        self.assertIn("ld hl,DEFAULT_LISTENER_PORT", parser)
+        self.assertIn("ld (selected_port),bc", parser)
+        builder = parser.split("build_listener_command:", 1)[1]
+        self.assertIn("ld hl,command_listener_prefix", builder)
+        self.assertIn("ld de,command_listener_open", builder)
+        self.assertIn("ld hl,(selected_port)", builder)
+        self.assertIn("ld (de),a", builder)
+        self.assertIn("db \"ATQ0S41=0A\",0", self.source)
+        self.assertIn("LISTENER_COMMAND_CAPACITY: equ 16", self.source)
+        self.assertIn("COMMAND_BUFFER_CAPACITY: equ 128", self.source)
+
+        success = self.section("badinit_quiet:", "badinit_failed:")
+        self.assertIn("ld hl,command_listener_port_text", success)
+        self.assertIn("call print_c_string", success)
 
     def test_receive_fifo_is_drained_before_console_output_or_halt(self):
         fifo = self.section(
@@ -745,7 +1020,12 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
         self.assertIn("ld b,LISTENER_SETTLE_TICKS", quiet)
         self.assertNotIn("run_visible_command", quiet)
         self.assertNotIn("drain_input", quiet)
-        self.assertIn('db "ATQ0S41=0A6603",0', self.source)
+        self.assertIn('db "ATQ0S41=0A",0', self.source)
+        self.assertIn(
+            "ds LISTENER_PREFIX_LENGTH,0\ncommand_listener_port_text:\n"
+            "    ds LISTENER_PORT_CAPACITY,0\ncommand_listener_open_end:",
+            self.source,
+        )
         self.assertIn('db "ATHS41=1Q1",0', self.source)
         self.assertNotIn('db "ATQ1",0', self.source)
         self.assertNotIn('db "ATA6603",0', self.source)

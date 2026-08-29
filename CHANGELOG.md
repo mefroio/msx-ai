@@ -9,10 +9,15 @@ an annotated Git tag named `vMAJOR.MINOR.PATCH`.
   `BADINIT.COM` and the opt-in 115200-baud `MCP115K.TSR`; the exact 16C550
   default is now 57600 baud.
 - Added a non-persistent BaDCaT initializer and the coordinated safe sequence
-  `MSXAI /UNINSTALL`, `BADINIT [/115200]`, then
+  `MSXAI /UNINSTALL`, `BADINIT [/57600 | /115200] [/PORT:<1..65535>]`, then
   `MSXAI /DRIVER:16C550 [/115200]`. It keeps the host disconnected during
   setup, avoids save/reset/factory/`S60` operations, verifies listener creation
   with auto-stream disabled, and commits quiet auto-stream only afterward.
+- Made the BaDCaT listener port runtime-configurable, defaulting to 6603. Its
+  `/PORT` and optional baud arguments may appear in either order, duplicate
+  options are rejected, and the selected port must match `msx_agent_connect`.
+  Port 65535 remains valid for ZiModem `BADINIT`, unlike the UNAPI transport's
+  reserved random-port sentinel.
 - Hardened the BaDCaT bootstrap for saved XON/XOFF state, aligned UART setup
   with BaDCaT's reference order, respected ZiModem's delayed baud transition,
   and added stage/hex/LSR failure diagnostics with a no-write post-listener

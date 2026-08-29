@@ -8,8 +8,8 @@ The MSX-DOS side of the physical-target backend is a compact twelve-file suite:
 - `MCP8251.TSR`, `MCP16550.TSR`, `MCP115K.TSR`, and `MCPUNAPI.TSR` are
   fixed-driver resident images selected by `/DRIVER` and baud on first
   installation;
-- `BADINIT.COM` is the optional, non-persistent BaDCaT/ZiModem port-6603
-  session initializer;
+- `BADINIT.COM` is the optional, non-persistent BaDCaT/ZiModem session
+  initializer, with TCP port 6603 as its configurable default;
 - `TU.COM` is the transient pre-TL helper used only on a first UNAPI
   installation;
 - `MP.COM` is the transient first-install configurator for the selected UNAPI
@@ -914,9 +914,10 @@ not prove its serial timing on the device.
 
 ### BaDCaT/ZiModem session initializer
 
-`BADINIT.COM` configures a BaDCaT/ZiModem listener on TCP port 6603 without
-changing the modem's saved firmware state. Keep the host MCP connection closed
-until it finishes, and use this order from DOS:
+`BADINIT.COM` configures a BaDCaT/ZiModem listener without changing the modem's
+saved firmware state. The TCP port defaults to 6603; `/PORT:<decimal>` selects
+any port from 1 through 65535 for the current modem session. Keep the host MCP
+connection closed until initialization finishes, and use this order from DOS:
 
 ~~~~bat
 MSXAI /UNINSTALL
@@ -932,23 +933,36 @@ BADINIT /115200
 MSXAI /DRIVER:16C550 /115200
 ~~~~
 
-`BADINIT /57600` is the explicit form of the default. Before touching the UART,
-the utility checks for the named MemMan resident and refuses to continue while
-it is installed; otherwise the timer hook and `BADINIT` could consume the same
-receive FIFO. It initially probes the saved 57600-baud baseline. If the modem
-is still in a previous unsaved 115200-baud session, it can detect that second
-rate. A requested baud change waits for the UART transmitter and then switches
-the local divisor, remains silent for at least 40 JIFFYs while ZiModem applies
-its delayed baud change, and only then validates the new link. The transition
-uses quiet mode so a delayed result cannot be mistaken for the validation.
+To use another listener port, pass the same value to the host connection:
+
+~~~~bat
+BADINIT /PORT:43123
+~~~~
+
+Then call `msx_agent_connect` with the MSX IPv4 address and port 43123.
+`/PORT` may appear before or after at most one `/57600` or `/115200` option;
+duplicate port or baud options are invalid. `BADINIT /57600` is the explicit
+baud form of the default, while port 6603 is used when `/PORT` is omitted.
+ZiModem accepts port 65535 here; this differs from `/DRIVER:UNAPI`, where 65535
+is the UNAPI random-port sentinel and is deliberately rejected.
+
+Before touching the UART, the utility checks for the named MemMan resident and
+refuses to continue while it is installed; otherwise the timer hook and
+`BADINIT` could consume the same receive FIFO. It initially probes the saved
+57600-baud baseline. If the modem is still in a previous unsaved 115200-baud
+session, it can detect that second rate. A requested baud change waits for the
+UART transmitter and then switches the local divisor, remains silent for at
+least 40 JIFFYs while ZiModem applies its delayed baud change, and only then
+validates the new link. The transition uses quiet mode so a delayed result
+cannot be mistaken for the validation.
 
 The first bootstrap ends in `F0`, so a modem saved in blocked XON/XOFF mode
 switches to hardware RTS/CTS before producing the first required response. The
 UART itself follows BaDCaT's reference order: RTS is inactive while FIFO,
 divisor, and 8N1 are established, and AFE/RTS is enabled only afterward. The
 runtime transcript then closes old in-memory listeners, selects raw non-TELNET
-streaming, and prints the IP information. It opens port 6603 with
-`ATQ0S41=0A6603` and requires `OK` while automatic stream entry is disabled.
+streaming, and prints the IP information. It opens the selected port with
+`ATQ0S41=0A<port>` and requires `OK` while automatic stream entry is disabled.
 Only then does the final send-only `ATHS41=1Q1` drop premature clients, enable
 auto-stream, and enter quiet mode. ZiModem processes that complete serial line
 before accepting another client, so no later AT exchange can race a newly
@@ -963,7 +977,7 @@ does not send a recovery command that might become MCP stream payload.
 
 The binary contains no `AT&W`, `ATZ`, `AT&F`, or `ATS60` command. In particular,
 it does not send even `ATS60=0`, because ZiModem implements that value by
-deleting the persistent-listener file. `ATN0` and `A6603` affect only the
+deleting the persistent-listener file. `ATN0` and `A<port>` affect only the
 runtime listener list. On an ordinary command-mode failure, `BADINIT` makes a
 best-effort return to visible 57600-baud command mode. A continuous RX stream
 is bounded and diagnosed without sending recovery bytes that could corrupt

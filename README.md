@@ -239,13 +239,19 @@ Use this path when actual MSX hardware behavior is the subject of the session.
    `/115200` selects the faster UART divisor for both resident and monitor
    modes. Do not use either baud option with 8251 or UNAPI.
    For a BaDCaT/ZiModem server, disconnect the host first, run
-   `MSXAI /UNINSTALL`, then `BADINIT` (or `BADINIT /115200`) followed by the
-   matching `MSXAI /DRIVER:16C550` command. `BADINIT` opens port 6603 only for
-   the current modem session; it never saves, reloads, resets, factory-resets,
-   or changes the persistent-listener register. A power cycle therefore
-   restores the user's previously saved modem state. Its bootstrap recovers
-   from blocked XON/XOFF flow, observes ZiModem's delayed baud change, and
-   reports failed UART probes as hexadecimal diagnostics.
+   `MSXAI /UNINSTALL`, then `BADINIT` followed by the matching
+   `MSXAI /DRIVER:16C550` command. `BADINIT` defaults to port 6603 and accepts
+   `/PORT:<1..65535>` plus at most one of `/57600` or `/115200`; the port and
+   baud options may appear in either order, while duplicate options are
+   rejected. The selected port applies only to the current modem session and
+   must also be passed to `msx_agent_connect`. Unlike the UNAPI command below,
+   ZiModem `BADINIT` accepts port 65535 because it is an ordinary TCP listener
+   port there, not UNAPI's random-port sentinel. `BADINIT` never saves,
+   reloads, resets, factory-resets, or changes the persistent-listener
+   register. A power cycle therefore restores the user's previously saved
+   modem state. Its bootstrap recovers from blocked XON/XOFF flow, observes
+   ZiModem's delayed baud change, and reports failed UART probes as
+   hexadecimal diagnostics.
 3. For an MSX Pico+ or an original MSX Pico equipped with Wi-Fi, first use the
    cartridge's existing Wi-Fi Setup. Then run `MSXAI /DRIVER:UNAPI`, or add
    `/PORT:<1..65534>` to choose a listener port other than the default `6603`.

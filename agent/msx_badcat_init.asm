@@ -1,9 +1,10 @@
 ; BADINIT.COM - non-persistent BaDCaT/ZiModem listener initializer.
 ;
 ; Usage:
-;   BADINIT           57600 baud (default)
-;   BADINIT /57600    explicit 57600 baud
-;   BADINIT /115200   switch this session to 115200 baud
+;   BADINIT                         57600 baud, TCP port 6603 (defaults)
+;   BADINIT /57600                  explicit 57600 baud
+;   BADINIT /115200                 switch this session to 115200 baud
+;   BADINIT /PORT:7000 /115200      choose a TCP port and baud rate
 ;
 ; The saved modem configuration is expected to remain at 57600 baud.  Every
 ; command below affects only the current session.  In particular, this utility
@@ -29,6 +30,11 @@ UART_LSR:               equ 085h
 
 UART_DIVISOR_57600:     equ 2
 UART_DIVISOR_115200:    equ 1
+DEFAULT_LISTENER_PORT:  equ 6603
+LISTENER_PREFIX_LENGTH: equ 10
+LISTENER_PORT_CAPACITY: equ 6         ; five decimal digits plus NUL
+LISTENER_COMMAND_CAPACITY: equ 16     ; prefix + five digits plus NUL
+COMMAND_BUFFER_CAPACITY: equ 128      ; maximum DOS tail plus NUL
 RESPONSE_TIMEOUT:       equ 180       ; about 3 s NTSC / 3.6 s PAL
 RESPONSE_LINE_CAPACITY: equ 31
 RESPONSE_STREAM_LIMIT:  equ 1024      ; bound an accidental active TCP stream
@@ -54,8 +60,6 @@ MEMMAN_MINIMUM_MINOR:   equ 4
 
 badinit_start:
     ei
-    ld a,UART_DIVISOR_57600
-    ld (selected_divisor),a
     call parse_command_line
     jp c,badinit_usage
 
@@ -174,7 +178,7 @@ badinit_listener_loop:
 
 badinit_open_listener:
     ; Open the runtime listener while automatic stream entry is disabled.
-    ; Unlike Q1+A6603, this leaves any listener creation ERROR visible and
+    ; Unlike Q1+A<port>, this leaves any listener creation ERROR visible and
     ; prevents an early host from turning subsequent AT text into MCP payload.
     ld hl,stage_listener_open
     call diagnostic_begin_stage
@@ -197,7 +201,11 @@ badinit_quiet:
     ld b,LISTENER_SETTLE_TICKS
     call wait_ticks               ; no UART access after the commit
 
-    ld de,message_success
+    ld de,message_success_prefix
+    call print_string
+    ld hl,command_listener_port_text
+    call print_c_string
+    ld de,message_success_suffix
     call print_string
     xor a
     jp terminate
@@ -248,88 +256,309 @@ terminate:
 ; ---------------------------------------------------------------- command line
 
 parse_command_line:
+    ld a,UART_DIVISOR_57600
+    ld (selected_divisor),a
+    ld hl,DEFAULT_LISTENER_PORT
+    ld (selected_port),hl
+    xor a
+    ld (baud_option_seen),a
+    ld (port_option_seen),a
+
+    ; Normalize the counted DOS command tail to uppercase. The count is at
+    ; most 127, so command_buffer always has room for the terminating NUL.
     ld a,(COMMAND_TAIL)
     and 07Fh
     ld b,a
     ld hl,COMMAND_TEXT
-
-parse_skip_leading:
-    ld a,b
-    or a
-    ret z                        ; no option: keep the 57600 default
-    ld a,(hl)
-    cp ' '
-    jr z,parse_skip_leading_byte
-    cp 9
-    jr nz,parse_copy_start
-parse_skip_leading_byte:
-    inc hl
-    dec b
-    jr parse_skip_leading
-
-parse_copy_start:
     ld de,command_buffer
-    ld c,0
-parse_copy_loop:
+parse_copy_tail:
     ld a,b
     or a
-    jr z,parse_copy_done
+    jr z,parse_copy_tail_done
     ld a,(hl)
-    cp ' '
-    jr z,parse_trailing_start
-    cp 9
-    jr z,parse_trailing_start
-    ld a,c
-    cp 15
-    jr nc,parse_copy_bad
-    ld a,(hl)
+    cp 'a'
+    jr c,parse_copy_tail_store
+    cp 'z' + 1
+    jr nc,parse_copy_tail_store
+    sub 020h
+parse_copy_tail_store:
     ld (de),a
     inc hl
     inc de
-    inc c
     dec b
-    jr parse_copy_loop
-
-parse_trailing_start:
-    inc hl
-    dec b
-parse_trailing_loop:
-    ld a,b
-    or a
-    jr z,parse_copy_done
-    ld a,(hl)
-    cp ' '
-    jr z,parse_trailing_byte
-    cp 9
-    jr nz,parse_copy_bad
-parse_trailing_byte:
-    inc hl
-    dec b
-    jr parse_trailing_loop
-
-parse_copy_done:
+    jr parse_copy_tail
+parse_copy_tail_done:
     xor a
     ld (de),a
+
     ld hl,command_buffer
+parse_token_loop:
+    call parse_skip_spaces
+    ld a,(hl)
+    or a
+    jp z,build_listener_command
+
     ld de,option_57600
-    call strings_equal
+    call parse_token_equals
     jr z,parse_select_57600
-    ld hl,command_buffer
     ld de,option_115200
-    call strings_equal
+    call parse_token_equals
     jr z,parse_select_115200
-parse_copy_bad:
+    ld de,option_port_prefix
+    call parse_token_has_prefix
+    jp z,parse_select_port
+parse_bad:
     scf
     ret
 
 parse_select_57600:
     ld a,UART_DIVISOR_57600
-    jr parse_select
+    jr parse_select_baud
 parse_select_115200:
     ld a,UART_DIVISOR_115200
-parse_select:
-    ld (selected_divisor),a
+parse_select_baud:
+    ld c,a
+    ld a,(baud_option_seen)
     or a
+    jr nz,parse_bad
+    ld a,1
+    ld (baud_option_seen),a
+    ld a,c
+    ld (selected_divisor),a
+    call parse_skip_token
+    jr parse_token_loop
+
+parse_select_port:
+    ld a,(port_option_seen)
+    or a
+    jr nz,parse_bad
+    ld a,1
+    ld (port_option_seen),a
+
+    ; Advance HL past the already-matched "/PORT:" prefix.
+    ld de,option_port_prefix
+parse_port_prefix_loop:
+    ld a,(de)
+    or a
+    jr z,parse_port_digits_start
+    inc hl
+    inc de
+    jr parse_port_prefix_loop
+
+parse_port_digits_start:
+    ld bc,0
+    xor a
+    ld (port_digit_count),a
+parse_port_digit_loop:
+    ld a,(hl)
+    or a
+    jr z,parse_port_complete
+    cp ' '
+    jr z,parse_port_complete
+    cp 9
+    jr z,parse_port_complete
+    cp '0'
+    jp c,parse_bad
+    cp '9' + 1
+    jp nc,parse_bad
+    ld e,a
+    ld a,(port_digit_count)
+    inc a
+    cp 6
+    jp nc,parse_bad              ; a TCP port has at most five digits
+    ld (port_digit_count),a
+    ld a,e
+    sub '0'
+    ld (port_digit),a
+
+    ; BC = BC * 10 + digit, rejecting all 16-bit overflow. Unlike the UNAPI
+    ; client port option, FFFFh is a valid ZiModem listener port here.
+    push hl
+    ld h,b
+    ld l,c
+    add hl,hl                    ; value * 2
+    jp c,parse_port_overflow
+    ld d,h
+    ld e,l
+    add hl,hl                    ; value * 4
+    jp c,parse_port_overflow
+    add hl,hl                    ; value * 8
+    jp c,parse_port_overflow
+    add hl,de                    ; value * 10
+    jp c,parse_port_overflow
+    ld a,(port_digit)
+    ld e,a
+    ld d,0
+    add hl,de
+    jp c,parse_port_overflow
+    ld b,h
+    ld c,l
+    pop hl
+    inc hl
+    jr parse_port_digit_loop
+parse_port_overflow:
+    pop hl
+    jp parse_bad
+
+parse_port_complete:
+    ld a,(port_digit_count)
+    or a
+    jp z,parse_bad
+    ld a,b
+    or c
+    jp z,parse_bad               ; zero is not a listener port
+    ld (selected_port),bc
+    jp parse_token_loop
+
+parse_skip_spaces:
+    ld a,(hl)
+    cp ' '
+    jr z,parse_skip_one_space
+    cp 9
+    ret nz
+parse_skip_one_space:
+    inc hl
+    jr parse_skip_spaces
+
+parse_skip_token:
+    ld a,(hl)
+    or a
+    ret z
+    cp ' '
+    ret z
+    cp 9
+    ret z
+    inc hl
+    jr parse_skip_token
+
+; Compare the token at HL with the zero-terminated option at DE. Z means an
+; exact token match. Both input pointers and BC are preserved.
+parse_token_equals:
+    push hl
+    push de
+    push bc
+parse_token_compare:
+    ld a,(de)
+    or a
+    jr z,parse_token_end
+    ld c,a
+    ld a,(hl)
+    cp c
+    jr nz,parse_token_no
+    inc hl
+    inc de
+    jr parse_token_compare
+parse_token_end:
+    ld a,(hl)
+    or a
+    jr z,parse_token_yes
+    cp ' '
+    jr z,parse_token_yes
+    cp 9
+    jr z,parse_token_yes
+parse_token_no:
+    pop bc
+    pop de
+    pop hl
+    ld a,1
+    or a
+    ret
+parse_token_yes:
+    pop bc
+    pop de
+    pop hl
+    xor a
+    ret
+
+; Compare only the zero-terminated prefix at DE. Z means the token at HL
+; begins with it. Both input pointers and BC are preserved.
+parse_token_has_prefix:
+    push hl
+    push de
+    push bc
+parse_token_prefix_compare:
+    ld a,(de)
+    or a
+    jr z,parse_token_prefix_yes
+    ld c,a
+    ld a,(hl)
+    cp c
+    jr nz,parse_token_prefix_no
+    inc hl
+    inc de
+    jr parse_token_prefix_compare
+parse_token_prefix_no:
+    pop bc
+    pop de
+    pop hl
+    ld a,1
+    or a
+    ret
+parse_token_prefix_yes:
+    pop bc
+    pop de
+    pop hl
+    xor a
+    ret
+
+; Materialize exactly "ATQ0S41=0A<port>" in the audited 16-byte buffer. The
+; builder runs before the resident probe and before any UART access.
+build_listener_command:
+    ld hl,command_listener_prefix
+    ld de,command_listener_open
+build_listener_prefix_loop:
+    ld a,(hl)
+    or a
+    jr z,build_listener_port
+    ld (de),a
+    inc hl
+    inc de
+    jr build_listener_prefix_loop
+
+build_listener_port:
+    ld hl,(selected_port)
+    xor a
+    ld (port_format_started),a
+    ld bc,10000
+    call build_listener_decimal_place
+    ld bc,1000
+    call build_listener_decimal_place
+    ld bc,100
+    call build_listener_decimal_place
+    ld bc,10
+    call build_listener_decimal_place
+    ld a,l                       ; the final remainder is 0..9
+    add a,'0'
+    ld (de),a
+    inc de
+    xor a
+    ld (de),a                    ; also clears carry for parser success
+    ret
+
+build_listener_decimal_place:
+    xor a
+build_listener_decimal_loop:
+    or a                         ; clear carry before each subtraction
+    sbc hl,bc
+    jr c,build_listener_decimal_done
+    inc a
+    jr build_listener_decimal_loop
+build_listener_decimal_done:
+    add hl,bc                    ; restore the first negative subtraction
+    ld (port_digit),a
+    ld a,(port_format_started)
+    or a
+    jr nz,build_listener_decimal_emit
+    ld a,(port_digit)
+    or a
+    ret z                        ; suppress a leading zero
+    ld a,1
+    ld (port_format_started),a
+build_listener_decimal_emit:
+    ld a,(port_digit)
+    add a,'0'
+    ld (de),a
+    inc de
     ret
 
 strings_equal:
@@ -1042,8 +1271,20 @@ print_character:
 
 selected_divisor:
     db UART_DIVISOR_57600
+selected_port:
+    dw DEFAULT_LISTENER_PORT
 current_divisor:
     db UART_DIVISOR_57600
+baud_option_seen:
+    db 0
+port_option_seen:
+    db 0
+port_digit_count:
+    db 0
+port_digit:
+    db 0
+port_format_started:
+    db 0
 response_status:
     db RESPONSE_OK
 response_start:
@@ -1071,7 +1312,8 @@ diagnostic_command:
 failure_reported:
     db 0
 command_buffer:
-    ds 16,0
+    ds COMMAND_BUFFER_CAPACITY,0
+command_buffer_end:
 response_line_buffer:
     ds RESPONSE_LINE_CAPACITY + 1,0
 
@@ -1082,6 +1324,8 @@ option_57600:
     db "/57600",0
 option_115200:
     db "/115200",0
+option_port_prefix:
+    db "/PORT:",0
 
 initial_command_table:
     dw command_n0,command_s62_0,command_s63_0
@@ -1103,8 +1347,13 @@ command_b57600:
     db "ATQ1B57600",0
 command_b115200:
     db "ATQ1B115200",0
+command_listener_prefix:
+    db "ATQ0S41=0A",0
 command_listener_open:
-    db "ATQ0S41=0A6603",0
+    ds LISTENER_PREFIX_LENGTH,0
+command_listener_port_text:
+    ds LISTENER_PORT_CAPACITY,0
+command_listener_open_end:
 command_stream_commit:
     db "ATHS41=1Q1",0
 command_i2:
@@ -1159,12 +1408,15 @@ message_115200:
     db "115200 (temporary)",13,10,"$"
 message_retry_115200:
     db 13,10,"No valid reply at 57600; probing 115200.",13,10,"$"
-message_success:
-    db 13,10,"Listener 6603 ready; start matching MSXAI now.",13,10,"$"
+message_success_prefix:
+    db 13,10,"Listener $"
+message_success_suffix:
+    db " ready; start matching MSXAI now.",13,10,"$"
 message_failed:
     db 13,10,"BaDCaT initialization failed; power-cycle restores saved state.",13,10,"$"
 message_usage:
-    db 13,10,"Usage: BADINIT [/57600 | /115200]",13,10,"$"
+    db 13,10,"Usage: BADINIT [/57600 | /115200]",13,10
+    db "       [/PORT:<1..65535>]",13,10,"$"
 message_resident_active:
     db 13,10,"MSXAI resident active; run MSXAI /UNINSTALL first.",13,10,"$"
 message_diagnostic_stage:

@@ -206,20 +206,29 @@ BADINIT /115200
 MSXAI /DRIVER:16C550 /115200
 ```
 
+`BADINIT /PORT:<port>` selects a decimal listener port from 1 through 65535;
+omitting it selects 6603. The port option may appear before or after `/57600`
+or `/115200`, for example `BADINIT /PORT:7000 /115200` and
+`BADINIT /115200 /PORT:7000` are equivalent. Port 65535 is valid for the
+BaDCaT/ZiModem initializer; only the UNAPI driver described below reserves
+that value.
+
 Do not connect the host until the final `MSXAI` command has completed. A
 resident must be uninstalled before `BADINIT` because both would otherwise
 poll the same UART. `BADINIT` and `MSXAI /DRIVER:16C550` both default to
 exactly 57600 baud when no baud option is present, and the option on both
-commands must match.
+commands must match. Call `msx_agent_connect` with the selected runtime port;
+using a different port cannot reach the modem listener.
 
 `BADINIT` changes only the current modem session. It never saves with `AT&W`,
 never resets with `ATZ`, never restores factory settings with `AT&F`, and never
 writes the persistent `S60` listener register. A power cycle therefore returns
 to the modem's previously saved configuration. It first requires `OK` from
-`ATQ0S41=0A6603`, so port 6603 is verified while automatic stream entry is
-disabled. Its final send is `ATHS41=1Q1`, which drops premature clients,
-enables auto-stream, and only then enables quiet mode; no later AT command can
-race a host entering stream mode.
+`ATQ0S41=0A<port>`, where `<port>` is the selected decimal value, so the
+runtime listener is verified while automatic stream entry is disabled. With
+no `/PORT` option this command is `ATQ0S41=0A6603`. Its final send is
+`ATHS41=1Q1`, which drops premature clients, enables auto-stream, and only then
+enables quiet mode; no later AT command can race a host entering stream mode.
 
 The initializer enables hardware flow control in its first bootstrap response,
 uses BaDCaT's reference UART setup order, and observes ZiModem's delayed baud

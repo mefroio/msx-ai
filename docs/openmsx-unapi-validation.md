@@ -175,8 +175,8 @@ physical-hardware validation gates.
 ## Physical BaDCaT procedure is out of scope
 
 The harness above does not configure or emulate BaDCaT. On physical hardware,
-keep the host disconnected from port 6603, run `MSXAI /UNINSTALL` before the
-initializer, then use matching commands:
+keep the host disconnected from the selected port (6603 by default), run
+`MSXAI /UNINSTALL` before the initializer, then use matching commands:
 
 ```text
 BADINIT
@@ -190,13 +190,20 @@ BADINIT /115200
 MSXAI /DRIVER:16C550 /115200
 ```
 
+`BADINIT /PORT:<1..65535>` selects another listener port for the current modem
+session. It may appear before or after at most one of `/57600` and `/115200`;
+duplicate port or baud options are invalid. Port 65535 is valid for this
+ZiModem command, unlike `MSXAI /DRIVER:UNAPI /PORT:65535`, where `FFFFh` is
+reserved as the UNAPI random-port sentinel. Pass the selected port to
+`msx_agent_connect`.
+
 `BADINIT` uses runtime `ATN0`, never performs firmware save, modem reset,
-factory reset, or an `S60` write. It verifies `ATQ0S41=0A6603` while automatic
-stream entry is disabled, then commits with the final silent line
+factory reset, or an `S60` write. It verifies `ATQ0S41=0A<port>` while
+automatic stream entry is disabled, then commits with the final silent line
 `ATHS41=1Q1`. Start `msx_agent_connect` only after the matching MSXAI driver is
-running. Although the BaDCaT UART line can be selected up to 115200 baud, its
-effective throughput is approximately 57600 bps; 57600 is the safe default for
-both commands.
+running and use the same selected port. Although the BaDCaT UART line can be
+selected up to 115200 baud, its effective throughput is approximately 57600
+bps; 57600 is the safe default for both commands.
 
 ## Automated tests
 

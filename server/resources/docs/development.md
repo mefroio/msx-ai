@@ -178,15 +178,24 @@ BADINIT /115200
 MSXAI /DRIVER:16C550 /115200
 ```
 
+`BADINIT /PORT:<port>` accepts every decimal TCP port from 1 through 65535 and
+defaults to 6603. It can precede or follow `/57600` or `/115200`; for example,
+`BADINIT /PORT:7000 /115200` and `BADINIT /115200 /PORT:7000` select the same
+runtime configuration. Port 65535 is valid here because BaDCaT/ZiModem does
+not use the UNAPI driver's random-port sentinel.
+
 The no-option default for both programs is exactly 57600 baud. Do not let the
 host connect until the final command completes. `BADINIT` rejects an active
 resident before touching the UART, performs no persistent write, and never
 issues `AT&W`, reset `ATZ`, factory restore `AT&F`, or the persistent `S60`
-listener setting. It requires `OK` from `ATQ0S41=0A6603`, opening port 6603
-with automatic stream entry disabled so creation errors remain visible. Its
-final, send-only `ATHS41=1Q1` line drops premature clients, enables auto-stream,
-and only then enables quiet mode; no later command-mode exchange can race the
-incoming host connection. A power cycle restores the saved modem configuration.
+listener setting. It requires `OK` from `ATQ0S41=0A<port>`, where `<port>` is
+the selected decimal value, opening the runtime listener with automatic stream
+entry disabled so creation errors remain visible. The no-option command is
+`ATQ0S41=0A6603`. Its final, send-only `ATHS41=1Q1` line drops premature
+clients, enables auto-stream, and only then enables quiet mode; no later
+command-mode exchange can race the incoming host connection. A power cycle
+restores the saved modem configuration. The host must pass that same selected
+port to `msx_agent_connect`.
 
 `BADINIT` follows the official BaDCaT UART initialization order and puts `F0`
 at the end of the first bootstrap so a blocked XON/XOFF state cannot suppress
