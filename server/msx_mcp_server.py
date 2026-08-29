@@ -88,9 +88,11 @@ AGENT_COM = AGENT_DIR / "MSXAI.COM"
 AGENT_XFER_COM = AGENT_DIR / "MSXAIXF.COM"
 AGENT_TSR_8251 = AGENT_DIR / "MCP8251.TSR"
 AGENT_TSR_16C550 = AGENT_DIR / "MCP16550.TSR"
+AGENT_TSR_16C550_115200 = AGENT_DIR / "MCP115K.TSR"
 AGENT_TSR_UNAPI = AGENT_DIR / "MCPUNAPI.TSR"
 AGENT_TU_COM = AGENT_DIR / "TU.COM"
 AGENT_PORT_COM = AGENT_DIR / "MP.COM"
+AGENT_BADINIT_COM = AGENT_DIR / "BADINIT.COM"
 AGENT_MEMMAN_COM = AGENT_DIR / "MEMMAN.COM"
 AGENT_TL_COM = AGENT_DIR / "TL.COM"
 AGENT_TK_COM = AGENT_DIR / "TK.COM"
@@ -117,9 +119,11 @@ AGENT_PACKAGE_NAMES = (
     BENCH_XFER_NAME,
     "MCP8251.TSR",
     "MCP16550.TSR",
+    "MCP115K.TSR",
     "MCPUNAPI.TSR",
     "TU.COM",
     "MP.COM",
+    "BADINIT.COM",
     "MEMMAN.COM",
     "TL.COM",
     "TK.COM",
@@ -166,9 +170,11 @@ def _build_agent_artifacts():
         AGENT_XFER_COM,
         AGENT_TSR_8251,
         AGENT_TSR_16C550,
+        AGENT_TSR_16C550_115200,
         AGENT_TSR_UNAPI,
         AGENT_TU_COM,
         AGENT_PORT_COM,
+        AGENT_BADINIT_COM,
         AGENT_MEMMAN_COM,
         AGENT_TL_COM,
         AGENT_TK_COM,
@@ -541,7 +547,7 @@ class Session:
         root = pathlib.Path(runtime.name)
         disk = root / "msxdos.dsk"
         home = root / "openmsx-home"
-        # The disposable bench disk receives the complete ten-file package
+        # The disposable bench disk receives the complete twelve-file package
         # under A:\MSXAI. Legacy root copies and stale directory copies are
         # removed because diskmanipulator does not overwrite same-name files.
         machine = None

@@ -38,7 +38,7 @@ REQUIRED_LABELS = (
     "unapi_request_transport",
     "unapi_request_connection",
     "unapi_request_target",
-    "unapi_request_reserved",
+    "unapi_request_16c550_divisor",
     "trace_request",
     "trace_request_status",
     "trace_requested",
@@ -54,7 +54,7 @@ REQUIRED_CONSTANTS = {
     "MSXAI_TALK_TRACE": 0xA8,
     "MSXAI_TRANSPORT_UNAPI": 2,
     "MSXAI_UNAPI_REQUEST_MAGIC": 0xA75A,
-    "MSXAI_UNAPI_REQUEST_VERSION": 1,
+    "MSXAI_UNAPI_REQUEST_VERSION": 2,
     "MSXAI_UNAPI_REQUEST_SIZE": 16,
     "MSXAI_UNAPI_STACK_SIZE": 0x400,
     "MSXAI_UNAPI_GUARD_SIZE": 16,
@@ -75,7 +75,7 @@ REQUEST_FIELD_OFFSETS = {
     "unapi_request_transport": 12,
     "unapi_request_connection": 13,
     "unapi_request_target": 14,
-    "unapi_request_reserved": 15,
+    "unapi_request_16c550_divisor": 15,
 }
 
 
@@ -190,10 +190,11 @@ def validate_port_helper_image(
     if request_data[target_offset] != labels["MSXAI_TRANSPORT_UNAPI"]:
         raise PortHelperBuildError(
             "MP.COM A7 request target is not the UNAPI transport")
-    reserved_offset = REQUEST_FIELD_OFFSETS["unapi_request_reserved"]
-    if request_data[reserved_offset] != 0:
+    divisor_offset = REQUEST_FIELD_OFFSETS[
+        "unapi_request_16c550_divisor"]
+    if request_data[divisor_offset] != 0:
         raise PortHelperBuildError(
-            "MP.COM A7 request reserved byte is not zero")
+            "MP.COM A7 request 16C550 divisor is not zero for UNAPI")
 
     trace_request = labels["trace_request"]
     trace_size = labels["MSXAI_TRACE_REQUEST_SIZE"]

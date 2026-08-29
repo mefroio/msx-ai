@@ -228,12 +228,24 @@ does not prevent `msx_local_screenshot` from diagnosing the existing machine.
 
 Use this path when actual MSX hardware behavior is the subject of the session.
 
-1. Install the ten-file suite described below.
+1. Install the twelve-file suite described below.
 2. For a UART bridge, run `MSXAI /DRIVER:8251` or
-   `MSXAI /DRIVER:16C550` and configure the bridge with matching serial
-   settings and flow control. If it connects outward, call
+   `MSXAI /DRIVER:16C550`. Configure 8251 for 19200 baud/8N1; configure
+   16C550 for 57600 baud/8N1 with hardware RTS/CTS. If the bridge connects
+   outward, call
    `msx_agent_listen` on the host's specific LAN IPv4 address; if it accepts
    connections, call `msx_agent_connect` with its IPv4 address.
+   The 16C550 default is exactly 57600; `/57600` makes it explicit and
+   `/115200` selects the faster UART divisor for both resident and monitor
+   modes. Do not use either baud option with 8251 or UNAPI.
+   For a BaDCaT/ZiModem server, disconnect the host first, run
+   `MSXAI /UNINSTALL`, then `BADINIT` (or `BADINIT /115200`) followed by the
+   matching `MSXAI /DRIVER:16C550` command. `BADINIT` opens port 6603 only for
+   the current modem session; it never saves, reloads, resets, factory-resets,
+   or changes the persistent-listener register. A power cycle therefore
+   restores the user's previously saved modem state. Its bootstrap recovers
+   from blocked XON/XOFF flow, observes ZiModem's delayed baud change, and
+   reports failed UART probes as hexadecimal diagnostics.
 3. For an MSX Pico+ or an original MSX Pico equipped with Wi-Fi, first use the
    cartridge's existing Wi-Fi Setup. Then run `MSXAI /DRIVER:UNAPI`, or add
    `/PORT:<1..65534>` to choose a listener port other than the default `6603`.
@@ -256,10 +268,11 @@ Use this path when actual MSX hardware behavior is the subject of the session.
 6. Call `msx_agent_status` before any mutation and verify runtime, transport,
    and feature negotiation.
 
-The agent does not configure Wi-Fi, issue modem AT commands, or depend on a
-specific network-adapter brand. The UNAPI path discovers a TCP/IP UNAPI
-implementation by capability, so it is not tied to the Pico+ product name.
-BaDCaT is one planned 16C550-compatible transport, not a project requirement.
+The `MSXAI` agent core does not configure Wi-Fi, issue modem AT commands, or
+depend on a specific network-adapter brand. `BADINIT.COM` is a separate,
+optional BaDCaT/ZiModem session initializer; the generic 16C550 driver remains
+product-neutral. The UNAPI path discovers a TCP/IP UNAPI implementation by
+capability, so it is not tied to the Pico+ product name.
 
 ## Reproducible demonstrations
 
@@ -341,9 +354,9 @@ The physical and simulated agent paths use these files:
 
 ```text
 A:\MSXAI\
-  MSXAI.COM     MSXAIXF.COM  MCP8251.TSR  MCP16550.TSR
-  MCPUNAPI.TSR  TU.COM       MP.COM       MEMMAN.COM   TL.COM
-  TK.COM
+  MSXAI.COM     MSXAIXF.COM  BADINIT.COM  MCP8251.TSR
+  MCP16550.TSR  MCP115K.TSR  MCPUNAPI.TSR TU.COM
+  MP.COM        MEMMAN.COM   TL.COM       TK.COM
 ```
 
 Build them from source with `make agent`, or use matching binaries from a
@@ -364,11 +377,12 @@ selected UNAPI port, including the default 6603 when `/PORT` is omitted. The
 public `/PORT` syntax remains decimal; the compact hexadecimal form passed to
 `MP.COM` is private to the install chain. Internally, `MP.COM` and every
 existing-resident reconfiguration use
-the private MemMan `A7h` v1 lifecycle request: 16 bytes containing the port,
+the private MemMan `A7h` v2 lifecycle request: 16 bytes containing the port,
 a caller-owned 1 KiB page-2 stack, structured results, and the requested
-transport at offset 14 (`0=8251`, `1=16C550`, `2=UNAPI`); offset 15 must remain
-zero. `MP.COM` always sets target `2` because it is the first-install UNAPI
-port helper. The stack has 16-byte low/high guards and is placed below the TPA
+transport at offset 14 (`0=8251`, `1=16C550`, `2=UNAPI`). Offset 15 is the
+16C550 divisor (`2=57600`, `1=115200`) and must be zero for other targets.
+`MP.COM` always sets target `2` and a zero divisor because it is the
+first-install UNAPI port helper. The stack has 16-byte low/high guards and is placed below the TPA
 limit with 256 bytes of headroom from the caller's current SP. Thus driver
 changes and potentially deep TCP lifecycle work do not use MemMan's internal
 stack. The old `A6h` raw-port ABI is rejected, so mixed old/new suite files
@@ -520,7 +534,7 @@ The corresponding direct Windows commands are
 
 `release-assets` publishes the versioned Python source distribution and wheel,
 plus the stable, MSX-DOS-compatible `MSXAI.ZIP` and its standalone
-`README.TXT`, under `dist/`. The ZIP contains the same README, the ten matching
+`README.TXT`, under `dist/`. The ZIP contains the same README, the twelve matching
 MSX files, the project license, the MemMan notice, checksums, and explicit
 wire-protocol, transfer-protocol, and toolchain metadata. Existing artifacts
 are never overwritten. The gate proves same-host equivalence with the pinned

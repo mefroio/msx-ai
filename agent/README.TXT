@@ -10,7 +10,7 @@ REQUIREMENTS
 
 - MSX-DOS 2 or Nextor.
 - A memory mapper with free 16 KiB segments.
-- All ten program files from this ZIP kept together.
+- All twelve program files from this ZIP kept together.
 - For UNAPI: a TCP/IP UNAPI implementation and configured Wi-Fi.
 
 INSTALLATION
@@ -28,9 +28,11 @@ INSTALLATION
    MSXAI /DRIVER:UNAPI /PORT:43123
    MSXAI /DRIVER:8251
    MSXAI /DRIVER:16C550
+   MSXAI /DRIVER:16C550 /115200
 
 The 8251 driver uses ports 80h/81h, 19200 baud, and 8N1. The 16C550
-driver uses ports 80h-87h, 115200 baud, 8N1, and hardware RTS/CTS.
+driver uses ports 80h-87h, 8N1, and hardware RTS/CTS. It defaults to
+exactly 57600 baud. /57600 is explicit; /115200 selects divisor 1.
 
 UNAPI listens on TCP port 6603 by default. /PORT accepts 1 through 65534.
 Configure the cartridge Wi-Fi before starting MSXAI. The host must connect
@@ -45,10 +47,11 @@ can connect again to the same IP address and port without typing a command or
 pressing a key on the MSX. This was validated on a physical HOTBIT 1.0 with an
 MSX Pico+ cartridge.
 
-MemMan A7 v1 is the safe lifecycle request for targets 0, 1, and 2. Offset
-14 selects 8251, 16C550, or UNAPI; offset 15 is reserved and stays zero.
-MP.COM selects UNAPI. Its 1 KiB page-2 stack has low/high guards and leaves
-256 bytes below the caller SP. A6 is rejected; keep the suite at one version.
+MemMan A7 v2 is the safe lifecycle request for targets 0, 1, and 2. Offset
+14 selects 8251, 16C550, or UNAPI. Offset 15 selects divisor 2 (57600) or
+1 (115200) for 16C550 and is zero otherwise. MP.COM selects UNAPI. Its
+1 KiB page-2 stack has low/high guards and leaves 256 bytes below caller SP.
+A6 is rejected; keep the suite at one version.
 
 On the first UNAPI install only, TU.COM runs after warm boot and before
 TL.COM to prepare compatible Pico/Pico+ firmware state. UART installs run
@@ -56,6 +59,29 @@ TL.COM directly. MP.COM configures the UNAPI port after TL.COM.
 
 After BASIC-to-DOS _SYSTEM or CALL SYSTEM, the resident restores the same
 listener automatically. No second MSXAI command is required.
+
+BADCAT / ZIMODEM
+----------------
+
+Keep the host MCP connection closed while initializing a BaDCaT. From DOS:
+
+   MSXAI /UNINSTALL
+   BADINIT
+   MSXAI /DRIVER:16C550
+
+For a temporary 115200-baud line, use the matching options:
+
+   MSXAI /UNINSTALL
+   BADINIT /115200
+   MSXAI /DRIVER:16C550 /115200
+
+BADINIT opens TCP port 6603 only in the current modem session. It never
+saves, reloads, resets, factory-resets, or changes register S60. It does not
+send even S60=0 because that deletes saved listeners. Existing saved modem
+settings return after a power cycle. BADINIT refuses to run while the MSXAI
+resident is installed, preventing two programs from consuming the UART.
+Its first response selects RTS/CTS, and baud changes include the ZiModem
+settle delay. A failed probe shows its stage, RX bytes in hex, and LSR flags.
 
 MONITOR MODE
 ------------
@@ -88,6 +114,8 @@ MSXAIXF.COM    File-transfer worker launched automatically by the host.
 MCPUNAPI.TSR   TCP/IP UNAPI resident transport.
 MCP8251.TSR    8251 serial resident transport.
 MCP16550.TSR   16C550 serial resident transport.
+MCP115K.TSR    16C550 115200-baud resident transport.
+BADINIT.COM    Non-persistent BaDCaT/ZiModem listener initializer.
 TU.COM         Internal pre-TL helper used only for first UNAPI install.
 MP.COM         Internal UNAPI port configurator used during installation.
 MEMMAN.COM     MemMan resident manager.

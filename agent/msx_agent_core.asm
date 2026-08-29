@@ -107,7 +107,7 @@ TSR_TALK_UNAPI_PORT_LEGACY: equ 0A6h
 TSR_TALK_UNAPI_PORT: equ 0A7h
 TSR_TALK_TRACE: equ 0A8h
 TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah
-TSR_UNAPI_REQUEST_VERSION: equ 1
+TSR_UNAPI_REQUEST_VERSION: equ 2
 TSR_UNAPI_REQUEST_SIZE: equ 16
 TSR_UNAPI_REQUEST_PORT: equ 4
 TSR_UNAPI_REQUEST_STACK_BOTTOM: equ 6
@@ -117,7 +117,7 @@ TSR_UNAPI_REQUEST_ERROR: equ 11
 TSR_UNAPI_REQUEST_TRANSPORT: equ 12
 TSR_UNAPI_REQUEST_CONNECTION: equ 13
 TSR_UNAPI_REQUEST_TARGET: equ 14
-TSR_UNAPI_REQUEST_RESERVED: equ 15
+TSR_UNAPI_REQUEST_16C550_DIVISOR: equ 15
 TSR_TRACE_REQUEST_MAGIC: equ 0A85Ah
 TSR_TRACE_REQUEST_VERSION: equ 1
 TSR_TRACE_REQUEST_SIZE: equ 16
@@ -266,8 +266,14 @@ installer:
     ld de,transport_8251_banner
     jr z,install_banner_transport_ready
     cp UART16C550_ID
-    ld de,transport_16c550_banner
+    jr nz,install_banner_unapi
+    ld a,(loader_uart16c550_divisor)
+    cp UART16C550_DIVISOR_115200
+    ld de,transport_16c550_115200_banner
     jr z,install_banner_transport_ready
+    ld de,transport_16c550_57600_banner
+    jr install_banner_transport_ready
+install_banner_unapi:
     ld de,transport_unapi_banner
 install_banner_transport_ready:
     ld c,9
@@ -360,6 +366,8 @@ install_new:
     ld a,(loader_transport_id)
     ld (active_transport_id),a
     ld (bdos_proxy + 6),a
+    ld a,(loader_uart16c550_divisor)
+    ld (active_uart16c550_divisor),a
     ld a,(loader_runtime_mode)
     ld (runtime_mode),a
     ld a,(loader_debug_enabled)
@@ -530,7 +538,9 @@ install_banner:
     db 13,10,"MSX-AI universal MCP agent",13,10,"$"
 transport_8251_banner:
     db "Driver: 8251-compatible MSX RS-232",13,10,"$"
-transport_16c550_banner:
+transport_16c550_57600_banner:
+    db "Driver: 16C550-compatible UART, 57600 RTS/CTS",13,10,"$"
+transport_16c550_115200_banner:
     db "Driver: 16C550-compatible UART, 115200 RTS/CTS",13,10,"$"
 transport_unapi_banner:
     db "Driver: TCP/IP UNAPI passive listener",13,10,"$"
@@ -566,7 +576,7 @@ usage_message:
     db "Author: Rodrigo Galhardi M. Garcia",13,10,13,10
     db "Usage:",13,10
     db "  MSXAI /DRIVER:8251 [/MONITOR] [DEBUG]",13,10
-    db "  MSXAI /DRIVER:16C550 [/MONITOR] [DEBUG]",13,10
+    db "  MSXAI /DRIVER:16C550 [/57600 | /115200] [/MONITOR] [DEBUG]",13,10
 if MSXAI_DEVELOPMENT_TRACE
     db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/TRACE | /MONITOR [DEBUG]]",13,10
     db "  MSXAI <1..65534> [/TRACE]",13,10
@@ -585,6 +595,8 @@ transport_init_error_message:
     db "Transport initialization failed",13,10,"$"
 port_requires_unapi_message:
     db "/PORT requires /DRIVER:UNAPI and a value from 1 through 65534",13,10,"$"
+baud_requires_16c550_message:
+    db "/57600 and /115200 require /DRIVER:16C550",13,10,"$"
 debug_requires_monitor_message:
     db "DEBUG requires /MONITOR",13,10,"$"
 trace_requires_resident_unapi_message:
@@ -597,6 +609,10 @@ unknown_option_message:
     db "Unknown command-line option",13,10,"$"
 loader_transport_id:
     db 0FFh
+loader_uart16c550_divisor:
+    db UART16C550_DIVISOR_57600
+loader_baud_seen:
+    db 0
 loader_runtime_mode:
     db RUNTIME_RESIDENT
 loader_debug_enabled:
@@ -619,10 +635,13 @@ loader_parse_command_line:
     ld (loader_trace_enabled),a
     ld (loader_action),a
     ld (loader_port_seen),a
+    ld (loader_baud_seen),a
     ld (loader_trace_path),a
     ld (loader_trace_path + 1),a
     ld hl,6603
     ld (loader_unapi_port),hl
+    ld a,UART16C550_DIVISOR_57600
+    ld (loader_uart16c550_divisor),a
 
     ; Normalize the counted CP/M command tail to uppercase and terminate it.
     ld a,(0080h)
@@ -664,7 +683,7 @@ loader_parse_token_loop:
     jp z,loader_parse_help
     ld de,option_driver_8251
     call loader_token_equals
-    jr z,loader_parse_8251
+    jp z,loader_parse_8251
     ld de,option_driver_16c550
     call loader_token_equals
     jp z,loader_parse_16c550
@@ -674,6 +693,12 @@ loader_parse_token_loop:
     ld de,option_port_prefix
     call loader_token_has_prefix
     jp z,loader_parse_port
+    ld de,option_baud_57600
+    call loader_token_equals
+    jp z,loader_parse_baud_57600
+    ld de,option_baud_115200
+    call loader_token_equals
+    jp z,loader_parse_baud_115200
     ld de,option_monitor
     call loader_token_equals
     jp z,loader_parse_monitor
@@ -830,6 +855,22 @@ loader_parse_port_complete:
 loader_parse_port_storable:
     ld (loader_unapi_port),bc
     jp loader_parse_token_loop
+loader_parse_baud_57600:
+    ld a,UART16C550_DIVISOR_57600
+    jr loader_parse_baud
+loader_parse_baud_115200:
+    ld a,UART16C550_DIVISOR_115200
+loader_parse_baud:
+    ld b,a
+    ld a,(loader_baud_seen)
+    or a
+    jp nz,loader_parse_baud_error
+    ld a,1
+    ld (loader_baud_seen),a
+    ld a,b
+    ld (loader_uart16c550_divisor),a
+    call loader_skip_token
+    jp loader_parse_token_loop
 loader_parse_monitor:
     ld a,RUNTIME_MONITOR
     ld (loader_runtime_mode),a
@@ -887,20 +928,27 @@ loader_parse_tokens_done:
     jr z,loader_parse_uninstall_done
     ld a,(loader_transport_id)
     cp 0FFh
-    jr z,loader_parse_driver_error
+    jp z,loader_parse_driver_error
     ld a,(loader_port_seen)
     or a
     jr z,loader_parse_port_driver_ok
     ld a,(loader_transport_id)
     cp UNAPI_ID
-    jr nz,loader_parse_port_error
+    jp nz,loader_parse_port_error
 loader_parse_port_driver_ok:
+    ld a,(loader_baud_seen)
+    or a
+    jr z,loader_parse_baud_driver_ok
+    ld a,(loader_transport_id)
+    cp UART16C550_ID
+    jp nz,loader_parse_baud_error
+loader_parse_baud_driver_ok:
     ld a,(loader_trace_enabled)
     or a
     jr z,loader_parse_debug_check
     ld a,(loader_runtime_mode)
     or a
-    jr nz,loader_parse_trace_error
+    jp nz,loader_parse_trace_error
     ld a,(loader_transport_id)
     cp UNAPI_ID
     jr nz,loader_parse_trace_error
@@ -928,6 +976,9 @@ loader_parse_uninstall_done:
     ld a,(loader_trace_enabled)
     or a
     jr nz,loader_parse_uninstall_error
+    ld a,(loader_baud_seen)
+    or a
+    jr nz,loader_parse_uninstall_error
     jr loader_parse_ok
 loader_parse_dumptrace_done:
     ld hl,(loader_trace_path)
@@ -949,6 +1000,9 @@ loader_parse_dumptrace_done:
     ld a,(loader_trace_enabled)
     or a
     jr nz,loader_parse_dumptrace_error
+    ld a,(loader_baud_seen)
+    or a
+    jr nz,loader_parse_dumptrace_error
 loader_parse_ok:
     or a
     ret
@@ -960,6 +1014,9 @@ loader_parse_driver_error:
     jr loader_parse_error
 loader_parse_port_error:
     ld de,port_requires_unapi_message
+    jr loader_parse_error
+loader_parse_baud_error:
+    ld de,baud_requires_16c550_message
     jr loader_parse_error
 loader_parse_debug_error:
     ld de,debug_requires_monitor_message
@@ -1088,6 +1145,10 @@ option_driver_unapi:
     db "/DRIVER:UNAPI",0
 option_port_prefix:
     db "/PORT:",0
+option_baud_57600:
+    db "/57600",0
+option_baud_115200:
+    db "/115200",0
 option_monitor:
     db "/MONITOR",0
 option_debug:
@@ -1151,6 +1212,8 @@ resident_start:
 if MSXAI_TSR_BUILD
 active_transport_id:
     db 0FEh                     ; build-time template; packaged TSRs patch 0/1/2
+active_uart16c550_divisor:
+    db UART16C550_DIVISOR_57600
 resident_page:
     db 0
 resident_low:
@@ -1162,6 +1225,8 @@ bdos_proxy:
     db "MA",PROTO_VERSION
 active_transport_id:
     db 0FFh
+active_uart16c550_divisor:
+    db UART16C550_DIVISOR_57600
 resident_page:
     db 0
 resident_low:
@@ -1362,6 +1427,10 @@ tsr_config_old_transport:
     db 0
 tsr_config_requested_transport:
     db 0
+tsr_config_old_16c550_divisor:
+    db UART16C550_DIVISOR_57600
+tsr_config_requested_16c550_divisor:
+    db UART16C550_DIVISOR_57600
 tsr_config_old_port:
     dw 0
 tsr_config_requested_port:
@@ -6954,6 +7023,8 @@ tsr_talk_config:
     ; A same-driver UART request is already satisfied.
     jp tsr_talk_done
 tsr_talk_config_begin:
+    ld a,UART16C550_DIVISOR_57600
+    ld (tsr_config_requested_16c550_divisor),a
     ld a,(tsr_heap_fault)
     or a
     jp nz,tsr_talk_unsupported
@@ -6988,6 +7059,8 @@ tsr_talk_config_heap_guards_ok:
 tsr_talk_config_begin_common:
     ld a,(active_transport_id)
     ld (tsr_config_old_transport),a
+    ld a,(active_uart16c550_divisor)
+    ld (tsr_config_old_16c550_divisor),a
     ld hl,(unapi_listen_port)
     ld (tsr_config_old_port),hl
     ; A freshly installed fixed UNAPI image has completed discovery but owns no
@@ -7016,6 +7089,11 @@ tsr_talk_config_old_live_ready:
     jp nz,tsr_talk_config_abort_failed
     ld a,(tsr_config_requested_transport)
     ld (active_transport_id),a
+    cp UART16C550_ID
+    jr nz,tsr_talk_config_divisor_ready
+    ld a,(tsr_config_requested_16c550_divisor)
+    ld (active_uart16c550_divisor),a
+tsr_talk_config_divisor_ready:
     call transport_bind
     ld a,(tsr_config_explicit_port)
     or a
@@ -7055,6 +7133,8 @@ tsr_talk_config_failed:
     ld (unapi_listen_port),hl
     ld a,(tsr_config_old_transport)
     ld (active_transport_id),a
+    ld a,(tsr_config_old_16c550_divisor)
+    ld (active_uart16c550_divisor),a
     call transport_bind
     ld a,(active_transport_id)
     cp UNAPI_ID
@@ -7164,8 +7244,23 @@ tsr_talk_unapi_port:
     ld (tsr_config_requested_transport),a
     inc hl
     ld a,(hl)
+    ld (tsr_config_requested_16c550_divisor),a
+
+    ld b,a
+    ld a,(tsr_config_requested_transport)
+    cp UART16C550_ID
+    jr z,tsr_talk_unapi_validate_16c550_divisor
+    ld a,b
     or a
     jp nz,tsr_talk_unapi_bad_abi
+    jr tsr_talk_unapi_divisor_valid
+tsr_talk_unapi_validate_16c550_divisor:
+    ld a,b
+    cp UART16C550_DIVISOR_115200
+    jr z,tsr_talk_unapi_divisor_valid
+    cp UART16C550_DIVISOR_57600
+    jp nz,tsr_talk_unapi_bad_abi
+tsr_talk_unapi_divisor_valid:
 
     ld a,(tsr_config_requested_transport)
     cp UNAPI_ID
@@ -7340,11 +7435,23 @@ tsr_talk_unapi_write_result:
     inc hl
     ld a,(unapi_connection)
     ld (hl),a
+    inc hl                         ; preserve caller's target at offset 14
+    inc hl
+    xor a
+    ld b,a
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr nz,tsr_talk_unapi_result_divisor_ready
+    ld a,(active_uart16c550_divisor)
+    ld b,a
+tsr_talk_unapi_result_divisor_ready:
+    ld a,b
+    ld (hl),a
     ret
 
 ; Runs exclusively on the persistent page-3 heap stack. All driver changes and
 ; UNAPI relistens use the same transactional lifecycle here. Same-driver UART
-; requests remain a no-op because they have no TCP endpoint to rebuild.
+; requests are no-ops only when their complete configuration also matches.
 tsr_talk_unapi_port_inner:
     ld a,(tsr_config_requested_transport)
     ld b,a
@@ -7354,6 +7461,16 @@ tsr_talk_unapi_port_inner:
     ld a,b
     cp UNAPI_ID
     jr z,tsr_talk_unapi_port_switch
+    cp UART16C550_ID
+    jr nz,tsr_talk_unapi_port_same_other_uart
+    ld a,(active_uart16c550_divisor)
+    ld c,a
+    ld a,(tsr_config_requested_16c550_divisor)
+    cp c
+    jr nz,tsr_talk_unapi_port_switch
+    ld a,UART16C550_ID
+    ret
+tsr_talk_unapi_port_same_other_uart:
     ld a,b                         ; an already-selected UART needs no restart
     ret
 

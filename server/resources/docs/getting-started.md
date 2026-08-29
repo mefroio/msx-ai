@@ -166,22 +166,72 @@ Use `mode="monitor"` when the host must call, run, or stop injected code.
 
 ## Physical MSX agent
 
-Build or obtain one matching ten-file agent suite and copy it to a short
+Build or obtain one matching twelve-file agent suite and copy it to a short
 MSX-DOS directory such as `A:\MSXAI`. Set `MSXAI_HOME` and add that directory
 to `PATH`, then install one driver on the MSX:
 
 ```text
 MSXAI /DRIVER:8251
 MSXAI /DRIVER:16C550
+MSXAI /DRIVER:16C550 /57600
+MSXAI /DRIVER:16C550 /115200
 MSXAI /DRIVER:UNAPI
 MSXAI /DRIVER:UNAPI /PORT:43123
 ```
 
 For 8251 or 16C550, configure the transparent bridge for the same UART
-settings. If the bridge
+settings. The exact 16C550 default is 57600 baud, 8N1 with hardware RTS/CTS;
+`/57600` selects that default explicitly. `/115200` is an opt-in line rate and
+selects the matching `MCP115K.TSR` resident instead of the default
+`MCP16550.TSR`. If the bridge
 connects outward, call `msx_agent_listen` with the host machine's specific LAN
 IPv4 address; its safe default `127.0.0.1` accepts only local simulation. If
 the bridge accepts connections, call `msx_agent_connect` with its IPv4 address.
+
+For a BaDCaT Wi-Fi Modem, keep the host TCP client disconnected throughout
+setup and run one complete matching sequence from MSX-DOS. Use either the
+default path:
+
+```text
+MSXAI /UNINSTALL
+BADINIT
+MSXAI /DRIVER:16C550
+```
+
+or the temporary 115200-baud path:
+
+```text
+MSXAI /UNINSTALL
+BADINIT /115200
+MSXAI /DRIVER:16C550 /115200
+```
+
+Do not connect the host until the final `MSXAI` command has completed. A
+resident must be uninstalled before `BADINIT` because both would otherwise
+poll the same UART. `BADINIT` and `MSXAI /DRIVER:16C550` both default to
+exactly 57600 baud when no baud option is present, and the option on both
+commands must match.
+
+`BADINIT` changes only the current modem session. It never saves with `AT&W`,
+never resets with `ATZ`, never restores factory settings with `AT&F`, and never
+writes the persistent `S60` listener register. A power cycle therefore returns
+to the modem's previously saved configuration. It first requires `OK` from
+`ATQ0S41=0A6603`, so port 6603 is verified while automatic stream entry is
+disabled. Its final send is `ATHS41=1Q1`, which drops premature clients,
+enables auto-stream, and only then enables quiet mode; no later AT command can
+race a host entering stream mode.
+
+The initializer enables hardware flow control in its first bootstrap response,
+uses BaDCaT's reference UART setup order, and observes ZiModem's delayed baud
+transition before validating `/115200`. On failure it reports the stage,
+command, hexadecimal RX sample, and UART status instead of printing binary
+noise directly.
+
+The 115200 value is the UART line rate, not an end-to-end MCP throughput
+guarantee. BaDCaT's published effective-throughput limit is 57,600 bit/s, and
+protocol framing, flow control, modem processing, and MSX execution reduce the
+application payload rate further. Use `/115200` for controlled testing rather
+than assuming twice the transfer speed.
 
 For `/DRIVER:UNAPI`, configure the cartridge's existing Wi-Fi connection first.
 The MSX opens a passive TCP/IP UNAPI listener, so call `msx_agent_connect` with

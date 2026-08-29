@@ -12,6 +12,7 @@ AGENT_VERSION_INCLUDE := agent/msx_version.inc
 AGENT_PORT_SRC := agent/msx_port_helper.asm
 AGENT_TU_SRC := agent/msx_tu_helper.asm
 UNAPI_PROBE_SRC := agent/msx_unapi_probe.asm
+BADCAT_INIT_SRC := agent/msx_badcat_init.asm
 AGENT_TRANSPORTS := agent/transports/msx_transport_8251.inc \
 	agent/transports/msx_transport_16c550.inc \
 	agent/transports/msx_transport_unapi.inc
@@ -20,11 +21,13 @@ AGENT_XFER_COM := work/agent/MSXAIXF.COM
 AGENT_PORT_COM := work/agent/MP.COM
 AGENT_TU_COM := work/agent/TU.COM
 UNAPI_PROBE_COM := work/agent/UNAPIPRB.COM
+BADCAT_INIT_COM := work/agent/BADINIT.COM
 AGENT_BUILD_DIR := work/agent/build
 AGENT_TSR := $(AGENT_BUILD_DIR)/MSXAI.TSR
 AGENT_TSR_METADATA := $(AGENT_BUILD_DIR)/MSXAI_TSR.INC
 AGENT_TSR_8251 := work/agent/MCP8251.TSR
 AGENT_TSR_16C550 := work/agent/MCP16550.TSR
+AGENT_TSR_16C550_115200 := work/agent/MCP115K.TSR
 AGENT_TSR_UNAPI := work/agent/MCPUNAPI.TSR
 AGENT_TRACE_SRC := agent/msx_agent_trace.asm
 AGENT_TRACE_DIR := work/agent-trace
@@ -32,19 +35,22 @@ AGENT_TRACE_COM := $(AGENT_TRACE_DIR)/MSXAI.COM
 AGENT_TRACE_XFER_COM := $(AGENT_TRACE_DIR)/MSXAIXF.COM
 AGENT_TRACE_PORT_COM := $(AGENT_TRACE_DIR)/MP.COM
 AGENT_TRACE_TU_COM := $(AGENT_TRACE_DIR)/TU.COM
+AGENT_TRACE_BADCAT_INIT_COM := $(AGENT_TRACE_DIR)/BADINIT.COM
 AGENT_TRACE_BUILD_DIR := $(AGENT_TRACE_DIR)/build
 AGENT_TRACE_TSR := $(AGENT_TRACE_BUILD_DIR)/MSXAI.TSR
 AGENT_TRACE_TSR_METADATA := $(AGENT_TRACE_BUILD_DIR)/MSXAI_TSR.INC
 AGENT_TRACE_TSR_8251 := $(AGENT_TRACE_DIR)/MCP8251.TSR
 AGENT_TRACE_TSR_16C550 := $(AGENT_TRACE_DIR)/MCP16550.TSR
+AGENT_TRACE_TSR_16C550_115200 := $(AGENT_TRACE_DIR)/MCP115K.TSR
 AGENT_TRACE_TSR_UNAPI := $(AGENT_TRACE_DIR)/MCPUNAPI.TSR
 MEMMAN_VENDOR_DIR := work/agent
 MEMMAN_VENDOR := $(MEMMAN_VENDOR_DIR)/MEMMAN.COM \
 	$(MEMMAN_VENDOR_DIR)/TL.COM \
 	$(MEMMAN_VENDOR_DIR)/TK.COM
 AGENT_SUITE := $(AGENT_COM) $(AGENT_XFER_COM) \
-	$(AGENT_TSR_8251) $(AGENT_TSR_16C550) $(AGENT_TSR_UNAPI) \
-	$(AGENT_PORT_COM) $(AGENT_TU_COM) $(MEMMAN_VENDOR)
+	$(AGENT_TSR_8251) $(AGENT_TSR_16C550) $(AGENT_TSR_16C550_115200) \
+	$(AGENT_TSR_UNAPI) $(AGENT_PORT_COM) $(AGENT_TU_COM) \
+	$(BADCAT_INIT_COM) $(MEMMAN_VENDOR)
 # Bench MSX-DOS exposes a TPA from 0100h through 9898h (38,808 bytes).
 # Keep 2 KiB free above each transient COM for its stack and DOS call headroom.
 MSX_DOS_BENCH_COM_MAX := 36760
@@ -53,17 +59,19 @@ MSX_DOS_BENCH_COM_MAX := 36760
 MSX_XFER_PAGE0_COM_MAX := 16128
 
 .PHONY: agent agent-prerequisites agent-tsr agent-trace agent-trace-prerequisites \
-	agent-trace-tsr agent-trace-memman port-helper tu-helper unapi-probe \
+	agent-trace-tsr agent-trace-memman port-helper tu-helper unapi-probe badcat-init \
 	unapi-emulation-preflight test test-integration test-unapi-emulation \
 	release-check publish-check release-assets
 
-agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM) $(AGENT_PORT_COM) $(AGENT_TU_COM)
+agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM) $(AGENT_PORT_COM) $(AGENT_TU_COM) $(BADCAT_INIT_COM)
 	@test -s $(AGENT_COM)
 	@test -s $(AGENT_XFER_COM)
 	@test -s $(AGENT_PORT_COM)
 	@test -s $(AGENT_TU_COM)
+	@test -s $(BADCAT_INIT_COM)
 	@test -s $(AGENT_TSR_8251)
 	@test -s $(AGENT_TSR_16C550)
+	@test -s $(AGENT_TSR_16C550_115200)
 	@test -s $(AGENT_TSR_UNAPI)
 	@test -s $(MEMMAN_VENDOR_DIR)/MEMMAN.COM
 	@test -s $(MEMMAN_VENDOR_DIR)/TL.COM
@@ -72,13 +80,16 @@ agent: agent-prerequisites $(AGENT_COM) $(AGENT_XFER_COM) $(AGENT_PORT_COM) $(AG
 agent-prerequisites: memman-assets agent-tsr
 
 agent-trace: agent-trace-prerequisites $(AGENT_TRACE_COM) \
-		$(AGENT_TRACE_XFER_COM) $(AGENT_TRACE_PORT_COM) $(AGENT_TRACE_TU_COM)
+		$(AGENT_TRACE_XFER_COM) $(AGENT_TRACE_PORT_COM) $(AGENT_TRACE_TU_COM) \
+		$(AGENT_TRACE_BADCAT_INIT_COM)
 	@test -s $(AGENT_TRACE_COM)
 	@test -s $(AGENT_TRACE_XFER_COM)
 	@test -s $(AGENT_TRACE_PORT_COM)
 	@test -s $(AGENT_TRACE_TU_COM)
+	@test -s $(AGENT_TRACE_BADCAT_INIT_COM)
 	@test -s $(AGENT_TRACE_TSR_8251)
 	@test -s $(AGENT_TRACE_TSR_16C550)
+	@test -s $(AGENT_TRACE_TSR_16C550_115200)
 	@test -s $(AGENT_TRACE_TSR_UNAPI)
 	@test -s $(AGENT_TRACE_DIR)/MEMMAN.COM
 	@test -s $(AGENT_TRACE_DIR)/TL.COM
@@ -96,6 +107,7 @@ agent-trace-tsr: server/_version.py tools/build_version_include.py
 		--metadata-output $(AGENT_TRACE_TSR_METADATA) \
 		--8251-output $(AGENT_TRACE_TSR_8251) \
 		--16c550-output $(AGENT_TRACE_TSR_16C550) \
+		--16c550-115200-output $(AGENT_TRACE_TSR_16C550_115200) \
 		--unapi-output $(AGENT_TRACE_TSR_UNAPI)
 
 memman-assets:
@@ -106,6 +118,7 @@ agent-tsr: server/_version.py tools/build_version_include.py
 		--output $(AGENT_TSR) --metadata-output $(AGENT_TSR_METADATA) \
 		--8251-output $(AGENT_TSR_8251) \
 		--16c550-output $(AGENT_TSR_16C550) \
+		--16c550-115200-output $(AGENT_TSR_16C550_115200) \
 		--unapi-output $(AGENT_TSR_UNAPI)
 
 port-helper: $(AGENT_PORT_COM)
@@ -128,6 +141,13 @@ unapi-probe: $(UNAPI_PROBE_COM)
 $(UNAPI_PROBE_COM): $(UNAPI_PROBE_SRC) tools/build_unapi_probe.py
 	"$(PYTHON)" tools/build_unapi_probe.py --assembler "$(Z80ASM)" \
 		--source $(UNAPI_PROBE_SRC) --output $(UNAPI_PROBE_COM)
+
+badcat-init: $(BADCAT_INIT_COM)
+	@test -s $(BADCAT_INIT_COM)
+
+$(BADCAT_INIT_COM): $(BADCAT_INIT_SRC) tools/build_badcat_init.py
+	"$(PYTHON)" tools/build_badcat_init.py --assembler "$(Z80ASM)" \
+		--source $(BADCAT_INIT_SRC) --output $(BADCAT_INIT_COM)
 
 # Prerequisites are intentionally normal (not order-only): generated metadata
 # is assembled into the loader's external-suite validation, while the verified
@@ -157,6 +177,10 @@ $(AGENT_TRACE_PORT_COM): $(AGENT_PORT_SRC) tools/build_port_helper.py
 $(AGENT_TRACE_TU_COM): $(AGENT_TU_SRC) tools/build_tu_helper.py
 	"$(PYTHON)" tools/build_tu_helper.py --assembler "$(Z80ASM)" \
 		--source $(AGENT_TU_SRC) --output $(AGENT_TRACE_TU_COM)
+
+$(AGENT_TRACE_BADCAT_INIT_COM): $(BADCAT_INIT_SRC) tools/build_badcat_init.py
+	"$(PYTHON)" tools/build_badcat_init.py --assembler "$(Z80ASM)" \
+		--source $(BADCAT_INIT_SRC) --output $(AGENT_TRACE_BADCAT_INIT_COM)
 
 test:
 	"$(PYTHON)" -m unittest discover -s tests -v

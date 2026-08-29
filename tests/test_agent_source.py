@@ -704,6 +704,13 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn('db "/DRIVER:8251",0', self.source)
         self.assertIn('db "/DRIVER:16C550",0', self.source)
         self.assertIn('db "/DRIVER:UNAPI",0', self.source)
+        self.assertIn('db "/57600",0', self.source)
+        self.assertIn('db "/115200",0', self.source)
+        self.assertIn(
+            "loader_uart16c550_divisor:\n"
+            "    db UART16C550_DIVISOR_57600",
+            self.source,
+        )
         makefile = MAKEFILE.read_text(encoding="utf-8")
         self.assertIn("work/agent/MSXAI.COM", makefile)
         self.assertNotIn("MSXAI2.COM", makefile)
@@ -1040,10 +1047,10 @@ class ResidentAgentSourceTests(unittest.TestCase):
 
         for declaration in (
                 "TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah",
-                "TSR_UNAPI_REQUEST_VERSION: equ 1",
+                "TSR_UNAPI_REQUEST_VERSION: equ 2",
                 "TSR_UNAPI_REQUEST_SIZE: equ 16",
                 "TSR_UNAPI_REQUEST_TARGET: equ 14",
-                "TSR_UNAPI_REQUEST_RESERVED: equ 15",
+                "TSR_UNAPI_REQUEST_16C550_DIVISOR: equ 15",
                 "TSR_UNAPI_STACK_MINIMUM: equ 0400h",
                 "TSR_UNAPI_STACK_GUARD_SIZE: equ 16"):
             self.assertIn(declaration, self.source)
@@ -1067,7 +1074,14 @@ class ResidentAgentSourceTests(unittest.TestCase):
             safe,
             r"(?s)cp UNAPI_ID \+ 1\s+jp nc,tsr_talk_unapi_bad_abi\s+"
             r"ld \(tsr_config_requested_transport\),a.*"
-            r"ld a,\(hl\)\s+or a\s+jp nz,tsr_talk_unapi_bad_abi")
+            r"ld a,\(hl\)\s+"
+            r"ld \(tsr_config_requested_16c550_divisor\),a.*"
+            r"cp UART16C550_ID\s+"
+            r"jr z,tsr_talk_unapi_validate_16c550_divisor.*"
+            r"or a\s+jp nz,tsr_talk_unapi_bad_abi.*"
+            r"cp UART16C550_DIVISOR_115200.*"
+            r"cp UART16C550_DIVISOR_57600\s+"
+            r"jp nz,tsr_talk_unapi_bad_abi")
         self.assertRegex(
             safe,
             r"(?s)ld a,\(tsr_config_requested_transport\)\s+"
@@ -1094,6 +1108,12 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r"ld a,\(tsr_unapi_result\)\s+cp b")
 
         inner = safe.split("tsr_talk_unapi_port_inner:", 1)[1]
+        self.assertRegex(
+            inner,
+            r"(?s)cp UART16C550_ID.*"
+            r"ld a,\(active_uart16c550_divisor\).*"
+            r"ld a,\(tsr_config_requested_16c550_divisor\)\s+"
+            r"cp c\s+jr nz,tsr_talk_unapi_port_switch")
         self.assertRegex(
             inner,
             r"(?s)ld a,\(tsr_config_requested_transport\).*"
@@ -1204,12 +1224,19 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("A BaDCaT SMD is one known device", source)
         self.assertIn("restores the prior UART setup", source)
         self.assertNotIn("restores the previous user", source)
+        self.assertIn("UART16C550_DIVISOR_115200: equ 1", source)
+        self.assertIn("UART16C550_DIVISOR_57600:  equ 2", source)
         init = source.split("uart16c550_init:", 1)[1].split(
             "uart16c550_restore:", 1)[0]
         self.assertRegex(
             init,
-            r"(?s)ld a,083h.*out \(UART16C550_LCR\),a.*"
-            r"ld a,1\s+; 1\.8432 MHz / \(16 \* 1\) = 115200 baud.*"
+            r"(?s)ld a,\(active_uart16c550_divisor\)\s+"
+            r"cp UART16C550_DIVISOR_115200.*"
+            r"cp UART16C550_DIVISOR_57600.*"
+            r"ld a,1\s+ret\s+"
+            r"uart16c550_init_divisor_valid:.*"
+            r"ld a,083h.*out \(UART16C550_LCR\),a.*"
+            r"ld a,\(active_uart16c550_divisor\).*"
             r"out \(UART16C550_DATA\),a.*"
             r"xor a.*out \(UART16C550_IER\),a")
         self.assertIn("ld a,087h", init)

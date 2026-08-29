@@ -63,7 +63,7 @@
       "id": "getting-started",
       "path": "getting-started.md",
       "title": "Getting started",
-      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal workflows for direct, simulated-agent, physical-agent, and resident BLOAD targets.",
+      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal workflows for direct, simulated-agent, physical-agent, non-persistent BaDCaT initialization, and resident BLOAD targets.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -74,6 +74,7 @@
           "Makefile",
           "TECHNICAL.md",
           "agent/README.md",
+          "agent/msx_badcat_init.asm",
           "pyproject.toml",
           "server/mcp_runtime.py",
           "server/msx_application.py",
@@ -85,7 +86,10 @@
           "tests/test_mcp_application_tools.py",
           "tests/test_openmsx_cbios_integration.py",
           "tests/test_openmsx_launcher.py",
-          "tests/test_windows_sspi.py"
+          "tests/test_release_check.py",
+          "tests/test_windows_sspi.py",
+          "tools/build_agent_tsr.py",
+          "tools/build_badcat_init.py"
         ]
       },
       "tags": [
@@ -93,6 +97,8 @@
         "quick-start",
         "connection",
         "configuration",
+        "badcat",
+        "baud",
         "applications",
         "bload"
       ],
@@ -106,7 +112,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "65f91b5994935dae9c8ab219cee9d55bb37d87ac15d7b77520fe39f69386f6f3",
+      "sha256": "c3ce03ba2f9c74065ca5f759ab87388662f28d91202b312fcfa638e00a54572b",
       "external_references": [
         {
           "url": "https://github.com/mefroio/msx-ai.git",
@@ -252,7 +258,7 @@
       "id": "development",
       "path": "development.md",
       "title": "Development and validation",
-      "summary": "Deterministic tests, cross-platform C-BIOS integration, agent builds, deployable artifacts, release hygiene, and documentation provenance.",
+      "summary": "Deterministic tests, cross-platform C-BIOS integration, the canonical twelve-file agent build, BaDCaT runtime initialization, release hygiene, and documentation provenance.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -265,12 +271,15 @@
           "pyproject.toml",
           "TECHNICAL.md",
           "agent/README.md",
+          "agent/msx_badcat_init.asm",
           "tests/test_agent_source.py",
           "tests/test_mcp_runtime.py",
           "tests/test_openmsx_cbios_integration.py",
           "tests/test_openmsx_resident.py",
           "tests/test_packaging_paths.py",
           "tests/test_release_check.py",
+          "tools/build_agent_tsr.py",
+          "tools/build_badcat_init.py",
           "tools/release_check.py",
           "third_party/memman/NOTICE",
           "third_party/memman/SHA256SUMS"
@@ -280,6 +289,8 @@
         "development",
         "testing",
         "build",
+        "badcat",
+        "baud",
         "provenance",
         "release"
       ],
@@ -294,7 +305,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "47e33f854a12f66146b157f30bdf3aa5d6c7f6f15cf201c40d9222af323a185e",
+      "sha256": "c5b8031ed4813a5a151f0cb43dd40b14800f59832bc043aebd16366b90225e93",
       "external_references": []
     }
   ]

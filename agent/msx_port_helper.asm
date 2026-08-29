@@ -32,7 +32,7 @@ MSXAI_TALK_UNAPI_PORT:     equ 0A7h
 MSXAI_TALK_TRACE:          equ 0A8h
 MSXAI_TRANSPORT_UNAPI:     equ 2
 MSXAI_UNAPI_REQUEST_MAGIC: equ 0A75Ah
-MSXAI_UNAPI_REQUEST_VERSION: equ 1
+MSXAI_UNAPI_REQUEST_VERSION: equ 2
 MSXAI_UNAPI_REQUEST_SIZE:  equ 16
 MSXAI_UNAPI_STACK_SIZE:    equ 0400h
 MSXAI_UNAPI_GUARD_SIZE:    equ 16
@@ -517,7 +517,7 @@ prepare_unapi_high_guard_loop:
     ld (unapi_request_target),a
     xor a
     ld (unapi_request_connection),a
-    ld (unapi_request_reserved),a
+    ld (unapi_request_16c550_divisor),a
     or a
     ret
 prepare_unapi_no_stack:
@@ -579,7 +579,7 @@ unapi_request_connection:
     db 0
 unapi_request_target:
     db MSXAI_TRANSPORT_UNAPI
-unapi_request_reserved:
+unapi_request_16c550_divisor:
     db 0
 
 trace_request:

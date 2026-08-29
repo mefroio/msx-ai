@@ -5,6 +5,21 @@ an annotated Git tag named `vMAJOR.MINOR.PATCH`.
 
 ## 0.1.4 - 2026-08-28
 
+- Expanded the canonical MSX-DOS agent suite from ten to twelve binaries with
+  `BADINIT.COM` and the opt-in 115200-baud `MCP115K.TSR`; the exact 16C550
+  default is now 57600 baud.
+- Added a non-persistent BaDCaT initializer and the coordinated safe sequence
+  `MSXAI /UNINSTALL`, `BADINIT [/115200]`, then
+  `MSXAI /DRIVER:16C550 [/115200]`. It keeps the host disconnected during
+  setup, avoids save/reset/factory/`S60` operations, verifies listener creation
+  with auto-stream disabled, and commits quiet auto-stream only afterward.
+- Hardened the BaDCaT bootstrap for saved XON/XOFF state, aligned UART setup
+  with BaDCaT's reference order, respected ZiModem's delayed baud transition,
+  and added stage/hex/LSR failure diagnostics with a no-write post-listener
+  failure path.
+- Documented that a 115200-baud UART selection does not exceed BaDCaT's
+  published 57,600-bit/s effective-throughput limit and does not guarantee a
+  proportional MCP payload-rate increase.
 - Added silent automatic recovery of the resident UNAPI listener after a host
   disconnect, allowing the host to reconnect without a command or key press on
   the MSX.

@@ -1,12 +1,15 @@
 # MSX-AI physical-target agent
 
-The MSX-DOS side of the physical-target backend is a compact ten-file suite:
+The MSX-DOS side of the physical-target backend is a compact twelve-file suite:
 
 - `MSXAI.COM` is the command-line lifecycle front end and foreground monitor;
 - `MSXAIXF.COM` is the transient protocol-X PUT/GET worker, 16 KiB fast-I/O
   accumulator, and bounded PackBits decoder;
-- `MCP8251.TSR`, `MCP16550.TSR`, and `MCPUNAPI.TSR` are fixed-driver resident
-  images selected by `/DRIVER` on first installation;
+- `MCP8251.TSR`, `MCP16550.TSR`, `MCP115K.TSR`, and `MCPUNAPI.TSR` are
+  fixed-driver resident images selected by `/DRIVER` and baud on first
+  installation;
+- `BADINIT.COM` is the optional, non-persistent BaDCaT/ZiModem port-6603
+  session initializer;
 - `TU.COM` is the transient pre-TL helper used only on a first UNAPI
   installation;
 - `MP.COM` is the transient first-install configurator for the selected UNAPI
@@ -19,7 +22,7 @@ does not make their file sizes cumulative in MSX RAM.
 
 The release archive also contains `README.TXT`, an ASCII/CRLF quick-start guide
 with lines bounded for display through the MSX-DOS `TYPE` command. The same
-file is published beside `MSXAI.ZIP`; it is documentation, not an eleventh
+file is published beside `MSXAI.ZIP`; it is documentation, not a thirteenth
 program dependency. Its release number and the `MSXAI.COM` banner are generated
 from the same Python package version used for the wheel and source distribution.
 
@@ -49,7 +52,9 @@ work/agent/MSXAI.COM
 work/agent/MSXAIXF.COM
 work/agent/MCP8251.TSR
 work/agent/MCP16550.TSR
+work/agent/MCP115K.TSR
 work/agent/MCPUNAPI.TSR
+work/agent/BADINIT.COM
 work/agent/TU.COM
 work/agent/MP.COM
 work/agent/MEMMAN.COM
@@ -60,7 +65,7 @@ work/agent/TK.COM
 Internal build products include:
 
 - `work/agent/build/MSXAI.TSR`: the relocatable template used to generate the
-  three fixed-driver TSRs; and
+  four fixed-driver/baud TSRs; and
 - `work/agent/build/MSXAI_TSR.INC`: generated validation and relocation
   metadata consumed by the loader build.
 
@@ -75,7 +80,7 @@ For a hardware-facing TCP/IP UNAPI diagnostic independent of the resident:
 make unapi-probe
 ~~~~
 
-This creates `work/agent/UNAPIPRB.COM`. It is not an eleventh suite dependency.
+This creates `work/agent/UNAPIPRB.COM`. It is not a thirteenth suite dependency.
 Copy it separately and run `UNAPIPRB` for port 6603 or `UNAPIPRB 43123` for a
 chosen port. The program enumerates compatible implementations, reports the
 UNAPI location, versions, capabilities, IP and connection pool, opens a passive
@@ -83,7 +88,7 @@ listener, and monitors its state. Press `S` for a state snapshot, `R` to
 abort/reopen, or `Q`/Escape to abort and exit. Exit the probe before installing
 or reconnecting the resident on the same port.
 
-Keep all ten deployable files together. The recommended installation is a
+Keep all twelve deployable files together. The recommended installation is a
 short dedicated directory such as `A:\MSXAI`, configured from `AUTOEXEC.BAT`:
 
 ~~~~bat
@@ -91,13 +96,14 @@ SET MSXAI_HOME=A:\MSXAI
 PATH A:\MSXAI;%PATH%
 ~~~~
 
-`PATH` makes `MSXAI`, `MSXAIXF`, and the post-warm-boot `TU`, `TL`, and `MP`
-commands callable from any DOS directory. `MSXAI_HOME` lets the lifecycle
+`PATH` makes `MSXAI`, `BADINIT`, `MSXAIXF`, and the post-warm-boot `TU`, `TL`,
+and `MP` commands callable from any DOS directory. `MSXAI_HOME` lets the lifecycle
 construct and validate bounded, fully qualified paths for `MEMMAN.COM`,
 `TU.COM`, `TL.COM`, `TK.COM`, `MP.COM`, and the selected fixed-driver TSR. A
-missing or empty `MSXAI_HOME` deliberately falls back to resolving all ten
-files in the current directory for compatibility with portable test disks.
-Partial packages or files mixed from different builds are unsupported.
+missing or empty `MSXAI_HOME` deliberately falls back to resolving those
+lifecycle companions in the current directory for portable test disks. Keep
+all twelve deployable files together; partial packages or files mixed from
+different builds are unsupported.
 Keep the configured path short enough for the 39 command bytes preserved by
 MemMan's 40-byte buffer. `A:\MSXAI` is the canonical tested value; the loader's
 private fixed-width `MP/HHHH` form keeps every selected port within that limit.
@@ -116,10 +122,13 @@ or monitor mode.
 ~~~~text
 MSXAI /DRIVER:8251
 MSXAI /DRIVER:16C550
+MSXAI /DRIVER:16C550 /57600
+MSXAI /DRIVER:16C550 /115200
 MSXAI /DRIVER:UNAPI
 MSXAI /DRIVER:UNAPI /PORT:43123
 MSXAI /DRIVER:8251 /MONITOR
 MSXAI /DRIVER:16C550 /MONITOR
+MSXAI /DRIVER:16C550 /MONITOR /115200
 MSXAI /DRIVER:UNAPI /MONITOR
 MSXAI /DRIVER:8251 /MONITOR DEBUG
 MSXAI /DRIVER:16C550 /MONITOR DEBUG
@@ -139,9 +148,10 @@ accepted only with `/DRIVER:UNAPI`, takes a decimal value from 1 through
 because the host needs a predictable endpoint. For a first resident UNAPI
 install, the loader converts the selected value to the private four-digit
 hexadecimal `MP/HHHH` command. `MP.COM` builds a versioned 16-byte request and
-calls the resident with MemMan talk ABI `A=A7h`, `HL=request`. A7 v1 is the
+calls the resident with MemMan talk ABI `A=A7h`, `HL=request`. A7 v2 is the
 safe lifecycle ABI for all three targets: offset 14 selects `0=8251`,
-`1=16C550`, or `2=UNAPI`, while offset 15 is reserved and must be zero.
+`1=16C550`, or `2=UNAPI`; offset 15 selects divisor `2` (57600) or `1`
+(115200) for 16C550 and must be zero for the other targets.
 `MP.COM` always selects target `2`. The request also provides the port and a
 caller-owned 1 KiB page-2 stack surrounded by 16-byte low/high guards. The
 caller fits the complete guarded span below `C000h`, the TPA top, and the
@@ -154,6 +164,13 @@ DOS-file PUT and GET work is owned by `MSXAIXF.COM` and protocol X.
 
 The startup banner reports the selected driver and runtime mode before control
 passes to MemMan or the foreground monitor.
+
+`/57600` and `/115200` are accepted only with `/DRIVER:16C550`; exactly 57600
+is the default when neither is present. The option controls the foreground
+UART directly, selects `MCP16550.TSR` or `MCP115K.TSR` on a first resident
+install, and reinitializes an existing 16C550 resident through A7 v2 when the
+divisor changes. Duplicate, conflicting, and cross-driver baud options fail
+before hardware state changes.
 
 ## Runtime modes
 
@@ -552,7 +569,7 @@ remains a direct assembly/upload path and never enters BASIC automatically.
 
 ## Memory model
 
-The ten deployable files are not simultaneously resident. DOS initially
+The twelve deployable files are not simultaneously resident. DOS initially
 loads `MSXAI.COM` as a normal transient program. For a first resident install,
 the loader validates the external utilities and selected fixed-driver TSR,
 stages `MEMMAN.COM` at the guarded high end of free TPA, and overlays it at
@@ -571,7 +588,7 @@ exits. Uninstall similarly stages and overlays external `TK.COM` for one
 action. During a lifecycle handoff the front end and one staged external
 overlay briefly share the TPA; the other suite components do not. The
 requirement is therefore that active pair plus guarded stack and overlay
-headroom, never the sum of all ten file sizes. Only MemMan and the selected
+headroom, never the sum of all twelve file sizes. Only MemMan and the selected
 agent TSR remain allocated after installation.
 
 MemMan relocates the TSR within a managed segment. When a hook or talk entry is
@@ -803,9 +820,10 @@ analog artifacts, and exact interlaced-field timing are not reconstructed.
 ## Transport implementation
 
 The common resident core includes all three current drivers. The build emits
-`MCP8251.TSR`, `MCP16550.TSR`, and `MCPUNAPI.TSR` by fixing the initial
-transport-selection byte in otherwise equivalent TSR images; `/DRIVER` chooses
-the matching file for a first install. Re-running `MSXAI` against an existing
+`MCP8251.TSR`, `MCP16550.TSR`, `MCP115K.TSR`, and `MCPUNAPI.TSR` by fixing the
+initial transport-selection byte and, for 16C550, the divisor byte in otherwise
+equivalent TSR images; `/DRIVER` and baud choose the matching file for a first
+install. Re-running `MSXAI` against an existing
 resident uses its MemMan `TsrCall` reconfiguration entry, so it does not load a
 duplicate TSR. In either case initialization binds eight `JP` operands once,
 with no driver-selection branch in the per-byte hot path.
@@ -854,7 +872,7 @@ interface configured for 19,200-baud 8N1.
 `/DRIVER:16C550` uses ports `80h-87h`, assumes a 1.8432 MHz UART reference
 clock, and configures:
 
-- divisor 1 for 115200 baud, 8N1;
+- divisor 2 for the default `/57600`, or divisor 1 for `/115200`, at 8N1;
 - the 16-byte FIFO with an 8-byte receive trigger;
 - `IER=0` while active, with receive state polled from `H.TIMI`;
 - DTR, RTS, OUT1, and OUT2;
@@ -869,8 +887,8 @@ parity, framing, or break telemetry. The hook's serial deadline is an
 instruction-loop budget, not a CPU-independent wall-clock timer; sustained-rate
 claims therefore require tests on the target CPU mode and adapter.
 
-The configured 115200 baud describes the UART line, not guaranteed application
-throughput. The
+The selected baud describes the UART line, not guaranteed application
+throughput. Although the BaDCaT line interface supports 115200, the
 [published BaDCaT specification](https://sites.google.com/view/badcatelectronics/msx/badcat-wifi-modem)
 lists 57,600 bps effective throughput. End-to-end MCP throughput, flow-control
 behavior, and screenshot times remain subject to physical measurement.
@@ -886,11 +904,73 @@ compatible UART device model and transparent byte-stream peer in addition to
 any ROM image.
 
 `/DRIVER:16C550` selects the generic register and flow-control contract above,
-not a product. BaDCaT SMD is one intended physical validation target, not a
-separate build, protocol dependency, or required TCP transport. Another
+not a product. `BADINIT.COM` is deliberately separate because its AT command
+sequence is BaDCaT/ZiModem-specific. BaDCaT SMD is one intended physical
+validation target, not a protocol dependency or required TCP transport. Another
 transparent IPv4 bridge can use the same driver when it presents the compatible
 UART interface and preserves RTS/CTS. Physical BaDCaT validation remains
-pending arrival of that hardware.
+required for each released `BADINIT`/baud build; source and emulator checks do
+not prove its serial timing on the device.
+
+### BaDCaT/ZiModem session initializer
+
+`BADINIT.COM` configures a BaDCaT/ZiModem listener on TCP port 6603 without
+changing the modem's saved firmware state. Keep the host MCP connection closed
+until it finishes, and use this order from DOS:
+
+~~~~bat
+MSXAI /UNINSTALL
+BADINIT
+MSXAI /DRIVER:16C550
+~~~~
+
+For the optional faster UART line, add `/115200` to both commands:
+
+~~~~bat
+MSXAI /UNINSTALL
+BADINIT /115200
+MSXAI /DRIVER:16C550 /115200
+~~~~
+
+`BADINIT /57600` is the explicit form of the default. Before touching the UART,
+the utility checks for the named MemMan resident and refuses to continue while
+it is installed; otherwise the timer hook and `BADINIT` could consume the same
+receive FIFO. It initially probes the saved 57600-baud baseline. If the modem
+is still in a previous unsaved 115200-baud session, it can detect that second
+rate. A requested baud change waits for the UART transmitter and then switches
+the local divisor, remains silent for at least 40 JIFFYs while ZiModem applies
+its delayed baud change, and only then validates the new link. The transition
+uses quiet mode so a delayed result cannot be mistaken for the validation.
+
+The first bootstrap ends in `F0`, so a modem saved in blocked XON/XOFF mode
+switches to hardware RTS/CTS before producing the first required response. The
+UART itself follows BaDCaT's reference order: RTS is inactive while FIFO,
+divisor, and 8N1 are established, and AFE/RTS is enabled only afterward. The
+runtime transcript then closes old in-memory listeners, selects raw non-TELNET
+streaming, and prints the IP information. It opens port 6603 with
+`ATQ0S41=0A6603` and requires `OK` while automatic stream entry is disabled.
+Only then does the final send-only `ATHS41=1Q1` drop premature clients, enable
+auto-stream, and enter quiet mode. ZiModem processes that complete serial line
+before accepting another client, so no later AT exchange can race a newly
+connected stream. Receive data is buffered through a one-JIFFY quiet interval
+before DOS output, avoiding FIFO overruns at either baud.
+
+If a probe fails, `BADINIT` reports the stage, command, reason, byte count, a
+bounded hexadecimal receive sample, and the UART LSR/error bits. It never
+prints untrusted binary bytes directly to the DOS console. If transmission of
+the final listener command becomes uncertain, failure handling is DOS-only and
+does not send a recovery command that might become MCP stream payload.
+
+The binary contains no `AT&W`, `ATZ`, `AT&F`, or `ATS60` command. In particular,
+it does not send even `ATS60=0`, because ZiModem implements that value by
+deleting the persistent-listener file. `ATN0` and `A6603` affect only the
+runtime listener list. On an ordinary command-mode failure, `BADINIT` makes a
+best-effort return to visible 57600-baud command mode. A continuous RX stream
+is bounded and diagnosed without sending recovery bytes that could corrupt
+active MCP traffic; the same no-write rule applies once the final stream
+commit is uncertain. A power cycle always restores the modem state that the
+user had already saved. The audited builder rejects a deployable image if any
+forbidden persistent command fragment appears.
 
 ### TCP/IP UNAPI passive listener
 
@@ -984,7 +1064,7 @@ timing.
 
 The integration suite owns at most one openMSX process at a time. It validates:
 
-- staging of the canonical ten-file suite and selection of `MCP8251.TSR`;
+- staging of the canonical twelve-file suite and selection of `MCP8251.TSR`;
 - MemMan installation returning to DOS;
 - intervention in a DOS-launched program;
 - bounded snapshot pause, patch, resume, and repeated `H.TIMI` entry;

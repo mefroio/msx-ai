@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 
 from tools.build_agent_tsr import (  # noqa: E402
     BUILD_ORIGINS,
+    DIVISOR_115200,
+    DIVISOR_57600,
     H_CHGE,
     H_CHPU,
     H_CRUN,
@@ -49,10 +51,10 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 "resident_start: equ $5135\n")
 
     def test_third_origin_label_drift_is_rejected(self):
-        def linked(origin, talk_offset=7):
+        def linked(origin, talk_offset=8):
             return LinkedImage(
                 origin,
-                b"\xfe" + bytes(9),
+                bytes((0xFE, DIVISOR_57600)) + bytes(9),
                 {
                     "H_KEYI": H_KEYI,
                     "H_TIMI": H_TIMI,
@@ -61,16 +63,17 @@ class AgentTsrBuilderTest(unittest.TestCase):
                     "H_CRUN": H_CRUN,
                     "resident_start": origin,
                     "active_transport_id": origin,
-                    "resident_keyi_hook": origin + 1,
-                    "resident_timi_hook": origin + 2,
-                    "resident_console_put_hook": origin + 3,
-                    "resident_console_get_hook": origin + 4,
-                    "resident_basic_crunch_hook": origin + 5,
-                    "tsr_kill": origin + 6,
+                    "active_uart16c550_divisor": origin + 1,
+                    "resident_keyi_hook": origin + 2,
+                    "resident_timi_hook": origin + 3,
+                    "resident_console_put_hook": origin + 4,
+                    "resident_console_get_hook": origin + 5,
+                    "resident_basic_crunch_hook": origin + 6,
+                    "tsr_kill": origin + 7,
                     "tsr_talk": origin + talk_offset,
-                    "resident_end": origin + 8,
-                    "tsr_init": origin + 8,
-                    "tsr_init_end": origin + 10,
+                    "resident_end": origin + 9,
+                    "tsr_init": origin + 9,
+                    "tsr_init_end": origin + 11,
                 },
             )
 
@@ -93,6 +96,8 @@ class AgentTsrBuilderTest(unittest.TestCase):
             first_metadata = metadata.read_bytes()
             driver_8251 = first.driver_8251_path.read_bytes()
             driver_16c550 = first.driver_16c550_path.read_bytes()
+            driver_16c550_115200 = (
+                first.driver_16c550_115200_path.read_bytes())
             driver_unapi = first.driver_unapi_path.read_bytes()
 
             self.assertEqual(first.size, len(first_data))
@@ -120,13 +125,24 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 self.assertGreaterEqual(hook_handler, fields[4])
                 self.assertLess(hook_handler, fields[4] + fields[8])
             self.assertEqual(first_data[first.transport_file_offset], 0xFE)
+            self.assertEqual(
+                first_data[first.divisor_file_offset], DIVISOR_57600)
             self.assertEqual(len(driver_8251), len(first_data))
             self.assertEqual(len(driver_16c550), len(first_data))
+            self.assertEqual(len(driver_16c550_115200), len(first_data))
             self.assertEqual(len(driver_unapi), len(first_data))
             self.assertEqual(
                 driver_8251[first.transport_file_offset], TRANSPORT_8251)
             self.assertEqual(
                 driver_16c550[first.transport_file_offset], TRANSPORT_16C550)
+            self.assertEqual(
+                driver_16c550[first.divisor_file_offset], DIVISOR_57600)
+            self.assertEqual(
+                driver_16c550_115200[first.transport_file_offset],
+                TRANSPORT_16C550)
+            self.assertEqual(
+                driver_16c550_115200[first.divisor_file_offset],
+                DIVISOR_115200)
             self.assertEqual(
                 driver_unapi[first.transport_file_offset], TRANSPORT_UNAPI)
             self.assertEqual(
@@ -134,6 +150,11 @@ class AgentTsrBuilderTest(unittest.TestCase):
                     driver_8251, driver_16c550, driver_unapi, strict=True))
                  if len(set(values)) != 1],
                 [first.transport_file_offset])
+            self.assertEqual(
+                [index for index, values in enumerate(zip(
+                    driver_16c550, driver_16c550_115200, strict=True))
+                 if len(set(values)) != 1],
+                [first.divisor_file_offset])
 
             metadata_text = first_metadata.decode("ascii")
             self.assertRegex(
@@ -143,9 +164,13 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 metadata_text,
                 rf"MSXAI_TSR_TRANSPORT_OFFSET: equ "
                 rf"0{first.transport_file_offset:04X}h")
+            self.assertRegex(
+                metadata_text,
+                rf"MSXAI_TSR_16C550_DIVISOR_OFFSET: equ "
+                rf"0{first.divisor_file_offset:04X}h")
             self.assertEqual(
                 len(re.findall(r"^MSXAI_TSR_", metadata_text, re.MULTILINE)),
-                2,
+                3,
             )
 
             second = build_agent_tsr(ROOT, output, metadata)
@@ -155,6 +180,9 @@ class AgentTsrBuilderTest(unittest.TestCase):
             self.assertEqual(first.driver_8251_path.read_bytes(), driver_8251)
             self.assertEqual(
                 first.driver_16c550_path.read_bytes(), driver_16c550)
+            self.assertEqual(
+                first.driver_16c550_115200_path.read_bytes(),
+                driver_16c550_115200)
             self.assertEqual(
                 first.driver_unapi_path.read_bytes(), driver_unapi)
 
@@ -184,6 +212,9 @@ class AgentTsrBuilderTest(unittest.TestCase):
             self.assertEqual(traced_data[differing[0] - 1], 0xCA)
             # The separate development build must not mutate public outputs.
             self.assertEqual(output.read_bytes(), first_data)
+            self.assertEqual(
+                first.driver_16c550_115200_path.read_bytes(),
+                driver_16c550_115200)
             self.assertEqual(first.driver_unapi_path.read_bytes(), driver_unapi)
 
 

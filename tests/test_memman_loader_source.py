@@ -27,8 +27,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
         makefile = MAKEFILE.read_text(encoding="utf-8")
         for artifact in (
                 "MSXAI.COM", "MSXAIXF.COM", "MCP8251.TSR",
-                "MCP16550.TSR", "MCPUNAPI.TSR", "MP.COM", "TU.COM",
-                "MEMMAN.COM", "TL.COM", "TK.COM"):
+                "MCP16550.TSR", "MCP115K.TSR", "MCPUNAPI.TSR", "MP.COM",
+                "TU.COM", "MEMMAN.COM", "TL.COM", "TK.COM"):
             self.assertIn(artifact, makefile)
         self.assertNotIn("incbin", self.source.lower())
         self.assertIn('db "MEMMAN.COM",0', self.source)
@@ -37,6 +37,7 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn('db "TK.COM",0', self.source)
         self.assertIn('db "MCP8251.TSR",0', self.source)
         self.assertIn('db "MCP16550.TSR",0', self.source)
+        self.assertIn('db "MCP115K.TSR",0', self.source)
         self.assertIn('db "MCPUNAPI.TSR",0', self.source)
         self.assertIn('db "MP.COM",0', self.source)
         self.assertRegex(
@@ -95,12 +96,22 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("cp DRIVER_8251", preflight)
         self.assertIn("cp DRIVER_16C550", preflight)
         self.assertIn("cp DRIVER_UNAPI", preflight)
+        select_16c550 = self.source.split(
+            "preflight_select_16c550:", 1)[1].split(
+                "preflight_select_unapi:", 1)[0]
+        self.assertIn("ld de,suite_mcp16550_tsr_path", select_16c550)
+        self.assertIn("ld a,(loader_uart16c550_divisor)", select_16c550)
+        self.assertIn("cp UART16C550_DIVISOR_115200", select_16c550)
+        self.assertIn("ld de,suite_mcp115k_tsr_path", select_16c550)
         validate = self.source.split(
             "suite_validate_selected_tsr:", 1)[1].split(
                 "suite_close_preserving_error:", 1)[0]
         self.assertIn("ld hl,MSXAI_TSR_SIZE", validate)
         self.assertIn("ld hl,MSXAI_TSR_TRANSPORT_OFFSET", validate)
+        self.assertIn(
+            "ld hl,MSXAI_TSR_16C550_DIVISOR_OFFSET", validate)
         self.assertIn("ld a,(suite_expected_transport)", validate)
+        self.assertIn("ld a,(loader_uart16c550_divisor)", validate)
         self.assertNotIn("ld de,loader_transport_id", validate)
 
     def test_memman_install_tail_and_direct_tk_uninstall(self):
@@ -134,6 +145,7 @@ class MemManLoaderSourceTests(unittest.TestCase):
             self.source, r"(?m)^MEMMAN_COMMAND_MAX:\s+equ\s+39$")
         self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP8251@"), 39)
         self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP16550@"), 39)
+        self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP115K@"), 39)
         self.assertEqual(
             len(" _SYSTEM@@TU A:\\MSXAI\\MCPUNAPI@MP/19CB@"), 39)
         self.assertEqual(
@@ -154,7 +166,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
                 "suite_memman_path", "suite_tl_path", "suite_tk_path",
                 "suite_tu_path",
                 "suite_mcp8251_tsr_path", "suite_mcp16550_tsr_path",
-                "suite_mcpunapi_tsr_path", "suite_mp_path"):
+                "suite_mcp115k_tsr_path", "suite_mcpunapi_tsr_path",
+                "suite_mp_path"):
             self.assertIn(f"ld de,{destination}", resolver)
         self.assertIn("ld a,(suite_home_buffer)", resolver)
         self.assertIn("jr z,suite_build_path_name", resolver)
@@ -258,7 +271,7 @@ class MemManLoaderSourceTests(unittest.TestCase):
             request,
             r"(?s)memman_unapi_request_connection:\s+db 0\s+"
             r"memman_unapi_request_target:\s+db DRIVER_UNAPI\s+"
-            r"memman_unapi_request_reserved:\s+db 0")
+            r"memman_unapi_request_16c550_divisor:\s+db 0")
 
         prepare = reconfigure.split(
             "memman_prepare_unapi_request:", 1)[1].split(
@@ -280,7 +293,14 @@ class MemManLoaderSourceTests(unittest.TestCase):
             prepare.index("memman_prepare_unapi_high_guard_loop:"),
         )
         self.assertIn("ld (memman_unapi_request_target),a", prepare)
-        self.assertIn("ld (memman_unapi_request_reserved),a", prepare)
+        self.assertIn(
+            "ld (memman_unapi_request_16c550_divisor),a", prepare)
+        self.assertIn("cp DRIVER_16C550", prepare)
+        self.assertIn("ld a,(loader_uart16c550_divisor)", prepare)
+
+        self.assertIn(
+            "ld a,(memman_unapi_request_16c550_divisor)", unapi_call)
+        self.assertIn("ld a,(loader_uart16c550_divisor)", unapi_call)
 
         verify = reconfigure.split(
             "memman_verify_unapi_guards:", 1)[1].split(

@@ -341,7 +341,7 @@ class PortHelperTest(unittest.TestCase):
             "unapi_request_transport": 12,
             "unapi_request_connection": 13,
             "unapi_request_target": 14,
-            "unapi_request_reserved": 15,
+            "unapi_request_16c550_divisor": 15,
         }
         for name, expected in expected_offsets.items():
             with self.subTest(field=name):
@@ -349,7 +349,7 @@ class PortHelperTest(unittest.TestCase):
                     image.labels[name] - image.labels["unapi_request"],
                     expected,
                 )
-        self.assertEqual(image.data[request + 2], 1)
+        self.assertEqual(image.data[request + 2], 2)
         self.assertEqual(image.data[request + 3], 16)
         self.assertEqual(image.data[request + 14], 2)
         self.assertEqual(image.data[request + 15], 0)
@@ -366,7 +366,7 @@ class PortHelperTest(unittest.TestCase):
 
         mutated = bytearray(image.data)
         mutated[request + 15] = 1
-        with self.assertRaisesRegex(PortHelperBuildError, "reserved"):
+        with self.assertRaisesRegex(PortHelperBuildError, "divisor"):
             validate_port_helper_image(bytes(mutated), image.labels)
 
         shifted = dict(image.labels)
@@ -448,7 +448,7 @@ class PortHelperTest(unittest.TestCase):
             encoding="utf-8")
         for declaration in (
                 "MSXAI_UNAPI_REQUEST_MAGIC: equ 0A75Ah",
-                "MSXAI_UNAPI_REQUEST_VERSION: equ 1",
+                "MSXAI_UNAPI_REQUEST_VERSION: equ 2",
                 "MSXAI_UNAPI_REQUEST_SIZE:  equ 16",
                 "MSXAI_UNAPI_STACK_SIZE:    equ 0400h",
                 "MSXAI_UNAPI_GUARD_SIZE:    equ 16",
@@ -468,7 +468,7 @@ class PortHelperTest(unittest.TestCase):
             request,
             r"(?s)unapi_request_connection:\s+db 0\s+"
             r"unapi_request_target:\s+db MSXAI_TRANSPORT_UNAPI\s+"
-            r"unapi_request_reserved:\s+db 0")
+            r"unapi_request_16c550_divisor:\s+db 0")
 
         prepare = source.split("prepare_unapi_request:", 1)[1].split(
             "verify_unapi_guards:", 1)[0]
@@ -490,7 +490,7 @@ class PortHelperTest(unittest.TestCase):
             prepare.index("prepare_unapi_high_guard_loop:"),
         )
         self.assertIn("ld (unapi_request_target),a", prepare)
-        self.assertIn("ld (unapi_request_reserved),a", prepare)
+        self.assertIn("ld (unapi_request_16c550_divisor),a", prepare)
 
         verify = source.split("verify_unapi_guards:", 1)[1].split(
             "memman_tsr_name:", 1)[0]

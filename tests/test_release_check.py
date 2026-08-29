@@ -175,6 +175,9 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
         self.assertIn(
             "agent/msx_agent_trace.asm",
             release_check._SDIST_REQUIRED_FILES)
+        self.assertIn(
+            "agent/msx_badcat_init.asm",
+            release_check._SDIST_REQUIRED_FILES)
         names = [f"msx_ai-0.6.0/{name}"
                  for name in release_check._SDIST_REQUIRED_FILES]
         release_check._assert_sdist_contents(names)
@@ -184,8 +187,10 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                 release_check.ReleaseCheckError, "missing required source"):
             release_check._assert_sdist_contents(without_asset)
 
-    def test_agent_suite_requires_exactly_ten_nonempty_files(self):
-        self.assertEqual(len(release_check._AGENT_SUITE_FILES), 10)
+    def test_agent_suite_requires_exactly_twelve_nonempty_files(self):
+        self.assertEqual(len(release_check._AGENT_SUITE_FILES), 12)
+        self.assertIn("BADINIT.COM", release_check._AGENT_SUITE_FILES)
+        self.assertIn("MCP115K.TSR", release_check._AGENT_SUITE_FILES)
         self.assertIn("MP.COM", release_check._AGENT_SUITE_FILES)
         self.assertIn("TU.COM", release_check._AGENT_SUITE_FILES)
         with tempfile.TemporaryDirectory() as directory:
@@ -207,10 +212,10 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     release_check.ReleaseCheckError, "empty artifacts"):
                 release_check._assert_agent_suite(agent)
 
-    def test_agent_suite_enforces_all_four_com_size_ceilings(self):
+    def test_agent_suite_enforces_all_five_com_size_ceilings(self):
         self.assertEqual(
             set(release_check._AGENT_COM_SIZE_CEILINGS),
-            {"MSXAI.COM", "MSXAIXF.COM", "MP.COM", "TU.COM"},
+            {"BADINIT.COM", "MSXAI.COM", "MSXAIXF.COM", "MP.COM", "TU.COM"},
         )
         for oversized_name, ceiling in (
                 release_check._AGENT_COM_SIZE_CEILINGS.items()):
@@ -377,6 +382,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     "--metadata-output", str(build / "MSXAI_TSR.INC"),
                     "--8251-output", str(agent / "MCP8251.TSR"),
                     "--16c550-output", str(agent / "MCP16550.TSR"),
+                    "--16c550-115200-output", str(agent / "MCP115K.TSR"),
                     "--unapi-output", str(agent / "MCPUNAPI.TSR"),
                 ],
                 [
@@ -390,6 +396,12 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
                     "--repository", str(source), "--assembler", assembler,
                     "--source", str(source / "agent" / "msx_tu_helper.asm"),
                     "--output", str(agent / "TU.COM"),
+                ],
+                [
+                    sys.executable, str(tools / "build_badcat_init.py"),
+                    "--assembler", assembler,
+                    "--source", str(source / "agent" / "msx_badcat_init.asm"),
+                    "--output", str(agent / "BADINIT.COM"),
                 ],
                 [
                     assembler, str(source / "agent" / "msx_agent.asm"),
@@ -636,7 +648,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
             missing = root / "missing.zip"
             self.rewrite_zip(valid, missing, drop="TL.COM")
             with self.assertRaisesRegex(
-                    release_check.ReleaseCheckError, "exactly ten"):
+                    release_check.ReleaseCheckError, "exactly twelve"):
                 release_check._assert_agent_archive(
                     missing, source, suite,
                     release_check._Z80ASM_VERSION_LINE)

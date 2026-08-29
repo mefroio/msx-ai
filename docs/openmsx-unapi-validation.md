@@ -93,7 +93,17 @@ python3 tools/openmsx_unapi_validation.py run \
 
 Add `--window` to watch the emulator. The harness makes temporary copies of
 the DOS image and openMSX home, runs the canonical `make agent` build, imports
-the package into `A:\MSXAI`, and types:
+the twelve-file package into `A:\MSXAI`:
+
+```text
+MSXAI.COM     MSXAIXF.COM  MCP8251.TSR  MCP16550.TSR
+MCP115K.TSR   MCPUNAPI.TSR TU.COM       MP.COM
+BADINIT.COM   MEMMAN.COM   TL.COM       TK.COM
+```
+
+`MCP115K.TSR` is the prepatched 115200-baud 16C550 image and `BADINIT.COM` is
+the physical BaDCaT runtime initializer. The UNAPI harness stages both because
+it validates the canonical package, but executes neither one. It then types:
 
 ```text
 SET MSXAI_HOME=A:\MSXAI
@@ -109,9 +119,12 @@ a no-op for the UNAPINET fixture. UART installs bypass `TU.COM` and invoke
 `TL.COM` directly. The loader also
 encodes the selected value as the private fixed-width `MP/HHHH` command;
 `MP.COM` runs after `TL.COM` and applies it through a versioned 16-byte MemMan
-request with `A=A7h`, `HL=request`. A7 v1 is the general safe-lifecycle ABI for
+request with `A=A7h`, `HL=request`. A7 v2 is the general safe-lifecycle ABI for
 target transport `0=8251`, `1=16C550`, or `2=UNAPI`; `MP.COM` writes target `2` at
-offset 14, and the reserved byte at offset 15 remains zero. The request also
+offset 14 and divisor zero at offset 15. A7 v2 uses byte 15 as the requested
+16C550 divisor (`1=115200`, `2=57600`), which must remain zero for 8251 or
+UNAPI; the same byte returns the active divisor, or zero when 16C550 is not
+active. The request also
 identifies the port and a caller-owned 1 KiB page-2 stack surrounded by
 16-byte low/high guards. Its complete guarded span fits below `C000h`, the TPA
 top, and the current SP minus 256 bytes of caller headroom. Caller and resident
@@ -120,6 +133,11 @@ calls off MemMan's small internal `TsrCall` stack. The old `A6h`, `HL=port`
 raw ABI is reserved and rejected so mixed suite versions fail closed. The
 guarded handoff is also used when `/PORT` is omitted and the selected value is
 the default 6603; users never invoke the hexadecimal form directly.
+
+The suite's UART default is 57600 baud. `/57600` and `/115200` are mutually
+exclusive and accepted only with `/DRIVER:16C550`; a fresh resident install
+selects `MCP16550.TSR` or `MCP115K.TSR`, respectively. Existing-resident
+changes carry the divisor through A7 v2.
 
 The host side is exercised exclusively through the project's public MCP
 server over STDIO. The harness calls `msx_agent_connect`,
@@ -153,6 +171,32 @@ The observable end-to-end path covers:
 It does not validate Pico/Pico+ firmware, cartridge registers, bus timing,
 physical interrupts, Wi-Fi association, DHCP, or radio behaviour. Those remain
 physical-hardware validation gates.
+
+## Physical BaDCaT procedure is out of scope
+
+The harness above does not configure or emulate BaDCaT. On physical hardware,
+keep the host disconnected from port 6603, run `MSXAI /UNINSTALL` before the
+initializer, then use matching commands:
+
+```text
+BADINIT
+MSXAI /DRIVER:16C550
+```
+
+or, only for an explicit faster-line test:
+
+```text
+BADINIT /115200
+MSXAI /DRIVER:16C550 /115200
+```
+
+`BADINIT` uses runtime `ATN0`, never performs firmware save, modem reset,
+factory reset, or an `S60` write. It verifies `ATQ0S41=0A6603` while automatic
+stream entry is disabled, then commits with the final silent line
+`ATHS41=1Q1`. Start `msx_agent_connect` only after the matching MSXAI driver is
+running. Although the BaDCaT UART line can be selected up to 115200 baud, its
+effective throughput is approximately 57600 bps; 57600 is the safe default for
+both commands.
 
 ## Automated tests
 

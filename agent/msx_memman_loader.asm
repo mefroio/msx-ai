@@ -166,6 +166,11 @@ preflight_select_8251:
 
 preflight_select_16c550:
     ld de,suite_mcp16550_tsr_path
+    ld a,(loader_uart16c550_divisor)
+    cp UART16C550_DIVISOR_115200
+    jr nz,preflight_select_16c550_path_ready
+    ld de,suite_mcp115k_tsr_path
+preflight_select_16c550_path_ready:
     ld a,DRIVER_16C550
     jr preflight_install_selected
 
@@ -339,6 +344,11 @@ suite_resolve_paths:
     ret nz
     ld bc,mcp16550_tsr_name
     ld de,suite_mcp16550_tsr_path
+    call suite_build_path
+    or a
+    ret nz
+    ld bc,mcp115k_tsr_name
+    ld de,suite_mcp115k_tsr_path
     call suite_build_path
     or a
     ret nz
@@ -542,7 +552,7 @@ suite_open_exact_file:
     ld c,DOS_SEEK
     call 00005h
     or a
-    jr nz,suite_close_preserving_error
+    jp nz,suite_close_preserving_error
     ld a,d
     or e
     jp nz,suite_exact_size_error
@@ -555,7 +565,7 @@ suite_open_exact_file:
 
 suite_exact_size_error:
     ld a,ERR_INTERNAL
-    jr suite_close_preserving_error
+    jp suite_close_preserving_error
 
 suite_validate_regular_file:
     call suite_open_exact_file
@@ -577,10 +587,42 @@ suite_validate_selected_tsr:
     ld c,DOS_SEEK
     call 00005h
     or a
-    jr nz,suite_close_preserving_error
+    jp nz,suite_close_preserving_error
     ld a,d
     or e
+    jp nz,suite_exact_size_error
+    ld de,suite_probe_byte
+    ld hl,1
+    ld a,(suite_handle)
+    ld b,a
+    ld c,DOS_READ
+    call 00005h
+    or a
+    jp nz,suite_close_preserving_error
+    ld a,h
+    or a
+    jp nz,suite_exact_size_error
+    ld a,l
+    cp 1
+    jp nz,suite_exact_size_error
+    ld a,(suite_probe_byte)
+    ld b,a
+    ld a,(suite_expected_transport)
+    cp b
     jr nz,suite_exact_size_error
+
+    ld hl,MSXAI_TSR_16C550_DIVISOR_OFFSET
+    ld de,0
+    ld a,(suite_handle)
+    ld b,a
+    xor a
+    ld c,DOS_SEEK
+    call 00005h
+    or a
+    jp nz,suite_close_preserving_error
+    ld a,d
+    or e
+    jp nz,suite_exact_size_error
     ld de,suite_probe_byte
     ld hl,1
     ld a,(suite_handle)
@@ -591,15 +633,23 @@ suite_validate_selected_tsr:
     jr nz,suite_close_preserving_error
     ld a,h
     or a
-    jr nz,suite_exact_size_error
+    jp nz,suite_exact_size_error
     ld a,l
     cp 1
-    jr nz,suite_exact_size_error
+    jp nz,suite_exact_size_error
     ld a,(suite_probe_byte)
     ld b,a
+    ld a,UART16C550_DIVISOR_57600
+    ld c,a
     ld a,(suite_expected_transport)
+    cp DRIVER_16C550
+    jr nz,suite_validate_selected_tsr_divisor_ready
+    ld a,(loader_uart16c550_divisor)
+    ld c,a
+suite_validate_selected_tsr_divisor_ready:
+    ld a,c
     cp b
-    jr nz,suite_exact_size_error
+    jp nz,suite_exact_size_error
     xor a
     jp suite_close_preserving_error
 
@@ -796,6 +846,17 @@ memman_reconfigure_agent:
     ld a,(loader_transport_id)
     cp b
     jr nz,memman_reconfigure_unapi_failed
+    xor a
+    ld b,a
+    ld a,(loader_transport_id)
+    cp DRIVER_16C550
+    jr nz,memman_reconfigure_divisor_expected
+    ld a,(loader_uart16c550_divisor)
+    ld b,a
+memman_reconfigure_divisor_expected:
+    ld a,(memman_unapi_request_16c550_divisor)
+    cp b
+    jr nz,memman_reconfigure_unapi_failed
     ld a,(memman_unapi_call_result)
     ret
 memman_reconfigure_unapi_failed:
@@ -942,7 +1003,13 @@ memman_prepare_unapi_high_guard_loop:
     ld (memman_unapi_request_target),a
     xor a
     ld (memman_unapi_request_connection),a
-    ld (memman_unapi_request_reserved),a
+    ld (memman_unapi_request_16c550_divisor),a
+    ld a,(loader_transport_id)
+    cp DRIVER_16C550
+    jr nz,memman_prepare_unapi_divisor_ready
+    ld a,(loader_uart16c550_divisor)
+    ld (memman_unapi_request_16c550_divisor),a
+memman_prepare_unapi_divisor_ready:
     or a
     ret
 memman_prepare_unapi_no_stack:
@@ -1002,7 +1069,7 @@ memman_unapi_request_connection:
     db 0
 memman_unapi_request_target:
     db DRIVER_UNAPI
-memman_unapi_request_reserved:
+memman_unapi_request_16c550_divisor:
     db 0
 
 memman_unapi_request_stack_limit:
@@ -1525,6 +1592,8 @@ mcp8251_tsr_name:
     db "MCP8251.TSR",0
 mcp16550_tsr_name:
     db "MCP16550.TSR",0
+mcp115k_tsr_name:
+    db "MCP115K.TSR",0
 mcpunapi_tsr_name:
     db "MCPUNAPI.TSR",0
 mp_name:
@@ -1542,6 +1611,8 @@ suite_tk_path:
 suite_mcp8251_tsr_path:
     ds SUITE_PATH_BUFFER_SIZE,0
 suite_mcp16550_tsr_path:
+    ds SUITE_PATH_BUFFER_SIZE,0
+suite_mcp115k_tsr_path:
     ds SUITE_PATH_BUFFER_SIZE,0
 suite_mcpunapi_tsr_path:
     ds SUITE_PATH_BUFFER_SIZE,0

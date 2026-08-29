@@ -84,7 +84,7 @@ fail-closed. Linux and macOS continue to require Make. This pre-commit gate
 builds a clean snapshot
 of the checkout's current on-disk source, including uncommitted changes while
 excluding generated and local-state directories. It runs the unit suite,
-builds and inspects the sdist and wheel, rebuilds both the wheel and ten-file
+builds and inspects the sdist and wheel, rebuilds both the wheel and twelve-file
 agent suite from the sdist, and compares their same-host payloads. It installs
 the rebuilt wheel into a clean environment, runs `pip check`, verifies
 import/CLI state discipline and packaged openMSX resource materialization, and
@@ -115,7 +115,7 @@ On Windows, use `python tools/release_check.py --publish` for strict mode and
 
 This writes the versioned Python distributions, the deterministic,
 MSX-DOS-compatible `MSXAI.ZIP`, and a standalone `README.TXT` to `dist/`.
-The ZIP contains the same README and exactly ten binaries,
+The ZIP contains the same README and exactly twelve binaries,
 the project `LICENSE`, `MEMMAN-NOTICE.txt`, `SHA256SUMS`, and
 `COMPATIBILITY.json` recording the project release, wire v3, transfer `fast-v1`,
 and the pinned assembler. Checksums cover the binaries, README, license,
@@ -146,13 +146,60 @@ MSXAI.COM
 MSXAIXF.COM
 MCP8251.TSR
 MCP16550.TSR
+MCP115K.TSR
 MCPUNAPI.TSR
 TU.COM
 MP.COM
+BADINIT.COM
 MEMMAN.COM
 TL.COM
 TK.COM
 ```
+
+`MCP16550.TSR` is the exact 57600-baud default for the 16C550 driver.
+`MCP115K.TSR` is the otherwise matching `/115200` variant. `BADINIT.COM` is a
+transient BaDCaT/ZiModem runtime initializer; it does not remain resident and
+is not a general replacement for configuring another transparent UART bridge.
+
+Keep the host disconnected while preparing BaDCaT and use one matching
+sequence:
+
+```text
+MSXAI /UNINSTALL
+BADINIT
+MSXAI /DRIVER:16C550
+```
+
+or:
+
+```text
+MSXAI /UNINSTALL
+BADINIT /115200
+MSXAI /DRIVER:16C550 /115200
+```
+
+The no-option default for both programs is exactly 57600 baud. Do not let the
+host connect until the final command completes. `BADINIT` rejects an active
+resident before touching the UART, performs no persistent write, and never
+issues `AT&W`, reset `ATZ`, factory restore `AT&F`, or the persistent `S60`
+listener setting. It requires `OK` from `ATQ0S41=0A6603`, opening port 6603
+with automatic stream entry disabled so creation errors remain visible. Its
+final, send-only `ATHS41=1Q1` line drops premature clients, enables auto-stream,
+and only then enables quiet mode; no later command-mode exchange can race the
+incoming host connection. A power cycle restores the saved modem configuration.
+
+`BADINIT` follows the official BaDCaT UART initialization order and puts `F0`
+at the end of the first bootstrap so a blocked XON/XOFF state cannot suppress
+all earlier setup results. A quiet baud-change command is followed by TEMT, a
+40-JIFFY no-transmit interval, and only then link validation. Diagnostics show
+the failing stage, command, bounded RX bytes in hexadecimal, and LSR flags. A
+continuous RX stream is bounded and reported without transmitting recovery AT
+text; no UART recovery is attempted after listener commit becomes uncertain.
+
+The optional 115200 UART rate does not raise BaDCaT's published 57,600-bit/s
+effective-throughput limit. Framing, hardware flow control, bridge processing,
+and target execution impose additional overhead, so benchmark actual MCP
+payload throughput instead of deriving it from the UART divisor.
 
 `TU.COM` is transient and runs only on a first UNAPI installation, after the
 MemMan warm boot and before `TL.COM`. It prepares compatible Pico/Pico+

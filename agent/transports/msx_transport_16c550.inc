@@ -7,6 +7,8 @@ UART16C550_ID:            equ 1
 UART16C550_CONTROL_LEVEL: equ 1
 UART16C550_FLAGS:         equ TRANSPORT_FLAG_KEYI_EXCLUSIVE | TRANSPORT_FLAG_TIMI_ONLY | TRANSPORT_FLAG_FRAME_WAKE_ACK
 UART16C550_STATE_SIZE:    equ 5
+UART16C550_DIVISOR_115200: equ 1
+UART16C550_DIVISOR_57600:  equ 2
 
 UART16C550_DATA:          equ 080h
 UART16C550_IER:           equ 081h
@@ -21,6 +23,14 @@ UART16C550_SAVED_DLL:     equ 3
 UART16C550_SAVED_DLM:     equ 4
 
 uart16c550_init:
+    ld a,(active_uart16c550_divisor)
+    cp UART16C550_DIVISOR_115200
+    jr z,uart16c550_init_divisor_valid
+    cp UART16C550_DIVISOR_57600
+    jr z,uart16c550_init_divisor_valid
+    ld a,1
+    ret
+uart16c550_init_divisor_valid:
     ; Preserve readable state so a safe uninstall restores the prior UART setup.
     in a,(UART16C550_LCR)
     ld (transport_state + UART16C550_SAVED_LCR),a
@@ -48,7 +58,7 @@ uart16c550_init:
     out (UART16C550_FCR),a
     ld a,083h                  ; DLAB, 8N1
     out (UART16C550_LCR),a
-    ld a,1                     ; 1.8432 MHz / (16 * 1) = 115200 baud
+    ld a,(active_uart16c550_divisor)
     out (UART16C550_DATA),a
     xor a
     out (UART16C550_IER),a     ; DLM=0 while DLAB=1
