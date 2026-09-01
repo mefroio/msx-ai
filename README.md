@@ -349,7 +349,7 @@ names fix the route; connection order never changes it.
 | Direct call/run/stop | Yes | No | Yes |
 | I/O-port access | Via expert Tcl/debug tools | Yes | Yes |
 | Slot/mapper selection | Via expert Tcl/debug tools | No | Yes |
-| Reset/raw openMSX Tcl | Yes | No | No |
+| Reset/reboot and raw openMSX Tcl | Yes | No | No |
 
 “Cooperative” is important: the resident runs through the normal BIOS timer
 hook. It is not an NMI, bus master, or universal freeze mechanism.
@@ -383,10 +383,11 @@ selected UNAPI port, including the default 6603 when `/PORT` is omitted. The
 public `/PORT` syntax remains decimal; the compact hexadecimal form passed to
 `MP.COM` is private to the install chain. Internally, `MP.COM` and every
 existing-resident reconfiguration use
-the private MemMan `A7h` v2 lifecycle request: 16 bytes containing the port,
+the private MemMan `A7h` v3 lifecycle request: 20 bytes containing the port,
 a caller-owned 1 KiB page-2 stack, structured results, and the requested
 transport at offset 14 (`0=8251`, `1=16C550`, `2=UNAPI`). Offset 15 is the
 16C550 divisor (`2=57600`, `1=115200`) and must be zero for other targets.
+Offsets 16 through 19 return the local IPv4 address obtained from UNAPI.
 `MP.COM` always sets target `2` and a zero divisor because it is the
 first-install UNAPI port helper. The stack has 16-byte low/high guards and is placed below the TPA
 limit with 256 bytes of headroom from the caller's current SP. Thus driver
@@ -394,6 +395,8 @@ changes and potentially deep TCP lifecycle work do not use MemMan's internal
 stack. The old `A6h` raw-port ABI is rejected, so mixed old/new suite files
 fail closed. The other COM/TSR files are part of the same versioned suite.
 MSX-DOS 2 or Nextor and a memory mapper are required for resident mode.
+After a successful UNAPI startup, resident and foreground modes both print
+`MCP listening at: <IPv4>:<port>`.
 
 After that first installation, BASIC-to-DOS is a separate resident lifecycle.
 When `_SYSTEM` or `CALL SYSTEM` returns to DOS, the resident and its configured

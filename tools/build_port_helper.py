@@ -39,6 +39,7 @@ REQUIRED_LABELS = (
     "unapi_request_connection",
     "unapi_request_target",
     "unapi_request_16c550_divisor",
+    "unapi_request_local_ip",
     "trace_request",
     "trace_request_status",
     "trace_requested",
@@ -54,8 +55,8 @@ REQUIRED_CONSTANTS = {
     "MSXAI_TALK_TRACE": 0xA8,
     "MSXAI_TRANSPORT_UNAPI": 2,
     "MSXAI_UNAPI_REQUEST_MAGIC": 0xA75A,
-    "MSXAI_UNAPI_REQUEST_VERSION": 2,
-    "MSXAI_UNAPI_REQUEST_SIZE": 16,
+    "MSXAI_UNAPI_REQUEST_VERSION": 3,
+    "MSXAI_UNAPI_REQUEST_SIZE": 20,
     "MSXAI_UNAPI_STACK_SIZE": 0x400,
     "MSXAI_UNAPI_GUARD_SIZE": 16,
     "MSXAI_UNAPI_STACK_HEADROOM": 0x100,
@@ -76,6 +77,7 @@ REQUEST_FIELD_OFFSETS = {
     "unapi_request_connection": 13,
     "unapi_request_target": 14,
     "unapi_request_16c550_divisor": 15,
+    "unapi_request_local_ip": 16,
 }
 
 
@@ -195,6 +197,10 @@ def validate_port_helper_image(
     if request_data[divisor_offset] != 0:
         raise PortHelperBuildError(
             "MP.COM A7 request 16C550 divisor is not zero for UNAPI")
+    local_ip_offset = REQUEST_FIELD_OFFSETS["unapi_request_local_ip"]
+    if any(request_data[local_ip_offset:local_ip_offset + 4]):
+        raise PortHelperBuildError(
+            "MP.COM A7 request local-IP output is not initialized")
 
     trace_request = labels["trace_request"]
     trace_size = labels["MSXAI_TRACE_REQUEST_SIZE"]

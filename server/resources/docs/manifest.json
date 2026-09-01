@@ -63,7 +63,7 @@
       "id": "getting-started",
       "path": "getting-started.md",
       "title": "Getting started",
-      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal workflows for direct, simulated-agent, physical-agent, non-persistent BaDCaT initialization, and resident BLOAD targets.",
+      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal workflows for direct, simulated-agent, physical-agent, non-persistent BaDCaT initialization, resident warm reboot, and BLOAD targets.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -100,7 +100,8 @@
         "badcat",
         "baud",
         "applications",
-        "bload"
+        "bload",
+        "reboot"
       ],
       "audience": [
         "users",
@@ -112,7 +113,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "f9a4382d1868a2ce3b0ff49c52884759c471854c0b1b086d0582d1b67ce5a104",
+      "sha256": "67879189421015c6cfcc6382a8c89c6b9886ea892bc73951bf4bfc54b5c2d463",
       "external_references": [
         {
           "url": "https://github.com/mefroio/msx-ai.git",
@@ -126,7 +127,7 @@
       "id": "backends",
       "path": "backends.md",
       "title": "Backends and runtime modes",
-      "summary": "Capability matrix and selection guidance for direct openMSX, simulated agents, physical agents, residents, monitors, and BLOAD environments.",
+      "summary": "Capability matrix and selection guidance for direct openMSX, simulated agents, physical agents, residents, monitors, BLOAD environments, and resident warm reboot.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -153,7 +154,8 @@
         "resident",
         "monitor",
         "applications",
-        "bload"
+        "bload",
+        "reboot"
       ],
       "audience": [
         "users",
@@ -166,14 +168,14 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "9dad3a59f32243ae8320379100ff47ee159a36412e36461dfef59994a0c80fd2",
+      "sha256": "da29075d7a286eaf44555a193ac4e9dc7b82b753e2cde7930033115f368e80e4",
       "external_references": []
     },
     {
       "id": "safety",
       "path": "safety.md",
       "title": "Safety and operational limits",
-      "summary": "Fail-closed behavior, cooperative-control boundaries, application loading, memory hazards, input limits, and screenshot constraints.",
+      "summary": "Fail-closed behavior, cooperative-control boundaries, resident warm-reboot hazards, application loading, memory hazards, input limits, and screenshot constraints.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -197,7 +199,8 @@
         "timeouts",
         "screenshots",
         "applications",
-        "bload"
+        "bload",
+        "reboot"
       ],
       "audience": [
         "users",
@@ -210,7 +213,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "4d8314cfbedc84bfbe760e9adc0b14fade019d26c3d0cf1d35718ec61bdaa903",
+      "sha256": "83f96faeaa0426af75617b6606c696e041732b6214dc5523e6c2ef883f4816fe",
       "external_references": []
     },
     {

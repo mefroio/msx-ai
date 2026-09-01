@@ -103,6 +103,8 @@ state. A paired bench binds both identities to one emulator with a shared
 - Credit-controlled BIOS keyboard input through the resident agent, including
   255-byte batching for `msx_agent_type_lines` and credited, whole-file-CRC-checked
   ASCII or tokenized `.BAS` transfer for larger programs.
+- An acknowledged terminal warm reboot for a connected resident, with native
+  framed-v3 delivery and a prompt-checked BASIC compatibility path.
 - Streaming, resumable binary `PUT` and `GET` between the host and MSX-DOS,
   with 32-bit sizes and offsets, end-to-end CRC-32, restart recovery, and
   collision-safe publication.
@@ -137,6 +139,14 @@ quarantines that attachment instead of retrying into an unknown machine state.
 Unconditional control requires an independent NMI, bus-master, or equivalent
 hardware path. A transparent TCP/UART bridge does not create that capability by
 itself.
+
+`msx_agent_reboot` is a terminal exception rather than an unconditional
+supervisor. The resident must first receive it through `H.TIMI`. An
+indeterminate delivery is never retried. Once the response has been sent and
+transport-flushed, the reboot is committed; a bounded UART drain is only a
+best-effort attempt to keep the final bytes from being truncated before the
+agent maps Main-ROM page 0 and jumps to `0000h`. The command is a software warm
+reboot, not a power cycle or evidence that the subsequent boot completed.
 
 ## Requirements
 
@@ -664,14 +674,14 @@ MemMan with `A=A7h` and `HL=request`. This directly applies both an explicit
 decimal `/PORT` value and the default 6603 without a patched TSR or a second
 user command. The old `A6h`, `HL=port` entry is reserved and rejected.
 
-`A7h` version 2 is a private, 16-byte safe-lifecycle ABI used for every
+`A7h` version 3 is a private, 20-byte safe-lifecycle ABI used for every
 existing-resident transport selection, not only for UNAPI port changes:
 
 | Offset | Size | Direction | Meaning |
 |---:|---:|---|---|
 | 0 | 2 | In | Magic `A75Ah` |
-| 2 | 1 | In | ABI version `2` |
-| 3 | 1 | In | Request size `16` |
+| 2 | 1 | In | ABI version `3` |
+| 3 | 1 | In | Request size `20` |
 | 4 | 2 | In | Little-endian listener port; validated when target is UNAPI |
 | 6 | 2 | In | Inclusive caller-owned stack bottom |
 | 8 | 2 | In | Exclusive caller-owned stack top |
@@ -681,6 +691,7 @@ existing-resident transport selection, not only for UNAPI port changes:
 | 13 | 1 | Out | Active UNAPI connection handle, or zero |
 | 14 | 1 | In | Target: `0=8251`, `1=16C550`, `2=UNAPI` |
 | 15 | 1 | In/Out | Requested/active 16C550 divisor: `1=115200`, `2=57600`; zero for other transports |
+| 16 | 4 | Out | Local IPv4 address from `TCPIP_GET_IPINFO`, in UNAPI L.H.E.D memory order |
 
 The caller supplies a 1 KiB stack wholly in writable page 2, with a 16-byte
 `A5h` guard below it and a 16-byte `5Ah` guard above it. Before writing either
@@ -803,6 +814,7 @@ framed protocols, transport ABI, and driver implementation details.
 | Pause/read/patch/screenshot/resume | Bounded atomic lease; no persistent manual pause | Yes |
 | BIOS keyboard input | Yes | No |
 | FE-header BLOAD with `environment="auto"` | Verified DOS/BASIC-to-`USR` path | Not automatic; use `environment="direct"` for compatible payloads |
+| `msx_agent_reboot` | Terminal warm reboot | No |
 | Agent-side `call` and `run` | No | Yes |
 | Agent-side `stop` | No | Yes |
 | Slot and mapper selection | No | Yes, pages 0 and 1 |
@@ -954,6 +966,35 @@ identical encoded request and sequence number. The agent de-duplicates
 state-changing commands and searches for the next valid magic/header/CRC
 combination after damaged input.
 
+Opcode `R` is a resident-only terminal warm reboot with an empty request and
+empty successful response. The resident prepares and caches that response,
+sends it, and transport-flushes it. Once `frame_cache_and_send` succeeds, the
+reboot is committed because a complete response may already be observable. The
+agent then makes a bounded best-effort serializer-drain attempt: UART transports
+poll physical `TxEMPTY` or `TEMT`, while the UNAPI transport has already
+completed its synchronous TCP send. Whether the UART poll reports empty or
+exhausts its budget, the agent disables interrupts, maps the Main-ROM slot from
+`EXPTBL` into CPU page 0 through `ENASLT`, and jumps to `0000h`. This avoids the
+incorrect DOS-page-0 interpretation of a bare `JP 0000h`, where address zero is
+the warm-boot entry in RAM rather than the Main-ROM reset vector.
+
+The host always sends `R` with `retries=0`. A drain-budget failure may truncate
+the final response bytes even though the reboot is already committed. If
+delivery or its response becomes indeterminate, the attachment is quarantined
+and the operation is not repeated.
+After a successful response, the host intentionally detaches the channel; its
+result confirms ACK and submission, not boot completion. A pre-`R` framed
+resident can still be rebooted only from a recognized DOS or BASIC prompt: the
+host enters BASIC when necessary and atomically queues
+`DEFUSR0=0:A=USR0(0)`. This compatibility path uses the existing keyboard
+operation and uploads no binary. The structured MCP result records
+`acknowledged=true`, `reboot_submitted=true`, `binary_uploaded=false`, and
+`completion_confirmed=false`.
+
+Either path can interrupt active DOS disk I/O and is not equivalent to a power
+cycle. After MSX-DOS starts again, the resident must be reinstalled or otherwise
+restored and a new agent connection established.
+
 The public negotiated payload limit of the current agent is 320 bytes. Only an
 explicitly armed foreground `fast-v1` transfer pump can temporarily accept the
 larger private opcode-X frames described below. Eight consecutive credited
@@ -1002,7 +1043,7 @@ backend, Ctrl+C is a convenience alias for the Ctrl+STOP break event.
 
 When the foreground monitor runs with `DEBUG`, the optional
 `debug-peer-label` feature enables opcode `I`. Immediately after HELLO, a TCP
-host sends the accepted IPv4 source endpoint as printable ASCII and the MSX
+host sends its MCP-side IPv4 endpoint as printable ASCII and the MSX
 displays it as `MCP client: <ipv4>:<port>`. The UART-facing agent remains
 transport-neutral: it never attempts to discover network metadata itself.
 
@@ -1258,7 +1299,7 @@ normally from DOS.
 |---|---|
 | Inventory | `msx_targets_status` |
 | Local lifecycle | `msx_local_boot`, `msx_local_attach`, `msx_local_status`, `msx_local_shutdown` |
-| Agent lifecycle | `msx_agent_listen`, `msx_agent_connect`, `msx_agent_status`, `msx_agent_disconnect` |
+| Agent lifecycle | `msx_agent_listen`, `msx_agent_connect`, `msx_agent_status`, `msx_agent_reboot`, `msx_agent_disconnect` |
 | Paired bench | `msx_tcp_bench_start`, `msx_tcp_bench_status`, `msx_tcp_bench_shutdown` |
 | Local debug/execution | `msx_local_cpu_snapshot`, `msx_local_asm_load`, `msx_local_app_load` |
 | Agent debug/execution | `msx_agent_cpu_snapshot`, `msx_agent_asm_load`, `msx_agent_app_load`, `msx_agent_pause`, `msx_agent_resume`, `msx_agent_stop` |
@@ -1275,9 +1316,11 @@ Resident keyboard injection feeds the standard BIOS ring and therefore works
 with DOS, BASIC, and software that calls BIOS character input. Games that read
 the keyboard matrix directly do not observe those synthetic bytes. STOP and
 Ctrl+STOP are delivered through the BIOS `INTFLG`; the agent backend maps
-Ctrl+C to the same break event for MCP client convenience. Physical reset, raw
-matrix emulation, and openMSX console commands remain openMSX-only. Physical
-operations use the agent byte stream rather than openMSX APIs. On a physical
+Ctrl+C to the same break event for MCP client convenience. A resident warm
+reboot is available through `msx_agent_reboot`; power cycling, raw matrix
+emulation, and openMSX console commands remain outside the physical-agent
+channel. Physical operations use the agent byte stream rather than openMSX
+APIs. On a physical
 target, `msx_agent_run_basic` enters BASIC only after the caller sets
 `dos_prompt_confirmed=true`. Reusing an already-visible BASIC prompt requires
 the mutually exclusive `allow_existing_basic=true` opt-in. These confirmations
@@ -1731,6 +1774,8 @@ separately aggregated openMSX configuration resources remain GPL-2.0-only.
 - The standard 8251 driver restores the previous interrupt mask, but its UART
   mode and timer programming are not readable as a complete prior profile; the
   interface remains configured for 19,200-baud 8N1 after uninstall.
-- Physical reset and raw keyboard-matrix emulation remain openMSX-only. BIOS
-  key injection requires a resident agent that negotiates `keybuf-input`;
-  STOP/Ctrl+STOP additionally require writable BIOS work-area RAM.
+- The physical-agent channel can request only a cooperative resident warm
+  reboot. It cannot power-cycle the machine or confirm the following boot, and
+  raw keyboard-matrix emulation remains openMSX-only. BIOS key injection
+  requires a resident agent that negotiates `keybuf-input`; STOP/Ctrl+STOP
+  additionally require writable BIOS work-area RAM.

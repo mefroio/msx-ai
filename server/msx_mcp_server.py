@@ -25,8 +25,10 @@ import base64
 if __package__:
     from ._version import __version__
     from .msx_client import OpenMSX, OpenMSXError
-    from .msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
-                           CAPABILITY_RUN, FEATURE_FILE_TRANSFER,
+    from .msx_real import (RealMSX, RealMSXProtocolError,
+                           RealMSXUnsupportedError, CAPABILITY_NAMES,
+                           AGENT_FEATURE_NAMES, CAPABILITY_RUN,
+                           FEATURE_FILE_TRANSFER,
                            UART8251_BAUD, DEFAULT_PORT)
     from .msx_application import load_application, parse_application
     from . import msx_screenshot
@@ -50,8 +52,10 @@ if __package__:
 else:  # Preserve ``python server/msx_mcp_server.py`` and existing imports.
     from _version import __version__
     from msx_client import OpenMSX, OpenMSXError
-    from msx_real import (RealMSX, CAPABILITY_NAMES, AGENT_FEATURE_NAMES,
-                          CAPABILITY_RUN, FEATURE_FILE_TRANSFER,
+    from msx_real import (RealMSX, RealMSXProtocolError,
+                          RealMSXUnsupportedError, CAPABILITY_NAMES,
+                          AGENT_FEATURE_NAMES, CAPABILITY_RUN,
+                          FEATURE_FILE_TRANSFER,
                           UART8251_BAUD, DEFAULT_PORT)
     from msx_application import load_application, parse_application
     import msx_screenshot
@@ -137,6 +141,8 @@ APPLICATION_ENVIRONMENTS = ("auto", "direct", "basic")
 BASIC_PROMPT_ATTEMPTS = 3
 BASIC_PROMPT_SCREEN_TIMEOUT = 10.0
 BASIC_PROMPT_SETTLE_SECONDS = 0.5
+AGENT_REBOOT_VECTOR = 0x0000
+AGENT_REBOOT_LINE = "DEFUSR0=0:A=USR0(0)"
 
 LOCAL_PROFILES = ("basic", "disk", "dos", "msx2plus", "cbios", "auto")
 OPENMSX_CONFIG_MODES = ("isolated", "user", "overlay")
@@ -749,6 +755,29 @@ class Session:
             agent.close()
         finally:
             self._agent_msx = None
+            self.agent_id = None
+            if self._legacy_msx is agent:
+                self._legacy_msx = None
+                self._legacy_profile = None
+        return True
+
+    def detach_agent_without_probe(self, agent):
+        """Forget an agent after a terminal or indeterminate operation.
+
+        Unlike ``disconnect_agent``, this path must not issue STATUS or RESUME:
+        the target may already be rebooting or the attachment may be write
+        quarantined after an indeterminate terminal request.
+        """
+        current, _profile = self.backend("agent")
+        if current is not agent:
+            raise OpenMSXError(
+                "the terminal submission target is no longer the connected "
+                "ASM agent")
+        try:
+            agent.close(recover_snapshot=False)
+        finally:
+            if self._agent_msx is agent:
+                self._agent_msx = None
             self.agent_id = None
             if self._legacy_msx is agent:
                 self._legacy_msx = None
@@ -1861,6 +1890,30 @@ def _wait_for_basic_prompt(
     return None
 
 
+def _ensure_agent_basic_prompt(m, *, operation):
+    """Return the resident target's DOS-to-BASIC transition label."""
+    if getattr(m, "runtime_mode", None) != "resident":
+        raise OpenMSXError(
+            f"{operation} requires the resident agent; restart MSXAI without "
+            "/MONITOR. Foreground mode cannot enter BASIC without terminating "
+            "its TCP session")
+
+    screen = m.screen_text(timeout=BASIC_PROMPT_SCREEN_TIMEOUT)
+    if _basic_prompt_visible(screen):
+        return "already-basic"
+    if _dos_prompt_visible(screen):
+        m.type_line("BASIC")
+        if _wait_for_basic_prompt(m) is None:
+            raise OpenMSXError(
+                "MSX accepted the BASIC command but no BASIC Ok prompt was "
+                f"observed after three bounded screen probes; {operation} "
+                "was not submitted")
+        return "dos-to-basic"
+    raise OpenMSXError(
+        f"{operation} requires a visible MSX-DOS prompt or MSX BASIC Ok "
+        "prompt; no reboot or RAM execution was submitted")
+
+
 def _preflight_agent_direct(m, application, mode, address):
     """Validate direct-agent loading before STOP or the first target write."""
     runtime = getattr(m, "runtime_mode", None)
@@ -1906,28 +1959,8 @@ def _load_agent_bload_in_basic(m, application, execute, *, automatic):
     """Enter BASIC, load an FE-header BLOAD verbatim, and submit it via USR."""
     mode, address = _application_entry(application, execute)
     _validate_basic_bload(application, mode, address)
-    if getattr(m, "runtime_mode", None) != "resident":
-        raise OpenMSXError(
-            "automatic BLOAD/BASIC execution requires the resident agent; "
-            "restart MSXAI without /MONITOR. Foreground mode cannot enter "
-            "BASIC without terminating its TCP session")
-
-    screen = m.screen_text(timeout=10.0)
-    if _basic_prompt_visible(screen):
-        transition = "already-basic"
-    elif _dos_prompt_visible(screen):
-        m.type_line("BASIC")
-        screen = _wait_for_basic_prompt(m)
-        if screen is None:
-            raise OpenMSXError(
-                "MSX accepted the BASIC command but no BASIC Ok prompt was "
-                "observed after three bounded screen probes; BLOAD RAM was "
-                "not written")
-        transition = "dos-to-basic"
-    else:
-        raise OpenMSXError(
-            "automatic BLOAD loading requires a visible MSX-DOS prompt or "
-            "MSX BASIC Ok prompt; target RAM was not written")
+    transition = _ensure_agent_basic_prompt(
+        m, operation="automatic BLOAD/BASIC execution")
 
     # BASIC owns the correct Main-ROM page-0 environment. Load without asking
     # the resident protocol to CALL/RUN: resident execution is deliberately
@@ -1956,6 +1989,59 @@ def _load_agent_bload_in_basic(m, application, execute, *, automatic):
         "execution_submission": "basic-usr" if mode != "none" else "none",
         "screen_probe_performed": True,
     })
+    return result
+
+
+def t_agent_reboot():
+    """ACK a resident warm reboot and forget the terminal agent channel."""
+    m = SESSION.require("agent")
+    try:
+        try:
+            m.reboot()
+        except RealMSXUnsupportedError:
+            # Compatibility for an installed pre-reboot-opcode resident.
+            # BASIC maps Main-ROM into page 0, so USR can invoke the reset
+            # vector without uploading a mutable JP 0000h stub. The final line
+            # is published to the BIOS ring atomically and ACKed without
+            # waiting for it to drain.
+            transition = _ensure_agent_basic_prompt(
+                m, operation="resident warm reboot")
+            consumed = m.enqueue_terminal_line(AGENT_REBOOT_LINE)
+            submission = "basic-usr-zero"
+            fallback_used = True
+            screen_probe_performed = True
+        else:
+            transition = "not-required"
+            consumed = 0
+            submission = "resident-opcode-v3"
+            fallback_used = False
+            screen_probe_performed = False
+    except BaseException:
+        # An indeterminate terminal write is never retried. This also covers
+        # cancellation after the terminal frame started: a quarantined stream
+        # cannot be used safely even if the reset request was lost.
+        if getattr(m, "write_quarantined", False):
+            SESSION.detach_agent_without_probe(m)
+        raise
+
+    result = {
+        "backend": "agent",
+        "operation": "reboot",
+        "state": "submitted",
+        "runtime_mode": "resident",
+        "target_transition": transition,
+        "execution_submission": submission,
+        "reboot_vector": AGENT_REBOOT_VECTOR,
+        "binary_uploaded": False,
+        "bytes_consumed": consumed,
+        "fallback_used": fallback_used,
+        "screen_probe_performed": screen_probe_performed,
+        "acknowledged": True,
+        "reboot_submitted": True,
+        "agent_disconnected": True,
+        "completion_confirmed": False,
+    }
+    SESSION.detach_agent_without_probe(m)
     return result
 
 
@@ -2756,6 +2842,21 @@ TOOLS = {
             "timeout": {"type": "number", "exclusiveMinimum": 0,
                         "maximum": 300,
                         "default": 60}}, ["host"])),
+    "msx_agent_reboot": (t_agent_reboot,
+        "Warm-reboot a resident physical MSX through its ASM-agent channel. "
+        "A current resident sends and transport-flushes one terminal framed-v3 "
+        "response, thereby committing the reboot, then makes a bounded "
+        "best-effort physical UART serializer-drain attempt before mapping "
+        "Main-ROM page 0 and entering its reset vector. A truncated response "
+        "is indeterminate and is never retried. "
+        "For an older resident, the host recognizes only an MSX-DOS prompt or "
+        "an existing MSX BASIC Ok prompt, enters BASIC when necessary, and "
+        "atomically publishes DEFUSR0=0:A=USR0(0) to the BIOS keyboard ring. "
+        "Neither path needs an intermediate binary upload. A successful result "
+        "means the reboot submission was ACKed and the agent channel was "
+        "intentionally detached; boot completion cannot be observed on the "
+        "connection that reset destroys.",
+        _s({})),
     "msx_tcp_bench_start": (t_tcp_bench_start,
         "Start one isolated openMSX instance, install the resident ASM "
         "agent, and connect to it through RS232-Net and TCP/IP. A headless "
@@ -3325,6 +3426,7 @@ _EXPLICIT_CORE_TOOLS = {
     "msx_docs_search",
     "msx_agent_listen",
     "msx_agent_connect",
+    "msx_agent_reboot",
     "msx_tcp_bench_start",
 }
 for _legacy_name in _CANONICAL_TOOL_NAMES:

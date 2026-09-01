@@ -99,3 +99,25 @@ uart8251_service:
 uart8251_flush:
     xor a
     ret
+
+; Terminal operations must not reinitialize the UART while its shift register
+; still owns the final framed-response byte. Return zero only after TxEMPTY.
+uart8251_terminal_drain:
+    ld bc,HOOK_IO_BUDGET
+uart8251_terminal_drain_wait:
+    in a,(UART8251_STATUS)
+    inc a
+    jr z,uart8251_terminal_drain_failed ; FFh is an absent/floating device
+    dec a
+    and 04h                    ; 8251 TxEMPTY, not merely TxRDY
+    jr nz,uart8251_terminal_drain_done
+    dec bc
+    ld a,b
+    or c
+    jr nz,uart8251_terminal_drain_wait
+uart8251_terminal_drain_failed:
+    ld a,1
+    ret
+uart8251_terminal_drain_done:
+    xor a
+    ret

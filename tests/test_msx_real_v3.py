@@ -31,8 +31,33 @@ from msx_real import (  # noqa: E402
     RealMSXError,
     RealMSXProtocolError,
     RealMSXRangeError,
+    RealMSXUnsupportedError,
 )
 from msx_cpu import CPU_CONTEXT_SIZE, CPU_CONTEXT_VERSION  # noqa: E402
+
+
+class _EndpointStream:
+    def __init__(self, stream, *, local_endpoint):
+        self.stream = stream
+        self.local_endpoint = local_endpoint
+
+    def recv(self, size):
+        return self.stream.recv(size)
+
+    def sendall(self, data):
+        return self.stream.sendall(data)
+
+    def settimeout(self, timeout):
+        return self.stream.settimeout(timeout)
+
+    def gettimeout(self):
+        return self.stream.gettimeout()
+
+    def getsockname(self):
+        return self.local_endpoint
+
+    def close(self):
+        return self.stream.close()
 
 
 class FakeV3Resident:
@@ -46,6 +71,7 @@ class FakeV3Resident:
                  debug_peer_feature=False, frame_wake_ack_feature=None,
                  timi_poll_safe_feature=None,
                  cpu_snapshot_feature=False, cpu_context=None,
+                 reboot_supported=True, reboot_payload=b"",
                  bootstrap_features_supported=True,
                  bootstrap_feature_bits=None,
                  transport_id=1):
@@ -65,6 +91,8 @@ class FakeV3Resident:
         self.debug = bool(debug)
         self.debug_peer_feature = bool(debug_peer_feature)
         self.cpu_snapshot_feature = bool(cpu_snapshot_feature)
+        self.reboot_supported = bool(reboot_supported)
+        self.reboot_payload = bytes(reboot_payload)
         self.cpu_context = (
             self._default_cpu_context() if cpu_context is None
             else bytes(cpu_context))
@@ -95,6 +123,7 @@ class FakeV3Resident:
         self.keybuf_spool_authorized = False
         self.typed = bytearray()
         self.debug_peer_labels = []
+        self.reboot_requests = 0
 
         self.bootstrap_queries = 0
         self.bootstrap_feature_queries = 0
@@ -365,6 +394,19 @@ class FakeV3Resident:
                     + credits.to_bytes(2, "little")
                     + bytes([spool_flags])
                 )
+        elif opcode == "R":
+            if not self.reboot_supported:
+                status = FrameStatus.INVALID_OPCODE
+                flags = FrameFlag.ERROR
+            elif payload:
+                status = FrameStatus.INVALID_ARGUMENT
+                flags = FrameFlag.ERROR
+            elif self.runtime_mode != 0 or self.state != 1:
+                status = FrameStatus.INVALID_STATE
+                flags = FrameFlag.ERROR
+            else:
+                self.reboot_requests += 1
+                response_payload = self.reboot_payload
         elif opcode == "p" and len(payload) >= 2:
             address = self._le16(payload[:2])
             self.ram[address:address + len(payload) - 2] = payload[2:]
@@ -631,6 +673,93 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertTrue(self.msx._v3.quarantine_on_timeout)
         self.assertFalse(self.msx._v3.write_quarantined)
 
+    def test_resident_reboot_uses_one_empty_terminal_request(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, frame_wake_ack_feature=True,
+            timi_poll_safe_feature=True)
+        self.msx.info()
+        self.agent.state = 1
+
+        self.assertEqual(self.msx.reboot(), "accepted")
+
+        requests = [request for request in self.agent.requests
+                    if request.opcode == ord("R")]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].payload, b"")
+        self.assertEqual(self.agent.reboot_requests, 1)
+        self.assertFalse(self.msx.write_quarantined)
+
+    def test_resident_reboot_invalid_opcode_is_safe_and_recoverable(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, reboot_supported=False,
+            frame_wake_ack_feature=True, timi_poll_safe_feature=True)
+        self.msx.info()
+        self.agent.state = 1
+
+        with self.assertRaisesRegex(
+                RealMSXUnsupportedError, "does not implement"):
+            self.msx.reboot()
+
+        self.assertFalse(self.msx.write_quarantined)
+        self.assertEqual(self.msx.status()["state"], "running")
+
+    def test_resident_reboot_timeout_is_not_retried_and_quarantines(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, drop_once=(ord("R"),),
+            frame_wake_ack_feature=True, timi_poll_safe_feature=True)
+        self.msx.info()
+        self.agent.state = 1
+        self.msx._v3.timeout = 0.03
+
+        with self.assertRaisesRegex(
+                RealMSXProtocolError, "reboot request failed"):
+            self.msx.reboot()
+
+        requests = [request for request in self.agent.requests
+                    if request.opcode == ord("R")]
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(self.msx.write_quarantined)
+
+    def test_resident_reboot_unexpected_success_payload_quarantines(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, reboot_payload=b"unexpected",
+            frame_wake_ack_feature=True, timi_poll_safe_feature=True)
+        self.msx.info()
+        self.agent.state = 1
+
+        with self.assertRaisesRegex(
+                RealMSXProtocolError, "invalid agent reboot response"):
+            self.msx.reboot()
+
+        self.assertEqual(self.agent.reboot_requests, 1)
+        self.assertTrue(self.msx.write_quarantined)
+        with self.assertRaisesRegex(
+                RealMSXProtocolError, "write-quarantined"):
+            self.msx.reboot()
+        self.assertEqual(self.agent.reboot_requests, 1)
+
+    def test_reboot_rejects_foreground_before_wire_io(self):
+        before = len(self.agent.requests)
+        with self.assertRaisesRegex(RealMSXError, "resident mode"):
+            self.msx.reboot()
+        self.assertEqual(len(self.agent.requests), before)
+
     def test_timi_poll_safe_requires_resident_mode_and_wake_ack(self):
         for runtime_mode, wake_ack, message in (
                 (1, True, "outside resident mode"),
@@ -686,6 +815,23 @@ class RealMSXV3Test(unittest.TestCase):
         self.msx.info()
         self.assertEqual(
             self.agent.debug_peer_labels, [b"203.0.113.7:49152"])
+
+    def test_debug_client_uses_host_endpoint_when_host_connects_to_msx(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        stream = _EndpointStream(
+            client, local_endpoint=("192.0.2.20", 40000))
+        self.msx = RealMSX(socket_timeout=0.2).attach_stream(
+            stream, peer=("198.51.100.7", 6603),
+            network_transport="tcp", network_role="connect")
+        self.agent = FakeV3Resident(
+            resident, debug=True, debug_peer_feature=True)
+
+        self.msx.info()
+
+        self.assertEqual(
+            self.agent.debug_peer_labels, [b"192.0.2.20:40000"])
 
     def test_ipv6_peer_is_not_announced_to_debug(self):
         self.msx.close()
@@ -824,6 +970,50 @@ class RealMSXV3Test(unittest.TestCase):
                 self.msx.type("AB", timeout=10.0)
 
         cancel.assert_called_once_with(timeout=0.5)
+
+    def test_terminal_line_returns_after_atomic_keybuf_ack_without_drain(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, consume_keybuf=False,
+            frame_wake_ack_feature=True, timi_poll_safe_feature=True)
+        self.msx.info()
+        self.agent.state = 1
+        line = "DEFUSR0=0:A=USR0(0)"
+
+        self.assertEqual(
+            self.msx.enqueue_terminal_line(line), len(line) + 1)
+
+        requests = [request for request in self.agent.requests
+                    if request.opcode == ord("t") and request.payload]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].payload, line.encode("ascii") + b"\r")
+        self.assertEqual(bytes(self.agent.keybuf), requests[0].payload)
+
+    def test_terminal_line_quarantines_if_physical_input_wins_empty_queue_race(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, runtime_mode=0, consume_keybuf=False,
+            frame_wake_ack_feature=True, timi_poll_safe_feature=True)
+        self.msx.info()
+        self.agent.state = 1
+        self.agent.keybuf[:] = b"X"
+
+        with (mock.patch.object(self.msx, "wait_keybuf_empty"),
+              self.assertRaisesRegex(
+                  RealMSXProtocolError, "publication is indeterminate")):
+            self.msx.enqueue_terminal_line("DEFUSR0=0:A=USR0(0)")
+
+        self.assertTrue(self.msx.write_quarantined)
+        requests = [request for request in self.agent.requests
+                    if request.opcode == ord("t") and request.payload]
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(bytes(self.agent.keybuf).startswith(b"X"))
 
     def test_legacy_protocol_u_host_api_is_absent(self):
         self.assertFalse(hasattr(self.msx, "file_upload_write"))

@@ -216,6 +216,59 @@ class ResidentAgentSourceTests(unittest.TestCase):
         for forbidden in ("call bdos_proxy", "call CHGET", "call CHPUT"):
             self.assertNotIn(forbidden, spool)
 
+    def test_native_reboot_acks_drains_and_maps_main_rom_before_startup(self):
+        dispatch = self.source.split("frame_dispatch:", 1)[1].split(
+            "frame_require_length:", 1)[0]
+        self.assertRegex(dispatch, r"(?s)cp 'R'.*jp z,frame_cmd_reboot")
+
+        reboot = self.source.split("frame_cmd_reboot:", 1)[1].split(
+            "frame_reply_ok_prepare:", 1)[0]
+        self.assertRegex(
+            reboot,
+            r"(?s)ld de,0.*call frame_require_length.*"
+            r"cp RUNTIME_RESIDENT.*ld a,\(in_hook\).*"
+            r"ld a,\(run_state\).*cp 1")
+        ordered = (
+            "ld (post_action_pending),a",
+            "call frame_reply_ok_prepare",
+            "call frame_cache_and_send",
+            "call transport_terminal_drain",
+            "ld a,(EXPTBL)",
+            "call ENASLT",
+            "jp 0000h",
+        )
+        positions = [reboot.index(item) for item in ordered]
+        self.assertEqual(positions, sorted(positions))
+        self.assertRegex(
+            reboot,
+            r"(?s)call transport_terminal_drain\s*;.*?\s*xor a.*"
+            r"ld \(post_action_pending\),a")
+        for forbidden in (
+                "call transport_restore", "call bdos_proxy", "BASIC",
+                "call keybuf_spool"):
+            self.assertNotIn(forbidden, reboot)
+
+        transport = self.source.split("transport_terminal_drain:", 1)[1].split(
+            "; Foreground teardown", 1)[0]
+        self.assertIn("uart8251_terminal_drain", transport)
+        self.assertIn("uart16c550_terminal_drain", transport)
+        uart8251 = GENERIC_TRANSPORT.read_text(encoding="utf-8")
+        uart16c550 = UART16C550_TRANSPORT.read_text(encoding="utf-8")
+        self.assertRegex(
+            uart8251,
+            r"(?s)uart8251_terminal_drain:.*HOOK_IO_BUDGET.*and 04h")
+        self.assertRegex(
+            uart16c550,
+            r"(?s)uart16c550_terminal_drain:.*HOOK_IO_BUDGET.*and 040h")
+
+        timeout = self.source.split("hook_transport_timeout:", 1)[1].split(
+            "if MSXAI_TSR_BUILD", 1)[0]
+        self.assertRegex(
+            timeout,
+            r"(?s)ld a,\(post_action_pending\).*"
+            r"ld \(post_action_pending\),a.*"
+            r"ld \(last_response_valid\),a")
+
     def test_protocol_x_is_the_only_resident_file_transfer_path(self):
         self.assertNotIn("FEATURE_FILE_UPLOAD", self.source)
         features = self.source.split(
@@ -785,6 +838,16 @@ class ResidentAgentSourceTests(unittest.TestCase):
 
         listener = source.split("unapi_open_listener:", 1)[1].split(
             "unapi_abort_current:", 1)[0]
+        self.assertIn("UNAPI_TCP_GET_IPINFO:         equ 2", source)
+        self.assertLess(
+            listener.index("ld a,UNAPI_TCP_GET_IPINFO"),
+            listener.index("ld a,UNAPI_TCP_OPEN"),
+        )
+        self.assertRegex(
+            listener,
+            r"(?s)ld b,1.*ld a,UNAPI_TCP_GET_IPINFO.*"
+            r"call unapi_call.*ld \(unapi_local_ip\),hl.*"
+            r"ld \(unapi_local_ip \+ 2\),de")
         self.assertIn("ld de,13", listener)
         self.assertIn("ld de,(unapi_listen_port)", listener)
         self.assertIn("ld (hl),003h", listener)
@@ -1047,10 +1110,11 @@ class ResidentAgentSourceTests(unittest.TestCase):
 
         for declaration in (
                 "TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah",
-                "TSR_UNAPI_REQUEST_VERSION: equ 2",
-                "TSR_UNAPI_REQUEST_SIZE: equ 16",
+                "TSR_UNAPI_REQUEST_VERSION: equ 3",
+                "TSR_UNAPI_REQUEST_SIZE: equ 20",
                 "TSR_UNAPI_REQUEST_TARGET: equ 14",
                 "TSR_UNAPI_REQUEST_16C550_DIVISOR: equ 15",
+                "TSR_UNAPI_REQUEST_LOCAL_IP: equ 16",
                 "TSR_UNAPI_STACK_MINIMUM: equ 0400h",
                 "TSR_UNAPI_STACK_GUARD_SIZE: equ 16"):
             self.assertIn(declaration, self.source)
@@ -1106,6 +1170,22 @@ class ResidentAgentSourceTests(unittest.TestCase):
             safe,
             r"(?s)ld a,\(tsr_config_requested_transport\)\s+ld b,a\s+"
             r"ld a,\(tsr_unapi_result\)\s+cp b")
+        write_result = safe.split(
+            "tsr_talk_unapi_write_result:", 1)[1].split(
+                "tsr_talk_unapi_port_inner:", 1)[0]
+        self.assertRegex(
+            write_result,
+            r"(?s)ld a,b\s+ld \(hl\),a\s+inc hl\s+ex de,hl\s+"
+            r"ld hl,unapi_local_ip\s+ld bc,4\s+ldir")
+
+        self.assertIn('db "MCP listening at: $"', self.source)
+        monitor_ready = self.source.split(
+            "install_monitor_ready:", 1)[1].split(
+                "install_enter_monitor:", 1)[0]
+        self.assertRegex(
+            monitor_ready,
+            r"(?s)cp UNAPI_ID.*ld hl,unapi_local_ip.*"
+            r"ld bc,\(unapi_listen_port\).*call mcp_endpoint_print")
 
         inner = safe.split("tsr_talk_unapi_port_inner:", 1)[1]
         self.assertRegex(

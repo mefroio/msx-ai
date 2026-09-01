@@ -264,6 +264,40 @@ class ExplicitBackendRoutingTest(unittest.TestCase):
             session.connect_agent("127.0.0.1")
         constructor.assert_not_called()
 
+    def test_agent_reboot_detaches_only_agent_and_degrades_hybrid_bench(self):
+        local = _Local("POST-REBOOT DIAGNOSTICS")
+        agent = _Agent()
+        agent.runtime_mode = "resident"
+        agent.write_quarantined = False
+        agent.reboot = mock.Mock(return_value="accepted")
+        agent.status = mock.Mock(
+            side_effect=AssertionError("terminal detach must not probe status"))
+        agent.close = mock.Mock()
+        session = msx_mcp_server.SESSION
+        session._local_msx = local
+        session._local_profile = "bench"
+        session._agent_msx = agent
+        session.bench_machine = local
+        session.bench_runtime = mock.Mock()
+        session.bench_id = "bench-reboot"
+        session.local_id = "bench-reboot:local"
+        session.agent_id = "bench-reboot:agent"
+
+        result = msx_mcp_server.TOOLS["msx_agent_reboot"][0]()
+
+        self.assertTrue(result["acknowledged"])
+        agent.reboot.assert_called_once_with()
+        agent.status.assert_not_called()
+        agent.close.assert_called_once_with(recover_snapshot=False)
+        self.assertIsNone(session.backend("agent")[0])
+        self.assertIs(session.backend("local")[0], local)
+        self.assertEqual(msx_mcp_server.t_tcp_bench_status()["state"],
+                         "degraded")
+        self.assertEqual(
+            msx_mcp_server.TOOLS["msx_local_screen"][0](),
+            "POST-REBOOT DIAGNOSTICS")
+        self.assertFalse(local.closed)
+
     def test_target_inventory_never_probes_a_stalled_agent(self):
         local = _Local()
         agent = _Agent()

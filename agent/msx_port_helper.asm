@@ -32,8 +32,8 @@ MSXAI_TALK_UNAPI_PORT:     equ 0A7h
 MSXAI_TALK_TRACE:          equ 0A8h
 MSXAI_TRANSPORT_UNAPI:     equ 2
 MSXAI_UNAPI_REQUEST_MAGIC: equ 0A75Ah
-MSXAI_UNAPI_REQUEST_VERSION: equ 2
-MSXAI_UNAPI_REQUEST_SIZE:  equ 16
+MSXAI_UNAPI_REQUEST_VERSION: equ 3
+MSXAI_UNAPI_REQUEST_SIZE:  equ 20
 MSXAI_UNAPI_STACK_SIZE:    equ 0400h
 MSXAI_UNAPI_GUARD_SIZE:    equ 16
 MSXAI_UNAPI_STACK_HEADROOM: equ 0100h
@@ -103,8 +103,10 @@ port_helper_trace_ready:
     jr nz,port_helper_reconfigure_error_ei
     ei
 
-    ld de,message_success
-    call print_message
+    ld de,mcp_listening_prefix
+    ld hl,unapi_request_local_ip
+    ld bc,(port_value)
+    call mcp_endpoint_print
     xor a
     jp terminate_with_code
 
@@ -581,6 +583,8 @@ unapi_request_target:
     db MSXAI_TRANSPORT_UNAPI
 unapi_request_16c550_divisor:
     db 0
+unapi_request_local_ip:
+    ds 4,0
 
 trace_request:
     dw MSXAI_TRACE_REQUEST_MAGIC
@@ -612,8 +616,8 @@ trace_requested:
 exit_code:
     db 0
 
-message_success:
-    db 13,10,"MSXAI TCP port configured.",13,10,"$"
+mcp_listening_prefix:
+    db 13,10,"MCP listening at: $"
 message_usage:
     db 13,10,"MP: usage: MP <1..65534>",13,10,"$"
 message_bad_version:
@@ -624,5 +628,7 @@ message_trace_error:
     db 13,10,"MP: MSXAI resident trace enable failed.",13,10,"$"
 message_reconfigure_error:
     db 13,10,"MP: MSXAI UNAPI relisten failed.",13,10,"$"
+
+include 'agent/msx_endpoint_print.inc'
 
 port_helper_end:

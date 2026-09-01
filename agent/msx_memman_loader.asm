@@ -67,7 +67,7 @@ DOS_PATH_SEPARATOR:      equ 05Ch
 MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
-MP_FILE_SIZE:            equ 00426h ; 1062-byte guarded-stack trace/port helper
+MP_FILE_SIZE:            equ 004DAh ; 1242-byte guarded-stack endpoint helper
 TU_FILE_SIZE:            equ 0040Bh ; 1035-byte pre-TL UNAPI helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
@@ -1071,6 +1071,8 @@ memman_unapi_request_target:
     db DRIVER_UNAPI
 memman_unapi_request_16c550_divisor:
     db 0
+memman_unapi_request_local_ip:
+    ds 4,0
 
 memman_unapi_request_stack_limit:
     dw 0

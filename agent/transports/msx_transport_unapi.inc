@@ -45,6 +45,7 @@ UNAPI_MODE_ROM:               equ 2       ; page-1 ROM/non-mapped RAM via CALSLT
 UNAPI_MODE_MAPPED:            equ 3       ; page-1 mapped RAM via RAM helper
 
 UNAPI_TCP_GET_CAPAB:          equ 1
+UNAPI_TCP_GET_IPINFO:         equ 2
 UNAPI_TCP_OPEN:               equ 13
 UNAPI_TCP_ABORT:              equ 15
 UNAPI_TCP_STATE:              equ 16
@@ -418,6 +419,16 @@ if MSXAI_TSR_BUILD
     ld a,TRACE_EVENT_OPEN_BEGIN
     call trace_record
 endif
+    ; Refresh the interface address for every listener epoch. Querying before
+    ; TCP_OPEN means a failing implementation cannot leave an orphan handle.
+    ld b,1                          ; local IP address
+    ld a,UNAPI_TCP_GET_IPINFO
+    call unapi_call
+    ld (unapi_last_error),a
+    or a
+    jr nz,unapi_open_listener_ip_failed
+    ld (unapi_local_ip),hl
+    ld (unapi_local_ip + 2),de
     ld (unapi_saved_sp),sp
     ld hl,0
     add hl,sp
@@ -482,6 +493,13 @@ if MSXAI_TSR_BUILD
     call trace_record
 endif
     xor a
+    ret
+unapi_open_listener_ip_failed:
+if MSXAI_TSR_BUILD
+    ld a,TRACE_EVENT_OPEN_END
+    call trace_record
+endif
+    ld a,(unapi_last_error)
     ret
 
 unapi_abort_current:
@@ -1087,6 +1105,8 @@ unapi_io_count:
     dw 0
 unapi_pending_rx:
     dw 0
+unapi_local_ip:
+    ds 4,0
 unapi_runtime_end:
 
 if MSXAI_TSR_BUILD

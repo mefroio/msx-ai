@@ -28,7 +28,7 @@ server does not publish ambiguous compatibility aliases.
 | Direct I/O-port access | Use expert openMSX console facilities | Agent | Agent |
 | Call, run, stop injected code | Loader and emulator facilities | Monitor | Monitor |
 | Slot or mapper selection | Use expert openMSX console facilities | Monitor | Monitor |
-| Reset and raw openMSX commands | Yes | No | No |
+| Reset/reboot and raw openMSX commands | Yes | Resident warm reboot only | Resident warm reboot only |
 
 ## Resident agent
 
@@ -49,6 +49,17 @@ range, always verifies it by reading it back, and submits a nonzero entry throug
 `DEFUSR`/`USR`. The complete payload must be in CPU pages 2/3
 (`0x8000-0xFFFF`): page 0 is Main-ROM in BASIC and page 1 is not an available
 resident/BASIC payload area. No relocation is attempted.
+
+`msx_agent_reboot` is a terminal resident operation. A current agent sends and
+transport-flushes the response to framed-v3 opcode `R`, committing the reboot,
+then makes a bounded best-effort UART drain attempt before mapping Main-ROM page
+0 and entering `0000h`. Drain timeout does not cancel the reboot; truncated
+final bytes leave host delivery indeterminate, so the host never retries. An
+older compatible framed resident instead requires a recognized DOS or BASIC
+prompt and uses `DEFUSR0=0:A=USR0(0)` in BASIC; no binary is uploaded. Success
+confirms submission, not completed boot, and detaches only the agent channel.
+This is a warm reboot that can interrupt disk I/O, not a power cycle. Restore
+the resident after DOS starts and reconnect or listen again.
 
 ## Foreground monitor
 

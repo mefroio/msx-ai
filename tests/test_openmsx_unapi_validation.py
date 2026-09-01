@@ -574,6 +574,28 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
                 prompt=True,
             )
 
+    def test_screen_check_requires_matching_mcp_listening_endpoint(self):
+        screen = "MCP listening at: 192.168.0.62:43123\nA:\\>"
+        self.assertEqual(
+            harness._assert_mcp_listening_screen(screen, 43123),
+            "192.168.0.62",
+        )
+        with self.assertRaisesRegex(
+                harness.ValidationError, "expected 43123"):
+            harness._assert_mcp_listening_screen(
+                "MCP listening at: 192.168.0.62:6603\nA:\\>",
+                43123,
+            )
+        with self.assertRaisesRegex(
+                harness.ValidationError, "invalid IPv4"):
+            harness._assert_mcp_listening_screen(
+                "MCP listening at: 300.168.0.62:43123\nA:\\>",
+                43123,
+            )
+        with self.assertRaisesRegex(
+                harness.ValidationError, "did not display"):
+            harness._assert_mcp_listening_screen("A:\\>", 43123)
+
     def _fake_inputs(self, root: pathlib.Path):
         archive = root / "openmsx-macos-arm64.zip"
         xml = b"<msxconfig><devices><UnapiNet/></devices></msxconfig>\n"

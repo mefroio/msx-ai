@@ -302,12 +302,14 @@ class ResidentTraceSourceTests(unittest.TestCase):
             'trace_event_auto_relisten:   db "AUTO_RELISTEN",0',
             event_names)
 
-    def test_a7_v2_divisor_and_a8_enable_precede_reconfiguration(self):
+    def test_a7_v3_endpoint_and_a8_enable_precede_reconfiguration(self):
         self.assertEqual(
-            _equ_literal(self.source, "TSR_UNAPI_REQUEST_VERSION"), 2)
+            _equ_literal(self.source, "TSR_UNAPI_REQUEST_VERSION"), 3)
         self.assertEqual(
             _equ_literal(
                 self.source, "TSR_UNAPI_REQUEST_16C550_DIVISOR"), 15)
+        self.assertEqual(
+            _equ_literal(self.source, "TSR_UNAPI_REQUEST_LOCAL_IP"), 16)
         self.assertEqual(_equ_literal(self.source, "TSR_TALK_TRACE"), 0xA8)
         for source, divisor in (
                 (self.loader, "memman_unapi_request_16c550_divisor"),

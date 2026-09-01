@@ -118,13 +118,14 @@ the loader first invokes transient `TU.COM` after the warm boot and before
 a no-op for the UNAPINET fixture. UART installs bypass `TU.COM` and invoke
 `TL.COM` directly. The loader also
 encodes the selected value as the private fixed-width `MP/HHHH` command;
-`MP.COM` runs after `TL.COM` and applies it through a versioned 16-byte MemMan
-request with `A=A7h`, `HL=request`. A7 v2 is the general safe-lifecycle ABI for
+`MP.COM` runs after `TL.COM` and applies it through a versioned 20-byte MemMan
+request with `A=A7h`, `HL=request`. A7 v3 is the general safe-lifecycle ABI for
 target transport `0=8251`, `1=16C550`, or `2=UNAPI`; `MP.COM` writes target `2` at
-offset 14 and divisor zero at offset 15. A7 v2 uses byte 15 as the requested
+offset 14 and divisor zero at offset 15. A7 v3 uses byte 15 as the requested
 16C550 divisor (`1=115200`, `2=57600`), which must remain zero for 8251 or
 UNAPI; the same byte returns the active divisor, or zero when 16C550 is not
-active. The request also
+active. Bytes 16 through 19 return the local IPv4 address obtained through
+`TCPIP_GET_IPINFO`. The request also
 identifies the port and a caller-owned 1 KiB page-2 stack surrounded by
 16-byte low/high guards. Its complete guarded span fits below `C000h`, the TPA
 top, and the current SP minus 256 bytes of caller headroom. Caller and resident
@@ -137,7 +138,7 @@ the default 6603; users never invoke the hexadecimal form directly.
 The suite's UART default is 57600 baud. `/57600` and `/115200` are mutually
 exclusive and accepted only with `/DRIVER:16C550`; a fresh resident install
 selects `MCP16550.TSR` or `MCP115K.TSR`, respectively. Existing-resident
-changes carry the divisor through A7 v2.
+changes carry the divisor through A7 v3.
 
 The host side is exercised exclusively through the project's public MCP
 server over STDIO. The harness calls `msx_agent_connect`,

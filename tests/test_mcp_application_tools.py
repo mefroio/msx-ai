@@ -26,6 +26,11 @@ class FakeRealMSX:
         self.screen = "MSX-DOS 2\nA:\\>"
         self.runtime_mode = "foreground-monitor"
         self.screen_reads = 0
+        self.terminal_lines = []
+        self.closed = 0
+        self.native_reboot = False
+        self.reboot_calls = 0
+        self.write_quarantined = False
 
     def stop(self):
         self.stops += 1
@@ -78,6 +83,21 @@ class FakeRealMSX:
         lines = tuple(lines)
         self.typed.append(("lines", lines))
         return sum(len(line.encode("ascii")) + 1 for line in lines)
+
+    def enqueue_terminal_line(self, text):
+        self.terminal_lines.append(text)
+        return len(text.encode("ascii")) + 1
+
+    def close(self, *, recover_snapshot=True):
+        self.calls.append(("close", recover_snapshot))
+        self.closed += 1
+
+    def reboot(self):
+        self.reboot_calls += 1
+        if not self.native_reboot:
+            raise msx_mcp_server.RealMSXUnsupportedError(
+                "native reboot unavailable")
+        return "accepted"
 
     def put_file(self, source, target, **options):
         source = Path(source)
@@ -215,6 +235,128 @@ class MCPApplicationToolsTest(unittest.TestCase):
         self.assertEqual(result["target_transition"], "already-basic")
         self.assertEqual(result["execution_submission"], "none")
         self.assertTrue(result["segments"][0]["verified"])
+
+    def test_agent_reboot_enters_basic_acknowledges_and_detaches(self):
+        self.backend.runtime_mode = "resident"
+
+        result = msx_mcp_server.t_agent_reboot()
+
+        self.assertEqual(self.backend.typed, [("line", "BASIC")])
+        self.assertEqual(
+            self.backend.terminal_lines,
+            ["DEFUSR0=0:A=USR0(0)"],
+        )
+        self.assertEqual(self.backend.closed, 1)
+        self.assertIn(("close", False), self.backend.calls)
+        self.assertIsNone(msx_mcp_server.SESSION.backend("agent")[0])
+        self.assertEqual(result, {
+            "backend": "agent",
+            "operation": "reboot",
+            "state": "submitted",
+            "runtime_mode": "resident",
+            "target_transition": "dos-to-basic",
+            "execution_submission": "basic-usr-zero",
+            "reboot_vector": 0,
+            "binary_uploaded": False,
+            "bytes_consumed": 20,
+            "fallback_used": True,
+            "screen_probe_performed": True,
+            "acknowledged": True,
+            "reboot_submitted": True,
+            "agent_disconnected": True,
+            "completion_confirmed": False,
+        })
+
+    def test_agent_reboot_prefers_native_opcode_without_screen_probe(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.native_reboot = True
+        self.backend.screen = "GAME RUNNING"
+
+        result = msx_mcp_server.t_agent_reboot()
+
+        self.assertEqual(self.backend.reboot_calls, 1)
+        self.assertEqual(self.backend.screen_reads, 0)
+        self.assertEqual(self.backend.typed, [])
+        self.assertEqual(self.backend.terminal_lines, [])
+        self.assertEqual(result["target_transition"], "not-required")
+        self.assertEqual(result["execution_submission"], "resident-opcode-v3")
+        self.assertEqual(result["bytes_consumed"], 0)
+        self.assertFalse(result["fallback_used"])
+        self.assertFalse(result["screen_probe_performed"])
+        self.assertTrue(result["acknowledged"])
+        self.assertEqual(self.backend.closed, 1)
+        self.assertIn(("close", False), self.backend.calls)
+
+    def test_agent_reboot_accepts_existing_basic_without_binary_upload(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.screen = "Microsoft MSX BASIC version 2.1\nOk"
+
+        result = msx_mcp_server.t_agent_reboot()
+
+        self.assertEqual(result["target_transition"], "already-basic")
+        self.assertFalse(result["binary_uploaded"])
+        self.assertEqual(self.backend.typed, [])
+        self.assertEqual(self.backend.transfers, [])
+        self.assertEqual(
+            self.backend.terminal_lines,
+            ["DEFUSR0=0:A=USR0(0)"],
+        )
+
+    def test_agent_reboot_rejects_foreground_or_unknown_screen_before_submit(self):
+        with self.assertRaisesRegex(Exception, "resident agent"):
+            msx_mcp_server.t_agent_reboot()
+        self.assertEqual(self.backend.screen_reads, 0)
+        self.assertEqual(self.backend.terminal_lines, [])
+        self.assertEqual(self.backend.closed, 0)
+
+        self.backend.runtime_mode = "resident"
+        self.backend.screen = "GAME RUNNING"
+        with self.assertRaisesRegex(Exception, "DOS prompt or MSX BASIC"):
+            msx_mcp_server.t_agent_reboot()
+        self.assertEqual(self.backend.terminal_lines, [])
+        self.assertEqual(self.backend.closed, 0)
+
+    def test_agent_reboot_does_not_detach_without_terminal_ack(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.screen = "Microsoft MSX BASIC\nOk"
+        with mock.patch.object(
+                self.backend, "enqueue_terminal_line",
+                side_effect=RuntimeError("link failed before ACK")):
+            with self.assertRaisesRegex(Exception, "before ACK"):
+                msx_mcp_server.t_agent_reboot()
+
+        self.assertIs(msx_mcp_server.SESSION.backend("agent")[0], self.backend)
+        self.assertEqual(self.backend.closed, 0)
+
+    def test_agent_reboot_detaches_a_quarantined_fallback_failure(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.screen = "Microsoft MSX BASIC\nOk"
+        self.backend.write_quarantined = True
+        with mock.patch.object(
+                self.backend, "enqueue_terminal_line",
+                side_effect=msx_mcp_server.RealMSXProtocolError(
+                    "indeterminate terminal ACK")):
+            with self.assertRaisesRegex(Exception, "indeterminate"):
+                msx_mcp_server.t_agent_reboot()
+
+        self.assertIsNone(msx_mcp_server.SESSION.backend("agent")[0])
+        self.assertEqual(self.backend.closed, 1)
+        self.assertIn(("close", False), self.backend.calls)
+
+    def test_agent_reboot_detaches_a_quarantined_native_failure(self):
+        self.backend.runtime_mode = "resident"
+        self.backend.write_quarantined = True
+        with mock.patch.object(
+                self.backend, "reboot",
+                side_effect=msx_mcp_server.RealMSXProtocolError(
+                    "indeterminate native ACK")):
+            with self.assertRaisesRegex(Exception, "indeterminate"):
+                msx_mcp_server.t_agent_reboot()
+
+        self.assertIsNone(msx_mcp_server.SESSION.backend("agent")[0])
+        self.assertEqual(self.backend.screen_reads, 0)
+        self.assertEqual(self.backend.closed, 1)
+        self.assertIn(("close", False), self.backend.calls)
 
     def test_agent_bload_basic_call_waits_for_returned_prompt(self):
         self.backend.runtime_mode = "resident"
@@ -696,6 +838,7 @@ class MCPApplicationToolsTest(unittest.TestCase):
                      "msx_agent_io_write", "msx_agent_slot_select",
                      "msx_agent_mapper_select",
                      "msx_agent_listen", "msx_agent_connect",
+                     "msx_agent_reboot",
                      "msx_agent_type_lines", "msx_agent_run_basic_file",
                      "msx_agent_file_put", "msx_agent_file_get"):
             self.assertIn(name, msx_mcp_server.TOOLS)

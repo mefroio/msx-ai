@@ -29,7 +29,12 @@ import threading
 import time
 
 if __package__:
-    from .msx_v3 import V3Session, V3SessionError
+    from .msx_v3 import (
+        RemoteInvalidOpcodeError,
+        V3Session,
+        V3SessionError,
+        V3TransportError,
+    )
     from .msx_cpu import (
         CPU_CONTEXT_VERSION,
         CPUSnapshotError,
@@ -77,7 +82,12 @@ if __package__:
     )
     from .paths import source_root, transfer_state_directory, user_root
 else:  # pragma: no cover - repository-style top-level import
-    from msx_v3 import V3Session, V3SessionError
+    from msx_v3 import (
+        RemoteInvalidOpcodeError,
+        V3Session,
+        V3SessionError,
+        V3TransportError,
+    )
     from msx_cpu import (
         CPU_CONTEXT_VERSION,
         CPUSnapshotError,
@@ -237,6 +247,12 @@ class RealMSXError(RuntimeError):
 
 
 class RealMSXProtocolError(RealMSXError):
+    pass
+
+
+class RealMSXUnsupportedError(RealMSXProtocolError):
+    """The peer safely rejected an operation it does not implement."""
+
     pass
 
 
@@ -1017,19 +1033,24 @@ class RealMSX:
         }
 
     def _send_debug_peer_label(self):
-        """Announce host-known peer metadata to foreground DEBUG exactly once."""
+        """Announce the host-side TCP endpoint to foreground DEBUG once."""
+        endpoint = (
+            self.local_endpoint
+            if self.network_role == "connect" and self.local_endpoint is not None
+            else self.peer
+        )
         if (self._debug_peer_sent or self._v3 is None or not self.debug or
                 not self.feature_bits & FEATURE_DEBUG_PEER or
-                self.peer is None):
+                endpoint is None):
             return
-        if isinstance(self.peer, (tuple, list)):
-            peer_host = str(self.peer[0])
-            if len(self.peer) >= 2:
-                peer_label = f"{peer_host}:{self.peer[1]}"
+        if isinstance(endpoint, (tuple, list)):
+            peer_host = str(endpoint[0])
+            if len(endpoint) >= 2:
+                peer_label = f"{peer_host}:{endpoint[1]}"
             else:
                 peer_label = peer_host
         else:
-            peer_host = str(self.peer)
+            peer_host = str(endpoint)
             peer_label = peer_host
         try:
             ipaddress.IPv4Address(peer_host)
@@ -1387,6 +1408,54 @@ class RealMSX:
                 self._send(b"k")
                 self._expect_ack()
         return "monitor"
+
+    def reboot(self):
+        """Ask a resident v3 peer to ACK and then warm-reset the MSX.
+
+        The request is deliberately never retried: losing its response makes
+        delivery indeterminate, while a successful empty response is the
+        agent's acceptance boundary rather than evidence that boot completed.
+        """
+        if self.runtime_mode != "resident":
+            raise RealMSXError("agent reboot requires resident mode")
+        if self._v3 is None:
+            raise RealMSXUnsupportedError(
+                "agent reboot requires the framed-v3 resident; update MSXAI")
+        if self.write_quarantined:
+            raise RealMSXProtocolError(
+                "cannot reboot through a write-quarantined attachment; close "
+                "it and attach a fresh stream")
+        try:
+            with self._lock:
+                reply = self._v3.request(ord("R"), b"", retries=0)
+        except RemoteInvalidOpcodeError as exc:
+            raise RealMSXUnsupportedError(
+                "the connected resident does not implement native reboot; "
+                "update the MSXAI agent") from exc
+        except V3SessionError as exc:
+            if isinstance(exc, V3TransportError):
+                self._quarantine_attachment_writes(
+                    "agent reboot transport failed after terminal submission")
+            raise RealMSXProtocolError(
+                f"framed agent reboot request failed: {exc}") from exc
+        except BaseException:
+            # Cancellation or an unexpected local failure can interrupt the
+            # caller after the terminal frame was sent.  With no correlated
+            # rejection it is unsafe to reuse the byte stream or try again.
+            self._quarantine_attachment_writes(
+                "agent reboot was interrupted after terminal submission")
+            raise
+        if reply:
+            # A correlated success means the terminal action was accepted,
+            # even if a buggy/newer peer attached an unexpected payload.  Do
+            # not permit any follow-up write on a stream whose target may now
+            # be resetting.
+            self._quarantine_attachment_writes(
+                "agent reboot returned an unexpected payload after terminal "
+                "acceptance")
+            raise RealMSXProtocolError(
+                f"invalid agent reboot response payload: {reply!r}")
+        return "accepted"
 
     # ---- BIOS keyboard ring ---------------------------------------
     @staticmethod
@@ -2928,6 +2997,62 @@ class RealMSX:
             raise TypeError("text must be a string")
         return self.type(text + "\r", timeout=timeout)
 
+    def enqueue_terminal_line(self, text, timeout=KEYBUF_INPUT_TIMEOUT):
+        """Publish one final resident line and return after its wire ACK.
+
+        This deliberately does not wait for the BIOS keyboard ring to drain.
+        It is reserved for commands such as a warm reboot whose successful
+        execution destroys the agent session before the ordinary ``type``
+        completion poll can reply.  A framed ``t`` response proves that the
+        complete line was published atomically to KEYBUF while the resident
+        hook still had interrupts disabled, and its pending count proves that
+        no physical input won the preceding empty-queue race; callers must not
+        issue another protocol request after this method succeeds.
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        if "\r" in text or "\n" in text:
+            raise ValueError("terminal line must not contain Return or newline")
+        if self.runtime_mode != "resident":
+            raise RealMSXError(
+                "terminal keyboard submission requires resident mode")
+        if self._v3 is None or not self.feature_bits & FEATURE_KEYBUF_INPUT:
+            raise RealMSXError(
+                "terminal keyboard submission requires framed-v3 "
+                "keybuf-input support; update the resident agent")
+        payload = self._encode_keyboard_text(text) + b"\r"
+        if len(payload) > KEYBUF_CAPACITY:
+            raise RealMSXRangeError(
+                f"terminal line exceeds the {KEYBUF_CAPACITY}-byte BIOS "
+                "keyboard ring")
+
+        # Keep this as two acknowledged operations.  The first establishes an
+        # empty queue; the second publishes the complete terminal line in one
+        # idempotent framed request.  No drain/status probe follows the second
+        # ACK because the submitted command is expected to end the session.
+        self.wait_keybuf_empty(timeout=timeout)
+        try:
+            accepted, pending = self.keybuf_write(payload, timeout=timeout)
+        except BaseException:
+            # The final t frame may already have published a prefix or the
+            # complete command.  No protocol operation may follow an outcome
+            # that cannot prove exactly what BASIC will consume.
+            self._quarantine_attachment_writes(
+                "terminal keyboard publication outcome is indeterminate")
+            raise
+        if accepted != len(payload) or pending != len(payload):
+            # ``pending`` closes the physical-keyboard TOCTOU between the
+            # preceding empty-queue query and this atomic publication.  The
+            # resident constructs this reply with interrupts disabled, so the
+            # only valid postcondition is precisely our complete line.
+            self._quarantine_attachment_writes(
+                "terminal keyboard publication did not own an empty queue")
+            raise RealMSXProtocolError(
+                "terminal line publication is indeterminate: expected "
+                f"accepted={len(payload)}, pending={len(payload)}; got "
+                f"accepted={accepted}, pending={pending}")
+        return accepted
+
     def press(self, key):
         """Send one BIOS-visible special key through the real agent.
 
@@ -3267,8 +3392,14 @@ class RealMSX:
     def screen_text(self, timeout=None):
         return "\n".join(self.read_screen(timeout=timeout))
 
-    def close(self):
-        if self.conn is not None and self._snapshot_pause_owned:
+    def close(self, *, recover_snapshot=True):
+        """Close owned streams, optionally skipping target-side recovery.
+
+        Terminal operations such as reboot must pass ``recover_snapshot=False``
+        because the peer may already have destroyed the protocol session.
+        """
+        if (recover_snapshot and self.conn is not None and
+                self._snapshot_pause_owned):
             try:
                 with self._lock:
                     self._resume_snapshot_pause()

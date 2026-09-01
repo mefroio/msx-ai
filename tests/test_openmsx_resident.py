@@ -142,6 +142,39 @@ class OpenMSXResidentIntegrationTest(unittest.TestCase):
         self.assertIs(machine, msx_mcp_server.SESSION.require("local"))
         self.assertIsNot(machine, msx_mcp_server.SESSION.require("agent"))
 
+    def test_native_agent_reboot_preserves_local_boot_observer(self):
+        machine = self.start_bench(mode="resident")
+        local_before = json.loads(self.call_tool(
+            "msx_local_status")[0]["text"])
+
+        result = json.loads(self.call_tool(
+            "msx_agent_reboot")[0]["text"])
+
+        self.assertEqual(result["execution_submission"],
+                         "resident-opcode-v3")
+        self.assertTrue(result["acknowledged"])
+        self.assertTrue(result["agent_disconnected"])
+        self.assertFalse(result["completion_confirmed"])
+        self.assertIsNone(msx_mcp_server.SESSION.backend("agent")[0])
+        self.assertIs(msx_mcp_server.SESSION.backend("local")[0], machine)
+        self.assertEqual(
+            msx_mcp_server.t_tcp_bench_status()["state"], "degraded")
+
+        # The terminal agent channel cannot confirm boot, but the independent
+        # openMSX control channel in this opt-in bench can observe it without
+        # weakening the physical-agent contract.
+        machine.cmd("set throttle off")
+        screen = machine.screen_text()
+        for _ in range(20):
+            if msx_mcp_server._dos_prompt_visible(screen):
+                break
+            machine.advance(1.0)
+            screen = machine.screen_text()
+        self.assertTrue(msx_mcp_server._dos_prompt_visible(screen), screen)
+        local_after = json.loads(self.call_tool(
+            "msx_local_status")[0]["text"])
+        self.assertEqual(local_after["target_id"], local_before["target_id"])
+
     def test_direct_openmsx_cpu_snapshot_preserves_run_and_break_states(self):
         msx_mcp_server.SESSION.boot("basic", window=False)
         machine = msx_mcp_server.SESSION.require("local")

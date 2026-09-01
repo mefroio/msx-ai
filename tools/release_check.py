@@ -144,6 +144,7 @@ _SDIST_REQUIRED_FILES = {
     "agent/msx_agent_core.asm",
     "agent/msx_agent_trace.asm",
     "agent/msx_agent_tsr.asm",
+    "agent/msx_endpoint_print.inc",
     "agent/msx_memman_loader.asm",
     "agent/msx_port_helper.asm",
     "agent/msx_tu_helper.asm",
@@ -1140,7 +1141,7 @@ _RUNTIME_REQUIRED_TOOLS = frozenset({
     "msx_local_screenshot", "msx_local_memory_read", "msx_local_type_line",
     "msx_agent_listen", "msx_agent_connect", "msx_agent_status",
     "msx_agent_screen", "msx_agent_screenshot", "msx_agent_memory_read",
-    "msx_agent_type_line", "msx_agent_disconnect",
+    "msx_agent_type_line", "msx_agent_reboot", "msx_agent_disconnect",
     "msx_tcp_bench_start", "msx_tcp_bench_status",
     "msx_tcp_bench_shutdown",
 })

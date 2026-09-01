@@ -61,6 +61,7 @@ DESTRUCTIVE_TOOLS = frozenset({
     "msx_file_put",
     "msx_file_get",
     "msx_reset",
+    "msx_reboot",
     "msx_app_load",
     "msx_asm_load",
     "msx_dos_asm_run",
@@ -708,6 +709,65 @@ APP_LOAD_OUTPUT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+AGENT_REBOOT_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Resident warm-reboot submission acknowledged before its agent "
+        "connection is intentionally detached."
+    ),
+    "properties": {
+        "backend": {"const": "agent"},
+        "operation": {"const": "reboot"},
+        "state": {"const": "submitted"},
+        "runtime_mode": {"const": "resident"},
+        "target_transition": {
+            "enum": ["not-required", "dos-to-basic", "already-basic"],
+        },
+        "execution_submission": {
+            "enum": ["resident-opcode-v3", "basic-usr-zero"],
+        },
+        "reboot_vector": {"const": 0},
+        "binary_uploaded": {"const": False},
+        "bytes_consumed": {"type": "integer", "minimum": 0},
+        "fallback_used": {"type": "boolean"},
+        "screen_probe_performed": {"type": "boolean"},
+        "acknowledged": {"const": True},
+        "reboot_submitted": {"const": True},
+        "agent_disconnected": {"const": True},
+        "completion_confirmed": {"const": False},
+    },
+    "required": [
+        "backend", "operation", "state", "runtime_mode",
+        "target_transition", "execution_submission", "reboot_vector",
+        "binary_uploaded", "bytes_consumed", "fallback_used",
+        "screen_probe_performed", "acknowledged", "reboot_submitted",
+        "agent_disconnected", "completion_confirmed",
+    ],
+    "additionalProperties": False,
+    "oneOf": [
+        {
+            "properties": {
+                "target_transition": {"const": "not-required"},
+                "execution_submission": {"const": "resident-opcode-v3"},
+                "bytes_consumed": {"const": 0},
+                "fallback_used": {"const": False},
+                "screen_probe_performed": {"const": False},
+            },
+        },
+        {
+            "properties": {
+                "target_transition": {
+                    "enum": ["dos-to-basic", "already-basic"],
+                },
+                "execution_submission": {"const": "basic-usr-zero"},
+                "bytes_consumed": {"type": "integer", "minimum": 1},
+                "fallback_used": {"const": True},
+                "screen_probe_performed": {"const": True},
+            },
+        },
+    ],
+}
+
 INPUT_ACKNOWLEDGEMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": "Input accepted by the physical resident without a VRAM read.",
@@ -1020,6 +1080,7 @@ OBJECT_RESULT_TOOLS = frozenset({
     "msx_run_basic_file",
     "msx_file_put",
     "msx_file_get",
+    "msx_reboot",
 })
 
 
@@ -1138,6 +1199,8 @@ def output_schema_for(name: str) -> Mapping[str, Any]:
         return LOCAL_STATUS_OUTPUT_SCHEMA
     if public_name == "msx_agent_status":
         return AGENT_STATUS_OUTPUT_SCHEMA
+    if public_name == "msx_agent_reboot":
+        return AGENT_REBOOT_OUTPUT_SCHEMA
     if public_name == "msx_local_cpu_snapshot":
         return _backend_specific_schema(
             CPU_SNAPSHOT_OUTPUT_SCHEMA, "openmsx")

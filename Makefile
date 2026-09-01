@@ -10,6 +10,7 @@ AGENT_XFER_ENGINE := agent/msx_xfer_engine.inc
 AGENT_XFER_PROTOCOL := agent/msx_xfer_protocol.inc
 AGENT_VERSION_INCLUDE := agent/msx_version.inc
 AGENT_PORT_SRC := agent/msx_port_helper.asm
+AGENT_ENDPOINT_PRINT := agent/msx_endpoint_print.inc
 AGENT_TU_SRC := agent/msx_tu_helper.asm
 UNAPI_PROBE_SRC := agent/msx_unapi_probe.asm
 BADCAT_INIT_SRC := agent/msx_badcat_init.asm
@@ -124,7 +125,7 @@ agent-tsr: server/_version.py tools/build_version_include.py
 port-helper: $(AGENT_PORT_COM)
 	@test -s $(AGENT_PORT_COM)
 
-$(AGENT_PORT_COM): $(AGENT_PORT_SRC) tools/build_port_helper.py
+$(AGENT_PORT_COM): $(AGENT_PORT_SRC) $(AGENT_ENDPOINT_PRINT) tools/build_port_helper.py
 	"$(PYTHON)" tools/build_port_helper.py --assembler "$(Z80ASM)" \
 		--source $(AGENT_PORT_SRC) --output $(AGENT_PORT_COM)
 
@@ -158,7 +159,7 @@ $(AGENT_COM): AGENT_MAIN_SOURCE := $(AGENT_SRC)
 $(AGENT_TRACE_COM): AGENT_MAIN_SOURCE := $(AGENT_TRACE_SRC)
 $(AGENT_COM): $(AGENT_SRC)
 $(AGENT_TRACE_COM): $(AGENT_TRACE_SRC)
-$(AGENT_COM) $(AGENT_TRACE_COM): $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_XFER_PROTOCOL) $(AGENT_VERSION_INCLUDE) $(AGENT_TRANSPORTS)
+$(AGENT_COM) $(AGENT_TRACE_COM): $(AGENT_CORE) $(AGENT_LOADER) $(AGENT_ENDPOINT_PRINT) $(AGENT_XFER_PROTOCOL) $(AGENT_VERSION_INCLUDE) $(AGENT_TRANSPORTS)
 	mkdir -p $(dir $@)
 	$(Z80ASM) $(AGENT_MAIN_SOURCE) -o $@
 	"$(PYTHON)" tools/check_msx_com_size.py $@ $(MSX_DOS_BENCH_COM_MAX)
@@ -170,7 +171,7 @@ $(AGENT_XFER_COM) $(AGENT_TRACE_XFER_COM): $(AGENT_XFER_ENGINE) $(AGENT_XFER_PRO
 	$(Z80ASM) $(AGENT_XFER_SRC) -o $@
 	"$(PYTHON)" tools/check_msx_com_size.py $@ $(MSX_XFER_PAGE0_COM_MAX)
 
-$(AGENT_TRACE_PORT_COM): $(AGENT_PORT_SRC) tools/build_port_helper.py
+$(AGENT_TRACE_PORT_COM): $(AGENT_PORT_SRC) $(AGENT_ENDPOINT_PRINT) tools/build_port_helper.py
 	"$(PYTHON)" tools/build_port_helper.py --assembler "$(Z80ASM)" \
 		--source $(AGENT_PORT_SRC) --output $(AGENT_TRACE_PORT_COM)
 

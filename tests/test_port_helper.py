@@ -301,12 +301,12 @@ class PortHelperTest(unittest.TestCase):
         second = assemble_port_helper()
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.sha256, second.sha256)
-        self.assertEqual(len(first.data), 1062)
+        self.assertEqual(len(first.data), 1242)
         self.assertLess(first.labels["port_helper_end"], 0x4000)
 
         loader = (ROOT / "agent" / "msx_memman_loader.asm").read_text(
             encoding="utf-8")
-        self.assertIn("MP_FILE_SIZE:            equ 00426h", loader)
+        self.assertIn("MP_FILE_SIZE:            equ 004DAh", loader)
 
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "MP.COM"
@@ -342,6 +342,7 @@ class PortHelperTest(unittest.TestCase):
             "unapi_request_connection": 13,
             "unapi_request_target": 14,
             "unapi_request_16c550_divisor": 15,
+            "unapi_request_local_ip": 16,
         }
         for name, expected in expected_offsets.items():
             with self.subTest(field=name):
@@ -349,10 +350,11 @@ class PortHelperTest(unittest.TestCase):
                     image.labels[name] - image.labels["unapi_request"],
                     expected,
                 )
-        self.assertEqual(image.data[request + 2], 2)
-        self.assertEqual(image.data[request + 3], 16)
+        self.assertEqual(image.data[request + 2], 3)
+        self.assertEqual(image.data[request + 3], 20)
         self.assertEqual(image.data[request + 14], 2)
         self.assertEqual(image.data[request + 15], 0)
+        self.assertEqual(image.data[request + 16:request + 20], bytes(4))
 
         mutated = bytearray(image.data)
         mutated[request + 2] ^= 1
@@ -367,6 +369,11 @@ class PortHelperTest(unittest.TestCase):
         mutated = bytearray(image.data)
         mutated[request + 15] = 1
         with self.assertRaisesRegex(PortHelperBuildError, "divisor"):
+            validate_port_helper_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        mutated[request + 16] = 1
+        with self.assertRaisesRegex(PortHelperBuildError, "local-IP"):
             validate_port_helper_image(bytes(mutated), image.labels)
 
         shifted = dict(image.labels)
@@ -433,6 +440,8 @@ class PortHelperTest(unittest.TestCase):
         self.assertIn("ld a,(unapi_request_status)", entry)
         self.assertIn("ld a,(unapi_request_transport)", entry)
         self.assertIn("cp MSXAI_TRANSPORT_UNAPI", entry)
+        self.assertIn("ld hl,unapi_request_local_ip", entry)
+        self.assertIn("call mcp_endpoint_print", entry)
 
         discovery = source.split("find_memman_agent:", 1)[1].split(
             "memman_tsr_name:", 1)[0]
@@ -448,8 +457,8 @@ class PortHelperTest(unittest.TestCase):
             encoding="utf-8")
         for declaration in (
                 "MSXAI_UNAPI_REQUEST_MAGIC: equ 0A75Ah",
-                "MSXAI_UNAPI_REQUEST_VERSION: equ 2",
-                "MSXAI_UNAPI_REQUEST_SIZE:  equ 16",
+                "MSXAI_UNAPI_REQUEST_VERSION: equ 3",
+                "MSXAI_UNAPI_REQUEST_SIZE:  equ 20",
                 "MSXAI_UNAPI_STACK_SIZE:    equ 0400h",
                 "MSXAI_UNAPI_GUARD_SIZE:    equ 16",
                 "MSXAI_UNAPI_STACK_HEADROOM: equ 0100h"):
@@ -468,7 +477,9 @@ class PortHelperTest(unittest.TestCase):
             request,
             r"(?s)unapi_request_connection:\s+db 0\s+"
             r"unapi_request_target:\s+db MSXAI_TRANSPORT_UNAPI\s+"
-            r"unapi_request_16c550_divisor:\s+db 0")
+            r"unapi_request_16c550_divisor:\s+db 0\s+"
+            r"unapi_request_local_ip:\s+ds 4,0")
+        self.assertIn('db 13,10,"MCP listening at: $"', source)
 
         prepare = source.split("prepare_unapi_request:", 1)[1].split(
             "verify_unapi_guards:", 1)[0]

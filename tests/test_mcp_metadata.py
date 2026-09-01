@@ -54,7 +54,8 @@ class MCPMetadataTest(unittest.TestCase):
     def test_unrestricted_and_hardware_writes_are_destructive(self):
         expected = {
             "msx_cmd", "msx_memory_write", "msx_io_write", "msx_reset",
-            "msx_app_load", "msx_asm_load", "msx_file_put", "msx_file_get",
+            "msx_reboot", "msx_app_load", "msx_asm_load", "msx_file_put",
+            "msx_file_get",
         }
         self.assertLessEqual(expected, mcp_metadata.DESTRUCTIVE_TOOLS)
 
@@ -83,11 +84,36 @@ class MCPMetadataTest(unittest.TestCase):
                 "msx_agent_app_load",
                 "msx_agent_type_line", "msx_agent_type_lines",
                 "msx_agent_type", "msx_agent_key",
-                "msx_agent_run_basic", "msx_agent_run_basic_file"):
+                "msx_agent_run_basic", "msx_agent_run_basic_file",
+                "msx_agent_reboot"):
             with self.subTest(tool=name):
                 schema = mcp_metadata.output_schema_for(name)
                 jsonschema.Draft202012Validator.check_schema(schema)
                 self.assertIsNot(schema, mcp_metadata.OBJECT_OUTPUT_SCHEMA)
+
+    def test_agent_reboot_is_destructive_terminal_and_strictly_structured(self):
+        hints = mcp_metadata.hints_for("msx_agent_reboot")
+        self.assertFalse(hints.read_only)
+        self.assertTrue(hints.destructive)
+        self.assertFalse(hints.idempotent)
+        schema = mcp_metadata.output_schema_for("msx_agent_reboot")
+        native = {
+            "backend": "agent", "operation": "reboot",
+            "state": "submitted", "runtime_mode": "resident",
+            "target_transition": "not-required",
+            "execution_submission": "resident-opcode-v3",
+            "reboot_vector": 0, "binary_uploaded": False,
+            "bytes_consumed": 0, "fallback_used": False,
+            "screen_probe_performed": False, "acknowledged": True,
+            "reboot_submitted": True, "agent_disconnected": True,
+            "completion_confirmed": False,
+        }
+        fallback = dict(
+            native, target_transition="dos-to-basic",
+            execution_submission="basic-usr-zero", bytes_consumed=20,
+            fallback_used=True, screen_probe_performed=True)
+        jsonschema.validate(native, schema)
+        jsonschema.validate(fallback, schema)
 
     def test_status_schema_distinguishes_local_agent_and_hybrid_channels(self):
         local_identity = {

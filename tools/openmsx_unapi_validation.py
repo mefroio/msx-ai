@@ -1248,6 +1248,29 @@ def _assert_command_screen(command: str, screen: str, *, prompt: bool) -> None:
             f"MSX command {command!r} did not return to a DOS prompt:\n{screen}")
 
 
+_MCP_LISTENING_LINE = re.compile(
+    r"(?im)^MCP listening at: "
+    r"(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<port>[0-9]{1,5})\s*$")
+
+
+def _assert_mcp_listening_screen(screen: str, port: int) -> str:
+    match = _MCP_LISTENING_LINE.search(screen)
+    if match is None:
+        raise ValidationError(
+            "resident startup did not display the MCP listening endpoint:\n"
+            + screen)
+    address = match.group("ip")
+    if any(int(octet) > 255 for octet in address.split(".")):
+        raise ValidationError(
+            f"resident startup displayed an invalid IPv4 address: {address}")
+    observed_port = int(match.group("port"))
+    if observed_port != port:
+        raise ValidationError(
+            "resident startup displayed listener port "
+            f"{observed_port}, expected {port}")
+    return address
+
+
 def _openmsx_memory(machine: object, address: int, size: int) -> bytes:
     value = machine.cmd(
         f"set d [debug read_block memory {address} {size}]; "
@@ -2226,6 +2249,7 @@ def run_validation(settings: Settings, *,
                     screen = machine.screen_text()
                 try:
                     _assert_command_screen(commands[3], screen, prompt=True)
+                    _assert_mcp_listening_screen(screen, settings.port)
                 except ValidationError as install_error:
                     if not trace_validation:
                         raise

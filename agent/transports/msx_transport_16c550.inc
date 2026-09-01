@@ -121,3 +121,25 @@ uart16c550_service:
 uart16c550_flush:
     xor a
     ret
+
+; THR-empty is insufficient before a reset; wait for both FIFO and serializer
+; empty so the response CRC is physically on the wire.
+uart16c550_terminal_drain:
+    ld bc,HOOK_IO_BUDGET
+uart16c550_terminal_drain_wait:
+    in a,(UART16C550_LSR)
+    inc a
+    jr z,uart16c550_terminal_drain_failed ; FFh is an absent/floating device
+    dec a
+    and 040h                   ; 16C550 TEMT
+    jr nz,uart16c550_terminal_drain_done
+    dec bc
+    ld a,b
+    or c
+    jr nz,uart16c550_terminal_drain_wait
+uart16c550_terminal_drain_failed:
+    ld a,1
+    ret
+uart16c550_terminal_drain_done:
+    xor a
+    ret

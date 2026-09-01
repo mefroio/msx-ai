@@ -47,9 +47,10 @@ can connect again to the same IP address and port without typing a command or
 pressing a key on the MSX. This was validated on a physical HOTBIT 1.0 with
 an MSX Pico+ cartridge.
 
-MemMan A7 v2 is the safe lifecycle request for targets 0, 1, and 2. Offset
+MemMan A7 v3 is the safe lifecycle request for targets 0, 1, and 2. Offset
 14 selects 8251, 16C550, or UNAPI. Offset 15 selects divisor 2 (57600) or
-1 (115200) for 16C550 and is zero otherwise. MP.COM selects UNAPI. Its
+1 (115200) for 16C550 and is zero otherwise. Bytes 16-19 return the local IP.
+MP.COM selects UNAPI. Its
 1 KiB page-2 stack has low/high guards and leaves 256 bytes below caller SP.
 A6 is rejected; keep the suite at one version.
 

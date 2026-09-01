@@ -40,6 +40,18 @@ transport failure. It does not retry a possibly delivered write into an unknown
 machine state. A bounded snapshot lease automatically resumes the target after
 transport silence.
 
+`msx_agent_reboot` is explicitly destructive. Finish file transfers and disk
+writes first: a warm reset can interrupt DOS I/O and damage unfinished work.
+The current resident commits the reboot after sending and transport-flushing
+its terminal opcode-`R` response, then makes a bounded best-effort UART drain
+attempt before it maps Main-ROM and enters `0000h`. Drain timeout cannot cancel
+the reboot; if final bytes are truncated, delivery is indeterminate and the
+host does not retry. A successful result confirms only submission, never
+completion of the following boot, and the server detaches the agent channel.
+This is not a power cycle and does not guarantee power-on peripheral state.
+After MSX-DOS returns, reinstall or otherwise restore the resident and
+reconnect.
+
 An agent CPU snapshot describes the register frame visible at the timer-hook
 callback boundary. It must not be presented as the interrupted application's
 arbitrary PC or SP. Direct openMSX snapshots use an exact debugger instruction

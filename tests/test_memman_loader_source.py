@@ -47,10 +47,10 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertRegex(
             self.source, r"(?m)^TK_FILE_SIZE:\s+equ\s+00580h")
         self.assertRegex(
-            self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+00426h")
+            self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+004DAh")
         self.assertRegex(
             self.source, r"(?m)^TU_FILE_SIZE:\s+equ\s+0040Bh")
-        self.assertIn("1062-byte guarded-stack trace/port helper", self.source)
+        self.assertIn("1242-byte guarded-stack endpoint helper", self.source)
         self.assertIn("1035-byte pre-TL UNAPI helper", self.source)
 
     def test_resident_lifecycle_creates_no_temporary_files(self):
@@ -271,7 +271,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
             request,
             r"(?s)memman_unapi_request_connection:\s+db 0\s+"
             r"memman_unapi_request_target:\s+db DRIVER_UNAPI\s+"
-            r"memman_unapi_request_16c550_divisor:\s+db 0")
+            r"memman_unapi_request_16c550_divisor:\s+db 0\s+"
+            r"memman_unapi_request_local_ip:\s+ds 4,0")
 
         prepare = reconfigure.split(
             "memman_prepare_unapi_request:", 1)[1].split(
@@ -322,6 +323,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
             r"call memman_reconfigure_agent\s+ld b,a\s+ei\s+"
             r"ld a,\(loader_transport_id\)",
         )
+        self.assertIn("ld hl,memman_unapi_request_local_ip", installed)
+        self.assertIn("call mcp_endpoint_print", installed)
 
     def test_overlay_has_guards_and_an_explicit_point_of_no_return(self):
         self.assertIn("POINT OF NO RETURN", self.source)

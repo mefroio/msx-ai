@@ -147,11 +147,12 @@ accepted only with `/DRIVER:UNAPI`, takes a decimal value from 1 through
 (`65535`) to request a random local port; the agent rejects that sentinel
 because the host needs a predictable endpoint. For a first resident UNAPI
 install, the loader converts the selected value to the private four-digit
-hexadecimal `MP/HHHH` command. `MP.COM` builds a versioned 16-byte request and
-calls the resident with MemMan talk ABI `A=A7h`, `HL=request`. A7 v2 is the
+hexadecimal `MP/HHHH` command. `MP.COM` builds a versioned 20-byte request and
+calls the resident with MemMan talk ABI `A=A7h`, `HL=request`. A7 v3 is the
 safe lifecycle ABI for all three targets: offset 14 selects `0=8251`,
 `1=16C550`, or `2=UNAPI`; offset 15 selects divisor `2` (57600) or `1`
-(115200) for 16C550 and must be zero for the other targets.
+(115200) for 16C550 and must be zero for the other targets. Offsets 16 through
+19 return the local IPv4 address reported by TCP/IP UNAPI.
 `MP.COM` always selects target `2`. The request also provides the port and a
 caller-owned 1 KiB page-2 stack surrounded by 16-byte low/high guards. The
 caller fits the complete guarded span below `C000h`, the TPA top, and the
@@ -163,12 +164,13 @@ transfer ID staged by the host. `MSXAI.COM` has no file-transfer command; all
 DOS-file PUT and GET work is owned by `MSXAIXF.COM` and protocol X.
 
 The startup banner reports the selected driver and runtime mode before control
-passes to MemMan or the foreground monitor.
+passes to MemMan or the foreground monitor. Once a UNAPI listener is open,
+both modes print `MCP listening at: <IPv4>:<port>`.
 
 `/57600` and `/115200` are accepted only with `/DRIVER:16C550`; exactly 57600
 is the default when neither is present. The option controls the foreground
 UART directly, selects `MCP16550.TSR` or `MCP115K.TSR` on a first resident
-install, and reinitializes an existing 16C550 resident through A7 v2 when the
+install, and reinitializes an existing 16C550 resident through A7 v3 when the
 divisor changes. Duplicate, conflicting, and cross-driver baud options fail
 before hardware state changes.
 
@@ -435,7 +437,7 @@ fixed address is not used by the default MemMan lifecycle.
 
 Debug is disabled by default. `DEBUG` prints each foreground protocol
 opcode as `[XX]`, where `XX` is the uppercase hexadecimal byte. A v3 TCP host
-also sends its accepted IPv4 source endpoint once after HELLO when the agent
+also sends its MCP-side IPv4 endpoint once after HELLO when the agent
 advertises the `debug-peer-label` feature; the screen prints
 `MCP client: <ipv4>:<port>`.
 
@@ -696,7 +698,7 @@ the first framed request to use the negotiated wake and no-retry policy. Older
 9-byte and 14-byte framed HELLO responses remain valid.
 Opcode `t` accepts zero bytes as a queue-status query or up to 39 input bytes
 and returns `[accepted, pending]`. Opcode `I` accepts 1..63 printable ASCII
-bytes and displays the host-provided peer label. The one unused ring position
+bytes and displays the host-provided MCP endpoint. The one unused ring position
 preserves the BIOS convention that equal get/put pointers mean empty. Because
 the result is cached by sequence, response loss and retry cannot repeat either
 side effect.

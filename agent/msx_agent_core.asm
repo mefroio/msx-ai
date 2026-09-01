@@ -61,6 +61,7 @@ MSXVER:         equ 0002Dh
 RDSLT:          equ 0000Ch
 WRSLT:          equ 00014h
 CALSLT:         equ 0001Ch
+ENASLT:         equ 00024h
 BREAKX:         equ 000B7h
 EXTBIO:         equ 0FFCAh
 EXPTBL:         equ 0FCC1h
@@ -107,8 +108,8 @@ TSR_TALK_UNAPI_PORT_LEGACY: equ 0A6h
 TSR_TALK_UNAPI_PORT: equ 0A7h
 TSR_TALK_TRACE: equ 0A8h
 TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah
-TSR_UNAPI_REQUEST_VERSION: equ 2
-TSR_UNAPI_REQUEST_SIZE: equ 16
+TSR_UNAPI_REQUEST_VERSION: equ 3
+TSR_UNAPI_REQUEST_SIZE: equ 20
 TSR_UNAPI_REQUEST_PORT: equ 4
 TSR_UNAPI_REQUEST_STACK_BOTTOM: equ 6
 TSR_UNAPI_REQUEST_STACK_TOP: equ 8
@@ -118,6 +119,7 @@ TSR_UNAPI_REQUEST_TRANSPORT: equ 12
 TSR_UNAPI_REQUEST_CONNECTION: equ 13
 TSR_UNAPI_REQUEST_TARGET: equ 14
 TSR_UNAPI_REQUEST_16C550_DIVISOR: equ 15
+TSR_UNAPI_REQUEST_LOCAL_IP: equ 16
 TSR_TRACE_REQUEST_MAGIC: equ 0A85Ah
 TSR_TRACE_REQUEST_VERSION: equ 1
 TSR_TRACE_REQUEST_SIZE: equ 16
@@ -431,7 +433,7 @@ install_tpa_ready:
 
     call resident_initialize
     or a
-    jr z,install_enter_monitor
+    jr z,install_monitor_ready
     push af
     call transport_restore
     di
@@ -453,6 +455,15 @@ install_tpa_ready:
     ld c,0                     ; keep /MONITOR failure portable to MSX-DOS 1
     jp 0005h
 
+install_monitor_ready:
+    ei
+    ld a,(active_transport_id)
+    cp UNAPI_ID
+    jr nz,install_enter_monitor
+    ld de,mcp_listening_prefix
+    ld hl,unapi_local_ip
+    ld bc,(unapi_listen_port)
+    call mcp_endpoint_print
 install_enter_monitor:
     ; The foreground monitor stack grows down through the reduced TPA, while
     ; hook parsing uses its independent protected stack above the resident.
@@ -492,6 +503,15 @@ loader_install_resident_reconfigure:
     ld a,(loader_transport_id)
     cp b
     jr nz,loader_resident_call_error
+    cp UNAPI_ID
+    jr nz,loader_resident_already_message
+    ld de,mcp_listening_prefix
+    ld hl,memman_unapi_request_local_ip
+    ld bc,(loader_unapi_port)
+    call mcp_endpoint_print
+    ld c,0
+    jp 0005h
+loader_resident_already_message:
     ld de,already_message
     jr loader_resident_message_exit
 loader_install_resident_new:
@@ -1200,6 +1220,10 @@ loader_timi_is_agent:
 ; External-suite validation, MemMan discovery, and TsrLoad/TsrKill command
 ; chains are transient and never enter the TSR.
 include 'agent/msx_memman_loader.asm'
+
+mcp_listening_prefix:
+    db "MCP listening at: $"
+include 'agent/msx_endpoint_print.inc'
 
 ; z80asm's ORG changes label addresses without padding the output.  Therefore
 ; resident_source is the loader-time source and resident_start is its runtime
@@ -3493,6 +3517,8 @@ endif
     jp z,frame_cmd_keybuf_input
     cp 'T'
     jp z,frame_cmd_keybuf_spool
+    cp 'R'
+    jp z,frame_cmd_reboot
 if MSXAI_TSR_BUILD
     cp 'X'
     jp z,frame_cmd_file_transfer
@@ -3910,8 +3936,8 @@ frame_cpu_context_iff2_ready:
     ld (frame_response_status),a
     jp frame_cache_and_send
 
-; Optional host-provided peer label. The UART agent cannot discover TCP/IP
-; metadata itself, so a v3 host sends the accepted peer address after HELLO.
+; Optional host-provided MCP endpoint. The UART agent cannot discover TCP/IP
+; metadata itself, so a v3 host sends its client-side address after HELLO.
 ; Only printable ASCII is accepted, preventing terminal-control injection.
 frame_cmd_debug_peer:
     ld a,(runtime_mode)
@@ -5834,6 +5860,45 @@ frame_run_allowed:
     ld (run_state),a
     ret
 
+; Warm reboot is a terminal resident operation.  The complete framed response
+; is cached, emitted and transport-flushed before Main-ROM replaces DOS RAM in
+; page 0.  A failure while emitting the frame unwinds through hook_transport_*
+; while post_action_pending is set.  Once frame_cache_and_send succeeds the
+; reboot is committed: the bounded UART serializer wait is best-effort because
+; cancelling after a complete ACK became observable would violate the host's
+; success contract.  The host must use retries=0 and detach after the ACK.
+frame_cmd_reboot:
+    ld de,0
+    call frame_require_length
+    jp nz,frame_reply_bad_arg
+    ld a,(runtime_mode)
+    cp RUNTIME_RESIDENT
+    jp nz,frame_reply_bad_state
+    ld a,(in_hook)
+    or a
+    jp z,frame_reply_bad_state
+    ld a,(run_state)
+    cp 1
+    jp nz,frame_reply_bad_state
+    ld a,1
+    ld (post_action_pending),a
+    call frame_reply_ok_prepare
+    call frame_cache_and_send
+    call transport_terminal_drain
+    ; Ignore a bounded-drain failure and preserve success => committed.  If
+    ; the final bytes were truncated, the host gets an indeterminate timeout
+    ; and still never retries this terminal operation.
+    xor a
+    ld (post_action_pending),a
+    di
+    ; MSX-DOS maps RAM at 0000h, where JP 0000h would mean WBOOT rather than
+    ; Main-ROM STARTUP.  Select the documented Main-ROM slot for page 0 first,
+    ; using EXPTBL in the BIOS work area and DOS's preserved ENASLT vector.
+    ld a,(EXPTBL)
+    ld h,0
+    call ENASLT
+    jp 0000h
+
 frame_reply_ok_prepare:
     xor a
     ld (frame_response_status),a
@@ -6105,6 +6170,19 @@ transport_service:
     jp 0000h
 transport_flush:
     jp 0000h
+
+; A normal flush is intentionally cheap for UART throughput. Terminal actions
+; additionally wait for the physical serializer so their final response byte
+; cannot be truncated by immediate hardware reinitialization.
+transport_terminal_drain:
+    ld a,(active_transport_id)
+    cp UART8251_ID
+    jp z,uart8251_terminal_drain
+    cp UART16C550_ID
+    jp z,uart16c550_terminal_drain
+    ; UNAPI flush already completed the buffered TCP_SEND synchronously.
+    xor a
+    ret
 
 ; Foreground teardown is immediately followed by discarding the monitor image
 ; or by TK releasing the MemMan segment. Retry transient restore/ABORT failures
@@ -7184,7 +7262,7 @@ tsr_talk_done:
     ld a,(active_transport_id)
     ret
 
-; Private safe lifecycle ABI. HL points to a versioned 16-byte request in page
+; Private safe lifecycle ABI. HL points to a versioned 20-byte request in page
 ; zero. The caller still supplies and guards the historical 1 KiB page-2 stack
 ; so mixed suite files fail closed, but lifecycle work now always uses the
 ; resident's persistent page-3 heap stack. The old A6/raw-port ABI is rejected.
@@ -7447,6 +7525,11 @@ tsr_talk_unapi_write_result:
 tsr_talk_unapi_result_divisor_ready:
     ld a,b
     ld (hl),a
+    inc hl
+    ex de,hl
+    ld hl,unapi_local_ip
+    ld bc,4
+    ldir
     ret
 
 ; Runs exclusively on the persistent page-3 heap stack. All driver changes and

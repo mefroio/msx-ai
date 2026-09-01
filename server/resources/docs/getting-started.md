@@ -270,6 +270,30 @@ After negotiation, call
 `msx_agent_status` and verify the runtime mode, transport, and feature list before
 performing writes.
 
+## Warm-reboot a resident MSX
+
+Finish any disk write or transfer, verify that `msx_agent_status` reports the
+default resident, and call:
+
+```text
+msx_agent_reboot()
+```
+
+A current resident sends and transport-flushes the response to terminal
+framed-v3 opcode `R`, committing the reboot. It then makes a bounded best-effort
+UART drain attempt before mapping Main-ROM into page 0 and entering `0000h`.
+Drain timeout does not cancel the reboot; truncated final bytes make delivery
+indeterminate, and the host never retries. An older compatible framed resident
+uses a recognized DOS or BASIC prompt, enters BASIC when needed, and atomically
+submits `DEFUSR0=0:A=USR0(0)`. Neither path sends a reset binary.
+
+The result reports an acknowledged submission with
+`completion_confirmed=false`; the server detaches the terminal agent channel,
+so boot completion cannot be observed there. This warm reboot can interrupt
+disk I/O and is not a power cycle. Wait for MSX-DOS, reinstall or otherwise
+restore the resident, then call `msx_agent_connect` or `msx_agent_listen` to
+create a new channel.
+
 ## Load a BLOAD through resident MSX BASIC
 
 With the agent installed in its default resident mode and the visible MSX at an
