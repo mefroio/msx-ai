@@ -79,6 +79,10 @@ KEYBUF_SIZE:    equ 40
 PROTO_VERSION:  equ 2
 FRAMED_VERSION: equ 3
 FRAMED_SAFE_MAX: equ 0140h     ; public hook-safe v3 ceiling
+; Physical 16C550/BaDCaT validation at 57600 showed deterministic TX stalls
+; above a 128-byte response payload. Keep the universal work area at 320
+; bytes, but negotiate this conservative wire ceiling only for that driver.
+UART16C550_FRAMED_SAFE_MAX: equ 0080h
 FRAMED_MAX:      equ 0800h     ; private parser/buffer ceiling for fast-v1
 CAPABILITIES:   equ 0FFh       ; core + framed v3 + hardware/mapping
 CAPABILITY_RUN: equ 008h
@@ -106,6 +110,27 @@ TSR_TALK_CONFIG: equ 0A5h
 TSR_TALK_UNAPI_PORT_LEGACY: equ 0A6h
 TSR_TALK_UNAPI_PORT: equ 0A7h
 TSR_TALK_TRACE: equ 0A8h
+; Private, versioned BaDCaT reverse-dial request. A5..B2 are already occupied
+; by configuration, trace, and transfer ABIs; B3 is the first free opcode. It
+; is accepted only while the resident native 16C550 transport is active at the
+; validated 57600 baud.
+TSR_TALK_BADCAT_DIAL: equ 0B3h
+TSR_BADCAT_DIAL_MAGIC: equ 0A95Ah
+TSR_BADCAT_DIAL_VERSION: equ 1
+TSR_BADCAT_DIAL_REQUEST_SIZE: equ 12
+TSR_BADCAT_DIAL_REQUEST_STATUS: equ 4
+TSR_BADCAT_DIAL_REQUEST_RESERVED: equ 5
+TSR_BADCAT_DIAL_REQUEST_IPV4: equ 6
+TSR_BADCAT_DIAL_REQUEST_PORT: equ 10
+TSR_BADCAT_DIAL_STATUS_OK: equ 0
+TSR_BADCAT_DIAL_STATUS_ABI: equ 1
+TSR_BADCAT_DIAL_STATUS_TRANSPORT: equ 2
+TSR_BADCAT_DIAL_STATUS_BAUD: equ 3
+TSR_BADCAT_DIAL_STATUS_TARGET: equ 4
+TSR_BADCAT_DIAL_STATUS_TX_TIMEOUT: equ 5
+TSR_BADCAT_DIAL_STATUS_STACK: equ 6
+TSR_BADCAT_DIAL_STATUS_STATE: equ 7
+TSR_BADCAT_DIAL_COMMAND_CAPACITY: equ 35
 TSR_UNAPI_REQUEST_MAGIC: equ 0A75Ah
 TSR_UNAPI_REQUEST_VERSION: equ 2
 TSR_UNAPI_REQUEST_SIZE: equ 16
@@ -147,6 +172,12 @@ TRACE_EXPORT_RECORDS: equ TRACE_HEADER_SIZE + TRACE_SNAPSHOT_SIZE
 TRACE_FLAG_ENABLED: equ 1
 TRACE_FLAG_INCIDENT: equ 2
 TRACE_FLAG_WRAPPED: equ 4
+; Records use an event-dependent UART interpretation when this development-only
+; flag is set. Hardware events retain LSR,MSR,MCR,phase,opcode,jiffy16; boundary
+; markers use phase,opcode,frame-sequence16,length16,flags. The physical 8-byte
+; V1 record remains unchanged, so the established A8 snapshot ABI and ring size
+; stay stable.
+TRACE_FLAG_UART16C550: equ 8
 TRACE_EVENT_ENABLE: equ 1
 TRACE_EVENT_STATE: equ 2
 TRACE_EVENT_STATE_ERROR: equ 3
@@ -162,6 +193,32 @@ TRACE_EVENT_SYSTEM_RESUME: equ 12
 TRACE_EVENT_RECONFIG_BEGIN: equ 13
 TRACE_EVENT_RECONFIG_END: equ 14
 TRACE_EVENT_AUTO_RELISTEN: equ 15
+TRACE_EVENT_UART_INIT: equ 16
+TRACE_EVENT_UART_WAKE: equ 17
+TRACE_EVENT_UART_FRAME_RX: equ 18
+TRACE_EVENT_UART_FLUSH: equ 19
+TRACE_EVENT_UART_TIMEOUT: equ 20
+TRACE_EVENT_UART_RECOVER: equ 21
+TRACE_EVENT_UART_REARM: equ 22
+TRACE_EVENT_UART_TX_BEGIN: equ 23
+TRACE_EVENT_UART_TX_END: equ 24
+TRACE_EVENT_UART_RECONNECT: equ 25
+TRACE_UART_PHASE_IDLE: equ 0
+TRACE_UART_PHASE_RX_WAKE: equ 1
+TRACE_UART_PHASE_TX_WAKE_ACK: equ 2
+TRACE_UART_PHASE_RX_HEADER: equ 3
+TRACE_UART_PHASE_RX_PAYLOAD: equ 4
+TRACE_UART_PHASE_RX_CRC: equ 5
+TRACE_UART_PHASE_TX_HEADER: equ 6
+TRACE_UART_PHASE_TX_PAYLOAD: equ 7
+TRACE_UART_PHASE_TX_CRC: equ 8
+TRACE_UART_TIMEOUT_TX: equ 1
+TRACE_UART_TIMEOUT_RX: equ 2
+TRACE_UART_TIMEOUT_DIRECTION_MASK: equ 3
+TRACE_UART_TIMEOUT_PUMP: equ 080h
+TRACE_UART_MARKER_HOOK_BIT: equ 0
+TRACE_UART_MARKER_TIMI_BIT: equ 1
+TRACE_UART_MARKER_PUMP_BIT: equ 2
 TSR_UNAPI_STACK_MINIMUM: equ 0400h
 TSR_UNAPI_STACK_GUARD_SIZE: equ 16
 TSR_UNAPI_STACK_LOW_GUARD: equ 0A5h
@@ -184,6 +241,10 @@ TSR_HEAP_LOW_GUARD: equ 0A5h
 TSR_HEAP_HIGH_GUARD: equ 05Ah
 include 'agent/msx_xfer_protocol.inc'
 XFER_INLINE_GET_CAPACITY: equ FRAMED_SAFE_MAX - 8
+; Preserve fast-v1's existing one-byte PUT headroom and eight-byte GET header
+; while keeping every 16C550 request/response payload within the 128-byte cap.
+UART16C550_XFER_FAST_PUT_CAPACITY: equ UART16C550_FRAMED_SAFE_MAX - 22
+UART16C550_XFER_FAST_GET_CAPACITY: equ UART16C550_FRAMED_SAFE_MAX - 8
 ; The hook stack's protocol work itself stays below 64 bytes. A block transport
 ; may reserve one additional 64-byte non-page-1 UNAPI staging window below SP.
 ; The reserve of 224 bytes still leaves at least 96 bytes of call/interrupt
@@ -266,15 +327,18 @@ installer:
     ld de,transport_8251_banner
     jr z,install_banner_transport_ready
     cp UART16C550_ID
-    jr nz,install_banner_unapi
+    jr nz,install_banner_software_transport
     ld a,(loader_uart16c550_divisor)
     cp UART16C550_DIVISOR_115200
     ld de,transport_16c550_115200_banner
     jr z,install_banner_transport_ready
     ld de,transport_16c550_57600_banner
     jr install_banner_transport_ready
-install_banner_unapi:
+install_banner_software_transport:
+    cp UNAPI_ID
     ld de,transport_unapi_banner
+    jr z,install_banner_transport_ready
+    ld de,transport_fossil_banner
 install_banner_transport_ready:
     ld c,9
     call 0005h
@@ -544,6 +608,8 @@ transport_16c550_115200_banner:
     db "Driver: 16C550-compatible UART, 115200 RTS/CTS",13,10,"$"
 transport_unapi_banner:
     db "Driver: TCP/IP UNAPI passive listener",13,10,"$"
+transport_fossil_banner:
+    db "Driver: external FOSSIL v1.40 UART, 57600",13,10,"$"
 resident_mode_banner:
     db "Mode: MemMan resident agent (default)",13,10,"$"
 monitor_mode_banner:
@@ -554,7 +620,7 @@ uninstall_mode_banner:
 debug_on_banner:
     db "On-screen command trace: DEBUG",13,10,"$"
 trace_on_banner:
-    db "Resident TCP trace: enabled",13,10,"$"
+    db "Resident transport trace: enabled",13,10,"$"
 no_room_message:
     db "Not enough upper TPA space for the resident agent",13,10,"$"
 already_message:
@@ -576,21 +642,24 @@ usage_message:
     db "Author: Rodrigo Galhardi M. Garcia",13,10,13,10
     db "Usage:",13,10
     db "  MSXAI /DRIVER:8251 [/MONITOR] [DEBUG]",13,10
-    db "  MSXAI /DRIVER:16C550 [/57600 | /115200] [/MONITOR] [DEBUG]",13,10
 if MSXAI_DEVELOPMENT_TRACE
+    db "  MSXAI /DRIVER:16C550 [/57600 | /115200] [/TRACE | /MONITOR [DEBUG]]",13,10
     db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/TRACE | /MONITOR [DEBUG]]",13,10
+    db "  MSXAI /DRIVER:FOSSIL /MONITOR [DEBUG]",13,10
     db "  MSXAI <1..65534> [/TRACE]",13,10
     db "  MSXAI /DUMPTRACE <file>",13,10
     db "  MSXAI /UNINSTALL",13,10
-    db "DEBUG is restricted to /MONITOR; /TRACE to resident UNAPI.",13,10,"$"
+    db "DEBUG requires /MONITOR; /TRACE requires resident 16C550 or UNAPI.",13,10,"$"
 else
+    db "  MSXAI /DRIVER:16C550 [/57600 | /115200] [/MONITOR [DEBUG]]",13,10
     db "  MSXAI /DRIVER:UNAPI [/PORT:<1..65534>] [/MONITOR [DEBUG]]",13,10
+    db "  MSXAI /DRIVER:FOSSIL /MONITOR [DEBUG]",13,10
     db "  MSXAI <1..65534>",13,10
     db "  MSXAI /UNINSTALL",13,10
     db "DEBUG is restricted to /MONITOR.",13,10,"$"
 endif
 driver_required_message:
-    db "Select exactly one /DRIVER:8251, /DRIVER:16C550, or /DRIVER:UNAPI",13,10,"$"
+    db "Select exactly one /DRIVER:8251, /DRIVER:16C550, /DRIVER:UNAPI, or /DRIVER:FOSSIL",13,10,"$"
 transport_init_error_message:
     db "Transport initialization failed",13,10,"$"
 port_requires_unapi_message:
@@ -599,8 +668,10 @@ baud_requires_16c550_message:
     db "/57600 and /115200 require /DRIVER:16C550",13,10,"$"
 debug_requires_monitor_message:
     db "DEBUG requires /MONITOR",13,10,"$"
-trace_requires_resident_unapi_message:
-    db "/TRACE requires resident /DRIVER:UNAPI",13,10,"$"
+fossil_requires_monitor_message:
+    db "/DRIVER:FOSSIL requires /MONITOR",13,10,"$"
+trace_requires_resident_transport_message:
+    db "/TRACE requires resident /DRIVER:16C550 or /DRIVER:UNAPI",13,10,"$"
 dumptrace_syntax_message:
     db "/DUMPTRACE requires one DOS filename and no other options",13,10,"$"
 uninstall_syntax_message:
@@ -690,6 +761,9 @@ loader_parse_token_loop:
     ld de,option_driver_unapi
     call loader_token_equals
     jp z,loader_parse_unapi
+    ld de,option_driver_fossil
+    call loader_token_equals
+    jp z,loader_parse_fossil
     ld de,option_port_prefix
     call loader_token_has_prefix
     jp z,loader_parse_port
@@ -770,6 +844,14 @@ loader_parse_unapi:
     cp 0FFh
     jp nz,loader_parse_driver_error
     ld a,UNAPI_ID
+    ld (loader_transport_id),a
+    call loader_skip_token
+    jp loader_parse_token_loop
+loader_parse_fossil:
+    ld a,(loader_transport_id)
+    cp 0FFh
+    jp nz,loader_parse_driver_error
+    ld a,FOSSIL_ID
     ld (loader_transport_id),a
     call loader_skip_token
     jp loader_parse_token_loop
@@ -923,7 +1005,7 @@ loader_parse_uninstall:
 loader_parse_tokens_done:
     ld a,(loader_action)
     cp LOADER_ACTION_DUMPTRACE
-    jr z,loader_parse_dumptrace_done
+    jp z,loader_parse_dumptrace_done
     cp LOADER_ACTION_UNINSTALL
     jr z,loader_parse_uninstall_done
     ld a,(loader_transport_id)
@@ -945,13 +1027,22 @@ loader_parse_port_driver_ok:
 loader_parse_baud_driver_ok:
     ld a,(loader_trace_enabled)
     or a
-    jr z,loader_parse_debug_check
+    jr z,loader_parse_fossil_monitor_check
     ld a,(loader_runtime_mode)
     or a
     jp nz,loader_parse_trace_error
     ld a,(loader_transport_id)
     cp UNAPI_ID
-    jr nz,loader_parse_trace_error
+    jr z,loader_parse_debug_check
+    cp UART16C550_ID
+    jp nz,loader_parse_trace_error
+loader_parse_fossil_monitor_check:
+    ld a,(loader_transport_id)
+    cp FOSSIL_ID
+    jr nz,loader_parse_debug_check
+    ld a,(loader_runtime_mode)
+    cp RUNTIME_MONITOR
+    jp nz,loader_parse_fossil_monitor_error
 loader_parse_debug_check:
     ld a,(loader_debug_enabled)
     or a
@@ -1021,8 +1112,11 @@ loader_parse_baud_error:
 loader_parse_debug_error:
     ld de,debug_requires_monitor_message
     jr loader_parse_error
+loader_parse_fossil_monitor_error:
+    ld de,fossil_requires_monitor_message
+    jr loader_parse_error
 loader_parse_trace_error:
-    ld de,trace_requires_resident_unapi_message
+    ld de,trace_requires_resident_transport_message
     jr loader_parse_error
 loader_parse_dumptrace_error:
     ld de,dumptrace_syntax_message
@@ -1143,6 +1237,8 @@ option_driver_16c550:
     db "/DRIVER:16C550",0
 option_driver_unapi:
     db "/DRIVER:UNAPI",0
+option_driver_fossil:
+    db "/DRIVER:FOSSIL",0
 option_port_prefix:
     db "/PORT:",0
 option_baud_57600:
@@ -1289,6 +1385,13 @@ post_action_pending:
     db 0
 vram_active:
     db 0
+if MSXAI_TSR_BUILD
+else
+fossil_vdp_restore_ei:
+    ; Saved IFF2 for the short FOSSIL-only VDP critical section. A command
+    ; serviced from a BIOS hook enters with DI and must never return with EI.
+    db 0
+endif
 vdp_generation:
     db 0
 vram_bank_count:
@@ -1477,6 +1580,19 @@ trace_last_tcp_result:
     db 0FFh
 trace_last_tcp_state:
     db 0FFh
+; Development-only 16C550 diagnostic context. These bytes are outside the
+; exported V1 block; the first incident copies the relevant values into its
+; fixed eight-byte EXTRA area.
+trace_uart_phase:
+    db TRACE_UART_PHASE_IDLE
+trace_uart_timeout_context:
+    db 0
+trace_uart_timeout_outer_bc:
+    dw 0
+trace_uart_timeout_lsr:
+    db 0
+trace_uart_timeout_msr:
+    db 0
 ; A TCP/IP UNAPI implementation can share cartridge hardware with the active
 ; Nextor disk driver. H.TIMI must not re-enter that firmware while a foreground
 ; page-0 slot transaction or an extended BASIC command is in flight.
@@ -1526,6 +1642,19 @@ tsr_unapi_status:
     db TSR_UNAPI_STATUS_ABI
 tsr_trace_request_pointer:
     dw 0
+tsr_badcat_dial_request_pointer:
+    dw 0
+; Native UART streaming has no reliable local "still command mode" signal.
+; Make reverse dial fail closed after one attempt for this resident lifetime;
+; only a fresh installation/reboot can safely establish a new command baseline.
+tsr_badcat_dial_attempted:
+    db 0
+tsr_badcat_dial_result:
+    db 0FFh
+tsr_badcat_decimal_started:
+    db 0
+tsr_badcat_dial_command:
+    ds TSR_BADCAT_DIAL_COMMAND_CAPACITY,0
 endif
 
 resident_initialize:
@@ -1612,6 +1741,15 @@ endif
 main_loop:
 if MSXAI_TSR_BUILD
 else
+    ; CALSLT (used by the idle CTRL+STOP probe below), BDOS and launched code
+    ; may return with interrupts disabled.  The external FOSSIL driver fills
+    ; its RX ring from H.KEYI, so reassert EI on every foreground iteration.
+    ; All other transports retain the monitor's established DI policy.
+    ld a,(active_transport_id)
+    cp FOSSIL_ID
+    jr nz,main_loop_interrupts_ready
+    ei
+main_loop_interrupts_ready:
     ld (hook_dispatch_sp),sp    ; safe foreground unwind boundary
     call transport_service
     call transport_session_finalize
@@ -1675,6 +1813,22 @@ receive_dispatch:
     or a
     jp nz,frame_receive
     call ser_get
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ; A fresh host begins with one credited ESC while it does not yet know
+    ; whether the resident is raw or framed. Preserve that command for the raw
+    ; dispatcher, but leave a RAM-only ingress marker before it emits E,1.
+    cp RECONNECT_BYTE
+    jr nz,receive_dispatch_raw_ready
+    push af
+    ld a,TRACE_UART_PHASE_RX_WAKE
+    call trace_uart_set_phase
+    ld a,TRACE_EVENT_UART_RECONNECT
+    call trace_uart_record
+    pop af
+receive_dispatch_raw_ready:
+endif
+endif
     jp dispatch
 
 ; ------------------------------------------------------------ BIOS hooks ----
@@ -2525,6 +2679,25 @@ debug_trace_command:            ; A = raw/v3 opcode, all registers preserved
     ld a,(in_hook)
     or a
     jr nz,debug_trace_done
+if MSXAI_TSR_BUILD
+else
+    ; A FOSSIL screenshot is assembled from a status probe plus many RAM/VRAM
+    ; reads. Printing a DEBUG line for each request changes (and eventually
+    ; scrolls) the very VRAM being captured. Keep those observational requests
+    ; silent only on FOSSIL; every other transport and every state-changing
+    ; opcode retain the established on-screen DEBUG behavior.
+    ld a,(active_transport_id)
+    cp FOSSIL_ID
+    jr nz,debug_trace_emit
+    ld a,b
+    cp 'q'
+    jr z,debug_trace_done
+    cp 'r'
+    jr z,debug_trace_done
+    cp 'v'
+    jr z,debug_trace_done
+debug_trace_emit:
+endif
     push bc                     ; preserve the opcode across BIOS output calls
     ld a,13
     call debug_putchar
@@ -2590,6 +2763,18 @@ else
     pop hl
     pop de
     pop bc
+    ; BDOS can leave interrupts disabled. Raw DEBUG commands may still need
+    ; argument bytes, so restore the FOSSIL driver's H.KEYI receive path after
+    ; every diagnostic character. Preserve the legacy DI policy elsewhere.
+    push af
+    ld a,(active_transport_id)
+    cp FOSSIL_ID
+    jr nz,debug_putchar_interrupts_ready
+    pop af
+    ei
+    ret
+debug_putchar_interrupts_ready:
+    pop af
     ret
 endif
 
@@ -2694,6 +2879,41 @@ current_features_resident:
     ld a,b
     ret z
     or FEATURE_TIMI_POLL_SAFE
+    ret
+
+; Return the public framed-v3 payload limit for the selected transport. The
+; 8251 and UNAPI retain the original 320-byte contract. Both BaDCaT UART paths
+; use the physically validated conservative 128-byte wire ceiling.
+current_framed_max:
+    ld hl,FRAMED_SAFE_MAX
+    ld a,(active_transport_id)
+if MSXAI_TSR_BUILD
+    cp UART16C550_ID
+    ret nz
+else
+    cp UART16C550_ID
+    jr z,current_framed_max_uart
+    cp FOSSIL_ID
+    ret nz
+current_framed_max_uart:
+endif
+    ld hl,UART16C550_FRAMED_SAFE_MAX
+    ret
+
+current_xfer_fast_put_capacity:
+    ld de,XFER_FAST_PUT_CAPACITY
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    ret nz
+    ld de,UART16C550_XFER_FAST_PUT_CAPACITY
+    ret
+
+current_xfer_fast_get_capacity:
+    ld de,XFER_FAST_GET_CAPACITY
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    ret nz
+    ld de,UART16C550_XFER_FAST_GET_CAPACITY
     ret
 
 cmd_status:
@@ -2834,18 +3054,59 @@ cmd_vram_read:
     ld a,b
     or a
     ret z
+if MSXAI_TSR_BUILD
+else
+    ; DRIVER.COM's byte API may enable interrupts. On FOSSIL, stage the whole
+    ; raw response in RAM so no serial call can split a VDP control-port pair
+    ; or change the VRAM address counter between bytes.
+    ld a,(active_transport_id)
+    cp FOSSIL_ID
+    jr z,cmd_vram_read_fossil
+endif
     call set_vram_read
 vram_read_loop:
     in a,(098h)
     call ser_put
     djnz vram_read_loop
     jp restore_r14
+if MSXAI_TSR_BUILD
+else
+cmd_vram_read_fossil:
+    ld c,b
+    call fossil_vdp_access_enter
+    call set_vram_read
+    ld de,frame_response_buffer
+    ld b,c
+cmd_vram_read_fossil_stage_loop:
+    in a,(098h)
+    ld (de),a
+    inc de
+    djnz cmd_vram_read_fossil_stage_loop
+    call restore_r14
+    call fossil_vdp_access_leave
+    ld hl,frame_response_buffer
+    ld b,c
+cmd_vram_read_fossil_send_loop:
+    ld a,(hl)
+    call ser_put
+    inc hl
+    djnz cmd_vram_read_fossil_send_loop
+    ret
+endif
 
 cmd_vram_write:
     call get_vram_frame
     ld a,b
     or a
     jr z,vram_write_ack
+if MSXAI_TSR_BUILD
+else
+    ; Receive the complete FOSSIL request before touching the VDP. The legacy
+    ; transports retain their established direct byte-stream path below.
+    ld a,(active_transport_id)
+    cp FOSSIL_ID
+    jr z,cmd_vram_write_fossil
+endif
     call set_vram_write
 vram_write_loop:
     call ser_get
@@ -2855,6 +3116,30 @@ vram_write_loop:
 vram_write_ack:
     ld a,'K'
     jp ser_put
+if MSXAI_TSR_BUILD
+else
+cmd_vram_write_fossil:
+    ld c,b
+    ld hl,frame_request_buffer
+    ld b,c
+cmd_vram_write_fossil_receive_loop:
+    call ser_get
+    ld (hl),a
+    inc hl
+    djnz cmd_vram_write_fossil_receive_loop
+    call fossil_vdp_access_enter
+    call set_vram_write
+    ld hl,frame_request_buffer
+    ld b,c
+cmd_vram_write_fossil_stage_loop:
+    ld a,(hl)
+    out (098h),a
+    inc hl
+    djnz cmd_vram_write_fossil_stage_loop
+    call restore_r14
+    call fossil_vdp_access_leave
+    jr vram_write_ack
+endif
 
 cmd_call:
     call get_addr
@@ -3067,9 +3352,10 @@ cmd_frame_enable:
     call ser_put
     ld a,FRAMED_VERSION
     call ser_put
-    ld a,FRAMED_SAFE_MAX & 0FFh
+    call current_framed_max
+    ld a,l
     call ser_put
-    ld a,FRAMED_SAFE_MAX >> 8
+    ld a,h
     call ser_put
     ld a,1
     ld (framed_mode),a
@@ -3175,6 +3461,12 @@ jump_hl:
 ; cached, so a retry with the same sequence is idempotent. New requests must
 ; advance monotonically; an old sequence can therefore never execute again.
 frame_receive:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_RX_WAKE
+    call trace_uart_set_phase
+endif
+endif
 frame_seek_magic:
     call ser_get
     cp RECONNECT_BYTE
@@ -3192,10 +3484,26 @@ frame_have_magic_m:
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_FRAME_WAKE_ACK
     jr z,frame_wait_second_magic
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_TX_WAKE_ACK
+    call trace_uart_set_phase
+    ; This marker is written before ACK while the host is deliberately gated.
+    ; It performs no UART register I/O and therefore cannot consume line status.
+    ld a,TRACE_EVENT_UART_WAKE
+    call trace_uart_record
+endif
+endif
     ld a,FRAME_WAKE_ACK
     call ser_put
     call transport_flush_checked
 frame_wait_second_magic:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_RX_HEADER
+    call trace_uart_set_phase
+endif
+endif
     call ser_get
     cp 'X'
     jr z,frame_magic_found
@@ -3209,6 +3517,20 @@ frame_reconnect_byte:
     ld a,(active_transport_flags)
     and TRANSPORT_FLAG_FRAME_WAKE_ACK
     jr z,frame_reconnect_count_byte
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_TX_WAKE_ACK
+    call trace_uart_set_phase
+    ; Only the first ESC in the eight-byte reconnect run is needed to prove
+    ; TCP-to-UART ingress. Avoid consuming eight of the twenty ring entries.
+    ld a,(frame_reconnect_count)
+    or a
+    jr nz,frame_reconnect_trace_done
+    ld a,TRACE_EVENT_UART_RECONNECT
+    call trace_uart_record
+frame_reconnect_trace_done:
+endif
+endif
     ld a,FRAME_WAKE_ACK
     call ser_put
     call transport_flush_checked
@@ -3247,6 +3569,12 @@ endif
     jp cmd_hello
 
 frame_magic_found:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_RX_HEADER
+    call trace_uart_set_phase
+endif
+endif
 if MSXAI_TSR_BUILD
     xor a
     ld (frame_external_request),a
@@ -3299,14 +3627,20 @@ frame_request_status_ok:
     ; byte length would wedge the foreground monitor. Reject immediately; the
     ; next invocation scans the remaining stream for a fresh magic marker.
     ld de,(frame_length)
-    ld hl,FRAMED_SAFE_MAX
+    call current_framed_max
     or a
     sbc hl,de
     jr nc,frame_payload_store
 if MSXAI_TSR_BUILD
-    ; Payloads above the public 320-byte limit are private to an explicitly
-    ; armed fast-v1 transfer.  They may never run from H.TIMI/H.KEYI or expose
-    ; the larger resident buffer to ordinary MCP commands.
+    ; The 16C550's validated 128-byte ceiling is absolute, including fast-v1.
+    ; Its negotiated PUT/GET blocks already fit inside that payload.  The
+    ; private 2 KiB parser window remains unchanged for 8251 and UNAPI only.
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr z,frame_payload_range
+    ; Payloads above the public 320-byte limit are otherwise private to an
+    ; explicitly armed fast-v1 transfer. They may never run from H.TIMI/H.KEYI
+    ; or expose the larger resident buffer to ordinary MCP commands.
     ld a,(frame_opcode)
     cp 'X'
     jr nz,frame_payload_range
@@ -3329,6 +3663,12 @@ frame_payload_range:
     jp frame_reply_error_uncached
 
 frame_payload_store:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_RX_PAYLOAD
+    call trace_uart_set_phase
+endif
+endif
     ld bc,(frame_length)
     ld hl,frame_request_buffer
 if MSXAI_TSR_BUILD
@@ -3353,6 +3693,12 @@ frame_payload_store_loop:
     jr frame_payload_store_loop
 
 frame_payload_complete:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_RX_CRC
+    call trace_uart_set_phase
+endif
+endif
     ld hl,(frame_crc)
     ld (frame_request_crc),hl
     call ser_get
@@ -3367,6 +3713,14 @@ frame_payload_complete:
     jp frame_reply_error_uncached
 
 frame_crc_valid:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ; The complete request, including its CRC, reached resident RAM. No UART
+    ; register is sampled here, so the marker cannot pace an arriving payload.
+    ld a,TRACE_EVENT_UART_FRAME_RX
+    call trace_uart_record
+endif
+endif
 if MSXAI_TSR_BUILD
     ; Large pump requests were received into the helper's page-zero frame
     ; workspace. Copy only the fixed PUT_DATA control prefix into the resident
@@ -3591,6 +3945,16 @@ frame_cache_payload_done:
     ld (last_response_valid),a
 
 frame_emit_response:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_TX_HEADER
+    call trace_uart_set_phase
+    ; Mark only the response boundary, before its first byte. The payload loop
+    ; remains completely uninstrumented so a marginal stream is not masked.
+    ld a,TRACE_EVENT_UART_TX_BEGIN
+    call trace_uart_record
+endif
+endif
     call frame_crc_reset
     ld a,'M'
     call frame_send_crc_byte
@@ -3623,6 +3987,12 @@ frame_emit_no_error_flag:
     ld bc,(frame_response_length)
     ld hl,frame_response_buffer
 if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_TX_PAYLOAD
+    call trace_uart_set_phase
+endif
+endif
+if MSXAI_TSR_BUILD
     ld a,(frame_external_response)
     or a
     jr z,frame_emit_payload_loop
@@ -3638,6 +4008,12 @@ frame_emit_payload_loop:
     dec bc
     jr frame_emit_payload_loop
 frame_emit_crc:
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_UART_PHASE_TX_CRC
+    call trace_uart_set_phase
+endif
+endif
     ld hl,(frame_crc)
     ld a,l
     call ser_put
@@ -3645,6 +4021,12 @@ frame_emit_crc:
     call ser_put
     call transport_flush_checked
 if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ; Reaching this point proves every response byte was accepted by the local
+    ; UART writer. It does not claim that BaDCaT forwarded the bytes over TCP.
+    ld a,TRACE_EVENT_UART_TX_END
+    call trace_uart_record
+endif
     ; In redesigned fast-v1, successfully emitting the complete GET response
     ; is the delivery boundary. The reliable ordered stream makes a second
     ; application GET_ACK redundant. A transport timeout jumps away before
@@ -3757,9 +4139,13 @@ frame_cmd_hello:
     ld a,(active_transport_id)
     ld (hl),a
     inc hl
-    ld (hl),FRAMED_SAFE_MAX & 0FFh
+    push hl
+    call current_framed_max
+    ex de,hl
+    pop hl
+    ld (hl),e
     inc hl
-    ld (hl),FRAMED_SAFE_MAX >> 8
+    ld (hl),d
     inc hl
     ld a,(active_transport_control_level)
     ld (hl),a
@@ -4609,12 +4995,12 @@ frame_xfer_fast_caps:
     inc hl
     ld (hl),XFER_FAST_CAPABILITIES
     inc hl
-    ld de,XFER_FAST_PUT_CAPACITY
+    call current_xfer_fast_put_capacity
     ld (hl),e
     inc hl
     ld (hl),d
     inc hl
-    ld de,XFER_FAST_GET_CAPACITY
+    call current_xfer_fast_get_capacity
     ld (hl),e
     inc hl
     ld (hl),d
@@ -4696,12 +5082,12 @@ frame_xfer_caps:
     inc hl
     ld (hl),a
     inc hl
-    ld de,XFER_FAST_PUT_CAPACITY
+    call current_xfer_fast_put_capacity
     ld (hl),e
     inc hl
     ld (hl),d
     inc hl
-    ld de,XFER_FAST_GET_CAPACITY
+    call current_xfer_fast_get_capacity
     ld (hl),e
     inc hl
     ld (hl),d
@@ -4978,7 +5364,7 @@ frame_xfer_put_data:
     ld a,(xfer_fast_pump_active)
     or a
     jp z,frame_reply_bad_state
-    ld de,XFER_FAST_PUT_CAPACITY
+    call current_xfer_fast_put_capacity
     push hl
     or a
     sbc hl,de
@@ -5123,7 +5509,7 @@ frame_xfer_get_read:
     ld a,(xfer_fast_pump_active)
     or a
     jp z,frame_reply_bad_state
-    ld de,XFER_FAST_GET_CAPACITY
+    call current_xfer_fast_get_capacity
     push hl
     or a
     sbc hl,de
@@ -5441,7 +5827,7 @@ xfer_credit_state_ok:
     ret c
     call xfer_fast_put_window_remaining
     ret c
-    ld de,XFER_FAST_PUT_CAPACITY
+    call current_xfer_fast_put_capacity
     push hl
     or a
     sbc hl,de
@@ -5508,7 +5894,7 @@ frame_cmd_ram_read:
     ld hl,(frame_request_buffer)
     ld de,(frame_request_buffer + 2)
     push hl
-    ld hl,FRAMED_SAFE_MAX
+    call current_framed_max
     or a
     sbc hl,de
     pop hl
@@ -5704,7 +6090,7 @@ frame_cmd_vram_read:
     jp nz,frame_reply_range
     ld de,(frame_request_buffer + 3)
     push hl
-    ld hl,FRAMED_SAFE_MAX
+    call current_framed_max
     or a
     sbc hl,de
     pop hl
@@ -5721,6 +6107,10 @@ frame_cmd_vram_read:
     jp frame_reply_range
 frame_vram_read_range_ok:
     pop hl
+if MSXAI_TSR_BUILD
+else
+    call fossil_vdp_access_enter
+endif
     call set_vram_read
     ld bc,(frame_request_buffer + 3)
     ld de,frame_response_buffer
@@ -5735,6 +6125,10 @@ frame_vram_read_loop:
     jr frame_vram_read_loop
 frame_vram_read_done:
     call restore_r14
+if MSXAI_TSR_BUILD
+else
+    call fossil_vdp_access_leave
+endif
     xor a
     ld (frame_response_status),a
     jp frame_cache_and_send
@@ -5762,6 +6156,10 @@ frame_cmd_vram_write:
     jp frame_reply_range
 frame_vram_write_range_ok:
     pop hl
+if MSXAI_TSR_BUILD
+else
+    call fossil_vdp_access_enter
+endif
     call set_vram_write
     ld hl,frame_request_buffer + 3
 frame_vram_write_loop:
@@ -5775,6 +6173,10 @@ frame_vram_write_loop:
     jr frame_vram_write_loop
 frame_vram_write_done:
     call restore_r14
+if MSXAI_TSR_BUILD
+else
+    call fossil_vdp_access_leave
+endif
     jp frame_reply_ok
 
 frame_cmd_call:
@@ -6014,6 +6416,38 @@ endif
     jp frame_reply_ok
 
 ; ----------------------------------------------------------- VDP helpers ----
+if MSXAI_TSR_BUILD
+else
+; FOSSIL fills its UART ring from H.KEYI, so the monitor normally runs with
+; interrupts enabled. VDP port 99h is a two-write latch and its address counter
+; is shared with the BIOS ISR; keep each staged VRAM copy atomic, then restore
+; the exact incoming IFF2 state. Other transports return before changing IFF.
+fossil_vdp_access_enter:
+    ld a,(active_transport_id)
+    cp FOSSIL_ID
+    ret nz
+    ld a,i
+    di
+    jp po,fossil_vdp_access_enter_was_di
+    ld a,1
+    ld (fossil_vdp_restore_ei),a
+    ret
+fossil_vdp_access_enter_was_di:
+    xor a
+    ld (fossil_vdp_restore_ei),a
+    ret
+
+fossil_vdp_access_leave:
+    ld a,(active_transport_id)
+    cp FOSSIL_ID
+    ret nz
+    ld a,(fossil_vdp_restore_ei)
+    or a
+    ret z
+    ei
+    ret
+endif
+
 get_vram_frame:
     call ser_get
     and 07h
@@ -6127,6 +6561,11 @@ transport_bind:
     jr z,transport_bind_8251
     cp UNAPI_ID
     jr z,transport_bind_unapi
+if MSXAI_TSR_BUILD
+else
+    cp FOSSIL_ID
+    jr z,transport_bind_fossil
+endif
     ld hl,uart16c550_vector_table
     ld a,UART16C550_FLAGS
     ld (active_transport_flags),a
@@ -6146,6 +6585,16 @@ transport_bind_8251:
     ld (active_transport_flags),a
     ld a,UART8251_CONTROL_LEVEL
     ld (active_transport_control_level),a
+if MSXAI_TSR_BUILD
+else
+    jr transport_bind_vectors
+transport_bind_fossil:
+    ld hl,fossil_vector_table
+    ld a,FOSSIL_FLAGS
+    ld (active_transport_flags),a
+    ld a,FOSSIL_CONTROL_LEVEL
+    ld (active_transport_control_level),a
+endif
 transport_bind_vectors:
     ld de,transport_init + 1
     ld b,8
@@ -6174,6 +6623,13 @@ unapi_vector_table:
     dw unapi_init,unapi_restore,unapi_rx_ready
     dw unapi_tx_ready,unapi_read,unapi_write
     dw unapi_service,unapi_flush
+if MSXAI_TSR_BUILD
+else
+fossil_vector_table:
+    dw fossil_init,fossil_restore,fossil_rx_ready
+    dw fossil_tx_ready,fossil_read,fossil_write
+    dw fossil_service,fossil_flush
+endif
 
 ; A clean TCP disconnect is a stream boundary, not a serial timeout.  Reset
 ; only protocol state owned by that stream.  In particular, preserve the
@@ -6233,6 +6689,15 @@ transport_flush_failed:
     ld (transport_session_lost),a
     jp transport_session_abort
 
+; A transparent UART does not expose the TCP peer's disconnect edge. If a
+; bounded hook-side wait expires, discard only the 16C550's partial FIFOs and
+; restore its active line-control state. Other transports remain untouched.
+transport_timeout_recover:
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    ret nz
+    jp uart16c550_timeout_recover
+
 transport_session_abort:
 if MSXAI_TSR_BUILD
     ld a,(xfer_fast_pump_active)
@@ -6256,6 +6721,10 @@ endif
 include 'agent/transports/msx_transport_8251.inc'
 include 'agent/transports/msx_transport_16c550.inc'
 include 'agent/transports/msx_transport_unapi.inc'
+if MSXAI_TSR_BUILD
+else
+include 'agent/transports/msx_transport_fossil.inc'
+endif
 
 ; In foreground monitor mode serial I/O waits indefinitely. Inside a BIOS hook
 ; a missing byte/peer gets one explicitly bounded polling period; expiration
@@ -6282,7 +6751,15 @@ ser_put_hook_wait:
     ld a,b
     or c
     jr nz,ser_put_hook_wait
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    jp hook_transport_tx_timeout
+else
     jp hook_transport_timeout
+endif
+else
+    jp hook_transport_timeout
+endif
 ser_put_hook_ready:
     pop bc
     pop af
@@ -6301,7 +6778,11 @@ ser_put_pump_wait:
     ld a,b
     or c
     jr nz,ser_put_pump_wait
+if MSXAI_DEVELOPMENT_TRACE
+    jp xfer_fast_pump_tx_timeout
+else
     jp xfer_fast_pump_timeout
+endif
 ser_put_pump_ready:
     pop bc
     pop af
@@ -6339,7 +6820,15 @@ ser_get_hook_wait:
     ld a,b
     or c
     jr nz,ser_get_hook_wait
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    jp hook_transport_rx_timeout
+else
     jp hook_transport_timeout
+endif
+else
+    jp hook_transport_timeout
+endif
 ser_get_hook_ready:
     pop bc
     jp transport_read
@@ -6357,7 +6846,11 @@ ser_get_pump_wait:
     ld a,b
     or c
     jr nz,ser_get_pump_wait
+if MSXAI_DEVELOPMENT_TRACE
+    jp xfer_fast_pump_rx_timeout
+else
     jp xfer_fast_pump_timeout
+endif
 ser_get_pump_ready:
     pop bc
     jp transport_read
@@ -6394,6 +6887,38 @@ hook_session_state_ready:
     call transport_session_finalize
     jp hook_done
 
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+hook_transport_tx_timeout:
+    ld a,TRACE_UART_TIMEOUT_TX
+    jr hook_transport_capture_timeout
+hook_transport_rx_timeout:
+    ld a,TRACE_UART_TIMEOUT_RX
+hook_transport_capture_timeout:
+    ld (trace_uart_timeout_context),a
+    ; Capture t0 while the exhausted poll still owns its original stack. This
+    ; preserves LSR level bits and MSR state/deltas before unwind/recovery.
+    ; The readiness poll already read LSR, so cleared OE/PE/FE/BI bits are not
+    ; reconstructed here; their absence in the dump is deliberately inconclusive.
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jp nz,hook_transport_timeout
+    in a,(UART16C550_LSR)
+    ld (trace_uart_timeout_lsr),a
+    in a,(UART16C550_MSR)
+    ld (trace_uart_timeout_msr),a
+    ; ser_put/ser_get saved their caller's BC immediately before loading the
+    ; bounded polling budget, so the top word is the remaining frame count.
+    ld hl,0
+    add hl,sp
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    ld (trace_uart_timeout_outer_bc),de
+    jp hook_transport_timeout
+endif
+endif
+
 hook_transport_timeout:
     ; Drop all nested dispatcher return addresses, resume a paused application
     ; and unwind through the single saved hook context.
@@ -6401,6 +6926,13 @@ hook_transport_timeout:
     ld a,(vram_active)
     or a
     call nz,restore_r14
+if MSXAI_TSR_BUILD
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_EVENT_UART_TIMEOUT
+    call trace_uart_record
+endif
+endif
+    call transport_timeout_recover
     ld a,(post_action_pending)
     or a
     jr z,hook_timeout_no_pending_action
@@ -6449,8 +6981,37 @@ xfer_fast_pump_session_lost:
     ld (tsr_heap_result),a
     jp tsr_talk_xfer_pump_leave_heap
 
+if MSXAI_DEVELOPMENT_TRACE
+xfer_fast_pump_tx_timeout:
+    ld a,TRACE_UART_TIMEOUT_TX | TRACE_UART_TIMEOUT_PUMP
+    jr xfer_fast_pump_capture_timeout
+xfer_fast_pump_rx_timeout:
+    ld a,TRACE_UART_TIMEOUT_RX | TRACE_UART_TIMEOUT_PUMP
+xfer_fast_pump_capture_timeout:
+    ld (trace_uart_timeout_context),a
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jp nz,xfer_fast_pump_timeout
+    in a,(UART16C550_LSR)
+    ld (trace_uart_timeout_lsr),a
+    in a,(UART16C550_MSR)
+    ld (trace_uart_timeout_msr),a
+    ld hl,0
+    add hl,sp
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    ld (trace_uart_timeout_outer_bc),de
+    jp xfer_fast_pump_timeout
+endif
+
 xfer_fast_pump_timeout:
     ld sp,(xfer_fast_pump_sp)
+if MSXAI_DEVELOPMENT_TRACE
+    ld a,TRACE_EVENT_UART_TIMEOUT
+    call trace_uart_record
+endif
+    call transport_timeout_recover
     call xfer_fast_pump_abandon
     xor a
     ld (tsr_heap_result),a
@@ -6589,6 +7150,13 @@ trace_reset:
     dec a
     ld (trace_last_tcp_result),a
     ld (trace_last_tcp_state),a
+    xor a
+    ld (trace_uart_phase),a
+    ld (trace_uart_timeout_context),a
+    ld (trace_uart_timeout_outer_bc),a
+    ld (trace_uart_timeout_outer_bc + 1),a
+    ld (trace_uart_timeout_lsr),a
+    ld (trace_uart_timeout_msr),a
     pop hl
     pop de
     pop bc
@@ -6597,15 +7165,41 @@ trace_reset:
 
 trace_enable:
     push af
+    push bc
     ld a,(trace_flags)
     and TRACE_FLAG_ENABLED
+    jr z,trace_enable_reset
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr z,trace_enable_check_uart
+    ld a,(trace_flags)
+    and TRACE_FLAG_UART16C550
+    jr z,trace_enable_done
+    jr trace_enable_reset
+trace_enable_check_uart:
+    ld a,(trace_flags)
+    and TRACE_FLAG_UART16C550
     jr nz,trace_enable_done
+trace_enable_reset:
     call trace_reset
     ld a,TRACE_FLAG_ENABLED
+    ld b,a
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    ld a,b
+    jr nz,trace_enable_store_flags
+    or TRACE_FLAG_UART16C550
+trace_enable_store_flags:
     ld (trace_flags),a
     ld a,TRACE_EVENT_ENABLE
     call trace_record
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr nz,trace_enable_done
+    ld a,TRACE_EVENT_UART_INIT
+    call trace_uart_record
 trace_enable_done:
+    pop bc
     pop af
     ret
 
@@ -6669,8 +7263,49 @@ trace_record_tcp_state_done:
     pop af
     ret
 
-; Input A=event. All registers and flags are preserved. Each record is:
-; event,error,state,active,cleanup,flags,jiffy-lo,jiffy-hi.
+; Record one UART event only while the development trace is active for the
+; 16C550 transport. Input A=event; all registers and flags are preserved.
+trace_uart_record:
+    push af
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr nz,trace_uart_record_done
+    ld a,(trace_flags)
+    and TRACE_FLAG_ENABLED | TRACE_FLAG_UART16C550
+    cp TRACE_FLAG_ENABLED | TRACE_FLAG_UART16C550
+    jr nz,trace_uart_record_done
+    pop af
+    call trace_record
+    ret
+trace_uart_record_done:
+    pop af
+    ret
+
+; Input A=phase. The write is scoped to an enabled 16C550 development trace;
+; all registers and flags are preserved except that A retains its input value.
+trace_uart_set_phase:
+    push af
+    push bc
+    ld b,a
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr nz,trace_uart_set_phase_done
+    ld a,(trace_flags)
+    and TRACE_FLAG_ENABLED | TRACE_FLAG_UART16C550
+    cp TRACE_FLAG_ENABLED | TRACE_FLAG_UART16C550
+    jr nz,trace_uart_set_phase_done
+    ld a,b
+    ld (trace_uart_phase),a
+trace_uart_set_phase_done:
+    pop bc
+    pop af
+    ret
+
+; Input A=event. All registers and flags are preserved. UNAPI records remain
+; event,error,state,active,cleanup,flags,jiffy16. UART hardware records use
+; event,LSR,MSR,MCR,phase,opcode,jiffy16. The five stream-boundary markers use
+; event,phase,opcode,frame-sequence16,length16,marker-flags and deliberately
+; perform no UART register I/O.
 trace_record:
     push af
     push bc
@@ -6692,6 +7327,9 @@ trace_record:
     push hl
     ld (hl),c
     inc hl
+    ld a,(trace_flags)
+    and TRACE_FLAG_UART16C550
+    jr nz,trace_record_uart_fields
     ld a,(unapi_last_error)
     ld (hl),a
     inc hl
@@ -6747,10 +7385,108 @@ trace_record_flag_prompt:
 trace_record_flags_ready:
     ld (hl),b
     inc hl
+    jr trace_record_jiffy
+trace_record_uart_fields:
+    ld a,c
+    cp TRACE_EVENT_UART_WAKE
+    jr z,trace_record_uart_marker_fields
+    cp TRACE_EVENT_UART_FRAME_RX
+    jr z,trace_record_uart_marker_fields
+    cp TRACE_EVENT_UART_TX_BEGIN
+    jr z,trace_record_uart_marker_fields
+    cp TRACE_EVENT_UART_TX_END
+    jr z,trace_record_uart_marker_fields
+    cp TRACE_EVENT_UART_RECONNECT
+    jr z,trace_record_uart_marker_fields
+    in a,(UART16C550_LSR)
+    ld (hl),a
+    inc hl
+    in a,(UART16C550_MSR)
+    ld (hl),a
+    inc hl
+    in a,(UART16C550_MCR)
+    ld (hl),a
+    inc hl
+    ld a,(trace_uart_phase)
+    ld (hl),a
+    inc hl
+    ld a,(frame_opcode)
+    ld (hl),a
+    inc hl
+trace_record_jiffy:
     ld de,(CPU_JIFFY)
     ld (hl),e
     inc hl
     ld (hl),d
+    jr trace_record_fields_done
+
+trace_record_uart_marker_fields:
+    ld a,(trace_uart_phase)
+    ld (hl),a
+    inc hl
+    ld a,c
+    cp TRACE_EVENT_UART_WAKE
+    jr z,trace_record_uart_marker_waiting
+    cp TRACE_EVENT_UART_RECONNECT
+    jr nz,trace_record_uart_marker_frame
+trace_record_uart_marker_waiting:
+    ; The header has not arrived at WAKE/RECONNECT. Report the sequence the
+    ; parser is waiting for and clear fields that would otherwise be stale.
+    xor a
+    ld (hl),a
+    inc hl
+    ld de,(next_sequence)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    xor a
+    ld (hl),a
+    inc hl
+    ld (hl),a
+    inc hl
+    jr trace_record_uart_marker_flags
+trace_record_uart_marker_frame:
+    ld a,(frame_opcode)
+    ld (hl),a
+    inc hl
+    ld de,(frame_sequence)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld a,c
+    cp TRACE_EVENT_UART_FRAME_RX
+    ld de,(frame_response_length)
+    jr nz,trace_record_uart_marker_length_ready
+    ld de,(frame_length)
+trace_record_uart_marker_length_ready:
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+trace_record_uart_marker_flags:
+    ld b,0
+    ; The foreground transfer pump deliberately owns the resident guard, so
+    ; in_hook may be set and hook_kind may still contain an older TIMI sample.
+    ; Give the explicit pump state precedence instead of reporting a false hook.
+    ld a,(xfer_fast_pump_active)
+    or a
+    jr z,trace_record_uart_marker_hook
+    set TRACE_UART_MARKER_PUMP_BIT,b
+    jr trace_record_uart_marker_flags_ready
+trace_record_uart_marker_hook:
+    ld a,(in_hook)
+    or a
+    jr z,trace_record_uart_marker_flags_ready
+    set TRACE_UART_MARKER_HOOK_BIT,b
+    ld a,(hook_kind)
+    or a
+    jr z,trace_record_uart_marker_flags_ready
+    set TRACE_UART_MARKER_TIMI_BIT,b
+trace_record_uart_marker_flags_ready:
+    ld (hl),b
+trace_record_fields_done:
     pop de                       ; start of the just-written record
 
     ld hl,(trace_sequence)
@@ -6775,6 +7511,14 @@ trace_record_advance:
 trace_record_store_index:
     ld (trace_write_index),a
 
+    ld a,(trace_flags)
+    and TRACE_FLAG_UART16C550
+    jr z,trace_record_unapi_incident
+    ld a,c
+    cp TRACE_EVENT_UART_TIMEOUT
+    jr z,trace_record_freeze
+    jr trace_record_done
+trace_record_unapi_incident:
     ld a,c
     cp TRACE_EVENT_DROP
     jr z,trace_record_freeze
@@ -6806,7 +7550,7 @@ trace_freeze_first_failure:
     push hl
     ld a,(trace_flags)
     and TRACE_FLAG_INCIDENT
-    jr nz,trace_freeze_first_failure_done
+    jp nz,trace_freeze_first_failure_done
     ld a,(trace_flags)
     or TRACE_FLAG_INCIDENT
     ld (trace_flags),a
@@ -6815,6 +7559,43 @@ trace_freeze_first_failure:
     ld bc,TRACE_RECORD_SIZE
     ldir
     ld hl,trace_failure_snapshot + TRACE_RECORD_SIZE
+    ld a,(trace_flags)
+    and TRACE_FLAG_UART16C550
+    jr z,trace_freeze_unapi_extra
+    ; UART timeout context: direction plus hook/pump origin, outer caller BC
+    ; (usually remaining bytes), the direction-relevant payload length, the
+    ; immediate pre-unwind LSR/MSR samples, and the configured divisor.
+    ld a,(trace_uart_timeout_context)
+    ld (hl),a
+    inc hl
+    ld de,(trace_uart_timeout_outer_bc)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld a,(trace_uart_timeout_context)
+    and TRACE_UART_TIMEOUT_DIRECTION_MASK
+    cp TRACE_UART_TIMEOUT_TX
+    jr nz,trace_freeze_uart_rx_length
+    ld de,(frame_response_length)
+    jr trace_freeze_uart_length_ready
+trace_freeze_uart_rx_length:
+    ld de,(frame_length)
+trace_freeze_uart_length_ready:
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld a,(trace_uart_timeout_lsr)
+    ld (hl),a
+    inc hl
+    ld a,(trace_uart_timeout_msr)
+    ld (hl),a
+    inc hl
+    ld a,(active_uart16c550_divisor)
+    ld (hl),a
+    jr trace_freeze_first_failure_done
+trace_freeze_unapi_extra:
     ld a,(unapi_retry_count)
     ld (hl),a
     inc hl
@@ -6905,6 +7686,8 @@ if MSXAI_DEVELOPMENT_TRACE
 else
     jp z,tsr_talk_unsupported
 endif
+    cp TSR_TALK_BADCAT_DIAL
+    jp z,tsr_talk_badcat_dial
     cp TSR_TALK_XFER_CLAIM
     jp z,tsr_talk_xfer_claim
     cp TSR_TALK_XFER_READY
@@ -6926,6 +7709,288 @@ endif
     cp TSR_TALK_XFER_PUMP
     jp z,tsr_talk_xfer_pump
     jp tsr_talk_unsupported
+
+; B3 is deliberately narrower than the generic transport lifecycle ABIs. The
+; caller supplies a 12-byte binary request in page 0; the resident validates
+; every ABI field, constructs the complete silent ZiModem dial command in its
+; own memory, resets MCP session state, and transmits it only through the active
+; native 16C550 at 57600. Stale FIFOs are cleared before ATD. After the final
+; CR, only a successful TEMT path avoids RX reads and FIFO clears; an uncertain
+; TX fails closed with a destructive FIFO reset.
+tsr_talk_badcat_dial:
+    ld a,(in_hook)
+    or a
+    jp nz,tsr_talk_unsupported
+    ld a,h
+    or a
+    jp z,tsr_talk_unsupported
+    ld bc,TSR_BADCAT_DIAL_REQUEST_SIZE
+    call tsr_talk_page0_range
+    jp c,tsr_talk_unsupported
+    ld (tsr_badcat_dial_request_pointer),hl
+    ld a,TSR_BADCAT_DIAL_STATUS_ABI
+    call tsr_badcat_dial_set_status
+
+    ld a,(hl)
+    cp TSR_BADCAT_DIAL_MAGIC & 0FFh
+    jp nz,tsr_badcat_dial_rejected
+    inc hl
+    ld a,(hl)
+    cp TSR_BADCAT_DIAL_MAGIC >> 8
+    jp nz,tsr_badcat_dial_rejected
+    inc hl
+    ld a,(hl)
+    cp TSR_BADCAT_DIAL_VERSION
+    jp nz,tsr_badcat_dial_rejected
+    inc hl
+    ld a,(hl)
+    cp TSR_BADCAT_DIAL_REQUEST_SIZE
+    jp nz,tsr_badcat_dial_rejected
+
+    ld hl,(tsr_badcat_dial_request_pointer)
+    ld bc,TSR_BADCAT_DIAL_REQUEST_RESERVED
+    add hl,bc
+    ld a,(hl)
+    or a
+    jr z,tsr_badcat_dial_reserved_ok
+    ld a,TSR_BADCAT_DIAL_STATUS_TARGET
+    jp tsr_badcat_dial_fail_status
+tsr_badcat_dial_reserved_ok:
+    ld hl,(tsr_badcat_dial_request_pointer)
+    ld bc,TSR_BADCAT_DIAL_REQUEST_IPV4
+    add hl,bc
+    ld a,(hl)
+    inc hl
+    or (hl)
+    inc hl
+    or (hl)
+    inc hl
+    or (hl)
+    jr z,tsr_badcat_dial_bad_target
+    ld hl,(tsr_badcat_dial_request_pointer)
+    ld bc,TSR_BADCAT_DIAL_REQUEST_IPV4
+    add hl,bc
+    ld a,(hl)
+    inc hl
+    and (hl)
+    inc hl
+    and (hl)
+    inc hl
+    and (hl)
+    inc a
+    jr nz,tsr_badcat_dial_ip_ok
+tsr_badcat_dial_bad_target:
+    ld a,TSR_BADCAT_DIAL_STATUS_TARGET
+    jp tsr_badcat_dial_fail_status
+tsr_badcat_dial_ip_ok:
+    ld hl,(tsr_badcat_dial_request_pointer)
+    ld bc,TSR_BADCAT_DIAL_REQUEST_PORT
+    add hl,bc
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    ld a,d
+    or e
+    jr nz,tsr_badcat_dial_target_ok
+    ld a,TSR_BADCAT_DIAL_STATUS_TARGET
+    jp tsr_badcat_dial_fail_status
+tsr_badcat_dial_target_ok:
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr z,tsr_badcat_dial_transport_ok
+    ld a,TSR_BADCAT_DIAL_STATUS_TRANSPORT
+    jp tsr_badcat_dial_fail_status
+tsr_badcat_dial_transport_ok:
+    ld a,(active_uart16c550_divisor)
+    cp UART16C550_DIVISOR_57600
+    jr z,tsr_badcat_dial_baud_ok
+    ld a,TSR_BADCAT_DIAL_STATUS_BAUD
+    jp tsr_badcat_dial_fail_status
+
+tsr_badcat_dial_baud_ok:
+    ld a,(tsr_badcat_dial_attempted)
+    or a
+    jr z,tsr_badcat_dial_state_ready
+    ld a,TSR_BADCAT_DIAL_STATUS_STATE
+    jp tsr_badcat_dial_fail_status
+tsr_badcat_dial_state_ready:
+    ; Command construction and bounded polling are too deep for MemMan's
+    ; private TsrCall stack. Reject a damaged heap before excluding hooks, then
+    ; run the complete transition on the resident's guarded stack.
+    ld a,(tsr_heap_fault)
+    or a
+    jr nz,tsr_badcat_dial_stack_failed
+    call tsr_heap_guards_ok
+    jr z,tsr_badcat_dial_heap_ready
+    ld a,1
+    ld (tsr_heap_fault),a
+tsr_badcat_dial_stack_failed:
+    ld a,TSR_BADCAT_DIAL_STATUS_STACK
+    jp tsr_badcat_dial_fail_status
+tsr_badcat_dial_heap_ready:
+    di
+    ld a,1
+    ld (in_hook),a
+    ld (tsr_heap_memman_sp),sp
+    ld sp,(tsr_heap_stack_top)
+    call tsr_badcat_dial_inner
+    ld (tsr_heap_result),a
+    di
+    call tsr_heap_guards_ok
+    jr z,tsr_badcat_dial_heap_guards_ok
+    ld a,1
+    ld (tsr_heap_fault),a
+    ld a,TSR_BADCAT_DIAL_STATUS_STACK
+    ld (tsr_heap_result),a
+tsr_badcat_dial_heap_guards_ok:
+    ld sp,(tsr_heap_memman_sp)
+    xor a
+    ld (in_hook),a
+    ld a,(tsr_heap_result)
+    or a
+    jr nz,tsr_badcat_dial_fail_status
+    call tsr_badcat_dial_set_status
+    xor a
+    ret
+
+; The driver-local handoff performs the read-only TEMT preflight, one-shot
+; latch, protocol reset, raw UART write, and success/failure hardware barrier.
+; Keeping every register access in the 16C550 include preserves the transport
+; abstraction for 8251, FOSSIL, and UNAPI builds.
+tsr_badcat_dial_inner:
+    call tsr_badcat_dial_build_command
+    ld hl,tsr_badcat_dial_command
+    call uart16c550_badcat_dial
+    jr c,tsr_badcat_dial_inner_failed
+    ld a,TSR_BADCAT_DIAL_STATUS_OK
+    ret
+    ; Carry means either the no-write TEMT preflight failed or a started dial
+    ; was left behind the driver's closed/reset fail-safe barrier.
+tsr_badcat_dial_inner_failed:
+    ld a,TSR_BADCAT_DIAL_STATUS_TX_TIMEOUT
+    ret
+
+tsr_badcat_dial_rejected:
+    ld a,TSR_BADCAT_DIAL_STATUS_ABI
+tsr_badcat_dial_fail_status:
+    call tsr_badcat_dial_set_status
+    ld a,0FFh
+    ret
+
+tsr_badcat_dial_set_status:
+    push hl
+    push de
+    ld hl,(tsr_badcat_dial_request_pointer)
+    ld de,TSR_BADCAT_DIAL_REQUEST_STATUS
+    add hl,de
+    ld (hl),a
+    pop de
+    pop hl
+    ret
+
+; Build exactly ATS2=255Q1D"a.b.c.d:port" in the resident-owned 35-byte
+; buffer. ZiModem 3.5.5 applies the volatile escape-character guard before D;
+; Q1 suppresses both CONNECT and ERROR, so neither can prefix a successful MCP
+; stream. The request is binary: caller text can never inject an AT delimiter.
+tsr_badcat_dial_build_command:
+    ld hl,tsr_badcat_dial_prefix
+    ld de,tsr_badcat_dial_command
+tsr_badcat_dial_prefix_loop:
+    ld a,(hl)
+    or a
+    jr z,tsr_badcat_dial_ipv4_begin
+    ld (de),a
+    inc hl
+    inc de
+    jr tsr_badcat_dial_prefix_loop
+tsr_badcat_dial_ipv4_begin:
+    ld hl,(tsr_badcat_dial_request_pointer)
+    ld bc,TSR_BADCAT_DIAL_REQUEST_IPV4
+    add hl,bc
+    ld b,4
+tsr_badcat_dial_ipv4_loop:
+    ld a,(hl)
+    inc hl
+    push hl
+    push bc
+    call tsr_badcat_append_byte_decimal
+    pop bc
+    pop hl
+    ld a,b
+    cp 1
+    jr z,tsr_badcat_dial_ipv4_no_dot
+    ld a,'.'
+    ld (de),a
+    inc de
+tsr_badcat_dial_ipv4_no_dot:
+    djnz tsr_badcat_dial_ipv4_loop
+    ld a,':'
+    ld (de),a
+    inc de
+    ld hl,(tsr_badcat_dial_request_pointer)
+    ld bc,TSR_BADCAT_DIAL_REQUEST_PORT
+    add hl,bc
+    ld c,(hl)
+    inc hl
+    ld b,(hl)
+    ld h,b
+    ld l,c
+    call tsr_badcat_append_word_decimal
+    ld a,'"'
+    ld (de),a
+    inc de
+    xor a
+    ld (de),a
+    ret
+
+tsr_badcat_append_byte_decimal:
+    ld l,a
+    ld h,0
+tsr_badcat_append_word_decimal:
+    xor a
+    ld (tsr_badcat_decimal_started),a
+    ld bc,10000
+    call tsr_badcat_append_decimal_place
+    ld bc,1000
+    call tsr_badcat_append_decimal_place
+    ld bc,100
+    call tsr_badcat_append_decimal_place
+    ld bc,10
+    call tsr_badcat_append_decimal_place
+    ld a,l
+    add a,'0'
+    ld (de),a
+    inc de
+    ret
+
+tsr_badcat_append_decimal_place:
+    xor a
+tsr_badcat_append_decimal_loop:
+    or a
+    sbc hl,bc
+    jr c,tsr_badcat_append_decimal_done
+    inc a
+    jr tsr_badcat_append_decimal_loop
+tsr_badcat_append_decimal_done:
+    add hl,bc
+    ld (tsr_badcat_dial_result),a
+    ld a,(tsr_badcat_decimal_started)
+    or a
+    jr nz,tsr_badcat_append_decimal_emit
+    ld a,(tsr_badcat_dial_result)
+    or a
+    ret z
+    ld a,1
+    ld (tsr_badcat_decimal_started),a
+tsr_badcat_append_decimal_emit:
+    ld a,(tsr_badcat_dial_result)
+    add a,'0'
+    ld (de),a
+    inc de
+    ret
+
+tsr_badcat_dial_prefix:
+    db "ATS2=255Q1D",34,0
 
 ; Private trace ABI. ENABLE is idempotent and SNAPSHOT copies the complete
 ; fixed export block immediately after the 16-byte page-zero request. No
@@ -7118,6 +8183,14 @@ tsr_talk_config_init_done:
 tsr_talk_config_reset_xfer:
     call xfer_reset               ; a real driver change invalidates staging
 tsr_talk_config_xfer_done:
+if MSXAI_DEVELOPMENT_TRACE
+    ; A8 may have armed the previously active resident before A7 switched its
+    ; transport. Rebind/reset the V1 record interpretation only after the new
+    ; driver initialized successfully; same-kind reconfiguration is a no-op.
+    ld a,(trace_flags)
+    and TRACE_FLAG_ENABLED
+    call nz,trace_enable
+endif
     ld a,(tsr_config_previous_in_hook)
     ld (in_hook),a
     jr tsr_talk_done
@@ -7616,9 +8689,20 @@ tsr_talk_xfer_claim:
     call xfer_id_matches
     pop de
     jp nz,tsr_talk_unsupported
+    push de
     ld hl,xfer_descriptor
     ld bc,XFER_DESC_SIZE
     ldir
+    pop hl
+    ld de,XFER_DESC_RESERVED
+    add hl,de
+    xor a
+    ld (hl),a                  ; zero retains the 2,040-byte default
+    ld a,(active_transport_id)
+    cp UART16C550_ID
+    jr nz,tsr_talk_xfer_claim_limit_ready
+    ld (hl),UART16C550_XFER_FAST_GET_CAPACITY
+tsr_talk_xfer_claim_limit_ready:
     ld a,XFER_STATE_OPENING
     ld (xfer_state),a
     xor a
@@ -7844,7 +8928,8 @@ tsr_talk_xfer_get_publish:
     or c
     jp z,tsr_talk_unsupported
     push hl
-    ld hl,XFER_FAST_GET_CAPACITY
+    call current_xfer_fast_get_capacity
+    ex de,hl
     or a
     sbc hl,bc
     pop hl

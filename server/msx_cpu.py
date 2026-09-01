@@ -30,7 +30,12 @@ CPU_CONTEXT_REQUIRED_FLAGS = (
 
 STATE_NAMES = {0: "monitor", 1: "running", 2: "paused"}
 RUNTIME_NAMES = {0: "resident", 1: "foreground-monitor"}
-TRANSPORT_NAMES = {0: "uart-8251", 1: "uart-16c550", 2: "tcpip-unapi"}
+TRANSPORT_NAMES = {
+    0: "uart-8251",
+    1: "uart-16c550",
+    2: "tcpip-unapi",
+    3: "uart-fossil",
+}
 
 REGISTER_WORDS = (
     "af", "bc", "de", "hl", "af_alt", "bc_alt", "de_alt", "hl_alt",

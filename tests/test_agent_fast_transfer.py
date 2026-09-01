@@ -106,7 +106,7 @@ class AgentFastTransferSourceTest(unittest.TestCase):
         self.assertIn("call xfer_fast_put_window_remaining", put_guard)
         self.assertIn("ld de,(xfer_request_count)", put_guard)
         self.assertIn("call xfer_fast_put_window_remaining", credit)
-        self.assertIn("ld de,XFER_FAST_PUT_CAPACITY", credit)
+        self.assertIn("call current_xfer_fast_put_capacity", credit)
         self.assertIn("xfer_accepted", remaining)
         self.assertIn("xfer_durable", remaining)
         self.assertIn("ld hl,XFER_FAST_ACCUMULATOR_CAPACITY", remaining)
@@ -124,6 +124,8 @@ class AgentFastTransferSourceTest(unittest.TestCase):
         self.assertIn("ld de,loader_xfer_accumulator", refill)
         self.assertIn("ld c,DOS_READ", refill)
         self.assertIn("ld de,XFER_FAST_GET_CAPACITY", emit)
+        self.assertIn("XFER_DESC_RESERVED", emit)
+        self.assertIn("loader_xfer_get_fast_limit_ready:", emit)
         self.assertIn("ld hl,loader_xfer_accumulator", emit)
         self.assertIn("ld de,loader_xfer_buffer + 6", emit)
         self.assertIn("ldir", emit)
@@ -156,6 +158,33 @@ class AgentFastTransferSourceTest(unittest.TestCase):
         self.assertEqual(fast_put + 21, 2047)
         self.assertEqual(fast_get + 8, 2048)
 
+    def test_16c550_fast_chunks_stay_inside_128_byte_payloads(self):
+        self.assertRegex(
+            CORE,
+            r"(?m)^UART16C550_FRAMED_SAFE_MAX:\s+equ\s+0080h$")
+        self.assertRegex(
+            CORE,
+            r"(?m)^UART16C550_XFER_FAST_PUT_CAPACITY:\s+equ\s+"
+            r"UART16C550_FRAMED_SAFE_MAX - 22$")
+        self.assertRegex(
+            CORE,
+            r"(?m)^UART16C550_XFER_FAST_GET_CAPACITY:\s+equ\s+"
+            r"UART16C550_FRAMED_SAFE_MAX - 8$")
+
+        claim = CORE.split("tsr_talk_xfer_claim:", 1)[1].split(
+            "tsr_talk_xfer_ready:", 1)[0]
+        self.assertRegex(
+            claim,
+            r"(?s)ld \(hl\),a.*cp UART16C550_ID.*"
+            r"ld \(hl\),UART16C550_XFER_FAST_GET_CAPACITY")
+
+        put = CORE.split("frame_xfer_put_data:", 1)[1].split(
+            "frame_xfer_put_length_ok:", 1)[0]
+        get = CORE.split("frame_xfer_get_read:", 1)[1].split(
+            "frame_xfer_get_max_ok:", 1)[0]
+        self.assertIn("call current_xfer_fast_put_capacity", put)
+        self.assertIn("call current_xfer_fast_get_capacity", get)
+
     def test_caps_and_open_expose_only_the_fast_data_plane(self):
         caps = CORE.split("frame_xfer_caps:", 1)[1].split(
             "frame_xfer_open:", 1)[0]
@@ -164,18 +193,31 @@ class AgentFastTransferSourceTest(unittest.TestCase):
         open_flags = CORE.split(
             "frame_xfer_open_encoding_ok:", 1)[1].split(
             "frame_xfer_open_resume_flag_ok:", 1)[0]
-        self.assertIn("XFER_FAST_PUT_CAPACITY", caps)
-        self.assertIn("XFER_FAST_GET_CAPACITY", caps)
-        self.assertIn("XFER_FAST_PUT_CAPACITY", fast_caps)
-        self.assertIn("XFER_FAST_GET_CAPACITY", fast_caps)
+        for section in (caps, fast_caps):
+            self.assertIn("call current_xfer_fast_put_capacity", section)
+            self.assertIn("call current_xfer_fast_get_capacity", section)
+        put_limit = CORE.split(
+            "current_xfer_fast_put_capacity:", 1)[1].split(
+            "current_xfer_fast_get_capacity:", 1)[0]
+        get_limit = CORE.split(
+            "current_xfer_fast_get_capacity:", 1)[1].split(
+            "cmd_status:", 1)[0]
+        self.assertIn("ld de,XFER_FAST_PUT_CAPACITY", put_limit)
+        self.assertIn("ld de,XFER_FAST_GET_CAPACITY", get_limit)
+        self.assertIn("cp UART16C550_ID", put_limit)
+        self.assertIn("cp UART16C550_ID", get_limit)
         self.assertNotIn("XFER_PUT_CAPACITY", CORE + PROTOCOL)
         self.assertNotIn("XFER_GET_CAPACITY", CORE + PROTOCOL)
         self.assertIn("and XFER_FLAG_FAST_PUMP", open_flags)
         self.assertIn("jp z,frame_reply_unsupported", open_flags)
 
     def test_large_parser_window_is_x_only_armed_and_pumped(self):
-        bounds = CORE.split("ld hl,FRAMED_SAFE_MAX", 1)[1].split(
+        bounds = CORE.split("frame_request_status_ok:", 1)[1].split(
             "frame_payload_store:", 1)[0]
+        self.assertIn("call current_framed_max", bounds)
+        self.assertRegex(
+            bounds,
+            r"(?s)cp UART16C550_ID\s+jr z,frame_payload_range.*cp 'X'")
         self.assertIn("cp 'X'", bounds)
         self.assertIn("xfer_fast_pump_active", bounds)
         self.assertIn("xfer_fast_armed", bounds)
@@ -187,7 +229,7 @@ class AgentFastTransferSourceTest(unittest.TestCase):
         vram_read = CORE.split("frame_cmd_vram_read:", 1)[1].split(
             "frame_cmd_vram_write:", 1)[0]
         for ordinary_read in (ram_read, vram_read):
-            self.assertIn("ld hl,FRAMED_SAFE_MAX", ordinary_read)
+            self.assertIn("call current_framed_max", ordinary_read)
             self.assertNotIn("ld hl,FRAMED_MAX", ordinary_read)
 
     def test_foreground_pump_has_an_independent_timeout_stack(self):
@@ -198,6 +240,7 @@ class AgentFastTransferSourceTest(unittest.TestCase):
         self.assertIn("ld (xfer_fast_pump_sp),sp", pump)
         self.assertIn("call frame_receive", pump)
         self.assertIn("ld sp,(xfer_fast_pump_sp)", timeout)
+        self.assertIn("call transport_timeout_recover", timeout)
         self.assertIn("ld (xfer_fast_get_commit_after_send),a", timeout)
         self.assertIn("ld (frame_external_response),a", timeout)
         self.assertNotIn("hook_done", timeout)
@@ -275,7 +318,7 @@ class AgentFastTransferSourceTest(unittest.TestCase):
         publish = CORE.split("tsr_talk_xfer_get_publish:", 1)[1].split(
             "tsr_talk_xfer_get_poll:", 1)[0]
         self.assertIn("ld (xfer_fast_page0_buffer),hl", publish)
-        self.assertIn("ld hl,XFER_FAST_GET_CAPACITY", publish)
+        self.assertIn("call current_xfer_fast_get_capacity", publish)
         self.assertNotIn("XFER_FLAG_FAST_PUMP", publish)
         self.assertNotIn("ld de,xfer_buffer\n", publish)
         self.assertNotIn("xfer_buffer_crc", publish)

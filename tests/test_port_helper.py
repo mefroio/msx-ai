@@ -7,8 +7,10 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 from tools.build_port_helper import (  # noqa: E402
+    EXPECTED_IMAGE_SIZE,
     ORIGIN,
     TSR_NAME,
+    TRACE_SUCCESS_MESSAGE,
     PortHelperBuildError,
     assemble_port_helper,
     build_port_helper,
@@ -296,23 +298,30 @@ class PortHelperTest(unittest.TestCase):
                 "port_helper_start: equ $0200\n")
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
-    def test_real_build_is_minimal_deterministic_and_matches_loader_size(self):
+    def test_real_build_is_minimal_deterministic_and_has_pinned_size(self):
         first = assemble_port_helper()
         second = assemble_port_helper()
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.sha256, second.sha256)
-        self.assertEqual(len(first.data), 1062)
+        self.assertEqual(EXPECTED_IMAGE_SIZE, 0x0498)
+        self.assertEqual(len(first.data), EXPECTED_IMAGE_SIZE)
         self.assertLess(first.labels["port_helper_end"], 0x4000)
-
-        loader = (ROOT / "agent" / "msx_memman_loader.asm").read_text(
-            encoding="utf-8")
-        self.assertIn("MP_FILE_SIZE:            equ 00426h", loader)
 
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "MP.COM"
             published = build_port_helper(output=output)
             self.assertEqual(output.read_bytes(), first.data)
             self.assertEqual(published.data, first.data)
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_validator_rejects_an_unpinned_image_size(self):
+        image = assemble_port_helper()
+        oversized = image.data + b"\0"
+        labels = dict(image.labels)
+        labels["port_helper_end"] += 1
+        with self.assertRaisesRegex(
+                PortHelperBuildError, r"1177 bytes, expected 1176"):
+            validate_port_helper_image(oversized, labels)
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
     def test_validator_pins_tsr_identifier(self):
@@ -381,6 +390,41 @@ class PortHelperTest(unittest.TestCase):
             validate_port_helper_image(image.data, bad_guard)
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_validator_pins_trace_only_dispatch_and_exit(self):
+        image = assemble_port_helper()
+        self.assertEqual(
+            image.labels["trace_only_requested"],
+            image.labels["trace_requested"] + 1,
+        )
+        for name in ("trace_requested", "trace_only_requested"):
+            self.assertEqual(image.data[image.labels[name] - ORIGIN], 0)
+        self.assertEqual(
+            image.data[
+                image.labels["message_trace_success"] - ORIGIN:
+                image.labels["message_trace_success_end"] - ORIGIN],
+            TRACE_SUCCESS_MESSAGE,
+        )
+
+        mutated = bytearray(image.data)
+        mutated[
+            image.labels["port_helper_trace_mode_dispatch"] - ORIGIN
+        ] ^= 1
+        with self.assertRaisesRegex(PortHelperBuildError, "branch around"):
+            validate_port_helper_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        mutated[
+            image.labels["port_helper_trace_only_success_ei"] - ORIGIN
+        ] ^= 1
+        with self.assertRaisesRegex(PortHelperBuildError, "EI, print, and exit"):
+            validate_port_helper_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        mutated[image.labels["message_trace_success"] - ORIGIN] ^= 1
+        with self.assertRaisesRegex(PortHelperBuildError, "trace-only message"):
+            validate_port_helper_image(bytes(mutated), image.labels)
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
     def test_actual_z80_parser_accepts_public_range_and_private_hex(self):
         image = assemble_port_helper()
         cases = {
@@ -391,6 +435,8 @@ class PortHelperTest(unittest.TestCase):
             "/19CB": 6603,
             "/A873": 43123,
             "/a873": 43123,
+            "/T123": 0xD123,
+            "/t123": 0xD123,
             "/FFFE": 65534,
             "  12345\t ": 12345,
             "65534": 65534,
@@ -401,6 +447,35 @@ class PortHelperTest(unittest.TestCase):
                     image, command).run()
                 self.assertFalse(carry)
                 self.assertEqual(value, expected)
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_actual_z80_parser_accepts_explicit_trace_only_mode(self):
+        image = assemble_port_helper()
+        for command in ("/T", "/t", "  /T\t  "):
+            with self.subTest(command=command):
+                machine = _PortParserMachine(image, command)
+                carry, value = machine.run()
+                self.assertFalse(carry)
+                self.assertEqual(value, 0)
+                self.assertEqual(
+                    machine.memory[image.labels["trace_requested"]], 1)
+                self.assertEqual(
+                    machine.memory[image.labels["trace_only_requested"]], 1)
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_compact_trace_port_encoding_does_not_become_trace_only(self):
+        image = assemble_port_helper()
+        cases = {"/G001": 1, "/T123": 0xD123, "/VFFE": 0xFFFE}
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                machine = _PortParserMachine(image, command)
+                carry, value = machine.run()
+                self.assertFalse(carry)
+                self.assertEqual(value, expected)
+                self.assertEqual(
+                    machine.memory[image.labels["trace_requested"]], 1)
+                self.assertEqual(
+                    machine.memory[image.labels["trace_only_requested"]], 0)
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
     def test_actual_z80_parser_rejects_missing_invalid_or_extra_values(self):
@@ -442,6 +517,30 @@ class PortHelperTest(unittest.TestCase):
         self.assertIn("ld e,MEMMAN_GET_TSR_ID", discovery)
         self.assertIn("ld c,DOS_TERM_ERROR", source)
         self.assertIn("MP: MSXAI UNAPI relisten failed.", source)
+
+    def test_trace_only_mode_calls_a8_and_skips_a7_configuration(self):
+        source = (ROOT / "agent" / "msx_port_helper.asm").read_text(
+            encoding="utf-8")
+        entry = source.split("port_helper_start:", 1)[1].split(
+            "port_helper_bad_version:", 1)[0]
+        trace_call = entry.split("ld hl,trace_request", 1)[1].split(
+            "port_helper_trace_ready:", 1)[0]
+        self.assertIn("ld a,MSXAI_TALK_TRACE", trace_call)
+        self.assertIn("call EXTBIO", trace_call)
+        self.assertIn("ld a,(trace_only_requested)", trace_call)
+        self.assertIn(
+            "jr nz,port_helper_trace_only_success_ei", trace_call)
+
+        unapi_path = entry.split("port_helper_trace_ready:", 1)[1].split(
+            "port_helper_trace_only_success_ei:", 1)[0]
+        self.assertIn("call prepare_unapi_request", unapi_path)
+        self.assertIn("ld a,MSXAI_TALK_UNAPI_PORT", unapi_path)
+        trace_only_path = entry.split(
+            "port_helper_trace_only_success_ei:", 1)[1]
+        self.assertNotIn("prepare_unapi_request", trace_only_path)
+        self.assertNotIn("MSXAI_TALK_UNAPI_PORT", trace_only_path)
+        self.assertIn("message_trace_success", trace_only_path)
+        self.assertIn('MP: usage: MP <1..65534> | MP/T', source)
 
     def test_helper_builds_a_versioned_guarded_one_kib_request(self):
         source = (ROOT / "agent" / "msx_port_helper.asm").read_text(

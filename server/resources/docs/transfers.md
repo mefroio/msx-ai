@@ -39,10 +39,13 @@ a hard-link-capable local filesystem and repeat the same resumable GET.
 
 ## Fast data plane and encoding
 
-The required `fast-v1` path moves near-2 KiB sequential frames through a
-transient 16 KiB disk-I/O accumulator. PUT avoids a separate status exchange
-for every data frame; GET records sparse durable acknowledgements. The final
-result reports stream bytes, elapsed seconds, and measured bytes per second.
+The required `fast-v1` path moves sequential frames through a transient 16 KiB
+disk-I/O accumulator. The 8251 and UNAPI transports retain near-2 KiB frames;
+the 16C550 transport negotiates 106-byte PUT and 120-byte GET blocks so every
+payload remains within its physically validated 128-byte UART burst limit. PUT
+avoids a separate status exchange for every data frame; GET records sparse
+durable acknowledgements. The final result reports stream bytes, elapsed
+seconds, and measured bytes per second.
 
 When the MCP client supplies a progress token, PUT reports accepted bytes and
 the latest durable boundary, while GET reports received bytes and its latest

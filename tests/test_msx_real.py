@@ -447,6 +447,22 @@ class RealMSXTransportTest(unittest.TestCase):
 
 
 class RealMSXTCPConnectionModesTest(unittest.TestCase):
+    def test_real_tcp_listener_accepts_reverse_agent_connection(self):
+        msx = RealMSX(host="127.0.0.1", port=0, socket_timeout=1).listen()
+        resident_socket = socket.create_connection(
+            ("127.0.0.1", msx.port), timeout=1)
+        agent = FakeResidentAgent(resident_socket)
+        try:
+            peer = msx.accept(timeout=1)
+
+            self.assertEqual(peer[0], "127.0.0.1")
+            self.assertEqual(msx.network_transport, "tcp")
+            self.assertEqual(msx.network_role, "listen")
+            self.assertEqual(msx.status()["state"], "monitor")
+        finally:
+            msx.close()
+            agent.close()
+
     def test_tcp_listener_accepts_adapter_client(self):
         accepted_socket, resident = socket.socketpair()
         accepted = _ConnectedStream(accepted_socket)

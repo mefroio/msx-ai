@@ -11,6 +11,8 @@ UART16C550_TRANSPORT = (
     ROOT / "agent" / "transports" / "msx_transport_16c550.inc")
 UNAPI_TRANSPORT = (
     ROOT / "agent" / "transports" / "msx_transport_unapi.inc")
+FOSSIL_TRANSPORT = (
+    ROOT / "agent" / "transports" / "msx_transport_fossil.inc")
 TSR_BUILDER = ROOT / "tools" / "build_agent_tsr.py"
 MAKEFILE = ROOT / "Makefile"
 
@@ -32,6 +34,10 @@ def _crc_table_entry(index):
         crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (
             crc << 1) & 0xFFFF
     return crc
+
+
+def _code_only(source):
+    return "\n".join(line.split(";", 1)[0] for line in source.splitlines())
 
 
 class ResidentAgentSourceTests(unittest.TestCase):
@@ -381,6 +387,16 @@ class ResidentAgentSourceTests(unittest.TestCase):
             self.assertNotRegex(section, r"(?m)^\s*ld bc,0\s*$")
             self.assertIn("jp hook_transport_timeout", section)
 
+        timeout = self.source.split("hook_transport_timeout:", 1)[1].split(
+            "hook_timeout_no_pending_action:", 1)[0]
+        self.assertIn("call transport_timeout_recover", timeout)
+        recovery = self.source.split("transport_timeout_recover:", 1)[1].split(
+            "transport_session_abort:", 1)[0]
+        self.assertRegex(
+            recovery,
+            r"(?s)cp UART16C550_ID\s+ret nz\s+"
+            r"jp uart16c550_timeout_recover")
+
     def test_hook_stack_comment_matches_reserved_bytes(self):
         reserve = re.search(
             r"(?m)^STACK_RESERVE:\s+equ\s+([0-9A-Fa-f]+)h", self.source)
@@ -701,9 +717,11 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertIn("msx_transport_8251.inc", self.source)
         self.assertIn("msx_transport_16c550.inc", self.source)
         self.assertIn("msx_transport_unapi.inc", self.source)
+        self.assertIn("msx_transport_fossil.inc", self.source)
         self.assertIn('db "/DRIVER:8251",0', self.source)
         self.assertIn('db "/DRIVER:16C550",0', self.source)
         self.assertIn('db "/DRIVER:UNAPI",0', self.source)
+        self.assertIn('db "/DRIVER:FOSSIL",0', self.source)
         self.assertIn('db "/57600",0', self.source)
         self.assertIn('db "/115200",0', self.source)
         self.assertIn(
@@ -741,6 +759,425 @@ class ResidentAgentSourceTests(unittest.TestCase):
                     f"{label_prefix}_restore:", 1)[1].split(
                         f"{label_prefix}_rx_ready:", 1)[0]
                 self.assertIn("xor a", restore)
+
+    def test_fossil_is_monitor_only_and_omitted_from_tsr_images(self):
+        source = _code_only(self.source)
+        scan = source.split("loader_parse_token_loop:", 1)[1].split(
+            "loader_parse_unknown:", 1)[0]
+        self.assertRegex(
+            scan,
+            r"(?s)ld de,option_driver_fossil\s+"
+            r"call loader_token_equals\s+jp z,loader_parse_fossil")
+
+        parser = source.split("loader_parse_fossil:", 1)[1].split(
+            "loader_parse_port:", 1)[0]
+        self.assertRegex(
+            parser,
+            r"(?s)ld a,\(loader_transport_id\)\s+cp 0FFh\s+"
+            r"jp nz,loader_parse_driver_error.*"
+            r"ld a,FOSSIL_ID\s+ld \(loader_transport_id\),a")
+
+        # Either the dedicated parser forces monitor mode or the common final
+        # validation rejects FOSSIL unless /MONITOR was explicitly selected.
+        validation = source.split("loader_parse_tokens_done:", 1)[1].split(
+            "loader_parse_uninstall_done:", 1)[0]
+        forced_monitor = re.search(
+            r"(?s)ld a,RUNTIME_MONITOR\s+"
+            r"ld \(loader_runtime_mode\),a",
+            parser,
+        )
+        gated_monitor = re.search(
+            r"(?s)ld a,\(loader_transport_id\)\s+cp FOSSIL_ID\s+"
+            r"(?:jr|jp) nz,[A-Za-z0-9_]+\s+"
+            r"ld a,\(loader_runtime_mode\)\s+cp RUNTIME_MONITOR\s+"
+            r"(?:jr|jp) nz,[A-Za-z0-9_]+",
+            validation,
+        )
+        self.assertTrue(
+            forced_monitor or gated_monitor,
+            "FOSSIL must never enter the resident/TSR runtime",
+        )
+
+        bind = source.split("transport_bind:", 1)[1].split(
+            "transport_session_reset:", 1)[0]
+        self.assertRegex(
+            bind,
+            r"(?s)cp FOSSIL_ID\s+(?:jr|jp) z,transport_bind_fossil.*"
+            r"transport_bind_fossil:.*ld hl,fossil_vector_table.*"
+            r"ld a,FOSSIL_FLAGS.*ld a,FOSSIL_CONTROL_LEVEL")
+        vector = bind.split("fossil_vector_table:", 1)[1]
+        for operation in (
+                "init", "restore", "rx_ready", "tx_ready", "read", "write",
+                "service", "flush"):
+            self.assertIn(f"fossil_{operation}", vector)
+
+        # The API table is copied into writable memory, so the include itself
+        # must be assembled only into the foreground COM image.
+        include = "include 'agent/transports/msx_transport_fossil.inc'"
+        include_at = source.index(include)
+        guard = source[max(0, include_at - 160):include_at + len(include) + 80]
+        guarded_by_empty_tsr_arm = re.search(
+            r"(?s)if MSXAI_TSR_BUILD\s+else\s+" + re.escape(include) +
+            r"\s+endif",
+            guard,
+        )
+        guarded_by_negative_test = re.search(
+            r"(?s)if\s+(?:!\s*MSXAI_TSR_BUILD|"
+            r"MSXAI_TSR_BUILD\s*=\s*0)\s+" + re.escape(include) +
+            r"\s+endif",
+            guard,
+        )
+        self.assertTrue(
+            guarded_by_empty_tsr_arm or guarded_by_negative_test,
+            "FOSSIL transport include must be absent from TSR builds",
+        )
+
+        framed_limit = source.split("current_framed_max:", 1)[1].split(
+            "current_xfer_fast_put_capacity:", 1)[0]
+        self.assertRegex(
+            framed_limit,
+            r"(?s)cp UART16C550_ID\s+(?:jr|jp) z,([A-Za-z0-9_]+)\s+"
+            r"cp FOSSIL_ID\s+ret nz\s+\1:\s+.*"
+            r"ld hl,UART16C550_FRAMED_SAFE_MAX",
+        )
+
+    def test_fossil_driver_copies_and_validates_the_v140_jump_table(self):
+        source = FOSSIL_TRANSPORT.read_text(encoding="utf-8")
+        code = _code_only(source)
+        self.assertRegex(source, r"(?m)^FOSSIL_ID:\s+equ\s+3\s*$")
+        self.assertRegex(
+            source,
+            r"(?m)^FOSSIL_FLAGS:\s+equ\s+"
+            r"TRANSPORT_FLAG_TIMI_ONLY\s*\|\s*"
+            r"TRANSPORT_FLAG_FRAME_WAKE_ACK\s*$",
+        )
+        flags = re.search(r"(?m)^FOSSIL_FLAGS:.*$", source).group(0)
+        self.assertNotIn("KEYI_EXCLUSIVE", flags)
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_SIGNATURE_R:\s+equ\s+0F3FCh\s*$")
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_SIGNATURE_S:\s+equ\s+0F3FDh\s*$")
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_TABLE_POINTER:\s+equ\s+0F3FEh\s*$")
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_REQUIRED_VERSION:\s+equ\s+0140h\s*$")
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_API_ENTRY_COUNT:\s+equ\s+21\s*$")
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_API_ENTRY_SIZE:\s+equ\s+3\s*$")
+        self.assertRegex(
+            source,
+            r"(?m)^FOSSIL_API_TABLE_SIZE:\s+equ\s+"
+            r"FOSSIL_API_ENTRY_COUNT\s*\*\s*FOSSIL_API_ENTRY_SIZE\s*$",
+        )
+
+        init = code.split("fossil_init_inner:", 1)[1].split(
+            "fossil_init_not_found:", 1)[0]
+        self.assertRegex(
+            init,
+            r"(?s)ld a,\(FOSSIL_SIGNATURE_R\)\s+cp 'R'.*"
+            r"ld a,\(FOSSIL_SIGNATURE_S\)\s+cp 'S'.*"
+            r"ld hl,\(FOSSIL_TABLE_POINTER\).*"
+            r"ld b,FOSSIL_API_ENTRY_COUNT.*"
+            r"cp FOSSIL_JP_OPCODE.*djnz fossil_validate_table_loop.*"
+            r"ld hl,\(FOSSIL_TABLE_POINTER\)\s+"
+            r"ld de,fossil_api_table\s+ld bc,FOSSIL_API_TABLE_SIZE\s+ldir.*"
+            r"call fossil_api_get_version.*FOSSIL_REQUIRED_VERSION",
+        )
+
+        expected_entries = (
+            "get_version", "init", "deinit", "set_baud", "protocol",
+            "channel", "rs_in", "rs_out", "rs_in_stat", "rs_out_stat",
+            "dtr", "rts", "carrier", "chars_in", "buffer_size", "flush_rx",
+            "fastint", "hook38stat", "chput_hook", "keyb_hook", "get_info",
+        )
+        table = source.split("fossil_api_table:", 1)[1]
+        entries = re.findall(
+            r"(?m)^fossil_api_([a-z0-9_]+):\s+"
+            r"ds\s+FOSSIL_API_ENTRY_SIZE(?:,0)?",
+            table,
+        )
+        self.assertEqual(entries, list(expected_entries))
+
+    def test_fossil_init_sets_and_verifies_57600_without_fastint(self):
+        source = FOSSIL_TRANSPORT.read_text(encoding="utf-8")
+        code = _code_only(source)
+        init = code.split("fossil_init_inner:", 1)[1].split(
+            "fossil_init_not_found:", 1)[0]
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_BAUD_57600:\s+equ\s+9\s*$")
+        self.assertRegex(
+            source, r"(?m)^FOSSIL_HARDWARE_16550:\s+equ\s+8\s*$")
+        self.assertRegex(
+            init,
+            r"(?s)ld hl,FOSSIL_BAUD_57600\s*\*\s*0101h\s+"
+            r"call fossil_api_set_baud\s+call fossil_api_init",
+        )
+        self.assertLess(
+            init.index("call fossil_api_set_baud"),
+            init.index("call fossil_api_init"),
+        )
+
+        # GET_INFO is the authoritative post-init speed report: +2 is RX and
+        # +3 is TX after the two packed-BCD version bytes.
+        self.assertRegex(
+            init,
+            r"(?s)call fossil_api_get_info\s+"
+            r"ld a,h\s+or l\s+jr z,[A-Za-z0-9_]+\s+"
+            r"ld a,\(hl\)\s+cp FOSSIL_REQUIRED_VERSION & 0FFh\s+"
+            r"jr nz,[A-Za-z0-9_]+\s+inc hl\s+"
+            r"ld a,\(hl\)\s+cp FOSSIL_REQUIRED_VERSION / 256\s+"
+            r"jr nz,[A-Za-z0-9_]+\s+inc hl\s+"
+            r"ld a,\(hl\)\s+cp FOSSIL_BAUD_57600\s+"
+            r"jr nz,[A-Za-z0-9_]+\s+inc hl\s+"
+            r"ld a,\(hl\)\s+cp FOSSIL_BAUD_57600",
+        )
+        self.assertRegex(
+            init,
+            r"(?s)ld de,7\s+add hl,de\s+ld a,\(hl\)\s+"
+            r"cp FOSSIL_HARDWARE_16550\s+"
+            r"jr nz,[A-Za-z0-9_]+",
+        )
+        self.assertIn("call fossil_api_flush_rx", init)
+        self.assertEqual(code.count("call fossil_api_flush_rx"), 1)
+        self.assertNotIn("call fossil_api_fastint", code)
+
+        flush = code.split("fossil_flush:", 1)[1].split(
+            "fossil_api_table:", 1)[0]
+        self.assertRegex(
+            source,
+            r"(?m)^FOSSIL_FRAME_DRAIN_ROUNDS:\s+equ\s+4\s*$",
+        )
+        self.assertRegex(
+            flush,
+            r"(?s)^\s*push bc\s+ld c,FOSSIL_FRAME_DRAIN_ROUNDS\s+"
+            r"fossil_frame_drain_outer:\s+ld b,0\s+"
+            r"fossil_frame_drain_inner:\s+"
+            r"djnz fossil_frame_drain_inner\s+dec c\s+"
+            r"jr nz,fossil_frame_drain_outer\s+pop bc\s+xor a\s+ret\s*$",
+        )
+        self.assertNotIn("call fossil_api_flush_rx", flush)
+
+    def test_fossil_alone_enables_and_restores_uart_hardware_flow(self):
+        source = FOSSIL_TRANSPORT.read_text(encoding="utf-8")
+        code = _code_only(source)
+        for symbol, value in (
+                ("FOSSIL_STATE_SIZE", "3"),
+                ("FOSSIL_STATE_SAVED_MCR", "2"),
+                ("FOSSIL_UART_FCR", "082h"),
+                ("FOSSIL_UART_MCR", "084h"),
+                ("FOSSIL_UART_FCR_DRIVER", "007h"),
+                ("FOSSIL_UART_FCR_ACTIVE", "087h"),
+                ("FOSSIL_UART_MCR_AFE", "020h")):
+            with self.subTest(symbol=symbol):
+                self.assertRegex(
+                    source,
+                    rf"(?m)^{symbol}:\s+equ\s+{value}\s*$",
+                )
+
+        init = code.split("fossil_init_inner:", 1)[1].split(
+            "fossil_init_not_found:", 1)[0]
+        self.assertRegex(
+            init,
+            r"(?s)call fossil_api_flush_rx\s+"
+            r"call fossil_enable_hardware_flow\s+or a\s+"
+            r"jr nz,fossil_init_bad_configuration_started\s+"
+            r"ld a,1",
+        )
+
+        enable = code.split("fossil_enable_hardware_flow:", 1)[1].split(
+            "fossil_restore_hardware_flow:", 1)[0]
+        self.assertRegex(
+            enable,
+            r"(?s)^\s*ld a,i\s+di\s+push af\s+"
+            r"in a,\(FOSSIL_UART_MCR\)\s+"
+            r"ld \(transport_state \+ FOSSIL_STATE_SAVED_MCR\),a\s+"
+            r"ld a,FOSSIL_UART_FCR_ACTIVE\s+"
+            r"out \(FOSSIL_UART_FCR\),a\s+"
+            r"ld a,\(transport_state \+ FOSSIL_STATE_SAVED_MCR\)\s+"
+            r"or FOSSIL_UART_MCR_AFE\s+out \(FOSSIL_UART_MCR\),a\s+"
+            r"in a,\(FOSSIL_UART_MCR\)\s+and FOSSIL_UART_MCR_AFE",
+        )
+        self.assertIn("ld a,FOSSIL_UART_FCR_DRIVER", enable)
+
+        restore_flow = code.split(
+            "fossil_restore_hardware_flow:", 1)[1].split(
+                "fossil_restore:", 1)[0]
+        self.assertRegex(
+            restore_flow,
+            r"(?s)^\s*ld a,i\s+di\s+push af\s+"
+            r"ld a,FOSSIL_UART_FCR_DRIVER\s+"
+            r"out \(FOSSIL_UART_FCR\),a\s+"
+            r"ld a,\(transport_state \+ FOSSIL_STATE_SAVED_MCR\)\s+"
+            r"out \(FOSSIL_UART_MCR\),a.*pop af.*jp po,.*ei.*ret\s*$",
+        )
+        restore = code.split("fossil_restore:", 1)[1].split(
+            "fossil_rx_ready:", 1)[0]
+        self.assertLess(
+            restore.index("call fossil_restore_hardware_flow"),
+            restore.index("call fossil_api_deinit"),
+        )
+
+        # The hardware writes stay behind the FOSSIL adapter boundary.
+        for foreign in (
+                self.source,
+                GENERIC_TRANSPORT.read_text(encoding="utf-8"),
+                UNAPI_TRANSPORT.read_text(encoding="utf-8")):
+            self.assertNotIn("FOSSIL_UART_MCR_AFE", foreign)
+
+    def test_fossil_stream_wrappers_preserve_the_core_register_contract(self):
+        source = _code_only(FOSSIL_TRANSPORT.read_text(encoding="utf-8"))
+        boundaries = (
+            ("init", "init_inner"),
+            ("restore", "rx_ready"),
+            ("rx_ready", "tx_ready"),
+            ("tx_ready", "read"),
+            ("read", "write"),
+            ("write", "turnaround_guard"),
+        )
+        for operation, next_operation in boundaries:
+            with self.subTest(operation=operation):
+                wrapper = source.split(f"fossil_{operation}:", 1)[1].split(
+                    f"fossil_{next_operation}:", 1)[0]
+                self.assertRegex(
+                    wrapper,
+                    r"(?s)^\s*push bc\s+push de\s+push hl\s+.*"
+                    r"pop hl\s+pop de\s+pop bc\s+ret\s*$",
+                )
+
+        transport = FOSSIL_TRANSPORT.read_text(encoding="utf-8")
+        self.assertRegex(
+            transport,
+            r"(?s)fossil_read:.*ld a,FOSSIL_TX_RX_PENDING\s+"
+            r"ld \(transport_state \+ FOSSIL_STATE_TX\),a.*"
+            r"fossil_write:.*bit 7,a.*call fossil_turnaround_guard.*"
+            r"cp FOSSIL_TX_BURST_BYTES.*call fossil_burst_guard",
+        )
+
+        # A credited v3 request can exceed a 16-byte hardware FIFO after its
+        # wake byte. Poll the exact predecessor H.KEYI handler while the
+        # foreground parser waits instead of depending on the next VBlank or
+        # enabling DRIVER.COM's invasive 0038h fast hook.
+        service = source.split("fossil_service:", 1)[1].split(
+            "fossil_flush:", 1)[0]
+        self.assertRegex(
+            service,
+            r"(?s)^\s*push bc\s+push de\s+push hl\s+"
+            r"ld a,i\s+di\s+push af\s+call old_keyi\s+pop af\s+"
+            r"jp po,fossil_service_restore_done\s+ei\s+"
+            r"fossil_service_restore_done:\s+"
+            r"pop hl\s+pop de\s+pop bc\s+xor a\s+ret\s*$",
+        )
+        self.assertEqual(service.count("call old_keyi"), 1)
+        self.assertNotIn("call fossil_api_fastint", source)
+
+    def test_foreground_enables_interrupts_only_for_fossil(self):
+        source = _code_only(self.source)
+        entry = source.split("resident_main:", 1)[1].split(
+            "monitor_reset:", 1)[0]
+        self.assertRegex(entry, r"^\s*di\s*$")
+        self.assertNotRegex(entry, r"(?m)^\s*ei\s*$")
+
+        # CALSLT, BDOS and launched code may return DI. FOSSIL must re-enable
+        # H.KEYI on every monitor iteration, not only at initial reset.
+        loop = source.split("main_loop:", 1)[1].split(
+            "main_loop_receive:", 1)[0]
+        self.assertEqual(len(re.findall(r"(?m)^\s*ei\s*$", loop)), 1)
+        self.assertRegex(
+            loop,
+            r"(?s)ld a,\(active_transport_id\)\s+"
+            r"cp FOSSIL_ID\s+(?:jr|jp) nz,([A-Za-z0-9_]+)\s+"
+            r"ei\s+\1:",
+        )
+
+        debug = source.split("debug_putchar:", 1)[1].split(
+            "; --------------------------------------------------------------- protocol",
+            1,
+        )[0]
+        self.assertRegex(
+            debug,
+            r"(?s)call bdos_proxy\s+di.*"
+            r"ld a,\(active_transport_id\)\s+cp FOSSIL_ID\s+"
+            r"(?:jr|jp) nz,[A-Za-z0-9_]+\s+pop af\s+ei\s+ret",
+        )
+
+    def test_fossil_vram_access_is_staged_atomic_and_debug_silent(self):
+        source = _code_only(self.source)
+
+        # Screenshot status/metadata/VRAM reads must not print into the same
+        # SCREEN 0 tables they are observing. The exception is intentionally
+        # scoped to FOSSIL; other transports and non-read opcodes reach emit.
+        trace = source.split("debug_trace_command:", 1)[1].split(
+            "debug_trace_done:", 1)[0]
+        self.assertRegex(
+            trace,
+            r"(?s)ld a,\(active_transport_id\)\s+cp FOSSIL_ID\s+"
+            r"(?:jr|jp) nz,(debug_trace_emit)\s+ld a,b\s+cp 'q'\s+"
+            r"(?:jr|jp) z,debug_trace_done\s+cp 'r'\s+"
+            r"(?:jr|jp) z,debug_trace_done\s+cp 'v'\s+"
+            r"(?:jr|jp) z,debug_trace_done\s+\1:",
+        )
+
+        helpers = source.split("fossil_vdp_access_enter:", 1)[1].split(
+            "get_vram_frame:", 1)[0]
+        self.assertRegex(
+            helpers,
+            r"(?s)ld a,\(active_transport_id\)\s+cp FOSSIL_ID\s+ret nz\s+"
+            r"ld a,i\s+di\s+jp po,fossil_vdp_access_enter_was_di",
+        )
+        self.assertRegex(
+            helpers,
+            r"(?s)fossil_vdp_access_leave:.*cp FOSSIL_ID\s+ret nz.*"
+            r"ld a,\(fossil_vdp_restore_ei\)\s+or a\s+ret z\s+ei\s+ret",
+        )
+
+        raw_read = source.split("cmd_vram_read_fossil:", 1)[1].split(
+            "cmd_vram_write:", 1)[0]
+        self.assertRegex(
+            raw_read,
+            r"(?s)call fossil_vdp_access_enter\s+call set_vram_read.*"
+            r"ld de,frame_response_buffer.*in a,\(098h\)\s+ld \(de\),a.*"
+            r"call restore_r14\s+call fossil_vdp_access_leave.*call ser_put",
+        )
+        critical_read = raw_read.split(
+            "call fossil_vdp_access_enter", 1)[1].split(
+                "call fossil_vdp_access_leave", 1)[0]
+        self.assertNotIn("call ser_put", critical_read)
+        self.assertNotIn("call ser_get", critical_read)
+
+        raw_write = source.split("cmd_vram_write_fossil:", 1)[1].split(
+            "cmd_call:", 1)[0]
+        self.assertRegex(
+            raw_write,
+            r"(?s)call ser_get\s+ld \(hl\),a.*"
+            r"call fossil_vdp_access_enter\s+call set_vram_write.*"
+            r"out \(098h\),a.*call restore_r14\s+"
+            r"call fossil_vdp_access_leave",
+        )
+        critical_write = raw_write.split(
+            "call fossil_vdp_access_enter", 1)[1].split(
+                "call fossil_vdp_access_leave", 1)[0]
+        self.assertNotIn("call ser_put", critical_write)
+        self.assertNotIn("call ser_get", critical_write)
+
+        frame_read = source.split("frame_cmd_vram_read:", 1)[1].split(
+            "frame_cmd_vram_write:", 1)[0]
+        frame_write = source.split("frame_cmd_vram_write:", 1)[1].split(
+            "frame_cmd_call:", 1)[0]
+        for section, setup in (
+                (frame_read, "set_vram_read"),
+                (frame_write, "set_vram_write")):
+            with self.subTest(setup=setup):
+                self.assertRegex(
+                    section,
+                    rf"(?s)call fossil_vdp_access_enter.*call {setup}.*"
+                    r"call restore_r14.*call fossil_vdp_access_leave",
+                )
+                critical = section.split(
+                    "call fossil_vdp_access_enter", 1)[1].split(
+                        "call fossil_vdp_access_leave", 1)[0]
+                self.assertNotIn("call ser_put", critical)
+                self.assertNotIn("call ser_get", critical)
 
     def test_unapi_transport_is_passive_buffered_and_reconnectable(self):
         source = UNAPI_TRANSPORT.read_text(encoding="utf-8")
@@ -1226,6 +1663,9 @@ class ResidentAgentSourceTests(unittest.TestCase):
         self.assertNotIn("restores the previous user", source)
         self.assertIn("UART16C550_DIVISOR_115200: equ 1", source)
         self.assertIn("UART16C550_DIVISOR_57600:  equ 2", source)
+        self.assertIn("UART16C550_FCR_ACTIVE:    equ 087h", source)
+        self.assertIn("UART16C550_LCR_ACTIVE:    equ 003h", source)
+        self.assertIn("UART16C550_MCR_ACTIVE:    equ 02Fh", source)
         init = source.split("uart16c550_init:", 1)[1].split(
             "uart16c550_restore:", 1)[0]
         self.assertRegex(
@@ -1239,11 +1679,12 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r"ld a,\(active_uart16c550_divisor\).*"
             r"out \(UART16C550_DATA\),a.*"
             r"xor a.*out \(UART16C550_IER\),a")
-        self.assertIn("ld a,087h", init)
-        self.assertIn("ld a,02Fh", init)
+        self.assertIn("ld a,UART16C550_FCR_ACTIVE", init)
+        self.assertIn("ld a,UART16C550_MCR_ACTIVE", init)
         self.assertRegex(
             init,
-            r"(?s)ld a,02Fh.*out \(UART16C550_MCR\),a.*"
+            r"(?s)ld a,UART16C550_MCR_ACTIVE.*"
+            r"out \(UART16C550_MCR\),a.*"
             r"xor a.*out \(UART16C550_IER\),a.*ret")
         self.assertNotIn("received-data interrupt", init)
         restore = source.split("uart16c550_restore:", 1)[1].split(
@@ -1252,6 +1693,268 @@ class ResidentAgentSourceTests(unittest.TestCase):
             restore,
             r"(?s)ld a,\(transport_state \+ UART16C550_SAVED_IER\).*"
             r"out \(UART16C550_IER\),a")
+        recovery = source.split("uart16c550_timeout_recover:", 1)[1]
+        for register in ("IER", "FCR", "LCR", "MCR"):
+            self.assertIn(f"out (UART16C550_{register}),a", recovery)
+        self.assertNotIn("active_uart16c550_divisor", recovery)
+
+    def test_16c550_turnaround_and_burst_guards_are_driver_local(self):
+        source = UART16C550_TRANSPORT.read_text(encoding="utf-8")
+        state_store = "ld (transport_state + UART16C550_TX_STATE),a"
+
+        self.assertRegex(
+            source, r"(?m)^UART16C550_STATE_SIZE:\s+equ\s+6\s*$")
+        self.assertRegex(
+            source,
+            r"(?m)^UART16C550_TX_STATE:\s+equ\s+5\s*$")
+        self.assertRegex(
+            source,
+            r"(?m)^UART16C550_TX_RX_PENDING:\s+equ\s+080h\s*$")
+        self.assertRegex(
+            source,
+            r"(?m)^UART16C550_TX_BURST_BYTES:\s+equ\s+020h\s*$")
+
+        # The combined latch/counter is part of the driver's opaque state, so
+        # every wrapper and generated relocatable TSR still reserves six bytes.
+        for wrapper in (
+                ROOT / "agent" / "msx_agent.asm",
+                ROOT / "agent" / "msx_agent_tsr.asm",
+                ROOT / "agent" / "msx_agent_trace.asm"):
+            with self.subTest(wrapper=wrapper.name):
+                self.assertRegex(
+                    wrapper.read_text(encoding="utf-8"),
+                    r"(?m)^TRANSPORT_STATE_SIZE:\s+equ\s+6\s*$")
+        self.assertIn(
+            '"TRANSPORT_STATE_SIZE: equ 6\\n"', self.tsr_builder_source)
+
+        init = source.split("uart16c550_init:", 1)[1].split(
+            "uart16c550_restore:", 1)[0]
+        restore = source.split("uart16c550_restore:", 1)[1].split(
+            "uart16c550_rx_ready:", 1)[0]
+        recovery = source.split("uart16c550_timeout_recover:", 1)[1]
+        for lifecycle, section in (
+                ("init", init), ("restore", restore),
+                ("timeout recovery", recovery)):
+            with self.subTest(lifecycle=lifecycle):
+                code = _code_only(section)
+                self.assertRegex(
+                    code,
+                    r"(?s)xor a\s+"
+                    r"(?:out \([A-Za-z0-9_ +]+\),a\s+)*"
+                    r"ld \(transport_state \+ "
+                    r"UART16C550_TX_STATE\),a")
+
+        # Reading a byte arms bit 7 and resets the burst count while preserving
+        # that byte in A for the protocol parser.
+        read = source.split("uart16c550_read:", 1)[1].split(
+            "uart16c550_write:", 1)[0]
+        self.assertRegex(
+            _code_only(read),
+            r"(?s)in a,\(UART16C550_DATA\)\s+push af\s+"
+            r"ld a,UART16C550_TX_RX_PENDING\s+"
+            r"ld \(transport_state \+ UART16C550_TX_STATE\),a\s+"
+            r"pop af\s+ret")
+
+        # The first following write consumes bit 7 and takes the turnaround
+        # guard. A normal count below 20h skips both delays.
+        write = source.split("uart16c550_write:", 1)[1].split(
+            "uart16c550_turnaround_guard:", 1)[0]
+        self.assertRegex(
+            write,
+            r"(?s)push af\s+ld a,\(transport_state \+ "
+            r"UART16C550_TX_STATE\)\s+bit 7,a\s+"
+            r"jr z,uart16c550_write_check_burst\s+xor a\s+"
+            r"ld \(transport_state \+ UART16C550_TX_STATE\),a\s+"
+            r"call uart16c550_turnaround_guard\s+"
+            r"jr uart16c550_write_count")
+        burst_check = write.index("uart16c550_write_check_burst:")
+        self.assertRegex(
+            write[burst_check:],
+            r"(?s)^uart16c550_write_check_burst:\s+"
+            r"cp UART16C550_TX_BURST_BYTES\s+"
+            r"jr c,uart16c550_write_count\s+xor a\s+"
+            r"ld \(transport_state \+ UART16C550_TX_STATE\),a\s+"
+            r"call uart16c550_burst_guard")
+
+        # Both guarded paths reset to zero, then the common tail increments
+        # before writing. The state therefore becomes 1 on bytes 1/33/65/etc.
+        count_at = write.index("uart16c550_write_count:")
+        output_at = write.index("out (UART16C550_DATA),a")
+        self.assertRegex(
+            write[count_at:],
+            r"(?s)^uart16c550_write_count:\s+"
+            r"ld a,\(transport_state \+ UART16C550_TX_STATE\)\s+"
+            r"inc a\s+"
+            r"ld \(transport_state \+ UART16C550_TX_STATE\),a\s+"
+            r"pop af\s+"
+            r"out \(UART16C550_DATA\),a\s+ret")
+        self.assertLess(burst_check, count_at)
+        self.assertLess(count_at, output_at)
+        self.assertEqual(write.count(state_store), 3)
+
+        turnaround = source.split(
+            "uart16c550_turnaround_guard:", 1)[1].split(
+            "uart16c550_burst_guard:", 1)[0]
+        self.assertRegex(
+            turnaround,
+            r"(?s)push bc\s+ld b,190\s+"
+            r"uart16c550_turnaround_guard_loop:\s+"
+            r"djnz uart16c550_turnaround_guard_loop\s+pop bc\s+ret")
+        self.assertNotRegex(
+            turnaround, r"(?i)\b(?:in|out)\s+.*\(UART16C550_")
+
+        burst = source.split("uart16c550_burst_guard:", 1)[1].split(
+            "uart16c550_service:", 1)[0]
+        self.assertRegex(
+            burst,
+            r"(?s)push bc\s+ld b,0\s+"
+            r"uart16c550_burst_guard_loop:\s+"
+            r"djnz uart16c550_burst_guard_loop\s+pop bc\s+ret")
+        self.assertNotRegex(
+            burst, r"(?i)\b(?:in|out)\s+.*\(UART16C550_")
+        self.assertEqual(
+            source.count("call uart16c550_turnaround_guard"), 1)
+        self.assertEqual(source.count("call uart16c550_burst_guard"), 1)
+
+        # No protocol loop or other transport inherits this hardware timing
+        # workaround. The byte ABI dispatch remains the isolation boundary.
+        for foreign_name, foreign_source in (
+                ("core", self.source),
+                ("8251", GENERIC_TRANSPORT.read_text(encoding="utf-8")),
+                ("UNAPI", UNAPI_TRANSPORT.read_text(encoding="utf-8"))):
+            with self.subTest(foreign=foreign_name):
+                self.assertNotIn(
+                    "call uart16c550_turnaround_guard", foreign_source)
+                self.assertNotIn(
+                    "call uart16c550_burst_guard", foreign_source)
+                self.assertNotIn("UART16C550_TX_STATE", foreign_source)
+
+    def test_badcat_b3_dial_is_one_shot_heap_guarded_and_driver_local(self):
+        transport = UART16C550_TRANSPORT.read_text(encoding="utf-8")
+        xfer_protocol = (
+            ROOT / "agent" / "msx_xfer_protocol.inc").read_text(
+                encoding="utf-8")
+
+        # B3 is the first free private TsrCall after the transfer range A9..B2.
+        opcode_source = self.source + "\n" + xfer_protocol
+        opcodes = {}
+        for name, hexadecimal in re.findall(
+                r"(?m)^(TSR_TALK_[A-Z0-9_]+):\s+equ\s+0([0-9A-F]+)h$",
+                opcode_source):
+            value = int(hexadecimal, 16)
+            self.assertNotIn(value, opcodes, (name, opcodes.get(value)))
+            opcodes[value] = name
+        self.assertEqual(opcodes[0xB3], "TSR_TALK_BADCAT_DIAL")
+        self.assertEqual(opcodes[0xA9], "TSR_TALK_XFER_CLAIM")
+        self.assertEqual(opcodes[0xB2], "TSR_TALK_XFER_PUMP")
+
+        dial = self.source.split("tsr_talk_badcat_dial:", 1)[1].split(
+            "tsr_talk_trace:", 1)[0]
+        validation_order = (
+            "cp UART16C550_ID",
+            "cp UART16C550_DIVISOR_57600",
+            "ld a,(tsr_badcat_dial_attempted)",
+            "ld a,(tsr_heap_fault)",
+            "call tsr_heap_guards_ok",
+            "\n    di\n",
+            "ld (in_hook),a",
+            "ld (tsr_heap_memman_sp),sp",
+            "ld sp,(tsr_heap_stack_top)",
+            "call tsr_badcat_dial_inner",
+        )
+        positions = [dial.index(item) for item in validation_order]
+        self.assertEqual(positions, sorted(positions))
+        unwind = dial.split("call tsr_badcat_dial_inner", 1)[1].split(
+            "tsr_badcat_dial_rejected:", 1)[0]
+        unwind_order = (
+            "call tsr_heap_guards_ok",
+            "ld sp,(tsr_heap_memman_sp)",
+            "ld (in_hook),a",
+        )
+        positions = [unwind.index(item) for item in unwind_order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("TSR_BADCAT_DIAL_STATUS_STATE", dial)
+        self.assertIn("TSR_BADCAT_DIAL_STATUS_STACK", dial)
+        self.assertIn("call uart16c550_badcat_dial", dial)
+        for token in (
+                "UART16C550_DATA", "UART16C550_LSR", "UART16C550_FCR",
+                "UART16C550_MCR", "UART16C550_TX_STATE"):
+            self.assertNotIn(token, dial)
+        self.assertNotRegex(_code_only(dial), r"(?m)^\s*(?:in|out)\s")
+        self.assertIn("TSR_BADCAT_DIAL_COMMAND_CAPACITY: equ 35", self.source)
+        self.assertIn('db "ATS2=255Q1D",34,0', self.source)
+
+        guarded = transport.split("if MSXAI_TSR_BUILD", 1)[1].split(
+            "endif", 1)[0]
+        handoff = guarded.split("uart16c550_badcat_dial:", 1)[1].split(
+            "uart16c550_service:", 1)[0]
+        preflight = handoff.split("ld (tsr_badcat_dial_attempted),a", 1)[0]
+        self.assertIn("call uart16c550_badcat_wait_temt", preflight)
+        self.assertIn("ret c", preflight)
+        self.assertNotRegex(_code_only(preflight), r"(?m)^\s*out\s")
+
+        start_order = (
+            "ld (tsr_badcat_dial_attempted),a",
+            "call transport_session_reset",
+            "ld (transport_state + UART16C550_TX_STATE),a",
+            "ld a,UART16C550_MCR_RTS_OFF",
+            "out (UART16C550_MCR),a",
+            "ld a,UART16C550_FCR_ACTIVE",
+            "out (UART16C550_FCR),a",
+            "call uart16c550_badcat_send_raw",
+        )
+        positions = [handoff.index(item) for item in start_order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(
+            transport.count("ld (tsr_badcat_dial_attempted),a"), 1)
+
+        success = handoff.split(
+            "call uart16c550_badcat_send_raw", 1)[1].split(
+                "uart16c550_badcat_started_failed:", 1)[0]
+        self.assertLess(
+            success.index("ld a,UART16C550_FCR_REARM"),
+            success.index("ld a,UART16C550_MCR_ACTIVE"),
+        )
+        self.assertNotIn("UART16C550_FCR_ACTIVE", success)
+        self.assertNotIn("in a,(UART16C550_DATA)", success)
+
+        failure = handoff.split(
+            "uart16c550_badcat_started_failed:", 1)[1].split(
+                "uart16c550_badcat_send_raw:", 1)[0]
+        self.assertLess(
+            failure.index("ld a,UART16C550_FCR_ACTIVE"),
+            failure.index("ld a,UART16C550_MCR_RTS_OFF"),
+        )
+        self.assertNotIn("UART16C550_FCR_REARM", failure)
+        self.assertNotIn("UART16C550_MCR_ACTIVE", failure)
+        self.assertIn("scf", failure)
+
+        sender = handoff.split("uart16c550_badcat_send_raw:", 1)[1]
+        self.assertIn("ld b,TSR_BADCAT_DIAL_COMMAND_CAPACITY", sender)
+        self.assertRegex(
+            sender,
+            r"(?s)ld a,13\s+out \(UART16C550_DATA\),a\s+"
+            r"jp uart16c550_badcat_wait_temt")
+        self.assertNotIn("in a,(UART16C550_DATA)", sender)
+        for forbidden in ("ser_put", "uart16c550_init", "timeout_recover"):
+            self.assertNotIn(forbidden, handoff)
+
+    def test_16c550_alone_negotiates_the_conservative_frame_limit(self):
+        self.assertRegex(
+            self.source,
+            r"(?m)^UART16C550_FRAMED_SAFE_MAX:\s+equ\s+0080h$")
+        limit = self.source.split("current_framed_max:", 1)[1].split(
+            "current_xfer_fast_put_capacity:", 1)[0]
+        self.assertRegex(
+            limit,
+            r"(?s)ld hl,FRAMED_SAFE_MAX.*cp UART16C550_ID.*"
+            r"ret nz.*ld hl,UART16C550_FRAMED_SAFE_MAX")
+        enable = self.source.split("cmd_frame_enable:", 1)[1].split(
+            "cmd_uninstall:", 1)[0]
+        hello = self.source.split("frame_cmd_hello:", 1)[1].split(
+            "frame_cmd_status:", 1)[0]
+        self.assertIn("call current_framed_max", enable)
+        self.assertIn("call current_framed_max", hello)
 
     def test_default_is_true_memman_resident_and_monitor_is_explicit(self):
         self.assertRegex(

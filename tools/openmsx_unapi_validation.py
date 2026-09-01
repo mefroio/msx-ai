@@ -51,12 +51,20 @@ TRACE_FAILURE_DUMP_NAME = "MSXFAIL.LOG"
 TRACE_FLAG_ENABLED = 0x01
 TRACE_FLAG_INCIDENT = 0x02
 TRACE_FLAG_WRAPPED = 0x04
+TRACE_FLAG_UART16C550 = 0x08
 TRACE_RECORD_CAPACITY = 20
 TRACE_EVENT_NAMES = frozenset({
     "ENABLE", "STATE", "STATE_ERROR", "DROP", "DOS_RELISTEN",
     "BASIC_RELISTEN", "OPEN_BEGIN", "OPEN_END", "ABORT_BEGIN",
     "ABORT_END", "SYSTEM_SUSPEND", "SYSTEM_RESUME", "RECONFIG_BEGIN",
     "RECONFIG_END", "AUTO_RELISTEN",
+    "UART_INIT", "UART_WAKE", "UART_FRAME_RX", "UART_FLUSH",
+    "UART_TIMEOUT", "UART_RECOVER", "UART_REARM", "UART_TX_BEGIN",
+    "UART_TX_END", "UART_RECONNECT",
+})
+TRACE_UART_MARKER_EVENT_NAMES = frozenset({
+    "UART_WAKE", "UART_FRAME_RX", "UART_TX_BEGIN", "UART_TX_END",
+    "UART_RECONNECT",
 })
 MIN_TEST_PORT = 1
 # TCP/IP UNAPI reserves FFFFh as the random/local-port sentinel.
@@ -698,19 +706,56 @@ _TRACE_RECORD_LINE = re.compile(
     r"E=(?P<error>[0-9A-F]{2}) S=(?P<state>[0-9A-F]{2}) "
     r"C=(?P<active>[0-9A-F]{2}) X=(?P<cleanup>[0-9A-F]{2}) "
     r"F=(?P<flags>[0-9A-F]{2}) T=(?P<jiffy>[0-9A-F]{4})$")
+_UART_TRACE_FIRST_LINE = re.compile(
+    r"^FIRST (?P<event>[A-Z_]+) "
+    r"LSR=(?P<lsr>[0-9A-F]{2}) MSR=(?P<msr>[0-9A-F]{2}) "
+    r"MCR=(?P<mcr>[0-9A-F]{2}) P=(?P<phase>[0-9A-F]{2}) "
+    r"OP=(?P<opcode>[0-9A-F]{2}) T=(?P<jiffy>[0-9A-F]{4}) "
+    r"EXTRA=(?P<extra>(?:[0-9A-F]{2}){8})$")
+_UART_TRACE_RECORD_LINE = re.compile(
+    r"^#(?P<sequence>[0-9A-F]{4}) (?P<event>[A-Z_]+) "
+    r"LSR=(?P<lsr>[0-9A-F]{2}) MSR=(?P<msr>[0-9A-F]{2}) "
+    r"MCR=(?P<mcr>[0-9A-F]{2}) P=(?P<phase>[0-9A-F]{2}) "
+    r"OP=(?P<opcode>[0-9A-F]{2}) T=(?P<jiffy>[0-9A-F]{4})$")
+_UART_TRACE_MARKER_RECORD_LINE = re.compile(
+    r"^#(?P<sequence>[0-9A-F]{4}) (?P<event>[A-Z_]+) "
+    r"P=(?P<phase>[0-9A-F]{2}) OP=(?P<opcode>[0-9A-F]{2}) "
+    r"SQ=(?P<frame_sequence>[0-9A-F]{4}) "
+    r"LEN=(?P<length>[0-9A-F]{4}) "
+    r"F=(?P<marker_flags>[0-9A-F]{2})$")
 
 
 def _trace_record_from_match(match: re.Match[str]) -> dict[str, object]:
     groups = match.groupdict()
-    record: dict[str, object] = {
-        "event": groups["event"],
-        "error": int(groups["error"], 16),
-        "state": int(groups["state"], 16),
-        "active": int(groups["active"], 16),
-        "cleanup": int(groups["cleanup"], 16),
-        "flags": int(groups["flags"], 16),
-        "jiffy": int(groups["jiffy"], 16),
-    }
+    if groups.get("frame_sequence") is not None:
+        record: dict[str, object] = {
+            "event": groups["event"],
+            "phase": int(groups["phase"], 16),
+            "opcode": int(groups["opcode"], 16),
+            "frame_sequence": int(groups["frame_sequence"], 16),
+            "length": int(groups["length"], 16),
+            "marker_flags": int(groups["marker_flags"], 16),
+        }
+    elif groups.get("lsr") is None:
+        record: dict[str, object] = {
+            "event": groups["event"],
+            "error": int(groups["error"], 16),
+            "state": int(groups["state"], 16),
+            "active": int(groups["active"], 16),
+            "cleanup": int(groups["cleanup"], 16),
+            "flags": int(groups["flags"], 16),
+            "jiffy": int(groups["jiffy"], 16),
+        }
+    else:
+        record = {
+            "event": groups["event"],
+            "lsr": int(groups["lsr"], 16),
+            "msr": int(groups["msr"], 16),
+            "mcr": int(groups["mcr"], 16),
+            "phase": int(groups["phase"], 16),
+            "opcode": int(groups["opcode"], 16),
+            "jiffy": int(groups["jiffy"], 16),
+        }
     if groups.get("sequence") is not None:
         record["sequence"] = int(groups["sequence"], 16)
     if groups.get("extra") is not None:
@@ -736,24 +781,34 @@ def parse_resident_trace(text: str) -> dict[str, object]:
     counters = _TRACE_COUNTER_LINE.fullmatch(lines[2])
     if status is None or counters is None:
         raise ValidationError("resident trace status/counter line is malformed")
+    trace_flags = int(status.group("flags"), 16)
+    uart_trace = bool(trace_flags & TRACE_FLAG_UART16C550)
+    first_pattern = (_UART_TRACE_FIRST_LINE if uart_trace
+                     else _TRACE_FIRST_LINE)
 
     if lines[3] == "FIRST NONE":
         first_incident = None
     else:
-        first = _TRACE_FIRST_LINE.fullmatch(lines[3])
+        first = first_pattern.fullmatch(lines[3])
         if first is None:
             raise ValidationError("resident trace FIRST record is malformed")
         first_incident = _trace_record_from_match(first)
 
     records: list[dict[str, object]] = []
     for line in lines[4:]:
-        match = _TRACE_RECORD_LINE.fullmatch(line)
+        if uart_trace:
+            match = _UART_TRACE_RECORD_LINE.fullmatch(line)
+            if match is None:
+                match = _UART_TRACE_MARKER_RECORD_LINE.fullmatch(line)
+        else:
+            match = _TRACE_RECORD_LINE.fullmatch(line)
         if match is None:
             raise ValidationError(f"resident trace record is malformed: {line}")
         records.append(_trace_record_from_match(match))
 
     return {
-        "flags": int(status.group("flags"), 16),
+        "flags": trace_flags,
+        "transport_trace": "uart-16c550" if uart_trace else "unapi",
         "count": int(status.group("count"), 16),
         "next_index": int(status.group("next"), 16),
         "sequence": int(status.group("sequence"), 16),
@@ -776,7 +831,7 @@ def validate_resident_trace(trace: Mapping[str, object]) -> None:
     records = list(trace["records"])
 
     if flags & ~(TRACE_FLAG_ENABLED | TRACE_FLAG_INCIDENT |
-                 TRACE_FLAG_WRAPPED):
+                 TRACE_FLAG_WRAPPED | TRACE_FLAG_UART16C550):
         raise ValidationError(f"resident trace has unknown flags: {flags:02X}")
     if not flags & TRACE_FLAG_ENABLED:
         raise ValidationError("resident trace is not marked enabled")
@@ -798,12 +853,19 @@ def validate_resident_trace(trace: Mapping[str, object]) -> None:
             "resident trace INCIDENT flag disagrees with the FIRST record")
     if first is not None:
         event = str(first["event"])
-        if event not in ("STATE_ERROR", "DROP", "OPEN_END", "ABORT_END"):
-            raise ValidationError(
-                f"resident trace FIRST event is not an incident: {event}")
-        if event != "DROP" and int(first["error"]) == 0:
-            raise ValidationError(
-                f"resident trace FIRST {event} has no error code")
+        if flags & TRACE_FLAG_UART16C550:
+            line_error = int(first["lsr"]) & 0x1E
+            if event != "UART_TIMEOUT" and not line_error:
+                raise ValidationError(
+                    f"resident UART trace FIRST event is not an incident: "
+                    f"{event}")
+        else:
+            if event not in ("STATE_ERROR", "DROP", "OPEN_END", "ABORT_END"):
+                raise ValidationError(
+                    f"resident trace FIRST event is not an incident: {event}")
+            if event != "DROP" and int(first["error"]) == 0:
+                raise ValidationError(
+                    f"resident trace FIRST {event} has no error code")
 
     if records:
         expected_first = (sequence - count + 1) & 0xFFFF
@@ -821,10 +883,21 @@ def validate_resident_trace(trace: Mapping[str, object]) -> None:
 
     previous: tuple[int, int] | None = None
     for record in records:
-        if record["event"] not in TRACE_EVENT_NAMES:
+        event = str(record["event"])
+        if event not in TRACE_EVENT_NAMES:
             raise ValidationError(
-                f"resident trace contains unknown event {record['event']}")
-        if record["event"] not in ("STATE", "STATE_ERROR"):
+                f"resident trace contains unknown event {event}")
+        if flags & TRACE_FLAG_UART16C550:
+            marker_layout = "frame_sequence" in record
+            marker_event = event in TRACE_UART_MARKER_EVENT_NAMES
+            if marker_layout != marker_event:
+                expected = "marker" if marker_event else "hardware"
+                raise ValidationError(
+                    f"resident UART trace {event} does not use its "
+                    f"{expected} record layout")
+            previous = None
+            continue
+        if event not in ("STATE", "STATE_ERROR"):
             previous = None
             continue
         current = (int(record["error"]), int(record["state"]))

@@ -188,42 +188,48 @@ connects outward, call `msx_agent_listen` with the host machine's specific LAN
 IPv4 address; its safe default `127.0.0.1` accepts only local simulation. If
 the bridge accepts connections, call `msx_agent_connect` with its IPv4 address.
 
-For a BaDCaT Wi-Fi Modem, keep the host TCP client disconnected throughout
-setup and run one complete matching sequence from MSX-DOS. Use either the
-default path:
+For the current BaDCaT prototype, use a reverse TCP connection at 57600 with
+the native 16C550 resident; do not install the external FOSSIL driver. From a
+clean boot, run:
 
 ```text
 MSXAI /UNINSTALL
-BADINIT
-MSXAI /DRIVER:16C550
+BADINIT /PREPARE
+MSXAI /DRIVER:16C550 /57600
 ```
 
-or the temporary 115200-baud path:
+Start the MCP host listener on its specific LAN IPv4 address and fixed port:
 
 ```text
-MSXAI /UNINSTALL
-BADINIT /115200
-MSXAI /DRIVER:16C550 /115200
+msx_agent_listen(host="192.168.0.62", port=6603)
 ```
 
-`BADINIT /PORT:<port>` selects a decimal listener port from 1 through 65535;
-omitting it selects 6603. The port option may appear before or after `/57600`
-or `/115200`, for example `BADINIT /PORT:7000 /115200` and
-`BADINIT /115200 /PORT:7000` are equivalent. Port 65535 is valid for the
-BaDCaT/ZiModem initializer; only the UNAPI driver described below reserves
-that value.
+While it is waiting, point BaDCaT at the MCP host address, not the MSX address:
 
-Do not connect the host until the final `MSXAI` command has completed. A
-resident must be uninstalled before `BADINIT` because both would otherwise
-poll the same UART. `BADINIT` and `MSXAI /DRIVER:16C550` both default to
-exactly 57600 baud when no baud option is present, and the option on both
-commands must match. Call `msx_agent_connect` with the selected runtime port;
-using a different port cannot reach the modem listener.
+```text
+BADINIT /CONNECT:192.168.0.62 /PORT:6603
+```
+
+The port defaults to 6603 and accepts 1 through 65535. `/CONNECT` is
+57600-only, requires the resident to be active already, and is deliberately
+one-shot for that installation. The UART provides no trustworthy TCP/command
+mode state, so repeating the AT dial could inject it as MCP payload. Reboot and
+repeat the complete sequence before another attempt. BADINIT reports only that
+the dial was issued; `msx_agent_listen` returning confirms the handshake.
+
+`/PREPARE` closes current listeners, establishes echo-off hardware-flow command
+mode, requests volatile `ATS2=255`, and requires `OK` before the resident takes
+ownership. The resident repeats `S2=255` in the final silent dial command
+before entering streaming. This mitigates ZiModem 3.5.5's unconditional guarded `+++` escape;
+that version does not implement the previously assumed `S63` switch.
 
 `BADINIT` changes only the current modem session. It never saves with `AT&W`,
 never resets with `ATZ`, never restores factory settings with `AT&F`, and never
 writes the persistent `S60` listener register. A power cycle therefore returns
-to the modem's previously saved configuration. It first requires `OK` from
+to the modem's previously saved configuration.
+
+The older inbound listener remains available with bare `BADINIT`. It first
+requires `OK` from
 `ATQ0S41=0A<port>`, where `<port>` is the selected decimal value, so the
 runtime listener is verified while automatic stream entry is disabled. With
 no `/PORT` option this command is `ATQ0S41=0A6603`. Its final send is
@@ -236,11 +242,27 @@ transition before validating `/115200`. On failure it reports the stage,
 command, hexadecimal RX sample, and UART status instead of printing binary
 noise directly.
 
+The 16C550 agent negotiates 128-byte MCP payloads so RAM, VRAM, screenshots,
+and file transfers are automatically split into UART bursts validated on a
+physical BaDCaT at 57600. This limit is local to the 16C550 driver; 8251 and
+UNAPI retain 320-byte public payloads. A bounded 16C550 timeout also clears only
+that UART's partial FIFOs and reapplies 8N1 RTS/CTS before a new connection.
+
+The 16C550 driver also uses a one-shot RX-to-TX turnaround guard motivated by
+physical BaDCaT timing. Every received byte arms a latch; only the first
+following write waits 190 `DJNZ` iterations (about 0.72 ms on a standard
+3.579545 MHz Z80), so response payload bytes do not receive a per-byte delay.
+This product-neutral behavior applies at 57600 and 115200; 8251 and UNAPI are
+unchanged.
+
 The 115200 value is the UART line rate, not an end-to-end MCP throughput
 guarantee. BaDCaT's published effective-throughput limit is 57,600 bit/s, and
 protocol framing, flow control, modem processing, and MSX execution reduce the
 application payload rate further. Use `/115200` for controlled testing rather
 than assuming twice the transfer speed.
+
+The earlier FOSSIL implementation remains in source control for comparison,
+but it is not loaded or required by this reverse workflow.
 
 For `/DRIVER:UNAPI`, configure the cartridge's existing Wi-Fi connection first.
 The MSX opens a passive TCP/IP UNAPI listener, so call `msx_agent_connect` with

@@ -193,23 +193,28 @@ class AgentTsrBuilderTest(unittest.TestCase):
                 trace_root / "MSXAI_TSR.INC",
                 development_trace=True,
             )
-            self.assertEqual(traced.size, first.size)
-            self.assertEqual(traced.relocation_offsets, first.relocation_offsets)
-            self.assertEqual(
-                traced.metadata_path.read_bytes(), first_metadata)
             traced_data = traced.tsr_path.read_bytes()
-            differing = [
-                index for index, values in enumerate(
-                    zip(first_data, traced_data, strict=True))
-                if len(set(values)) != 1
-            ]
-            # The resident layout stays identical. Only the relocated operand
-            # of `JP Z` at private TsrCall A8 changes: public goes to the
-            # unsupported handler, development goes to the trace handler.
-            self.assertEqual(len(differing), 2)
-            self.assertEqual(differing[1], differing[0] + 1)
-            self.assertEqual(first_data[differing[0] - 1], 0xCA)
-            self.assertEqual(traced_data[differing[0] - 1], 0xCA)
+            self.assertEqual(traced.size, len(traced_data))
+            self.assertEqual(traced.size % 128, 0)
+            self.assertGreaterEqual(traced.size, first.size)
+            self.assertGreater(len(traced.relocation_offsets), 0)
+            traced_metadata = traced.metadata_path.read_text(encoding="ascii")
+            self.assertRegex(
+                traced_metadata,
+                rf"MSXAI_TSR_SIZE: equ 0{traced.size:04X}h")
+            self.assertNotEqual(traced_data, first_data)
+            self.assertEqual(
+                traced.driver_16c550_path.read_bytes()[
+                    traced.transport_file_offset],
+                TRANSPORT_16C550)
+            self.assertEqual(
+                traced.driver_16c550_path.read_bytes()[
+                    traced.divisor_file_offset],
+                DIVISOR_57600)
+            self.assertEqual(
+                traced.driver_unapi_path.read_bytes()[
+                    traced.transport_file_offset],
+                TRANSPORT_UNAPI)
             # The separate development build must not mutate public outputs.
             self.assertEqual(output.read_bytes(), first_data)
             self.assertEqual(

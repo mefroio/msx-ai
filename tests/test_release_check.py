@@ -178,6 +178,9 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
         self.assertIn(
             "agent/msx_badcat_init.asm",
             release_check._SDIST_REQUIRED_FILES)
+        self.assertIn(
+            "agent/transports/msx_transport_fossil.inc",
+            release_check._SDIST_REQUIRED_FILES)
         names = [f"msx_ai-0.6.0/{name}"
                  for name in release_check._SDIST_REQUIRED_FILES]
         release_check._assert_sdist_contents(names)
@@ -193,6 +196,7 @@ class ReleaseCheckPolicyTest(unittest.TestCase):
         self.assertIn("MCP115K.TSR", release_check._AGENT_SUITE_FILES)
         self.assertIn("MP.COM", release_check._AGENT_SUITE_FILES)
         self.assertIn("TU.COM", release_check._AGENT_SUITE_FILES)
+        self.assertNotIn("DRIVER.COM", release_check._AGENT_SUITE_FILES)
         with tempfile.TemporaryDirectory() as directory:
             agent = pathlib.Path(directory)
             for name in release_check._AGENT_SUITE_FILES:

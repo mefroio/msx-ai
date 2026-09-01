@@ -15,6 +15,7 @@ UNAPI_PROBE_SRC := agent/msx_unapi_probe.asm
 BADCAT_INIT_SRC := agent/msx_badcat_init.asm
 AGENT_TRANSPORTS := agent/transports/msx_transport_8251.inc \
 	agent/transports/msx_transport_16c550.inc \
+	agent/transports/msx_transport_fossil.inc \
 	agent/transports/msx_transport_unapi.inc
 AGENT_COM := work/agent/MSXAI.COM
 AGENT_XFER_COM := work/agent/MSXAIXF.COM

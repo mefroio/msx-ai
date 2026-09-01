@@ -29,6 +29,11 @@ REQUIRED_CONSTANTS = {
     "LISTENER_PREFIX_LENGTH": 10,
     "LISTENER_PORT_CAPACITY": 6,
     "LISTENER_COMMAND_CAPACITY": 16,
+    "IPV4_TEXT_CAPACITY": 16,
+    "TSR_TALK_BADCAT_DIAL": 0xB3,
+    "BADCAT_DIAL_MAGIC": 0xA95A,
+    "BADCAT_DIAL_VERSION": 1,
+    "BADCAT_DIAL_REQUEST_SIZE": 12,
     "COMMAND_BUFFER_CAPACITY": 128,
     "UART_DATA": 0x80,
     "UART_IER": 0x81,
@@ -36,6 +41,11 @@ REQUIRED_CONSTANTS = {
     "UART_LCR": 0x83,
     "UART_MCR": 0x84,
     "UART_LSR": 0x85,
+    "UART_MCR_RTS_OFF": 0x01,
+    "UART_MCR_RTS_ON": 0x03,
+    "UART_FCR_FIFO_8": 0x87,
+    "UART_RTS_POLL_COUNT": 100,
+    "UART_RECEIVE_EVENT_MASK": 0x9F,
     "BAUD_SETTLE_TICKS": 40,
     "LISTENER_SETTLE_TICKS": 4,
     "RESPONSE_QUIET_TICKS": 2,
@@ -47,8 +57,7 @@ REQUIRED_CONSTANTS = {
 COMMANDS = {
     "command_bootstrap": b"ATQ0V1E0R1F0\0",
     "command_n0": b"ATN0\0",
-    "command_s62_0": b"ATS62=0\0",
-    "command_s63_0": b"ATS63=0\0",
+    "command_s2_255": b"ATS2=255\0",
     "command_s0_1": b"ATS0=1\0",
     "command_b57600": b"ATQ1B57600\0",
     "command_b115200": b"ATQ1B115200\0",
@@ -59,8 +68,7 @@ COMMANDS = {
 LISTENER_COMMAND_PREFIX = b"ATQ0S41=0A\0"
 INITIAL_COMMANDS = (
     "command_n0",
-    "command_s62_0",
-    "command_s63_0",
+    "command_s2_255",
     "command_s0_1",
 )
 LISTENER_COMMANDS = ("command_i2",)
@@ -79,27 +87,40 @@ REQUIRED_LABELS = (
     "badinit_end",
     "parse_command_line",
     "build_listener_command",
+    "build_badcat_dial_request",
     "find_resident_agent",
     "uart_init_57600",
     "uart_set_baud",
+    "uart_receive_status",
     "uart_wait_empty",
     "wait_ticks",
     "synchronize_command_mode",
     "change_runtime_baud",
     "restore_visible_57600",
     "run_visible_command",
+    "response_reset",
+    "send_command",
     "response_drain_fifo",
     "diagnostic_report_once",
     "badinit_listener_commit_failed",
+    "badinit_resident_reverse_dial",
     "response_buffer",
     "response_buffer_end",
     "selected_divisor",
     "selected_port",
+    "selected_host",
+    "selected_host_end",
     "current_divisor",
     "command_listener_prefix",
     "command_listener_open",
     "command_listener_port_text",
     "command_listener_open_end",
+    "badcat_dial_request",
+    "badcat_dial_request_status",
+    "badcat_dial_request_reserved",
+    "badcat_dial_request_ipv4",
+    "badcat_dial_request_port",
+    "badcat_dial_request_end",
     "command_buffer",
     "command_buffer_end",
     "initial_command_table",
@@ -202,6 +223,17 @@ def validate_badcat_init_image(
             raise BadcatInitBuildError(
                 f"{name} is 0x{labels[name]:04X}, expected 0x{expected:04X}")
 
+    visible_command = _offset(labels, "run_visible_command")
+    expected_entry = (
+        b"\xE5\xCD"
+        + labels["response_reset"].to_bytes(2, "little")
+        + b"\xE1\xCD"
+        + labels["send_command"].to_bytes(2, "little")
+    )
+    if data[visible_command:visible_command + len(expected_entry)] != expected_entry:
+        raise BadcatInitBuildError(
+            "run_visible_command must preserve HL across response_reset")
+
     for name in ("selected_divisor", "current_divisor"):
         offset = _offset(labels, name)
         if data[offset:offset + 1] != bytes((2,)):
@@ -242,6 +274,60 @@ def validate_badcat_init_image(
         raise BadcatInitBuildError(
             "dynamic listener command buffer must initialize to zero")
 
+    host_start = labels["selected_host"]
+    host_end = labels["selected_host_end"]
+    if not (
+        ORIGIN <= host_start <= host_end <= ORIGIN + len(data)
+    ):
+        raise BadcatInitBuildError(
+            "selected_host is outside the COM image")
+    if host_end - host_start != labels["IPV4_TEXT_CAPACITY"]:
+        raise BadcatInitBuildError(
+            "selected_host must reserve exactly 16 bytes")
+    host_offset = host_start - ORIGIN
+    if data[host_offset:host_offset + host_end - host_start] != bytes(
+            host_end - host_start):
+        raise BadcatInitBuildError(
+            "selected_host must initialize to zero")
+
+    request_start = labels["badcat_dial_request"]
+    request_status = labels["badcat_dial_request_status"]
+    request_reserved = labels["badcat_dial_request_reserved"]
+    request_ipv4 = labels["badcat_dial_request_ipv4"]
+    request_port = labels["badcat_dial_request_port"]
+    request_end = labels["badcat_dial_request_end"]
+    if not (
+        ORIGIN <= request_start <= request_status <= request_reserved
+        <= request_ipv4 <= request_port <= request_end
+        <= ORIGIN + len(data)
+    ):
+        raise BadcatInitBuildError(
+            "binary BaDCaT dial request is outside the COM image")
+    if request_end - request_start != labels["BADCAT_DIAL_REQUEST_SIZE"]:
+        raise BadcatInitBuildError(
+            "badcat_dial_request must reserve exactly 12 bytes")
+    expected_request_offsets = (
+        request_status - request_start,
+        request_reserved - request_start,
+        request_ipv4 - request_start,
+        request_port - request_start,
+    )
+    if expected_request_offsets != (4, 5, 6, 10):
+        raise BadcatInitBuildError(
+            "badcat_dial_request field offsets do not match B3 ABI")
+    request_offset = request_start - ORIGIN
+    expected_request = (
+        labels["BADCAT_DIAL_MAGIC"].to_bytes(2, "little")
+        + bytes((labels["BADCAT_DIAL_VERSION"],
+                 labels["BADCAT_DIAL_REQUEST_SIZE"], 0xFF, 0))
+        + bytes(4)
+        + labels["DEFAULT_LISTENER_PORT"].to_bytes(2, "little")
+    )
+    if data[request_offset:request_offset + len(expected_request)] != (
+            expected_request):
+        raise BadcatInitBuildError(
+            "badcat_dial_request has unsafe or incompatible defaults")
+
     command_buffer_start = labels["command_buffer"]
     command_buffer_end = labels["command_buffer_end"]
     if not (
@@ -267,7 +353,6 @@ def validate_badcat_init_image(
         raise BadcatInitBuildError(
             f"command_listener_prefix is {actual_prefix!r}, "
             f"expected {LISTENER_COMMAND_PREFIX!r}")
-
     for name, expected in COMMANDS.items():
         actual = _read_c_string(data, labels, name)
         if actual != expected:
@@ -280,6 +365,11 @@ def validate_badcat_init_image(
         data, labels, "listener_command_table", LISTENER_COMMANDS)
 
     uppercase = data.upper()
+    for fragment in (b"ATS62=", b"ATS63=", b'ATQ1D"'):
+        if fragment in uppercase:
+            raise BadcatInitBuildError(
+                "BADINIT must pass a binary B3 request instead of embedding "
+                f"the deprecated/runtime command {fragment!r}")
     for fragment in FORBIDDEN_COMMAND_FRAGMENTS:
         if fragment in uppercase:
             raise BadcatInitBuildError(

@@ -626,10 +626,13 @@ Driver selection is explicit and case-insensitive:
 | `MSXAI /DRIVER:8251 /MONITOR` | Start the non-resident foreground monitor with the 8251 driver |
 | `MSXAI /DRIVER:16C550 /MONITOR` | Start the non-resident foreground monitor with the 16C550 driver |
 | `MSXAI /DRIVER:UNAPI /MONITOR` | Start the non-resident foreground monitor with TCP/IP UNAPI |
+| `MSXAI /DRIVER:FOSSIL /MONITOR DEBUG` | Start the experimental foreground monitor through an externally installed FOSSIL driver, with visible command tracing |
 | `MSXAI /DRIVER:8251 /MONITOR DEBUG` | Start the foreground monitor with visible command tracing |
 | `BADINIT` or `BADINIT /57600` | Initialize a BaDCaT listener on the default port 6603 at the safe default 57600-baud line rate |
 | `BADINIT /115200` | Initialize the default listener and temporarily select a 115200-baud line rate |
 | `BADINIT /PORT:43123 /115200` | Initialize a runtime-only BaDCaT listener on a chosen port from 1 through 65535; the port and baud options may appear in either order |
+| `BADINIT /PREPARE` | Prepare volatile ZiModem command/flow/escape state for a later resident reverse dial at 57600; do not create a listener |
+| `BADINIT /CONNECT:192.168.0.62 /PORT:6603` | Ask an already active 57600-baud native 16C550 resident to connect outward to the MCP host |
 | `MSXAI /UNINSTALL` | Remove the named resident TSR safely through MemMan |
 | `MSXAIXF /PUT <32-hex-transfer-id>` | Run the foreground worker for a staged file-transfer-v2 upload |
 | `MSXAIXF /GET <32-hex-transfer-id>` | Run the foreground worker for a staged file-transfer-v2 download |
@@ -643,11 +646,19 @@ rejected for that driver: the host could not know which endpoint to connect to.
 65535 is valid there because ZiModem does not assign it the UNAPI sentinel
 meaning. Its port option may appear before or after at most one of `/57600` and
 `/115200`; duplicate port or baud options are rejected.
+`/PREPARE` is a separate 57600-only mode; it accepts an optional redundant
+`/57600`, but no port, `/115200`, or connect option. `/CONNECT:<IPv4>` accepts a numeric dotted-decimal address, an optional
+`/PORT:<1..65535>`, and no `/115200`; it requires the named resident to be
+active already with the native 16C550 transport at 57600. That path performs no
+direct BADINIT UART access.
 On `MSXAI`, `/57600` and `/115200` are mutually exclusive and valid only with
 `/DRIVER:16C550`; omitting both selects 57600. The same default and explicit
 speed forms apply to `BADINIT`, and its selected speed must match `MSXAI`.
 Omitting `BADINIT /PORT` selects 6603. The selected port is runtime-only and
 must match the port passed to `msx_agent_connect`.
+`/DRIVER:FOSSIL` is valid only with `/MONITOR`; it cannot install or
+reconfigure a MemMan resident. It accepts neither `/PORT` nor the direct-UART
+`/57600` and `/115200` options.
 `/UNINSTALL` must be used alone. Running the resident command again finds the
 existing named TSR and changes its selected driver through MemMan instead of
 installing a duplicate. Changing the live driver can disconnect the current
@@ -682,6 +693,35 @@ existing-resident transport selection, not only for UNAPI port changes:
 | 14 | 1 | In | Target: `0=8251`, `1=16C550`, `2=UNAPI` |
 | 15 | 1 | In/Out | Requested/active 16C550 divisor: `1=115200`, `2=57600`; zero for other transports |
 
+`B3h` is the private resident reverse-dial ABI. `A9h` through `B2h` already
+belong to protocol-X, so `B3h` is deliberately outside that contiguous range.
+BADINIT supplies this validated 12-byte page-zero request:
+
+| Offset | Size | Direction | Meaning |
+|---:|---:|---|---|
+| 0 | 2 | In | Magic `A95Ah` |
+| 2 | 1 | In | ABI version `1` |
+| 3 | 1 | In | Request size `12` |
+| 4 | 1 | Out | Structured result: `0=issued`, `1=ABI`, `2=transport`, `3=baud`, `4=target`, `5=TX timeout`, `6=resident stack`, `7=already attempted` |
+| 5 | 1 | In | Reserved; must be zero |
+| 6 | 4 | In | Binary IPv4 octets; all-zero and all-ones values are rejected |
+| 10 | 2 | In | Little-endian destination port from 1 through 65535 |
+
+The resident rejects any transport except native 16C550 at divisor 2, validates
+its persistent heap sentinels, and moves off MemMan's small `TsrCall` stack.
+With hooks excluded, it builds the command in resident memory, verifies that
+the UART transmitter is empty, latches the operation as one-shot, resets only
+the MCP session, and delegates every register access to the 16C550 driver. The
+driver holds RTS low, removes stale pre-dial FIFO data, and transmits
+`ATS2=255Q1D"<IPv4>:<port>"`. After successful TEMT it rearms the FIFO without
+clearing it and raises RTS last, so the host's first bootstrap byte remains
+available to `H.TIMI`. A started TX failure instead clears the partial FIFO and
+keeps RTS low. No other transport contains this handoff path.
+
+The FOSSIL monitor reports transport ID `3` in HELLO and CPU diagnostic
+metadata, which the host renders as `uart-fossil`. ID `3` is deliberately not
+an A7 target: FOSSIL has no resident lifecycle in this prototype.
+
 The caller supplies a 1 KiB stack wholly in writable page 2, with a 16-byte
 `A5h` guard below it and a 16-byte `5Ah` guard above it. Before writing either
 guard, it validates the complete span against the lowest of `C000h`, the TPA
@@ -711,10 +751,28 @@ host connection must negotiate with the reinstalled resident.
 | `8251` | Ports `80h/81h`, standard timer ports `84h/85h/87h`, 19,200 baud, 8N1 | Resident masks `COMMSK` UART IRQs and polls from `H.TIMI` |
 | `16C550` | Ports `80h-87h`, 1.8432 MHz reference clock, divisor 2 (57600 baud, default) or divisor 1 (115200 baud), 8N1, 16-byte FIFO, automatic RTS/CTS | `/57600` and `/115200` are valid only with this driver; resident keeps `IER=0` and polls from `H.TIMI`; hardware flow control is required |
 | `UNAPI` | Passive TCP/IPv4 listener, unspecified remote peer, configurable local port (default 6603) | Requires TCP/IP UNAPI passive-listener capability; host connects with `msx_agent_connect` |
+| `FOSSIL` | External FOSSIL UART service, selected at 57600 before initialization | Experimental foreground monitor only; requires a separately installed `DRIVER.COM` and has no MSX-AI resident artifact |
+
+The FOSSIL implementation remains source-controlled for diagnostic comparison,
+but the BaDCaT reverse-connect workflow does not install or call it. The active
+prototype uses only the native 16C550 resident.
+
+The 16C550 byte driver implements one-shot RX-to-TX turnaround and bounded
+response bursts in one opaque state byte. Every read sets bit 7; only the first
+following write consumes it and waits a fixed 190-`DJNZ` interval,
+approximately 0.72 ms on a standard 3.579545 MHz Z80. The lower seven bits then
+count transmitted bytes. Before bytes 33, 65, 97, and 129, the driver waits a
+256-`DJNZ` bridge-drain interval, approximately 0.94 ms, and restarts the count.
+This is block pacing rather than a per-byte delay. The behavior is identical at
+both UART divisors and does not affect the 8251 or UNAPI paths. Physical BaDCaT
+timing and ZiModem stream-buffer behavior motivated the guards, but their
+implementation and protocol contract remain product-neutral.
 
 BaDCaT SMD is an intended 16C550-compatible device, not a dependency or a
 separate agent driver. `BADINIT.COM` is a bounded, product-specific setup
-utility; the resident agent and its wire protocol remain transport-neutral.
+utility. The resident wire protocol and ordinary byte-driver ABI remain
+transport-neutral; only the private B3 reverse-dial handoff is BaDCaT-specific,
+TSR-only, and isolated inside the already selected 16C550 implementation.
 The BaDCaT UART accepts a line rate up to 115200 baud, but line rate is not a
 guarantee of end-to-end payload throughput. The
 [published BaDCaT specification](https://sites.google.com/view/badcatelectronics/msx/badcat-wifi-modem)
@@ -722,7 +780,42 @@ lists approximately 57,600 bps effective throughput. The safe default is
 therefore 57600; `/115200` is an explicit test setting rather than a throughput
 promise.
 
-### Safe BaDCaT listener initialization
+### Safe BaDCaT initialization
+
+The preferred test prototype makes BaDCaT a TCP client and the MCP host a
+server. It is intentionally limited to 57600 and does not use FOSSIL. Start
+from a clean modem/resident state:
+
+~~~~text
+MSXAI /UNINSTALL
+BADINIT /PREPARE
+MSXAI /DRIVER:16C550 /57600
+~~~~
+
+`/PREPARE` runs before the resident owns the UART. It closes runtime listeners,
+establishes 57600/8N1 hardware-flow command mode with echo disabled, and
+requires a visible `OK` for `ATS2=255`. It creates no TCP listener and performs
+no dial. The setting is volatile and no `AT&W`, `ATZ`, `AT&F`, `S60`, or
+firmware operation is issued.
+
+Next the host calls `msx_agent_listen` on its specific LAN IPv4 address and a
+fixed port. While that accept is waiting, run this on the MSX, substituting the
+MCP host address rather than the MSX address:
+
+~~~~text
+BADINIT /CONNECT:192.168.0.62 /PORT:6603
+~~~~
+
+The resident sends the outbound dial only after it is installed and able to
+service the MCP bootstrap. BADINIT reports that the dial was issued; successful
+protocol negotiation is confirmed only when `msx_agent_listen` returns. The
+attempt latch is not cleared after success or failure because direct UART mode
+cannot reliably prove that ZiModem has returned from streaming to command
+mode. For another physical attempt, disconnect the host, reboot to restore the
+saved modem state, and repeat the full sequence. Do not invoke `/CONNECT` a
+second time against the same resident.
+
+#### Legacy inbound listener
 
 Keep the modem's saved serial baseline at 57600 baud and keep the host
 disconnected from the selected TCP port throughout initialization (6603 when
@@ -762,8 +855,15 @@ MSXAI /DRIVER:16C550 /115200
 
 `BADINIT` refuses to run while the named resident is installed. It always
 probes the saved 57600-baud baseline first, uses `ATN0` only in the current
-runtime session, and makes no persistent configuration change. In particular,
-this procedure must never include a firmware-save operation, modem reset,
+runtime session, requires `OK` from volatile `ATS2=255`, and makes no
+persistent configuration change. ZiModem 3.5.5 otherwise recognizes a guarded
+`+++` sequence in every stream; that release has no effective `S63` control.
+Changing `S2` to 255 prevents the ordinary MCP byte value `2Bh` from being
+treated as the escape character for this runtime session. This is a mitigation,
+not proof of an eight-bit-transparent stream: a firmware build that treats
+`char` as unsigned can instead recognize an exact guarded `FF FF FF` sequence.
+In particular, this procedure must never include a firmware-save operation,
+modem reset,
 factory-default operation, or an `S60` write. It first sends
 `ATQ0S41=0A<port>` and requires `OK`, so listener-creation errors remain
 visible while automatic stream entry is disabled. It then sends the final,
@@ -772,13 +872,26 @@ and `Q1` suppresses the result only after those operations. Only after matching
 `MSXAI` is running should the host call `msx_agent_connect` with the BaDCaT
 IPv4 address and the same selected port.
 
-The UART is configured in the same safe order as BaDCaT's reference code: RTS
-is inactive while the FIFO, divisor, and 8N1 format are established, then
-AFE/RTS is enabled. The first command ends in `F0`, allowing a saved XON/XOFF
-state to switch to hardware flow control before the first required response.
+The bootstrap UART uses the working RetroTerm `RT-BD.COM` non-AFE profile for
+MCR, DLAB, TX, and manual RTS reception: `IER=00h`, `MCR=01h`, `LCR=80h`, the
+selected divisor, and `LCR=03h`; RX alternates `MCR=03h`/`01h` around a bounded
+LSR poll. BADINIT additionally uses `FCR=87h` to enable and clear the 16-byte
+FIFO. RT-BD's terminal loop can continuously poll with FIFO disabled, whereas
+physical BADINIT diagnostics showed `LSR OE=02h` when parsing a complete AT
+response burst under that setting.
+This is intentionally different from the resident 16C550 transport: enabling
+AFE during bootstrap can hold the first AT command behind low CTS before that
+same command establishes `F0` hardware flow control. The first command ends in
+`F0`, allowing a saved XON/XOFF state to switch before its required response.
 ZiModem applies `ATB` only after an internal delay; baud transitions therefore
 use a quiet command, wait for local TEMT, switch the local divisor, remain
 silent for 40 JIFFYs, and validate only after that settle interval.
+
+Once the resident owns the 16C550, it negotiates 128-byte framed payloads while
+8251 and UNAPI retain 320. If a bounded hook-side UART wait still expires, only
+the 16C550 recovery path clears its RX/TX FIFOs and reapplies 8N1 plus automatic
+RTS/CTS. It neither reruns modem AT setup nor changes the divisor or saved UART
+state, and the common timeout behavior of the other transports is unchanged.
 
 Failure output identifies the stage, baud, command, reason, and hexadecimal RX
 and LSR evidence. The final listener-commit failure path is DOS-only: once
@@ -954,11 +1067,16 @@ identical encoded request and sequence number. The agent de-duplicates
 state-changing commands and searches for the next valid magic/header/CRC
 combination after damaged input.
 
-The public negotiated payload limit of the current agent is 320 bytes. Only an
-explicitly armed foreground `fast-v1` transfer pump can temporarily accept the
-larger private opcode-X frames described below. Eight consecutive credited
-`ESC` bytes reset a current framed protocol session after a lost peer; a single
-noise byte cannot downgrade it.
+The public negotiated payload limit is transport-specific: 320 bytes for 8251
+and UNAPI, and 128 bytes for 16C550 and the experimental FOSSIL monitor. The
+smaller UART value follows physical 57600-baud BaDCaT testing in which
+128-byte responses were stable and a 256-byte response stalled. It is an
+empirical flow-control ceiling, not an assumption about a particular firmware
+buffer size. Only an explicitly armed
+foreground `fast-v1` transfer pump can temporarily accept the larger private
+opcode-X frames advertised for its selected transport. Eight consecutive
+credited `ESC` bytes reset a current framed protocol session after a lost peer;
+a single noise byte cannot downgrade it.
 
 In the negotiated feature bitmap, bit `0x40` advertises `cpu-snapshot-v1`.
 Bit `0x80` advertises `file-transfer-v2`, the only DOS-file transfer path in
@@ -1002,8 +1120,11 @@ backend, Ctrl+C is a convenience alias for the Ctrl+STOP break event.
 
 When the foreground monitor runs with `DEBUG`, the optional
 `debug-peer-label` feature enables opcode `I`. Immediately after HELLO, a TCP
-host sends the accepted IPv4 source endpoint as printable ASCII and the MSX
-displays it as `MCP client: <ipv4>:<port>`. The UART-facing agent remains
+host sends its connected socket's local IPv4 endpoint as printable ASCII and
+the MSX displays it as `MCP client: <ipv4>:<port>`. This is the MCP endpoint
+as seen by the MSX in both host-connect and reverse host-listen sessions; the
+remote socket endpoint would instead identify the MSX/adapter itself. The
+UART-facing agent remains
 transport-neutral: it never attempts to discover network metadata itself.
 
 The `cpu-snapshot-v1` feature enables framed opcode `D`. The request is one
@@ -1525,15 +1646,20 @@ creation; a rejected `FAST_BEGIN` or mismatched suite fails before any file
 payload is transferred. There is no alternate file-transfer data path.
 
 The helper asks the resident to pump one complete opcode `X` frame
-synchronously between DOS operations. PUT carries up to 2,026 data bytes and
-GET up to 2,040 data bytes, filling the helper's transient 2,048-byte page-zero
-frame workspace without exceeding it.
+synchronously between DOS operations. On 8251 and UNAPI, PUT carries up to
+2,026 data bytes and GET up to 2,040 data bytes, filling the helper's transient
+2,048-byte page-zero frame workspace without exceeding it. On 16C550, the same
+wire protocol negotiates 106-byte PUT and 120-byte GET blocks so the complete
+payload remains within 128 bytes.
 
-The public bootstrap and framed HELLO limits remain 320 bytes. For each fast
-bulk request only, the host temporarily raises its v3 request/parser ceiling to
-2,047 bytes for PUT or 2,048 bytes for GET and restores 320 immediately in a
-`finally` path. Ordinary RAM, VRAM, keyboard, CPU, and control operations never
-inherit the larger window. The leading-byte wake acknowledgement provides
+The public bootstrap and framed HELLO limits remain 320 bytes for 8251/UNAPI
+and are 128 bytes for 16C550 and FOSSIL. FOSSIL is monitor-only and advertises
+no file-transfer data plane. For each resident fast bulk request only, the host
+uses the separately negotiated v3 ceiling: up to 2,047 bytes for PUT or 2,048
+bytes for GET on 8251/UNAPI, and at most 127 bytes for PUT or 128 bytes for GET
+on 16C550. It restores the transport's public limit immediately in a `finally`
+path. Ordinary RAM, VRAM, keyboard, CPU, and control operations never inherit
+the private window. The leading-byte wake acknowledgement provides
 physical receive credit while the helper is inside a DOS read, write, or
 `ENSURE`; it is not a second transfer-level acknowledgement. This is especially
 important for a FIFO-less 8251. A bounded pump timeout unwinds to its own
@@ -1571,14 +1697,14 @@ top and its entry stack pointer against `8800h`, reserving 2 KiB of stack
 headroom above the accumulator. A build-time size guard guarantees that
 `MSXAIXF.COM` ends below `4000h` and therefore cannot overlap the accumulator.
 
-Physical framed-v3 payloads remain bounded at 2,026 PUT data bytes and 2,040
-GET data bytes; the 16 KiB area is an application-level disk-I/O window, not a
-larger wire frame. Fast PUT copies consecutive frames into that window. At a
-high-water threshold of approximately 14--16 KiB, or at EOF, the helper updates
-the rolling CRC-32 over the contiguous bytes, performs one exact DOS `WRITE`,
-one `ENSURE`, and one cumulative resident commit. Fast GET performs one DOS
-`READ` of up to 16 KiB, then slices the populated window into 2,040-byte framed
-responses.
+Physical framed-v3 data blocks remain bounded at 2,026 PUT/2,040 GET bytes on
+8251 and UNAPI, and 106 PUT/120 GET bytes on 16C550; the 16 KiB area is an
+application-level disk-I/O window, not a larger wire frame. Fast PUT copies
+consecutive frames into that window. At a high-water threshold of approximately
+14--16 KiB, or at EOF, the helper updates the rolling CRC-32 over the contiguous
+bytes, performs one exact DOS `WRITE`, one `ENSURE`, and one cumulative resident
+commit. Fast GET performs one DOS `READ` of up to 16 KiB, then slices the
+populated window according to the selected transport's negotiated block size.
 
 Generic PUT remains byte-exact except for an unambiguously textual `.BAS`
 target. Numbered BASIC source is automatically converted to the MSX-DOS text

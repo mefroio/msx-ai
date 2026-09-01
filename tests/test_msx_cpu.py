@@ -122,6 +122,15 @@ class AgentCPUContextTests(unittest.TestCase):
         self.assertEqual(snapshot["debug"]["transport"], "tcpip-unapi")
         self.assertEqual(snapshot["debug"]["transport_id"], 2)
 
+    def test_agent_context_names_fossil_transport(self):
+        payload = bytearray(agent_context_payload())
+        payload[7] = 3
+
+        snapshot = parse_agent_cpu_context(bytes(payload))
+
+        self.assertEqual(snapshot["debug"]["transport"], "uart-fossil")
+        self.assertEqual(snapshot["debug"]["transport_id"], 3)
+
     def test_agent_context_rejects_incompatible_or_reserved_records(self):
         cases = []
         cases.append(agent_context_payload()[:-1])

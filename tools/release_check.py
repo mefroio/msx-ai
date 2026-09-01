@@ -154,6 +154,7 @@ _SDIST_REQUIRED_FILES = {
     "agent/msx_version.inc",
     "agent/transports/msx_transport_16c550.inc",
     "agent/transports/msx_transport_8251.inc",
+    "agent/transports/msx_transport_fossil.inc",
     "agent/transports/msx_transport_unapi.inc",
     "assets/NOTICE.md",
     "assets/msx-ai-robot.png",

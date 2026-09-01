@@ -606,6 +606,20 @@ class RealMSXV3Test(unittest.TestCase):
         self.assertEqual(info["agent_transport"], "tcpip-unapi")
         self.assertEqual(info["agent_transport_id"], 2)
 
+    def test_fossil_transport_is_named_in_negotiated_status(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_socket(client)
+        self.agent = FakeV3Resident(
+            resident, transport_id=3, frame_wake_ack_feature=True)
+
+        info = self.msx.info()
+
+        self.assertEqual(info["transport"], "uart-fossil")
+        self.assertEqual(info["agent_transport"], "uart-fossil")
+        self.assertEqual(info["agent_transport_id"], 3)
+
     def test_safe_resident_negotiates_single_attempt_write_quarantine(self):
         self.msx.close()
         self.agent.close()
@@ -669,31 +683,49 @@ class RealMSXV3Test(unittest.TestCase):
             self.msx.info()
         self.assertEqual(len(self.agent.requests), request_count)
 
-    def test_debug_peer_ip_is_announced_once_after_v3_hello(self):
+    def test_debug_mcp_endpoint_is_announced_once_after_v3_hello(self):
         self.msx.close()
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.2).attach_stream(
             client, peer=("203.0.113.7", 49152),
             network_transport="tcp", network_role="listen")
+        self.msx.local_endpoint = ("192.0.2.20", 6603)
         self.agent = FakeV3Resident(
             resident, debug=True, debug_peer_feature=True)
 
         info = self.msx.info()
         self.assertIn("debug-peer-label", info["features"])
         self.assertEqual(
-            self.agent.debug_peer_labels, [b"203.0.113.7:49152"])
+            self.agent.debug_peer_labels, [b"192.0.2.20:6603"])
         self.msx.info()
         self.assertEqual(
-            self.agent.debug_peer_labels, [b"203.0.113.7:49152"])
+            self.agent.debug_peer_labels, [b"192.0.2.20:6603"])
 
-    def test_ipv6_peer_is_not_announced_to_debug(self):
+    def test_debug_mcp_endpoint_uses_local_side_when_host_connects(self):
         self.msx.close()
         self.agent.close()
         client, resident = socket.socketpair()
         self.msx = RealMSX(socket_timeout=0.2).attach_stream(
-            client, peer=("2001:db8::1", 49152),
+            client, peer=("192.0.2.63", 6603),
+            network_transport="tcp", network_role="connect")
+        self.msx.local_endpoint = ("192.0.2.20", 49321)
+        self.agent = FakeV3Resident(
+            resident, debug=True, debug_peer_feature=True)
+
+        self.msx.info()
+
+        self.assertEqual(
+            self.agent.debug_peer_labels, [b"192.0.2.20:49321"])
+
+    def test_ipv6_local_endpoint_is_not_announced_to_debug(self):
+        self.msx.close()
+        self.agent.close()
+        client, resident = socket.socketpair()
+        self.msx = RealMSX(socket_timeout=0.2).attach_stream(
+            client, peer=("203.0.113.7", 49152),
             network_transport="tcp", network_role="listen")
+        self.msx.local_endpoint = ("2001:db8::1", 6603)
         self.agent = FakeV3Resident(
             resident, debug=True, debug_peer_feature=True)
 

@@ -238,20 +238,55 @@ Use this path when actual MSX hardware behavior is the subject of the session.
    The 16C550 default is exactly 57600; `/57600` makes it explicit and
    `/115200` selects the faster UART divisor for both resident and monitor
    modes. Do not use either baud option with 8251 or UNAPI.
-   For a BaDCaT/ZiModem server, disconnect the host first, run
-   `MSXAI /UNINSTALL`, then `BADINIT` followed by the matching
-   `MSXAI /DRIVER:16C550` command. `BADINIT` defaults to port 6603 and accepts
-   `/PORT:<1..65535>` plus at most one of `/57600` or `/115200`; the port and
-   baud options may appear in either order, while duplicate options are
-   rejected. The selected port applies only to the current modem session and
-   must also be passed to `msx_agent_connect`. Unlike the UNAPI command below,
-   ZiModem `BADINIT` accepts port 65535 because it is an ordinary TCP listener
-   port there, not UNAPI's random-port sentinel. `BADINIT` never saves,
-   reloads, resets, factory-resets, or changes the persistent-listener
-   register. A power cycle therefore restores the user's previously saved
-   modem state. Its bootstrap recovers from blocked XON/XOFF flow, observes
-   ZiModem's delayed baud change, and reports failed UART probes as
-   hexadecimal diagnostics.
+   The recommended BaDCaT prototype uses an outbound connection at 57600 baud,
+   with no FOSSIL driver. From a clean boot, with no host connection open, run:
+
+   ```text
+   MSXAI /UNINSTALL
+   BADINIT /PREPARE
+   MSXAI /DRIVER:16C550 /57600
+   ```
+
+   Start `msx_agent_listen` on the host's specific LAN IPv4 address and fixed
+   port. While it is waiting, make the resident issue the reverse dial; for
+   example, when the MCP host is `192.168.0.62`:
+
+   ```text
+   BADINIT /CONNECT:192.168.0.62 /PORT:6603
+   ```
+
+   `/PORT` accepts 1 through 65535 and defaults to 6603. `/CONNECT` accepts
+   only a numeric IPv4 address and only an active native 16C550 resident at
+   57600. The resident is already able to consume the host's first bootstrap
+   byte when the TCP handshake completes, avoiding the startup race that
+   occurs if the modem connects before MSXAI is installed. A reverse dial is
+   deliberately one-shot for each resident installation: the transparent UART
+   has no trustworthy way to distinguish command mode from an existing TCP
+   stream, so a repeated AT dial could become MCP payload. Reboot and repeat
+   the complete sequence before another attempt.
+
+   `BADINIT /PREPARE` disables current listeners, selects hardware flow
+   control, disables command echo, requests volatile `S2=255`, and requires an
+   `OK` response. The resident repeats that volatile setting atomically in the
+   final dial command before ZiModem enters streaming. Neither command saves,
+   reloads, resets, factory-resets, nor changes firmware or the persistent
+   listener register. A power cycle restores the user's saved modem state.
+   The older inbound-listener workflow remains available through bare
+   `BADINIT` or `BADINIT /PORT:<port>`, followed by
+   `MSXAI /DRIVER:16C550` and host-side `msx_agent_connect`.
+   The 16C550 protocol profile negotiates 128-byte payloads at both supported
+   divisors; 8251 and UNAPI retain their 320-byte payloads. This conservative
+   framing follows physical 57600-baud BaDCaT validation and also applies to
+   RAM/VRAM captures and the transport's fast file-transfer block sizes.
+   The same physical testing motivated product-neutral turnaround and burst
+   pacing in the 16C550 driver. Every received byte arms a latch, and only the
+   first following write waits a fixed 190-`DJNZ` interval (about 0.72 ms on a
+   standard 3.579545 MHz Z80). During the following response, a 256-`DJNZ`
+   bridge-drain interval (about 0.94 ms) is inserted before bytes 33, 65, 97,
+   and 129 rather than after every byte. The behavior applies at both divisors;
+   8251 and UNAPI are unchanged.
+   The earlier experimental FOSSIL source remains available for diagnostic
+   comparison, but it is not loaded or required by this reverse workflow.
 3. For an MSX Pico+ or an original MSX Pico equipped with Wi-Fi, first use the
    cartridge's existing Wi-Fi Setup. Then run `MSXAI /DRIVER:UNAPI`, or add
    `/PORT:<1..65534>` to choose a listener port other than the default `6603`.
@@ -274,11 +309,13 @@ Use this path when actual MSX hardware behavior is the subject of the session.
 6. Call `msx_agent_status` before any mutation and verify runtime, transport,
    and feature negotiation.
 
-The `MSXAI` agent core does not configure Wi-Fi, issue modem AT commands, or
-depend on a specific network-adapter brand. `BADINIT.COM` is a separate,
-optional BaDCaT/ZiModem session initializer; the generic 16C550 driver remains
-product-neutral. The UNAPI path discovers a TCP/IP UNAPI implementation by
-capability, so it is not tied to the Pico+ product name.
+The normal `MSXAI` protocol core does not configure Wi-Fi or depend on a
+network-adapter brand. One private resident handoff, callable only by
+`BADINIT /CONNECT`, lets the validated native 16C550 path emit the final
+volatile ZiModem reverse-dial command after the resident is ready. All other
+adapter setup remains in the separate `BADINIT.COM` utility. The UNAPI path
+discovers a TCP/IP UNAPI implementation by capability, so it is not tied to
+the Pico+ product name.
 
 ## Reproducible demonstrations
 

@@ -97,8 +97,11 @@ class ResidentTraceSourceTests(unittest.TestCase):
             validation,
             r"(?s)ld a,\(loader_trace_enabled\).*"
             r"ld a,\(loader_runtime_mode\).*"
-            r"ld a,\(loader_transport_id\)\s+cp UNAPI_ID")
-        self.assertIn("/TRACE requires resident /DRIVER:UNAPI", self.source)
+            r"ld a,\(loader_transport_id\)\s+cp UNAPI_ID\s+"
+            r"jr z,loader_parse_debug_check\s+cp UART16C550_ID")
+        self.assertIn(
+            "/TRACE requires resident /DRIVER:16C550 or /DRIVER:UNAPI",
+            self.source)
 
     def test_dumptrace_requires_one_bare_path_and_is_an_isolated_action(self):
         parser = _section(
@@ -162,7 +165,7 @@ class ResidentTraceSourceTests(unittest.TestCase):
             wrapper.write_text(
                 "MSXAI_TSR_BUILD: equ 1\n"
                 "MSXAI_DEVELOPMENT_TRACE: equ 1\n"
-                "TRANSPORT_STATE_SIZE: equ 5\n"
+                "TRANSPORT_STATE_SIZE: equ 6\n"
                 "TSR_BUILD_BASE: equ 04024h\n"
                 "include 'agent/msx_agent_core.asm'\n",
                 encoding="ascii",
@@ -204,9 +207,11 @@ class ResidentTraceSourceTests(unittest.TestCase):
         self.assertRegex(
             enable,
             r"(?s)ld a,\(trace_flags\)\s+and TRACE_FLAG_ENABLED\s+"
-            r"(?:ret nz|jr nz,trace_enable_done)")
+            r"jr z,trace_enable_reset.*cp UART16C550_ID.*"
+            r"and TRACE_FLAG_UART16C550\s+jr nz,trace_enable_done")
         self.assertIn("call trace_reset", enable)
         self.assertIn("TRACE_EVENT_ENABLE", enable)
+        self.assertIn("TRACE_EVENT_UART_INIT", enable)
 
         state = _section(
             self.source, "trace_record_tcp_state:", "trace_record:")
@@ -233,7 +238,7 @@ class ResidentTraceSourceTests(unittest.TestCase):
         self.assertRegex(
             freeze,
             r"(?s)ld a,\(trace_flags\)\s+and TRACE_FLAG_INCIDENT\s+"
-            r"(?:ret nz|jr nz,trace_freeze_first_failure_done)")
+            r"(?:ret nz|(?:jr|jp) nz,trace_freeze_first_failure_done)")
         self.assertIn("trace_failure_snapshot", freeze)
         self.assertIn("trace_failure_snapshot + TRACE_RECORD_SIZE", freeze)
         self.assertIn("TRACE_FLAG_INCIDENT", freeze)
@@ -293,7 +298,7 @@ class ResidentTraceSourceTests(unittest.TestCase):
         event_formatter = _section(
             self.loader, "trace_line_append_event_name:",
             "trace_line_reset:")
-        self.assertIn("cp TRACE_EVENT_AUTO_RELISTEN", event_formatter)
+        self.assertIn("cp TRACE_EVENT_UART_RECONNECT", event_formatter)
         event_names = _section(
             self.loader, "trace_event_name_table:",
             "trace_event_unknown:")
@@ -301,6 +306,152 @@ class ResidentTraceSourceTests(unittest.TestCase):
         self.assertIn(
             'trace_event_auto_relisten:   db "AUTO_RELISTEN",0',
             event_names)
+        for name in (
+                "UART_INIT", "UART_WAKE", "UART_FRAME_RX", "UART_FLUSH",
+                "UART_TIMEOUT", "UART_RECOVER", "UART_REARM",
+                "UART_TX_BEGIN", "UART_TX_END", "UART_RECONNECT"):
+            with self.subTest(uart_event=name):
+                self.assertIn(f'db "{name}",0', event_names)
+
+    def test_uart_trace_has_lightweight_boundaries_and_requires_explicit_enable(
+            self):
+        transport = (ROOT / "agent" / "transports" /
+                     "msx_transport_16c550.inc").read_text(encoding="utf-8")
+        self.assertIn("UART16C550_MSR:           equ 086h", transport)
+        service = _section(transport, "uart16c550_service:",
+                           "uart16c550_flush:")
+        self.assertNotIn("trace", service.lower())
+        flush = _section(transport, "uart16c550_flush:",
+                         "uart16c550_timeout_recover:")
+        self.assertNotIn("trace", flush.lower())
+        recovery = _section(
+            transport, "uart16c550_timeout_recover:",
+            "uart16c550_vector_table:")
+        self.assertLess(
+            recovery.index("TRACE_UART_PHASE_IDLE"),
+            recovery.index("TRACE_EVENT_UART_REARM"))
+
+        record = _section(self.source, "trace_uart_record:", "trace_record:")
+        self.assertIn("TRACE_FLAG_UART16C550", record)
+        self.assertIn("trace_uart_set_phase:", record)
+
+        marker_events = (
+            "TRACE_EVENT_UART_WAKE",
+            "TRACE_EVENT_UART_FRAME_RX",
+            "TRACE_EVENT_UART_TX_BEGIN",
+            "TRACE_EVENT_UART_TX_END",
+            "TRACE_EVENT_UART_RECONNECT",
+            "TRACE_EVENT_UART_RECONNECT",
+        )
+        marker_calls = re.findall(
+            r"ld a,(TRACE_EVENT_UART_(?:WAKE|FRAME_RX|TX_BEGIN|TX_END|"
+            r"RECONNECT))\s+"
+            r"call trace_uart_record",
+            self.source,
+        )
+        self.assertCountEqual(marker_calls, marker_events)
+        self.assertEqual(len(marker_calls), 6)
+
+        safe_boundaries = (
+            ("frame_have_magic_m:", "frame_wait_second_magic:",
+             "TRACE_EVENT_UART_WAKE", "ld a,FRAME_WAKE_ACK"),
+            ("frame_crc_valid:", "frame_reply_bad_state:",
+             "TRACE_EVENT_UART_FRAME_RX", "frame_crc_request_ready"),
+            ("frame_emit_response:", "frame_emit_payload_loop:",
+             "TRACE_EVENT_UART_TX_BEGIN", "call frame_crc_reset"),
+        )
+        for start, end, event, boundary in safe_boundaries:
+            with self.subTest(marker=event):
+                section = _section(self.source, start, end)
+                self.assertRegex(
+                    section,
+                    rf"(?s)if MSXAI_TSR_BUILD\s+"
+                    rf"if MSXAI_DEVELOPMENT_TRACE\s+.*"
+                    rf"ld a,{event}\s+call trace_uart_record")
+                self.assertLess(section.index(event), section.index(boundary))
+
+        tx_end = _section(
+            self.source, "frame_emit_crc:", "frame_crc_reset:")
+        self.assertRegex(
+            tx_end,
+            r"(?s)call transport_flush_checked\s+"
+            r"if MSXAI_TSR_BUILD\s+if MSXAI_DEVELOPMENT_TRACE\s+.*"
+            r"ld a,TRACE_EVENT_UART_TX_END\s+call trace_uart_record")
+        self.assertLess(
+            tx_end.index("TRACE_EVENT_UART_TX_END"),
+            tx_end.index("xfer_fast_get_commit_after_send"))
+
+        raw_reconnect = _section(
+            self.source, "receive_dispatch:",
+            "; ------------------------------------------------------------ BIOS hooks")
+        self.assertLess(
+            raw_reconnect.index("TRACE_EVENT_UART_RECONNECT"),
+            raw_reconnect.index("jp dispatch"))
+        self.assertLess(
+            raw_reconnect.index("call ser_get"),
+            raw_reconnect.index("TRACE_EVENT_UART_RECONNECT"))
+
+        framed_reconnect = _section(
+            self.source, "frame_reconnect_byte:",
+            "frame_reconnect_count_byte:")
+        self.assertIn("ld a,(frame_reconnect_count)", framed_reconnect)
+        self.assertLess(
+            framed_reconnect.index("TRACE_EVENT_UART_RECONNECT"),
+            framed_reconnect.index("ld a,FRAME_WAKE_ACK"))
+
+        marker_fields = _section(
+            self.source, "trace_record_uart_marker_fields:",
+            "trace_record_fields_done:")
+        self.assertNotRegex(
+            _code_only(marker_fields),
+            r"(?i)\bin\s+a,\(UART16C550_(?:LSR|MSR)\)")
+        self.assertLess(
+            marker_fields.index("ld a,(xfer_fast_pump_active)"),
+            marker_fields.index("ld a,(in_hook)"))
+        self.assertIn("set TRACE_UART_MARKER_PUMP_BIT,b", marker_fields)
+        self.assertIn("set TRACE_UART_MARKER_HOOK_BIT,b", marker_fields)
+        self.assertIn("set TRACE_UART_MARKER_TIMI_BIT,b", marker_fields)
+        hardware_fields = _section(
+            self.source, "trace_record_uart_fields:",
+            "trace_record_uart_marker_fields:")
+        self.assertIn("in a,(UART16C550_LSR)", hardware_fields)
+        self.assertIn("in a,(UART16C550_MSR)", hardware_fields)
+
+        timeout = _section(
+            self.source, "hook_transport_tx_timeout:",
+            "hook_timeout_no_pending_action:")
+        self.assertIn("TRACE_UART_TIMEOUT_TX", timeout)
+        self.assertIn("TRACE_UART_TIMEOUT_RX", timeout)
+        self.assertIn("TRACE_EVENT_UART_TIMEOUT", timeout)
+        self.assertIn("UART16C550_LSR", timeout)
+        self.assertIn("UART16C550_MSR", timeout)
+        pump_timeout = _section(
+            self.source, "xfer_fast_pump_tx_timeout:",
+            "xfer_fast_pump_abandon:")
+        self.assertIn("TRACE_UART_TIMEOUT_PUMP", pump_timeout)
+
+        freeze = _section(
+            self.source, "trace_freeze_first_failure:", "tsr_kill:")
+        self.assertIn("trace_uart_timeout_context", freeze)
+        self.assertIn("frame_response_length", freeze)
+        self.assertIn("frame_length", freeze)
+        self.assertIn("trace_uart_timeout_lsr", freeze)
+        self.assertIn("trace_uart_timeout_msr", freeze)
+
+        initialize = _section(
+            self.source, "resident_initialize:", "resident_main:")
+        self.assertNotIn("trace_enable", initialize)
+        loader_builder = _section(
+            self.loader, "suite_build_install_command:",
+            "suite_build_install_command_length:")
+        self.assertIn("suite_trace_helper_required", loader_builder)
+        self.assertIn("install_trace_helper_suffix", loader_builder)
+        self.assertIn('db "MP/T@"', self.loader)
+
+        reconfigure = _section(
+            self.source, "tsr_talk_config_xfer_done:",
+            "tsr_talk_config_failed:")
+        self.assertIn("call nz,trace_enable", reconfigure)
 
     def test_a7_v2_divisor_and_a8_enable_precede_reconfiguration(self):
         self.assertEqual(
@@ -348,6 +499,8 @@ class ResidentTraceSourceTests(unittest.TestCase):
             self.loader, "suite_build_install_command:",
             "suite_build_install_command_length:")
         self.assertIn("loader_trace_enabled", builder)
+        self.assertIn("install_trace_helper_suffix", builder)
+        self.assertIn('db "MP/T@"', self.loader)
         self.assertIn("'G'", builder)
         self.assertIn("'V'", self.port_helper)
         decoder = _section(
@@ -367,7 +520,7 @@ class ResidentTraceSourceTests(unittest.TestCase):
         transient_core = self.source.split("resident_source:", 1)[0]
         transient = transient_core + "\n" + self.loader
         self.assertIn("loader_dump_trace:", transient)
-        dump = _label_window(transient, "loader_dump_trace", limit=10000)
+        dump = _label_window(transient, "loader_dump_trace", limit=14000)
         for operation in ("DOS_CREATE", "DOS_WRITE", "DOS_CLOSE"):
             self.assertIn(operation, dump)
         self.assertIn("call memman_snapshot_trace", dump)

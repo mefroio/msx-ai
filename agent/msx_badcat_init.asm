@@ -1,10 +1,13 @@
-; BADINIT.COM - non-persistent BaDCaT/ZiModem listener initializer.
+; BADINIT.COM - non-persistent BaDCaT/ZiModem session initializer.
 ;
 ; Usage:
 ;   BADINIT                         57600 baud, TCP port 6603 (defaults)
 ;   BADINIT /57600                  explicit 57600 baud
 ;   BADINIT /115200                 switch this session to 115200 baud
 ;   BADINIT /PORT:7000 /115200      choose a TCP port and baud rate
+;   BADINIT /PREPARE                prepare command mode for reverse dialing
+;   BADINIT /CONNECT:192.168.0.62   ask a resident 16C550 agent to dial port 6603
+;   BADINIT /CONNECT:192.168.0.62 /PORT:7000
 ;
 ; The saved modem configuration is expected to remain at 57600 baud.  Every
 ; command below affects only the current session.  In particular, this utility
@@ -30,10 +33,16 @@ UART_LSR:               equ 085h
 
 UART_DIVISOR_57600:     equ 2
 UART_DIVISOR_115200:    equ 1
+UART_MCR_RTS_OFF:       equ 001h      ; RetroTerm RT-BD: DTR active, RTS low
+UART_MCR_RTS_ON:        equ 003h      ; RetroTerm RT-BD: DTR and RTS active
+UART_FCR_FIFO_8:         equ 087h      ; FIFO on/reset, 8-byte RX trigger
+UART_RTS_POLL_COUNT:    equ 100       ; RT-BD LONGRX polling window
+UART_RECEIVE_EVENT_MASK: equ 09Fh     ; DR or any tracked line-status error
 DEFAULT_LISTENER_PORT:  equ 6603
 LISTENER_PREFIX_LENGTH: equ 10
 LISTENER_PORT_CAPACITY: equ 6         ; five decimal digits plus NUL
 LISTENER_COMMAND_CAPACITY: equ 16     ; prefix + five digits plus NUL
+IPV4_TEXT_CAPACITY:     equ 16        ; 15 characters plus NUL
 COMMAND_BUFFER_CAPACITY: equ 128      ; maximum DOS tail plus NUL
 RESPONSE_TIMEOUT:       equ 180       ; about 3 s NTSC / 3.6 s PAL
 RESPONSE_LINE_CAPACITY: equ 31
@@ -53,8 +62,18 @@ RESPONSE_STREAM_ERROR:  equ 5
 
 MEMMAN_INICHK:          equ 30
 MEMMAN_GET_TSR_ID:      equ 62
+MEMMAN_TSR_CALL:        equ 63
 MEMMAN_MINIMUM_MAJOR:   equ 2
 MEMMAN_MINIMUM_MINOR:   equ 4
+; A5..B2 belong to the existing configuration/trace/transfer ABIs. B3 is the
+; first private opcode after that contiguous range.
+TSR_TALK_BADCAT_DIAL:   equ 0B3h
+BADCAT_DIAL_MAGIC:      equ 0A95Ah
+BADCAT_DIAL_VERSION:    equ 1
+BADCAT_DIAL_REQUEST_SIZE: equ 12
+BADCAT_DIAL_STATUS_OK:  equ 0
+BADCAT_DIAL_STATUS_PENDING: equ 0FFh
+BADCAT_DIAL_STATUS_STATE: equ 7
 
     org 0100h
 
@@ -64,8 +83,20 @@ badinit_start:
     jp c,badinit_usage
 
     call find_resident_agent
-    jp nc,badinit_resident_active
+    jr c,badinit_no_resident
+    ld (memman_tsr_id),bc
+    ld a,(connect_option_seen)
+    or a
+    jp nz,badinit_resident_reverse_dial
+    jp badinit_resident_active
+badinit_no_resident:
     ei                            ; EXTBIO implementations may return with DI
+    ; /CONNECT is never an implicit preparatory pass. Failing here, before the
+    ; first UART instruction, prevents an outbound TCP handshake from starting
+    ; while no resident is available to answer it.
+    ld a,(connect_option_seen)
+    or a
+    jp nz,badinit_reverse_requires_resident
 
     ; The power-on/saved baseline is always probed at 57600 first, regardless
     ; of the requested final speed.  This prevents /115200 from talking to a
@@ -146,12 +177,20 @@ badinit_initial_done:
     ld b,a
     ld a,(current_divisor)
     cp b
-    jr z,badinit_listener
+    jr z,badinit_mode_dispatch
     ld hl,stage_baud_change
     call diagnostic_begin_stage
     ld a,b
     call change_runtime_baud
     jp c,badinit_failed
+
+badinit_mode_dispatch:
+    ld a,(prepare_option_seen)
+    or a
+    jp nz,badinit_prepared
+    ld a,(connect_option_seen)
+    or a
+    jp nz,badinit_reverse_requires_resident
 
 badinit_listener:
     ; ATI2 is deliberately issued before opening the listener.  Once a host
@@ -210,6 +249,69 @@ badinit_quiet:
     xor a
     jp terminate
 
+badinit_prepared:
+    ; ATN0 and the visible bootstrap have left ZiModem in ready command mode
+    ; with echo disabled and no runtime listener. Do not dial here: the host's
+    ; bootstrap timeout begins as soon as TCP connects, before a human could
+    ; install MSXAI. The resident dial ABI below performs the final transition.
+    ld de,message_prepare_success
+    call print_string
+    xor a
+    jp terminate
+
+badinit_reverse_requires_resident:
+    ld de,message_reverse_requires_resident
+    call print_string
+    ld a,4
+    jp terminate
+
+badinit_resident_reverse_dial:
+    ; The native 16C550 resident already owns the UART and is ready to service
+    ; the host handshake. B3 validates the binary request, resets only protocol
+    ; session state, builds ATS2=255Q1D"ip:port" internally, and emits it with a
+    ; bounded TX wait. No BADINIT UART access is legal on this path.
+    ld a,BADCAT_DIAL_STATUS_PENDING
+    ld (badcat_dial_request_status),a
+    ld bc,(memman_tsr_id)
+    ld hl,badcat_dial_request
+    ld a,TSR_TALK_BADCAT_DIAL
+    ld d,'M'
+    ld e,MEMMAN_TSR_CALL
+    call EXTBIO
+    ei
+    or a
+    jr nz,badinit_resident_dial_failed
+    ld a,(badcat_dial_request_status)
+    cp BADCAT_DIAL_STATUS_OK
+    jr nz,badinit_resident_dial_failed
+    ld de,message_reverse_success_prefix
+    call print_string
+    ld hl,selected_host
+    call print_c_string
+    ld a,':'
+    call print_character
+    ld hl,command_listener_port_text
+    call print_c_string
+    ld de,message_reverse_success_suffix
+    call print_string
+    xor a
+    jp terminate
+
+badinit_resident_dial_failed:
+    ld a,(badcat_dial_request_status)
+    cp BADCAT_DIAL_STATUS_STATE
+    jr z,badinit_resident_dial_already_attempted
+    ld de,message_resident_dial_failed
+    call print_string
+    ld a,5
+    jp terminate
+
+badinit_resident_dial_already_attempted:
+    ld de,message_resident_dial_already_attempted
+    call print_string
+    ld a,5
+    jp terminate
+
 badinit_failed:
     call diagnostic_report_once
     ld a,(response_status)
@@ -263,6 +365,8 @@ parse_command_line:
     xor a
     ld (baud_option_seen),a
     ld (port_option_seen),a
+    ld (connect_option_seen),a
+    ld (prepare_option_seen),a
 
     ; Normalize the counted DOS command tail to uppercase. The count is at
     ; most 127, so command_buffer always has room for the terminating NUL.
@@ -296,7 +400,7 @@ parse_token_loop:
     call parse_skip_spaces
     ld a,(hl)
     or a
-    jp z,build_listener_command
+    jp z,build_commands
 
     ld de,option_57600
     call parse_token_equals
@@ -307,6 +411,12 @@ parse_token_loop:
     ld de,option_port_prefix
     call parse_token_has_prefix
     jp z,parse_select_port
+    ld de,option_connect_prefix
+    call parse_token_has_prefix
+    jp z,parse_select_connect
+    ld de,option_prepare
+    call parse_token_equals
+    jp z,parse_select_prepare
 parse_bad:
     scf
     ret
@@ -410,6 +520,114 @@ parse_port_complete:
     ld (selected_port),bc
     jp parse_token_loop
 
+parse_select_connect:
+    ld a,(connect_option_seen)
+    or a
+    jp nz,parse_bad
+    ld a,1
+    ld (connect_option_seen),a
+
+    ; Advance HL past "/CONNECT:" and copy a validated dotted-decimal IPv4
+    ; address. B counts dots, C counts digits in the current octet. Three-digit
+    ; octets are checked lexically against 255, which avoids 16-bit arithmetic
+    ; while keeping the destination bounded to 15 characters plus NUL.
+    ld de,option_connect_prefix
+parse_connect_prefix_loop:
+    ld a,(de)
+    or a
+    jr z,parse_connect_address_start
+    inc hl
+    inc de
+    jr parse_connect_prefix_loop
+
+parse_connect_address_start:
+    ld de,selected_host
+    ld bc,0
+parse_connect_character_loop:
+    ld a,(hl)
+    or a
+    jr z,parse_connect_complete
+    cp ' '
+    jr z,parse_connect_complete
+    cp 9
+    jr z,parse_connect_complete
+    cp '.'
+    jr z,parse_connect_dot
+    cp '0'
+    jp c,parse_bad
+    cp '9' + 1
+    jp nc,parse_bad
+    ld (ip_current_digit),a
+    ld a,c
+    inc a
+    cp 4
+    jp nc,parse_bad
+    ld c,a
+    cp 1
+    jr nz,parse_connect_not_first_digit
+    ld a,(ip_current_digit)
+    ld (ip_first_digit),a
+    jr parse_connect_store_character
+parse_connect_not_first_digit:
+    cp 2
+    jr nz,parse_connect_validate_third_digit
+    ld a,(ip_current_digit)
+    ld (ip_second_digit),a
+    jr parse_connect_store_character
+parse_connect_validate_third_digit:
+    ld a,(ip_first_digit)
+    cp '2'
+    jr c,parse_connect_store_character
+    jp nz,parse_bad
+    ld a,(ip_second_digit)
+    cp '5'
+    jr c,parse_connect_store_character
+    jp nz,parse_bad
+    ld a,(ip_current_digit)
+    cp '5' + 1
+    jp nc,parse_bad
+parse_connect_store_character:
+    ld a,(ip_current_digit)
+    ld (de),a
+    inc de
+    inc hl
+    jr parse_connect_character_loop
+
+parse_connect_dot:
+    ld a,c
+    or a
+    jp z,parse_bad               ; empty octet
+    ld a,b
+    cp 3
+    jp nc,parse_bad              ; exactly three dots are allowed
+    ld a,'.'
+    ld (de),a
+    inc de
+    inc hl
+    inc b
+    ld c,0
+    jr parse_connect_character_loop
+
+parse_connect_complete:
+    ld a,c
+    or a
+    jp z,parse_bad               ; empty final octet / trailing dot
+    ld a,b
+    cp 3
+    jp nz,parse_bad
+    xor a
+    ld (de),a
+    jp parse_token_loop
+
+parse_select_prepare:
+    ld a,(prepare_option_seen)
+    or a
+    jp nz,parse_bad
+    ld a,1
+    ld (prepare_option_seen),a
+    call parse_skip_token
+    jp parse_token_loop
+
 parse_skip_spaces:
     ld a,(hl)
     cp ' '
@@ -501,8 +719,41 @@ parse_token_prefix_yes:
     xor a
     ret
 
-; Materialize exactly "ATQ0S41=0A<port>" in the audited 16-byte buffer. The
-; builder runs before the resident probe and before any UART access.
+; Materialize every selected dynamic command before the resident probe and
+; before any UART access. The listener buffer remains available even when the
+; reverse path is selected so decimal port formatting has one audited source.
+build_commands:
+    ; Reverse dialing is intentionally limited to the physically validated
+    ; 57600-baud handoff. /PREPARE cannot be combined with a target or an
+    ; otherwise-unused port; the listener-only legacy syntax remains unchanged.
+    ld a,(prepare_option_seen)
+    or a
+    jr z,build_commands_not_prepare
+    ld a,(connect_option_seen)
+    or a
+    jp nz,parse_bad
+    ld a,(port_option_seen)
+    or a
+    jp nz,parse_bad
+    ld a,(selected_divisor)
+    cp UART_DIVISOR_57600
+    jp nz,parse_bad
+    jr build_commands_listener
+build_commands_not_prepare:
+    ld a,(connect_option_seen)
+    or a
+    jr z,build_commands_listener
+    ld a,(selected_divisor)
+    cp UART_DIVISOR_57600
+    jp nz,parse_bad
+build_commands_listener:
+    call build_listener_command
+    ld a,(connect_option_seen)
+    or a
+    ret z
+    jp build_badcat_dial_request
+
+; Materialize exactly "ATQ0S41=0A<port>" in the audited 16-byte buffer.
 build_listener_command:
     ld hl,command_listener_prefix
     ld de,command_listener_open
@@ -533,6 +784,73 @@ build_listener_port:
     inc de
     xor a
     ld (de),a                    ; also clears carry for parser success
+    ret
+
+; Convert the already validated text address into B3's compact binary request.
+; The resident, rather than this transient utility, constructs the ATD string;
+; therefore no caller-provided byte can become an unvalidated AT command.
+build_badcat_dial_request:
+    ld hl,selected_host
+    ld de,badcat_dial_request_ipv4
+    ld b,0
+build_badcat_ipv4_loop:
+    ld a,(hl)
+    or a
+    jr z,build_badcat_ipv4_last
+    cp '.'
+    jr z,build_badcat_ipv4_store
+    sub '0'
+    ld (ip_current_digit),a
+    ld a,b
+    add a,a                     ; old value * 2
+    ld c,a
+    add a,a                     ; old value * 4
+    add a,a                     ; old value * 8
+    add a,c                     ; old value * 10
+    ld c,a
+    ld a,(ip_current_digit)
+    add a,c
+    ld b,a
+    inc hl
+    jr build_badcat_ipv4_loop
+build_badcat_ipv4_store:
+    ld a,b
+    ld (de),a
+    inc de
+    ld b,0
+    inc hl
+    jr build_badcat_ipv4_loop
+build_badcat_ipv4_last:
+    ld a,b
+    ld (de),a
+    ; A reverse endpoint must name one specific host. Reject the two special
+    ; all-zero/all-ones addresses after binary conversion, including textual
+    ; spellings with leading zeroes.
+    ld hl,badcat_dial_request_ipv4
+    ld a,(hl)
+    inc hl
+    or (hl)
+    inc hl
+    or (hl)
+    inc hl
+    or (hl)
+    jp z,parse_bad
+    ld hl,badcat_dial_request_ipv4
+    ld a,(hl)
+    inc hl
+    and (hl)
+    inc hl
+    and (hl)
+    inc hl
+    and (hl)
+    inc a
+    jp z,parse_bad
+    ld hl,(selected_port)
+    ld (badcat_dial_request_port),hl
+    ld a,BADCAT_DIAL_STATUS_PENDING
+    ld (badcat_dial_request_status),a
+    xor a
+    ld (badcat_dial_request_reserved),a
     ret
 
 build_listener_decimal_place:
@@ -573,9 +891,10 @@ strings_equal:
 
 ; --------------------------------------------------------------- TSR safety
 
-; BADINIT must be the only owner of the UART.  A MemMan-resident MSXAI polls
-; it from H.TIMI and would race command responses, so fail before touching the
-; modem and ask the user to uninstall the agent first.
+; Direct initialization requires BADINIT to be the only UART owner. A resident
+; would race command responses, so reject every such mode. /CONNECT is the
+; exception: BADINIT performs no UART access and delegates its binary B3
+; request to the already active resident.
 find_resident_agent:
     xor a
     ld d,'M'
@@ -603,30 +922,28 @@ find_resident_absent:
 ; ---------------------------------------------------------------------- UART
 
 uart_init_57600:
-    ; Match the BaDCaT reference initialization order: hold RTS inactive while
-    ; clearing/configuring the UART, then enable AFE+RTS only after 8N1 and the
-    ; divisor are established.  This avoids exposing setup transients to the
-    ; ESP UART on both AFE and older non-AFE boards.
+    ; Use RetroTerm RT-BD's proven non-AFE MCR/DLAB sequence, but keep the
+    ; 16-byte FIFO enabled as in BaDCaT BDSHELL.  RT-BD can leave FIFO mode off
+    ; because its terminal loop polls continuously; BADINIT parses complete AT
+    ; response bursts and physically overran the single-byte receiver (LSR OE)
+    ; with FCR=06h.  Enabling AFE is still forbidden here: it can deadlock the
+    ; first AT command when ZiModem has CTS low, before F0 can establish flow.
     ; Keep DLAB setup atomic: an old H.TIMI/H.KEYI/FOSSIL hook must not touch
     ; ports 80h/81h while they temporarily select DLL/DLM instead of DATA/IER.
     di
     xor a
     out (UART_IER),a
-    ld a,00Dh                    ; DTR|OUT1|OUT2, RTS inactive during setup
+    ld a,UART_MCR_RTS_OFF
     out (UART_MCR),a
-    ld a,087h                    ; FIFO on, clear RX/TX, 8-byte RX trigger
-    out (UART_FCR),a
     ld a,UART_DIVISOR_57600
     call uart_set_baud_raw
     ld (current_divisor),a
-    xor a
-    out (UART_IER),a
+    ld a,UART_FCR_FIFO_8
+    out (UART_FCR),a
     in a,(UART_LSR)
     ld (diagnostic_last_lsr),a
     cp 0FFh                      ; an unclaimed MSX I/O port commonly reads FF
     jr z,uart_init_missing
-    ld a,02Fh                    ; DTR|RTS|OUT1|OUT2|automatic RTS/CTS
-    out (UART_MCR),a
     ei
     or a
     ret
@@ -646,7 +963,7 @@ uart_set_baud:
 
 uart_set_baud_raw:
     push af
-    ld a,083h                    ; DLAB, 8N1
+    ld a,080h                    ; RT-BD DLAB value
     out (UART_LCR),a
     pop af
     out (UART_DATA),a            ; DLL
@@ -656,6 +973,44 @@ uart_set_baud_raw:
     ld a,003h                    ; 8N1, DLAB clear
     out (UART_LCR),a
     pop af
+    ret
+
+; Return the current LSR in A.  If no byte is already buffered, reproduce
+; RT-BD's manual receive handshake: raise RTS, busy-poll briefly for DR (or a
+; line error), and lower RTS before returning.  BC is preserved so callers can
+; use B as a bounded byte counter.  The FIFO absorbs bytes already in flight
+; while the response loop immediately drains every available character.
+uart_receive_status:
+    push bc
+    in a,(UART_LSR)
+    ld (diagnostic_last_lsr),a
+    cp 0FFh
+    jr z,uart_receive_status_ready
+    ld c,a
+    and UART_RECEIVE_EVENT_MASK
+    ld a,c
+    jr nz,uart_receive_status_ready
+
+    ld a,UART_MCR_RTS_ON
+    out (UART_MCR),a
+    ld b,UART_RTS_POLL_COUNT
+uart_receive_poll:
+    in a,(UART_LSR)
+    ld (diagnostic_last_lsr),a
+    cp 0FFh
+    jr z,uart_receive_pulse_done
+    ld c,a
+    and UART_RECEIVE_EVENT_MASK
+    ld a,c
+    jr nz,uart_receive_pulse_done
+    djnz uart_receive_poll
+uart_receive_pulse_done:
+    ld c,a
+    ld a,UART_MCR_RTS_OFF
+    out (UART_MCR),a
+    ld a,c
+uart_receive_status_ready:
+    pop bc
     ret
 
 uart_write:
@@ -690,7 +1045,7 @@ uart_wait_empty_loop:
     ld (diagnostic_last_lsr),a
     cp 0FFh
     jr z,uart_wait_empty_failed
-    and 040h                     ; TEMT: FIFO and shift register both empty
+    and 040h                     ; TEMT: holding and shift registers both empty
     jr nz,uart_wait_empty_ready
     dec bc
     ld a,b
@@ -708,8 +1063,7 @@ uart_wait_empty_ready:
 drain_input:
     ld b,0                       ; bounded: at most 256 stale bytes
 drain_input_loop:
-    in a,(UART_LSR)
-    ld (diagnostic_last_lsr),a
+    call uart_receive_status
     cp 0FFh
     jr z,drain_input_failed
     and 001h
@@ -821,18 +1175,23 @@ restore_visible_command:
 ; --------------------------------------------------------------- AT responses
 
 run_visible_command:
+    ; HL is the caller's command pointer.  response_reset uses HL to clear the
+    ; receive count and previously left it at 0000h, causing send_command to
+    ; transmit bytes from the BIOS page instead of the requested AT string.
+    push hl
     call response_reset
+    pop hl
     call send_command
     jp c,response_uart_failed
     ld a,(JIFFY)
     ld (response_start),a
 
 response_wait:
-    ; Drain the complete FIFO before yielding to DOS/interrupt timing.  Printing
-    ; while bytes are arriving is too slow and can overrun a 16-byte UART FIFO.
+    ; Consume every byte already released by the manual RT-BD RTS handshake
+    ; before yielding to DOS/interrupt timing.  No console output is allowed
+    ; in this path while modem data may still be arriving.
 response_drain_fifo:
-    in a,(UART_LSR)
-    ld (diagnostic_last_lsr),a
+    call uart_receive_status
     ld b,a
     cp 0FFh
     jp z,response_uart_failed
@@ -884,8 +1243,8 @@ response_received_not_pending:
     ld a,(response_lsr_errors)
     or a
     ; Once any received character is corrupt, ignore line tokens but keep
-    ; draining the FIFO.  Reporting through DOS before it is empty can itself
-    ; cause an overrun and destroy the evidence we need to diagnose the link.
+    ; consuming pending input.  Reporting through DOS too early can destroy
+    ; the evidence we need to diagnose the link.
     jr nz,response_drain_fifo
     ld a,c
     or a
@@ -1279,11 +1638,21 @@ baud_option_seen:
     db 0
 port_option_seen:
     db 0
+connect_option_seen:
+    db 0
+prepare_option_seen:
+    db 0
 port_digit_count:
     db 0
 port_digit:
     db 0
 port_format_started:
+    db 0
+ip_first_digit:
+    db 0
+ip_second_digit:
+    db 0
+ip_current_digit:
     db 0
 response_status:
     db RESPONSE_OK
@@ -1311,11 +1680,16 @@ diagnostic_command:
     dw 0
 failure_reported:
     db 0
+memman_tsr_id:
+    dw 0
 command_buffer:
     ds COMMAND_BUFFER_CAPACITY,0
 command_buffer_end:
 response_line_buffer:
     ds RESPONSE_LINE_CAPACITY + 1,0
+selected_host:
+    ds IPV4_TEXT_CAPACITY,0
+selected_host_end:
 
 memman_tsr_name:
     db "MSXAI MCP1  "           ; exactly 12 bytes, padded for GetTsrID
@@ -1326,10 +1700,13 @@ option_115200:
     db "/115200",0
 option_port_prefix:
     db "/PORT:",0
+option_connect_prefix:
+    db "/CONNECT:",0
+option_prepare:
+    db "/PREPARE",0
 
 initial_command_table:
-    dw command_n0,command_s62_0,command_s63_0
-    dw command_s0_1,0
+    dw command_n0,command_s2_255,command_s0_1,0
 listener_command_table:
     dw command_i2,0
 
@@ -1337,10 +1714,8 @@ command_bootstrap:
     db "ATQ0V1E0R1F0",0
 command_n0:
     db "ATN0",0
-command_s62_0:
-    db "ATS62=0",0
-command_s63_0:
-    db "ATS63=0",0
+command_s2_255:
+    db "ATS2=255",0
 command_s0_1:
     db "ATS0=1",0
 command_b57600:
@@ -1360,6 +1735,22 @@ command_i2:
     db "ATI2",0
 command_visible:
     db "ATQ0V1E1R1F0",0
+
+; Private B3 request shared with the resident core. The transient parser fills
+; only the binary IPv4 and little-endian port fields before TsrCall.
+badcat_dial_request:
+    dw BADCAT_DIAL_MAGIC
+    db BADCAT_DIAL_VERSION
+    db BADCAT_DIAL_REQUEST_SIZE
+badcat_dial_request_status:
+    db BADCAT_DIAL_STATUS_PENDING
+badcat_dial_request_reserved:
+    db 0
+badcat_dial_request_ipv4:
+    ds 4,0
+badcat_dial_request_port:
+    dw DEFAULT_LISTENER_PORT
+badcat_dial_request_end:
 
 response_token_ok:
     db "OK",0
@@ -1401,7 +1792,7 @@ reason_uart:
     db "UART failure",0
 
 message_banner:
-    db 13,10,"BaDCaT MCP listener initializer",13,10,"Baud: $"
+    db 13,10,"BaDCaT MCP session initializer",13,10,"Baud: $"
 message_57600:
     db "57600",13,10,"$"
 message_115200:
@@ -1412,11 +1803,26 @@ message_success_prefix:
     db 13,10,"Listener $"
 message_success_suffix:
     db " ready; start matching MSXAI now.",13,10,"$"
+message_prepare_success:
+    db 13,10,"BaDCaT prepared at 57600; install resident 16C550 MSXAI.",13,10,"$"
+message_reverse_requires_resident:
+    db 13,10,"/CONNECT requires an active 57600 resident 16C550 agent.",13,10,"$"
+message_reverse_success_prefix:
+    db 13,10,"Reverse dial issued to $"
+message_reverse_success_suffix:
+    db "; awaiting MCP handshake.",13,10,"$"
+message_resident_dial_failed:
+    db 13,10,"Resident 16C550 rejected or timed out reverse dial.",13,10,"$"
+message_resident_dial_already_attempted:
+    db 13,10,"Reverse dial already attempted; reboot and /PREPARE again.",13,10,"$"
 message_failed:
     db 13,10,"BaDCaT initialization failed; power-cycle restores saved state.",13,10,"$"
 message_usage:
     db 13,10,"Usage: BADINIT [/57600 | /115200]",13,10
-    db "       [/PORT:<1..65535>]",13,10,"$"
+    db "       [/PORT:<1..65535>]",13,10
+    db "       /PREPARE",13,10
+    db "       /CONNECT:<IPv4> [/PORT:<1..65535>]",13,10
+    db "Reverse modes require 57600 baud.",13,10,"$"
 message_resident_active:
     db 13,10,"MSXAI resident active; run MSXAI /UNINSTALL first.",13,10,"$"
 message_diagnostic_stage:

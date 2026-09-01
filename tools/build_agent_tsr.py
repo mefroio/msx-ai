@@ -31,9 +31,10 @@ from tools.build_version_include import materialize_version_include  # noqa: E40
 
 TSR_NAME = "MSXAI MCP1"
 # Keep all synthetic link origins low enough that the largest supported TSR
-# still fits in page 1.  They only need to be distinct to cross-check inferred
-# relocations; high origins unnecessarily reduced the builder's size ceiling.
-BUILD_ORIGINS = (0x4024, 0x44B5, 0x46F0)
+# still fits in page 1. They only need to be distinct to cross-check inferred
+# relocations; high origins unnecessarily reduce the builder's size ceiling.
+# The primary installed origin remains 4024h.
+BUILD_ORIGINS = (0x4024, 0x4357, 0x4200)
 H_KEYI = 0xFD9A
 H_TIMI = 0xFD9F
 H_CHPU = 0xFDA4
@@ -110,7 +111,7 @@ def _wrapper(origin: int, development_trace: bool = False) -> str:
         "; Generated temporarily by tools/build_agent_tsr.py.\n"
         "MSXAI_TSR_BUILD: equ 1\n"
         f"MSXAI_DEVELOPMENT_TRACE: equ {int(development_trace)}\n"
-        "TRANSPORT_STATE_SIZE: equ 5\n"
+        "TRANSPORT_STATE_SIZE: equ 6\n"
         f"TSR_BUILD_BASE: equ 0{origin:04X}h\n"
         "include 'agent/msx_agent_core.asm'\n"
     )

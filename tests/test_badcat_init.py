@@ -218,6 +218,8 @@ class _ParserMachine:
             self.de += 1
         elif opcode == 0x0C:  # INC C
             self.c = self.increment(self.c)
+        elif opcode == 0x04:  # INC B
+            self.b = self.increment(self.b)
         elif opcode == 0x3C:  # INC A
             self.a = self.increment(self.a)
         elif opcode == 0x05:  # DEC B
@@ -256,8 +258,22 @@ class _ParserMachine:
             self.a = result & 0xFF
             self.f = ((Z_FLAG if self.a == 0 else 0)
                       | (C_FLAG if result > 0xFF else 0))
+        elif opcode == 0x87:  # ADD A,A
+            result = self.a + self.a
+            self.a = result & 0xFF
+            self.f = ((Z_FLAG if self.a == 0 else 0)
+                      | (C_FLAG if result > 0xFF else 0))
+        elif opcode == 0x81:  # ADD A,C
+            result = self.a + self.c
+            self.a = result & 0xFF
+            self.f = ((Z_FLAG if self.a == 0 else 0)
+                      | (C_FLAG if result > 0xFF else 0))
+        elif opcode == 0xA6:  # AND (HL)
+            self.logic(self.a & self.memory[self.hl])
         elif opcode == 0xB1:  # OR C
             self.logic(self.a | self.c)
+        elif opcode == 0xB6:  # OR (HL)
+            self.logic(self.a | self.memory[self.hl])
         elif opcode == 0xB7:  # OR A
             self.logic(self.a)
         elif opcode == 0xAF:  # XOR A
@@ -335,7 +351,7 @@ class _ParserMachine:
             raise AssertionError(
                 f"unsupported parser opcode at {address:04X}: {opcode:02X}")
 
-    def run(self):
+    def run(self, include_request=False):
         for _ in range(12000):
             if self.pc == self.sentinel:
                 selected = self.memory[self.labels["selected_divisor"]]
@@ -351,11 +367,28 @@ class _ParserMachine:
                 guard = bytes(self.memory[end:end + len(COMMANDS[
                     "command_stream_commit"])])
                 self.assert_listener_guard(guard)
+                host_start = self.labels["selected_host"]
+                host_end = self.labels["selected_host_end"]
+                host_encoded = bytes(self.memory[host_start:host_end])
+                host_terminator = host_encoded.find(b"\0")
+                host = (None if host_terminator < 0 else
+                        host_encoded[:host_terminator].decode("ascii"))
+                request_start = self.labels["badcat_dial_request"]
+                request_end = self.labels["badcat_dial_request_end"]
+                request = bytes(self.memory[request_start:request_end])
+                request_guard = bytes(
+                    self.memory[request_end:request_end + 3])
+                if request_guard != b"OK\0":
+                    raise AssertionError(
+                        "binary dial request builder crossed its buffer")
                 if (self.memory[self.labels["command_buffer_end"]]
                         != self.command_buffer_canary):
                     raise AssertionError(
                         "command-tail parser crossed its 128-byte buffer")
-                return bool(self.f & C_FLAG), selected, port, command
+                result = bool(self.f & C_FLAG), selected, port, command
+                if include_request:
+                    return result + (host, request)
+                return result
             self.step()
         raise AssertionError("BADINIT option parser did not return")
 
@@ -523,6 +556,16 @@ class BadcatInitBuilderTest(unittest.TestCase):
             - first.labels["command_buffer"],
             128,
         )
+        self.assertEqual(
+            first.labels["selected_host_end"]
+            - first.labels["selected_host"],
+            16,
+        )
+        self.assertEqual(
+            first.labels["badcat_dial_request_end"]
+            - first.labels["badcat_dial_request"],
+            12,
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "nested" / "BADINIT.COM"
@@ -556,10 +599,31 @@ class BadcatInitBuilderTest(unittest.TestCase):
             validate_badcat_init_image(bytes(mutated), image.labels)
 
         mutated = bytearray(image.data)
+        host = image.labels["selected_host"] - ORIGIN
+        mutated[host] = 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "selected_host must initialize"):
+            validate_badcat_init_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        request = image.labels["badcat_dial_request"] - ORIGIN
+        mutated[request] ^= 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "badcat_dial_request has unsafe"):
+            validate_badcat_init_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
         command_buffer = image.labels["command_buffer"] - ORIGIN
         mutated[command_buffer] = 1
         with self.assertRaisesRegex(
                 BadcatInitBuildError, "command_buffer must initialize"):
+            validate_badcat_init_image(bytes(mutated), image.labels)
+
+        mutated = bytearray(image.data)
+        visible = image.labels["run_visible_command"] - ORIGIN
+        mutated[visible] = 0x00
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "must preserve HL"):
             validate_badcat_init_image(bytes(mutated), image.labels)
 
         mutated = bytearray(image.data)
@@ -610,8 +674,20 @@ class BadcatInitBuilderTest(unittest.TestCase):
                 BadcatInitBuildError, "reserve exactly 128"):
             validate_badcat_init_image(image.data, wrong_layout)
 
+        wrong_layout = dict(image.labels)
+        wrong_layout["selected_host_end"] -= 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "selected_host must reserve"):
+            validate_badcat_init_image(image.data, wrong_layout)
+
+        wrong_layout = dict(image.labels)
+        wrong_layout["badcat_dial_request_end"] -= 1
+        with self.assertRaisesRegex(
+                BadcatInitBuildError, "must reserve exactly 12"):
+            validate_badcat_init_image(image.data, wrong_layout)
+
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
-    def test_binary_pins_nonpersistent_transcript_and_atomic_listener(self):
+    def test_binary_pins_nonpersistent_transcript_listener_and_dial_abi(self):
         image = _real_image()
         address_to_name = {
             image.labels[name]: name for name in COMMANDS
@@ -651,8 +727,19 @@ class BadcatInitBuilderTest(unittest.TestCase):
             image.data[listener_start - ORIGIN:listener_end - ORIGIN],
             bytes(16),
         )
+        request_start = image.labels["badcat_dial_request"]
+        request_end = image.labels["badcat_dial_request_end"]
+        self.assertEqual(request_end - request_start, 12)
+        self.assertEqual(
+            image.data[request_start - ORIGIN:request_end - ORIGIN],
+            bytes.fromhex("5a a9 01 0c ff 00 00 00 00 00 cb 19"),
+        )
         self.assertEqual(
             commands["command_stream_commit"], "ATHS41=1Q1")
+        self.assertEqual(image.labels["TSR_TALK_BADCAT_DIAL"], 0xB3)
+        self.assertNotIn(b'ATQ1D"', image.data.upper())
+        self.assertNotIn(b"ATS62=", image.data.upper())
+        self.assertNotIn(b"ATS63=", image.data.upper())
         self.assertNotIn(b"ATQ1\0", image.data)
         self.assertNotIn(b"ATA6603\0", image.data)
         for fragment in FORBIDDEN_COMMAND_FRAGMENTS:
@@ -661,8 +748,7 @@ class BadcatInitBuilderTest(unittest.TestCase):
         common = [
             "ATQ0V1E0R1F0",
             "ATN0",
-            "ATS62=0",
-            "ATS63=0",
+            "ATS2=255",
             "ATS0=1",
         ]
 
@@ -692,6 +778,17 @@ class BadcatInitBuilderTest(unittest.TestCase):
             common
             + ["ATQ1B115200", "ATQ0V1E0R1F0", "ATI2",
                "ATQ0S41=0A7000", "ATHS41=1Q1"],
+        )
+
+        # Reverse mode materializes only a versioned binary TsrCall request;
+        # the resident owns construction and transmission of the AT command.
+        parsed = _ParserMachine(
+            image, "/CONNECT:192.168.0.62").run(include_request=True)
+        self.assertEqual(parsed[:5], (
+            False, 2, 6603, "ATQ0S41=0A6603", "192.168.0.62"))
+        self.assertEqual(
+            parsed[5],
+            bytes.fromhex("5a a9 01 0c ff 00 c0 a8 00 3e cb 19"),
         )
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
@@ -757,6 +854,77 @@ class BadcatInitBuilderTest(unittest.TestCase):
                 self.assertTrue(_ParserMachine(image, tail).run()[0])
 
     @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_actual_option_parser_builds_strict_binary_reverse_request(self):
+        image = _real_image()
+        valid_cases = {
+            "/CONNECT:192.168.0.62": (
+                False, 2, 6603, "ATQ0S41=0A6603", "192.168.0.62",
+                bytes.fromhex("5a a9 01 0c ff 00 c0 a8 00 3e cb 19")),
+            "/connect:10.0.0.7 /port:1": (
+                False, 2, 1, "ATQ0S41=0A1", "10.0.0.7",
+                bytes.fromhex("5a a9 01 0c ff 00 0a 00 00 07 01 00")),
+            "/PORT:65535 /CONNECT:254.255.255.255 /57600": (
+                False, 2, 65535, "ATQ0S41=0A65535", "254.255.255.255",
+                bytes.fromhex("5a a9 01 0c ff 00 fe ff ff ff ff ff")),
+            "/CONNECT:001.002.003.004 /PORT:43123": (
+                False, 2, 43123, "ATQ0S41=0A43123", "001.002.003.004",
+                bytes.fromhex("5a a9 01 0c ff 00 01 02 03 04 73 a8")),
+        }
+        for tail, expected in valid_cases.items():
+            with self.subTest(tail=tail):
+                self.assertEqual(
+                    _ParserMachine(image, tail).run(include_request=True),
+                    expected,
+                )
+
+        invalid_cases = (
+            "/CONNECT:",
+            "/CONNECT:1",
+            "/CONNECT:1.2",
+            "/CONNECT:1.2.3",
+            "/CONNECT:1.2.3.",
+            "/CONNECT:.1.2.3",
+            "/CONNECT:1..2.3",
+            "/CONNECT:1.2.3.4.5",
+            "/CONNECT:256.1.1.1",
+            "/CONNECT:1.999.1.1",
+            "/CONNECT:1.1.1000.1",
+            "/CONNECT:1.1.-1.1",
+            "/CONNECT:1.1.+1.1",
+            "/CONNECT:1.1.A.1",
+            "/CONNECT:HOSTNAME",
+            "/CONNECT:1.2.3.4X",
+            "/CONNECT:0.0.0.0",
+            "/CONNECT:000.000.000.000",
+            "/CONNECT:255.255.255.255",
+            "/CONNECT:1.2.3.4 /115200",
+            "/CONNECT:1.2.3.4 /CONNECT:5.6.7.8",
+            "/CONNECT=1.2.3.4",
+        )
+        for tail in invalid_cases:
+            with self.subTest(tail=tail):
+                self.assertTrue(
+                    _ParserMachine(image, tail).run(include_request=True)[0])
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
+    def test_prepare_is_explicit_57600_only_and_never_accepts_a_target(self):
+        image = _real_image()
+        for tail in ("/PREPARE", "/prepare /57600"):
+            with self.subTest(tail=tail):
+                self.assertEqual(
+                    _ParserMachine(image, tail).run()[:3],
+                    (False, 2, 6603),
+                )
+        for tail in (
+            "/PREPARE /115200",
+            "/PREPARE /PORT:6603",
+            "/PREPARE /CONNECT:192.168.0.62",
+            "/PREPARE /PREPARE",
+        ):
+            with self.subTest(tail=tail):
+                self.assertTrue(_ParserMachine(image, tail).run()[0])
+
+    @unittest.skipUnless(shutil.which("z80asm"), "z80asm is not installed")
     def test_actual_resident_guard_requires_memman_24_and_exact_tsr(self):
         image = _real_image()
         name = image.labels["memman_tsr_name"]
@@ -807,9 +975,9 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
         self.assertIn("ld e,MEMMAN_GET_TSR_ID", probe)
         self.assertIn("ld hl,memman_tsr_name", probe)
 
-    def test_dynamic_listener_command_is_bounded_and_built_before_uart(self):
+    def test_dynamic_listener_and_binary_dial_request_are_bounded(self):
         parser = self.section("parse_command_line:", "strings_equal:")
-        self.assertIn("jp z,build_listener_command", parser)
+        self.assertIn("jp z,build_commands", parser)
         self.assertIn("ld hl,DEFAULT_LISTENER_PORT", parser)
         self.assertIn("ld (selected_port),bc", parser)
         builder = parser.split("build_listener_command:", 1)[1]
@@ -821,15 +989,28 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
         self.assertIn("LISTENER_COMMAND_CAPACITY: equ 16", self.source)
         self.assertIn("COMMAND_BUFFER_CAPACITY: equ 128", self.source)
 
+        dial = parser.split("build_badcat_dial_request:", 1)[1]
+        self.assertIn("ld hl,selected_host", dial)
+        self.assertIn("ld de,badcat_dial_request_ipv4", dial)
+        self.assertIn("ld (badcat_dial_request_port),hl", dial)
+        self.assertIn("ld (badcat_dial_request_status),a", dial)
+        self.assertIn("IPV4_TEXT_CAPACITY:     equ 16", self.source)
+        self.assertIn("BADCAT_DIAL_REQUEST_SIZE: equ 12", self.source)
+        self.assertIn("TSR_TALK_BADCAT_DIAL:   equ 0B3h", self.source)
+        self.assertNotIn("command_reverse_dial", self.source)
+        self.assertNotIn('db "ATQ1D",34,0', self.source)
+
         success = self.section("badinit_quiet:", "badinit_failed:")
         self.assertIn("ld hl,command_listener_port_text", success)
         self.assertIn("call print_c_string", success)
 
-    def test_receive_fifo_is_drained_before_console_output_or_halt(self):
+    def test_receive_input_is_consumed_before_console_output_or_halt(self):
         fifo = self.section(
             "response_drain_fifo:", "response_no_byte_or_error:")
         self.assertLess(
-            fifo.index("in a,(UART_LSR)"), fifo.index("in a,(UART_DATA)"))
+            fifo.index("call uart_receive_status"),
+            fifo.index("in a,(UART_DATA)"),
+        )
         self.assertLess(
             fifo.index("in a,(UART_DATA)"),
             fifo.index("call response_store_character"),
@@ -845,6 +1026,18 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
         outcomes = self.section("response_succeeded:", "response_reset:")
         self.assertEqual(outcomes.count("call print_response_buffer"), 1)
         self.assertEqual(outcomes.count("call diagnostic_report_once"), 5)
+
+    def test_visible_command_preserves_command_pointer_across_reset(self):
+        entry = self.section("run_visible_command:", "response_wait:")
+        operations = (
+            "push hl",
+            "call response_reset",
+            "pop hl",
+            "call send_command",
+        )
+        positions = [entry.index(operation) for operation in operations]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(entry.count("push hl"), entry.count("pop hl"))
 
     def test_baud_transition_waits_for_temt_before_switching_divisor(self):
         wait_empty = self.section("uart_wait_empty:", "drain_input:")
@@ -874,24 +1067,24 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
             restore.index("call wait_ticks"),
         )
 
-    def test_uart_initialization_matches_badcat_reference_order(self):
+    def test_uart_initialization_uses_non_afe_profile_with_fifo(self):
         initialization = self.section("uart_init_57600:", "uart_set_baud:")
         operations = (
             "di",
-            "ld a,00Dh",
+            "ld a,UART_MCR_RTS_OFF",
             "out (UART_MCR),a",
-            "ld a,087h",
-            "out (UART_FCR),a",
             "call uart_set_baud_raw",
-            "ld a,02Fh",
-            "ei",
+            "ld a,UART_FCR_FIFO_8",
+            "out (UART_FCR),a",
+            "    ei\n",
         )
         positions = [initialization.index(item) for item in operations]
         self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("02Fh", initialization)
         missing = initialization.split("uart_init_missing:", 1)[1]
         self.assertIn("ei", missing)
 
-        runtime = self.section("uart_set_baud:", "uart_write:")
+        runtime = self.section("uart_set_baud:", "uart_receive_status:")
         runtime_operations = (
             "di",
             "call uart_set_baud_raw",
@@ -901,11 +1094,33 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
         )
         positions = [runtime.index(item) for item in runtime_operations]
         self.assertEqual(positions, sorted(positions))
+        raw = runtime.split("uart_set_baud_raw:", 1)[1]
+        self.assertIn("ld a,080h", raw)
+
+        self.assertIn("UART_MCR_RTS_OFF:       equ 001h", self.source)
+        self.assertIn("UART_MCR_RTS_ON:        equ 003h", self.source)
+        self.assertIn("UART_FCR_FIFO_8:         equ 087h", self.source)
+        receive = self.section("uart_receive_status:", "uart_write:")
+        rts_on = receive.index("ld a,UART_MCR_RTS_ON")
+        poll = receive.index("uart_receive_poll:", rts_on)
+        rts_off = receive.index("ld a,UART_MCR_RTS_OFF", poll)
+        self.assertLess(rts_on, poll)
+        self.assertLess(poll, rts_off)
+        self.assertIn("out (UART_MCR),a", receive[rts_on:poll])
+        self.assertIn("ld b,UART_RTS_POLL_COUNT", receive[rts_on:poll])
+        self.assertIn("in a,(UART_LSR)", receive[poll:rts_off])
+        self.assertIn("out (UART_MCR),a", receive[rts_off:])
+        self.assertNotIn("halt", receive)
+        self.assertNotIn("call BDOS", receive)
 
     def test_uart_errors_cannot_validate_a_response(self):
         fifo = self.section("response_drain_fifo:", "response_no_byte:")
         self.assertLess(
-            fifo.index("cp 0FFh"), fifo.index("and LSR_ERROR_MASK"))
+            fifo.index("call uart_receive_status"),
+            fifo.index("and LSR_ERROR_MASK"),
+        )
+        receive = self.section("uart_receive_status:", "uart_write:")
+        self.assertIn("cp 0FFh", receive)
         self.assertIn("response_no_byte_or_error:", fifo)
         self.assertIn("jr nz,response_drain_fifo", fifo)
         self.assertIn("jp nc,response_line_failed", fifo)
@@ -989,7 +1204,8 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
 
     def test_listener_commit_failure_never_writes_uart(self):
         handler = self.section(
-            "badinit_listener_commit_failed:", "badinit_usage:")
+            "badinit_listener_commit_failed:",
+            "badinit_usage:")
         self.assertIn("call diagnostic_report_once", handler)
         for forbidden in (
                 "restore_visible_57600", "send_command", "uart_write",
@@ -1029,6 +1245,37 @@ class BadcatInitSourceSafetyTest(unittest.TestCase):
         self.assertIn('db "ATHS41=1Q1",0', self.source)
         self.assertNotIn('db "ATQ1",0', self.source)
         self.assertNotIn('db "ATA6603",0', self.source)
+
+    def test_connect_without_resident_fails_before_any_uart_access(self):
+        entry = self.section("badinit_start:", "; ---------------------------------------------------------------- command line")
+        no_resident = entry.split("badinit_no_resident:", 1)[1]
+        self.assertLess(
+            no_resident.index("ld a,(connect_option_seen)"),
+            no_resident.index("call uart_init_57600"),
+        )
+        self.assertLess(
+            no_resident.index("jp nz,badinit_reverse_requires_resident"),
+            no_resident.index("call uart_init_57600"),
+        )
+
+    def test_resident_reverse_path_only_calls_versioned_b3_abi(self):
+        reverse = self.section(
+            "badinit_resident_reverse_dial:", "badinit_failed:")
+        operations = (
+            "ld hl,badcat_dial_request",
+            "ld a,TSR_TALK_BADCAT_DIAL",
+            "ld d,'M'",
+            "ld e,MEMMAN_TSR_CALL",
+            "call EXTBIO",
+        )
+        positions = [reverse.index(operation) for operation in operations]
+        self.assertEqual(positions, sorted(positions))
+        for forbidden in (
+                "uart_init", "send_command", "uart_write", "uart_wait_empty",
+                "drain_input", " in ", " out "):
+            self.assertNotIn(forbidden, reverse.lower())
+        self.assertIn("BADCAT_DIAL_STATUS_STATE", reverse)
+        self.assertIn("reboot and /PREPARE again", self.source)
 
 
 if __name__ == "__main__":

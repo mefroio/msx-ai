@@ -189,6 +189,7 @@ AGENT_TRANSPORT_NAMES = {
     0: "uart-8251",
     1: "uart-16c550",
     2: "tcpip-unapi",
+    3: "uart-fossil",
 }
 AGENT_RUNTIME_MODES = {0: "resident", 1: "foreground-monitor"}
 
@@ -1017,19 +1018,28 @@ class RealMSX:
         }
 
     def _send_debug_peer_label(self):
-        """Announce host-known peer metadata to foreground DEBUG exactly once."""
+        """Announce the MCP host endpoint to foreground DEBUG exactly once.
+
+        ``self.peer`` is the remote TCP endpoint from the host's perspective,
+        which is the MSX/adapter itself.  The endpoint that the MSX sees as its
+        MCP peer is instead the host-side socket address returned by
+        ``getsockname()`` and retained in ``self.local_endpoint``.  Keeping the
+        choice here makes the label correct for both host-listen (reverse) and
+        host-connect sessions without teaching any MSX transport about TCP.
+        """
         if (self._debug_peer_sent or self._v3 is None or not self.debug or
                 not self.feature_bits & FEATURE_DEBUG_PEER or
-                self.peer is None):
+                self.local_endpoint is None):
             return
-        if isinstance(self.peer, (tuple, list)):
-            peer_host = str(self.peer[0])
-            if len(self.peer) >= 2:
-                peer_label = f"{peer_host}:{self.peer[1]}"
+        endpoint = self.local_endpoint
+        if isinstance(endpoint, (tuple, list)):
+            peer_host = str(endpoint[0])
+            if len(endpoint) >= 2:
+                peer_label = f"{peer_host}:{endpoint[1]}"
             else:
                 peer_label = peer_host
         else:
-            peer_host = str(self.peer)
+            peer_host = str(endpoint)
             peer_label = peer_host
         try:
             ipaddress.IPv4Address(peer_host)

@@ -12,10 +12,11 @@
 ;     directory when that optional environment item is unset
 ;
 ; Installation validates MEMMAN.COM, TL.COM, and the selected fixed-driver TSR.
-; UNAPI additionally validates the pre-TL TU.COM helper and MP.COM.  The loader
-; stages external MEMMAN.COM at the top of the TPA and overlays address 0100h.
-; Uninstall uses the same mechanism for TK.COM.  No temporary file is created,
-; patched, deleted, or left behind by either lifecycle.
+; UNAPI additionally validates the pre-TL TU.COM helper and MP.COM; a fresh
+; development 16C550 /TRACE install validates MP.COM for its post-TL A8 handoff.
+; The loader stages external MEMMAN.COM at the top of the TPA and overlays
+; address 0100h. Uninstall uses the same mechanism for TK.COM. No temporary
+; file is created, patched, deleted, or left behind by either lifecycle.
 
 DOS_CLOSE:               equ 045h
 DOS_CREATE:              equ 044h
@@ -67,7 +68,7 @@ DOS_PATH_SEPARATOR:      equ 05Ch
 MEMMAN_FILE_SIZE:        equ 01E00h ; 7680 bytes
 TL_FILE_SIZE:            equ 00A00h ; 2560 bytes
 TK_FILE_SIZE:            equ 00580h ; 1408 bytes
-MP_FILE_SIZE:            equ 00426h ; 1062-byte guarded-stack trace/port helper
+MP_FILE_SIZE:            equ 00498h ; 1176-byte guarded-stack trace/port helper
 TU_FILE_SIZE:            equ 0040Bh ; 1035-byte pre-TL UNAPI helper
 
 ; Leave normal transient-program stack space above the relocation trampoline.
@@ -96,6 +97,7 @@ memman_loader_entry:
     xor a
     ld (dos2_available),a
     ld (suite_port_helper_required),a
+    ld (suite_trace_helper_required),a
     ld a,INVALID_HANDLE
     ld (suite_handle),a
 
@@ -171,6 +173,8 @@ preflight_select_16c550:
     jr nz,preflight_select_16c550_path_ready
     ld de,suite_mcp115k_tsr_path
 preflight_select_16c550_path_ready:
+    ld a,(loader_trace_enabled)
+    ld (suite_trace_helper_required),a
     ld a,DRIVER_16C550
     jr preflight_install_selected
 
@@ -209,12 +213,18 @@ preflight_install_selected:
     ret nz
     ld a,(suite_port_helper_required)
     or a
-    jr z,preflight_command_length
+    jr z,preflight_maybe_trace_helper
     ld de,suite_tu_path
     ld hl,TU_FILE_SIZE
     call suite_validate_regular_file
     or a
     ret nz
+    jr preflight_validate_mp
+preflight_maybe_trace_helper:
+    ld a,(suite_trace_helper_required)
+    or a
+    jr z,preflight_command_length
+preflight_validate_mp:
     ld de,suite_mp_path
     ld hl,MP_FILE_SIZE
     call suite_validate_regular_file
@@ -425,6 +435,7 @@ suite_build_path_too_long:
 ; Build MemMan's post-warm-boot command. COMMAND2 finds TL (UART) or TU
 ; (UNAPI) through PATH. TU primes TCP/IP UNAPI and overlays TL internally.
 ; Both receive the fully resolved TSR stem, with its canonical suffix removed.
+; A diagnostic UART /TRACE chain runs MP/T only after TL installed the TSR.
 suite_build_install_command:
     ld a,(suite_port_helper_required)
     or a
@@ -457,7 +468,15 @@ suite_build_install_command_suffix:
     inc de
     ld a,(suite_port_helper_required)
     or a
+    jr nz,suite_build_install_command_port
+    ld a,(suite_trace_helper_required)
+    or a
     jr z,suite_build_install_command_length
+    ld hl,install_trace_helper_suffix
+    ld bc,install_trace_helper_suffix_length
+    ldir
+    jr suite_build_install_command_length
+suite_build_install_command_port:
     ld hl,install_port_helper_prefix
     ld bc,install_port_helper_prefix_length
     ldir
@@ -1336,6 +1355,9 @@ trace_dump_record_store_index:
 
 ; Input HL points to one 8-byte record.
 trace_line_append_record:
+    ld a,(memman_trace_export + TRACE_EXPORT_FLAGS)
+    and TRACE_FLAG_UART16C550
+    jp nz,trace_line_append_uart_record
     push hl
     ld a,(hl)
     call trace_line_append_event_name
@@ -1377,9 +1399,111 @@ trace_line_append_record:
     call trace_line_append_hex_word
     ret
 
+; Input HL points to the same physical 8-byte UART record. Hardware events use
+; event,LSR,MSR,MCR,phase,opcode,jiffy16; boundary events use
+; event,phase,opcode,frame-sequence16,length16,marker-flags.
+trace_line_append_uart_record:
+    ld a,(hl)
+    cp TRACE_EVENT_UART_WAKE
+    jp z,trace_line_append_uart_marker
+    cp TRACE_EVENT_UART_FRAME_RX
+    jp z,trace_line_append_uart_marker
+    cp TRACE_EVENT_UART_TX_BEGIN
+    jp z,trace_line_append_uart_marker
+    cp TRACE_EVENT_UART_TX_END
+    jp z,trace_line_append_uart_marker
+    cp TRACE_EVENT_UART_RECONNECT
+    jp z,trace_line_append_uart_marker
+    push hl
+    ld a,(hl)
+    call trace_line_append_event_name
+    pop hl
+    inc hl
+    ld de,trace_text_lsr
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_msr
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_mcr
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_phase
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_opcode
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    ex de,hl
+    push hl
+    ld de,trace_text_jiffy
+    call trace_line_append_string
+    pop hl
+    call trace_line_append_hex_word
+    ret
+
+trace_line_append_uart_marker:
+    push hl
+    ld a,(hl)
+    call trace_line_append_event_name
+    pop hl
+    inc hl
+    ld de,trace_text_phase
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld de,trace_text_opcode
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    inc hl
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    push hl
+    ex de,hl
+    push hl
+    ld de,trace_text_frame_sequence
+    call trace_line_append_string
+    pop hl
+    call trace_line_append_hex_word
+    pop hl
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    push hl
+    ex de,hl
+    push hl
+    ld de,trace_text_length
+    call trace_line_append_string
+    pop hl
+    call trace_line_append_hex_word
+    pop hl
+    ld de,trace_text_record_flags
+    call trace_line_append_string
+    ld a,(hl)
+    call trace_line_append_hex_byte
+    ret
+
 trace_line_append_event_name:
     dec a
-    cp TRACE_EVENT_AUTO_RELISTEN
+    cp TRACE_EVENT_UART_RECONNECT
     jr nc,trace_line_event_unknown
     add a,a
     ld e,a
@@ -1473,6 +1597,11 @@ trace_event_name_table:
     dw trace_event_system_suspend,trace_event_system_resume
     dw trace_event_reconfig_begin,trace_event_reconfig_end
     dw trace_event_auto_relisten
+    dw trace_event_uart_init,trace_event_uart_wake
+    dw trace_event_uart_frame_rx,trace_event_uart_flush
+    dw trace_event_uart_timeout,trace_event_uart_recover
+    dw trace_event_uart_rearm,trace_event_uart_tx_begin
+    dw trace_event_uart_tx_end,trace_event_uart_reconnect
 trace_event_enable:          db "ENABLE",0
 trace_event_state:           db "STATE",0
 trace_event_state_error:     db "STATE_ERROR",0
@@ -1488,6 +1617,16 @@ trace_event_system_resume:   db "SYSTEM_RESUME",0
 trace_event_reconfig_begin:  db "RECONFIG_BEGIN",0
 trace_event_reconfig_end:    db "RECONFIG_END",0
 trace_event_auto_relisten:   db "AUTO_RELISTEN",0
+trace_event_uart_init:       db "UART_INIT",0
+trace_event_uart_wake:       db "UART_WAKE",0
+trace_event_uart_frame_rx:   db "UART_FRAME_RX",0
+trace_event_uart_flush:      db "UART_FLUSH",0
+trace_event_uart_timeout:    db "UART_TIMEOUT",0
+trace_event_uart_recover:    db "UART_RECOVER",0
+trace_event_uart_rearm:      db "UART_REARM",0
+trace_event_uart_tx_begin:   db "UART_TX_BEGIN",0
+trace_event_uart_tx_end:     db "UART_TX_END",0
+trace_event_uart_reconnect:  db "UART_RECONNECT",0
 trace_event_unknown:         db "UNKNOWN",0
 trace_text_title:            db "MSXAI TRACE V1",0
 trace_text_status_flags:     db "FLAGS=",0
@@ -1507,6 +1646,13 @@ trace_text_state:            db " S=",0
 trace_text_connection:       db " C=",0
 trace_text_cleanup:          db " X=",0
 trace_text_record_flags:     db " F=",0
+trace_text_lsr:              db " LSR=",0
+trace_text_msr:              db " MSR=",0
+trace_text_mcr:              db " MCR=",0
+trace_text_phase:            db " P=",0
+trace_text_opcode:           db " OP=",0
+trace_text_frame_sequence:   db " SQ=",0
+trace_text_length:           db " LEN=",0
 trace_text_jiffy:            db " T=",0
 
 trace_dump_success_message:
@@ -1562,6 +1708,8 @@ suite_close_error:
 suite_expected_transport:
     db DRIVER_8251
 suite_port_helper_required:
+    db 0
+suite_trace_helper_required:
     db 0
 suite_probe_byte:
     db 0
@@ -1639,6 +1787,10 @@ install_port_helper_prefix:
     db "MP/"
 install_port_helper_prefix_end:
 install_port_helper_prefix_length: equ install_port_helper_prefix_end - install_port_helper_prefix
+install_trace_helper_suffix:
+    db "MP/T@"
+install_trace_helper_suffix_end:
+install_trace_helper_suffix_length: equ install_trace_helper_suffix_end - install_trace_helper_suffix
 install_command_buffer:
     ds install_unapi_command_prefix_length + SUITE_PATH_MAX + 1 + install_port_helper_prefix_length + 5 + 1,0
 

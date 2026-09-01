@@ -63,34 +63,42 @@ listener automatically. No second MSXAI command is required.
 BADCAT / ZIMODEM
 ----------------
 
-Keep the host MCP connection closed while initializing a BaDCaT. From DOS:
+The preferred prototype uses BaDCaT as a TCP client at 57600. It needs no
+FOSSIL driver. From a clean boot, run:
+
+   MSXAI /UNINSTALL
+   BADINIT /PREPARE
+   MSXAI /DRIVER:16C550 /57600
+
+Start msx_agent_listen on the MCP host LAN IP and fixed port. While it waits,
+point BaDCaT at the host address, not the MSX address:
+
+   BADINIT /CONNECT:192.168.0.62 /PORT:6603
+
+The port defaults to 6603. /CONNECT needs the active 57600 native 16C550
+resident. It is one-shot for that resident because a second AT line might be
+sent as MCP data if the modem is still streaming. Reboot and repeat the full
+/PREPARE sequence before another attempt. The host listener confirms the
+handshake; BADINIT can report only that it issued the dial.
+
+/PREPARE closes runtime listeners, selects RTS/CTS, disables command echo,
+and requests volatile S2=255. The resident repeats S2 in the final dial. This
+mitigates ZiModem 3.5.5's +++ stream escape but does not save any setting.
+
+The older inbound listener is still available:
 
    MSXAI /UNINSTALL
    BADINIT
    MSXAI /DRIVER:16C550
 
-For a temporary 115200-baud line, use the matching options:
+For that legacy mode, /PORT:<decimal> accepts 1 through 65535 and defaults to
+6603. /57600 or /115200 selects the temporary baud and must match MSXAI. Use
+the selected address and port with msx_agent_connect.
 
-   MSXAI /UNINSTALL
-   BADINIT /115200
-   MSXAI /DRIVER:16C550 /115200
-
-To select another runtime listener port, use:
-
-   BADINIT /PORT:43123
-
-/PORT:<decimal> accepts 1 through 65535 and may appear before or after one
-/57600 or /115200 option. Duplicate port or baud options are invalid. Port
-6603 is the default. ZiModem accepts 65535; UNAPI treats it as the random-port
-sentinel and rejects it. Use the selected port with msx_agent_connect.
-
-BADINIT sends ATQ0S41=0A<port> only for the current modem session. It never
-saves, reloads, resets, factory-resets, or changes register S60. It does not
-send even S60=0 because that deletes saved listeners. Existing saved modem
-settings return after a power cycle. BADINIT refuses to run while the MSXAI
-resident is installed, preventing two programs from consuming the UART.
-Its first response selects RTS/CTS, and baud changes include the ZiModem
-settle delay. A failed probe shows its stage, RX bytes in hex, and LSR flags.
+BADINIT never saves, reloads, resets, factory-resets, or changes register S60.
+It does not send even S60=0 because that deletes saved listeners. Existing
+saved modem settings return after a power cycle. A failed probe shows its
+stage, RX bytes in hex, and LSR flags.
 
 MONITOR MODE
 ------------
@@ -124,7 +132,7 @@ MCPUNAPI.TSR   TCP/IP UNAPI resident transport.
 MCP8251.TSR    8251 serial resident transport.
 MCP16550.TSR   16C550 serial resident transport.
 MCP115K.TSR    16C550 115200-baud resident transport.
-BADINIT.COM    Non-persistent BaDCaT/ZiModem listener initializer.
+BADINIT.COM    Non-persistent BaDCaT/ZiModem session initializer.
 TU.COM         Internal pre-TL helper used only for first UNAPI install.
 MP.COM         Internal UNAPI port configurator used during installation.
 MEMMAN.COM     MemMan resident manager.

@@ -321,6 +321,15 @@ loader_xfer_get_fast_emit:
     or a
     sbc hl,de
     ld de,XFER_FAST_GET_CAPACITY
+    ; CLAIM uses the internal descriptor's reserved byte to publish a smaller
+    ; per-transport GET block. Zero retains the established 2,040-byte path for
+    ; 8251 and UNAPI; 16C550 supplies its 120-byte response capacity.
+    ld a,(loader_xfer_descriptor + XFER_DESC_RESERVED)
+    or a
+    jr z,loader_xfer_get_fast_limit_ready
+    ld e,a
+    ld d,0
+loader_xfer_get_fast_limit_ready:
     push hl
     or a
     sbc hl,de

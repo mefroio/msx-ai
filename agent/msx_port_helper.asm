@@ -4,9 +4,12 @@
 ; cannot complete the freshly installed resident's custom-port handoff. The
 ; install command runs this helper after TL.COM has returned. MP validates the
 ; port and passes a guarded A7 request through MemMan TsrCall before exiting.
+; The explicit MP/T form only enables the resident trace through A8; it never
+; prepares or invokes the UNAPI A7 handoff.
 ;
 ; Usage:
 ;   MP <1..65534>
+;   MP/T
 
 ; TCP/IP UNAPI reserves FFFFh (65535) as the random-local-port sentinel.
 
@@ -52,10 +55,10 @@ port_helper_start:
     jr nz,port_helper_bad_version
 
     call parse_port_argument
-    jr c,port_helper_bad_argument
+    jp c,port_helper_bad_argument
 
     call find_memman_agent
-    jr c,port_helper_agent_missing
+    jp c,port_helper_agent_missing
 
     ; Preserve MemMan's opaque ID while constructing the A7 request. The
     ; resident moves lifecycle work to this process's guarded page-2 stack and
@@ -76,6 +79,10 @@ port_helper_start:
     ld a,(trace_request_status)
     or a
     jr nz,port_helper_trace_error_ei
+port_helper_trace_mode_dispatch:
+    ld a,(trace_only_requested)
+    or a
+    jr nz,port_helper_trace_only_success_ei
 port_helper_trace_ready:
     ; A8 returns with DI like every resident TsrCall. TCP_OPEN must enter A7
     ; with normal foreground interrupt state, matching the non-TRACE path.
@@ -104,6 +111,13 @@ port_helper_trace_ready:
     ei
 
     ld de,message_success
+    call print_message
+    xor a
+    jp terminate_with_code
+
+port_helper_trace_only_success_ei:
+    ei
+    ld de,message_trace_success
     call print_message
     xor a
     jp terminate_with_code
@@ -168,6 +182,7 @@ require_dos2_unavailable:
 parse_port_argument:
     xor a
     ld (trace_requested),a
+    ld (trace_only_requested),a
     ld a,(COMMAND_TAIL)
     and 07Fh
     ld (port_remaining),a
@@ -192,7 +207,43 @@ parse_port_skip_leading:
     dec a
     ld (port_remaining),a
     jp z,parse_port_bad
+    ; MP/T is a trace-only foreground helper. Recognize it only when T is the
+    ; complete slash argument (apart from trailing whitespace). Four-nibble
+    ; compact forms such as MP/T123 must retain their established meaning:
+    ; trace-enable followed by an A7 request for port D123h.
+    ld a,(hl)
+    and 0DFh
+    cp 'T'
+    jp nz,parse_port_hex_begin
+    push hl
+    inc hl
+    ld a,(port_remaining)
+    dec a
+parse_trace_only_tail:
+    jr z,parse_trace_only_complete
+    ld e,a
+    ld a,(hl)
+    cp ' '
+    jr z,parse_trace_only_tail_one
+    cp 9
+    jr nz,parse_trace_only_fallback
+parse_trace_only_tail_one:
+    inc hl
+    ld a,e
+    dec a
+    jr parse_trace_only_tail
+parse_trace_only_fallback:
+    pop hl
     jp parse_port_hex_begin
+parse_trace_only_complete:
+    pop hl
+    ld a,1
+    ld (trace_requested),a
+    ld (trace_only_requested),a
+    ld bc,0
+    ld (port_value),bc
+    or a
+    ret
 parse_port_skip_leading_one:
     inc hl
     ld a,(port_remaining)
@@ -609,19 +660,24 @@ port_hex_digits:
     db 0
 trace_requested:
     db 0
+trace_only_requested:
+    db 0
 exit_code:
     db 0
 
 message_success:
     db 13,10,"MSXAI TCP port configured.",13,10,"$"
 message_usage:
-    db 13,10,"MP: usage: MP <1..65534>",13,10,"$"
+    db 13,10,"MP: usage: MP <1..65534> | MP/T",13,10,"$"
 message_bad_version:
     db 13,10,"MP: MSX-DOS 2 is required.",13,10,"$"
 message_agent_missing:
     db 13,10,"MP: MemMan 2.4+ or MSXAI MCP1 not found.",13,10,"$"
 message_trace_error:
     db 13,10,"MP: MSXAI resident trace enable failed.",13,10,"$"
+message_trace_success:
+    db 13,10,"MSXAI resident trace enabled.",13,10,"$"
+message_trace_success_end:
 message_reconfigure_error:
     db 13,10,"MP: MSXAI UNAPI relisten failed.",13,10,"$"
 

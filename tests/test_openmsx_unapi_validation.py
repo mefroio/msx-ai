@@ -57,6 +57,37 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
         ))
 
     @staticmethod
+    def _uart_resident_trace_fixture() -> str:
+        return "\r\n".join((
+            "MSXAI TRACE V1",
+            "FLAGS=0B COUNT=04 NEXT=04 SEQ=0004",
+            "POLLS=0000 CHANGES=0000 TIMI=0120",
+            "FIRST UART_TIMEOUT LSR=60 MSR=10 MCR=2F P=07 OP=03 "
+            "T=0110 EXTRA=8103008000601002",
+            "#0001 UART_INIT LSR=60 MSR=10 MCR=2F P=00 OP=00 T=0100",
+            "#0002 UART_TIMEOUT LSR=60 MSR=10 MCR=2F P=07 OP=03 T=0110",
+            "#0003 UART_RECOVER LSR=60 MSR=10 MCR=2F P=07 OP=03 T=0111",
+            "#0004 UART_REARM LSR=60 MSR=10 MCR=2F P=00 OP=03 T=0112",
+            "",
+        ))
+
+    @staticmethod
+    def _uart_marker_trace_fixture() -> str:
+        return "\r\n".join((
+            "MSXAI TRACE V1",
+            "FLAGS=09 COUNT=06 NEXT=06 SEQ=0006",
+            "POLLS=0000 CHANGES=0000 TIMI=0120",
+            "FIRST NONE",
+            "#0001 UART_INIT LSR=60 MSR=10 MCR=2F P=00 OP=00 T=0100",
+            "#0002 UART_RECONNECT P=02 OP=00 SQ=0017 LEN=0000 F=00",
+            "#0003 UART_WAKE P=02 OP=00 SQ=0017 LEN=0000 F=00",
+            "#0004 UART_FRAME_RX P=05 OP=03 SQ=0017 LEN=0008 F=00",
+            "#0005 UART_TX_BEGIN P=06 OP=03 SQ=0017 LEN=0080 F=00",
+            "#0006 UART_TX_END P=08 OP=03 SQ=0017 LEN=0080 F=00",
+            "",
+        ))
+
+    @staticmethod
     def _wrapped_resident_trace_fixture(*, next_index: int = 2) -> str:
         sequences = [
             (0xFFEF + index) & 0xFFFF for index in range(20)
@@ -286,6 +317,114 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
              "DROP", "AUTO_RELISTEN", "SYSTEM_SUSPEND", "SYSTEM_RESUME"])
         harness.validate_resident_trace(trace)
 
+    def test_uart_resident_trace_parser_decodes_register_context(self):
+        trace = harness.parse_resident_trace(
+            self._uart_resident_trace_fixture())
+        self.assertEqual(trace["flags"], 0x0B)
+        self.assertEqual(trace["transport_trace"], "uart-16c550")
+        self.assertEqual(trace["count"], 4)
+        self.assertEqual(trace["next_index"], 4)
+        self.assertEqual(trace["sequence"], 4)
+        self.assertEqual(trace["polls"], 0)
+        self.assertEqual(trace["state_changes"], 0)
+        self.assertEqual(trace["timi"], 0x0120)
+        self.assertEqual(trace["first_incident"], {
+            "event": "UART_TIMEOUT",
+            "lsr": 0x60,
+            "msr": 0x10,
+            "mcr": 0x2F,
+            "phase": 0x07,
+            "opcode": 0x03,
+            "jiffy": 0x0110,
+            "extra": [0x81, 0x03, 0x00, 0x80, 0x00, 0x60, 0x10, 0x02],
+        })
+        self.assertEqual(trace["records"][1], {
+            "event": "UART_TIMEOUT",
+            "lsr": 0x60,
+            "msr": 0x10,
+            "mcr": 0x2F,
+            "phase": 0x07,
+            "opcode": 0x03,
+            "jiffy": 0x0110,
+            "sequence": 2,
+        })
+        self.assertEqual(trace["events"], [
+            "UART_INIT", "UART_TIMEOUT", "UART_RECOVER", "UART_REARM",
+        ])
+        harness.validate_resident_trace(trace)
+
+    def test_uart_resident_trace_parser_rejects_unapi_record_layout(self):
+        malformed = self._uart_resident_trace_fixture().replace(
+            "#0001 UART_INIT LSR=60 MSR=10 MCR=2F P=00 OP=00 T=0100",
+            "#0001 UART_INIT E=00 S=00 C=00 X=00 F=00 T=0100",
+        )
+        with self.assertRaisesRegex(
+                harness.ValidationError, "record is malformed"):
+            harness.parse_resident_trace(malformed)
+
+    def test_uart_resident_trace_parser_decodes_mixed_marker_records(self):
+        trace = harness.parse_resident_trace(
+            self._uart_marker_trace_fixture())
+        self.assertEqual(trace["transport_trace"], "uart-16c550")
+        self.assertEqual(trace["events"], [
+            "UART_INIT", "UART_RECONNECT", "UART_WAKE", "UART_FRAME_RX",
+            "UART_TX_BEGIN", "UART_TX_END",
+        ])
+        self.assertEqual(trace["records"][1], {
+            "event": "UART_RECONNECT",
+            "phase": 0x02,
+            "opcode": 0x00,
+            "frame_sequence": 0x0017,
+            "length": 0x0000,
+            "marker_flags": 0x00,
+            "sequence": 2,
+        })
+        self.assertEqual(trace["records"][3], {
+            "event": "UART_FRAME_RX",
+            "phase": 0x05,
+            "opcode": 0x03,
+            "frame_sequence": 0x0017,
+            "length": 0x0008,
+            "marker_flags": 0x00,
+            "sequence": 4,
+        })
+        self.assertEqual(trace["records"][5], {
+            "event": "UART_TX_END",
+            "phase": 0x08,
+            "opcode": 0x03,
+            "frame_sequence": 0x0017,
+            "length": 0x0080,
+            "marker_flags": 0x00,
+            "sequence": 6,
+        })
+        harness.validate_resident_trace(trace)
+
+    def test_uart_resident_trace_parser_rejects_malformed_marker_record(self):
+        malformed = self._uart_marker_trace_fixture().replace(
+            "SQ=0017 LEN=0080 F=00",
+            "SQ=017 LEN=0080 F=00",
+            1,
+        )
+        with self.assertRaisesRegex(
+                harness.ValidationError, "record is malformed"):
+            harness.parse_resident_trace(malformed)
+
+    def test_uart_resident_trace_validator_rejects_wrong_marker_layout(self):
+        corruptions = (
+            self._uart_marker_trace_fixture().replace(
+                "UART_WAKE P=02", "UART_INIT P=02"),
+            self._uart_marker_trace_fixture().replace(
+                "UART_INIT LSR=60", "UART_WAKE LSR=60"),
+            self._uart_marker_trace_fixture().replace(
+                "UART_INIT LSR=60", "UART_RECONNECT LSR=60"),
+        )
+        for text in corruptions:
+            with self.subTest(text=text):
+                trace = harness.parse_resident_trace(text)
+                with self.assertRaisesRegex(
+                        harness.ValidationError, "record layout"):
+                    harness.validate_resident_trace(trace)
+
     def test_resident_trace_parser_rejects_truncated_or_malformed_text(self):
         valid = self._resident_trace_fixture()
         malformed = (
@@ -314,7 +453,7 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
     def test_resident_trace_validator_rejects_ring_and_incident_corruption(self):
         valid = self._resident_trace_fixture()
         corruptions = (
-            ("unknown flags", valid.replace("FLAGS=03", "FLAGS=0B")),
+            ("unknown flags", valid.replace("FLAGS=03", "FLAGS=13")),
             ("not enabled", valid.replace("FLAGS=03", "FLAGS=02")),
             ("count mismatch", valid.replace("COUNT=09", "COUNT=0A")),
             ("invalid next", valid.replace("NEXT=09", "NEXT=14")),
@@ -344,6 +483,32 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             self._resident_trace_fixture().replace(
                 "FIRST DROP E=00", "FIRST STATE_ERROR E=08"))
         harness.validate_resident_trace(trace)
+
+    def test_uart_resident_trace_validator_accepts_lsr_line_error_incident(self):
+        trace = harness.parse_resident_trace(
+            self._uart_resident_trace_fixture().replace(
+                "FIRST UART_TIMEOUT LSR=60",
+                "FIRST UART_RECOVER LSR=62",
+            ))
+        harness.validate_resident_trace(trace)
+
+    def test_uart_resident_trace_validator_rejects_clean_non_timeout_incident(self):
+        trace = harness.parse_resident_trace(
+            self._uart_resident_trace_fixture().replace(
+                "FIRST UART_TIMEOUT LSR=60",
+                "FIRST UART_RECOVER LSR=60",
+            ))
+        with self.assertRaisesRegex(
+                harness.ValidationError, "UART.*not an incident"):
+            harness.validate_resident_trace(trace)
+
+    def test_uart_resident_trace_validator_rejects_unknown_event(self):
+        trace = harness.parse_resident_trace(
+            self._uart_resident_trace_fixture().replace(
+                "#0003 UART_RECOVER", "#0003 UART_MYSTERY"))
+        with self.assertRaisesRegex(
+                harness.ValidationError, "unknown event UART_MYSTERY"):
+            harness.validate_resident_trace(trace)
 
     def test_resident_trace_validator_rejects_unknown_event(self):
         trace = harness.parse_resident_trace(

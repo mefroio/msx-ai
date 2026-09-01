@@ -19,13 +19,20 @@ DEFAULT_SOURCE = REPOSITORY / "agent" / "msx_port_helper.asm"
 DEFAULT_OUTPUT = REPOSITORY / "work" / "agent" / "MP.COM"
 ORIGIN = 0x0100
 PAGE_1_START = 0x4000
+EXPECTED_IMAGE_SIZE = 0x0498
 TSR_NAME = b"MSXAI MCP1  "
+TRACE_SUCCESS_MESSAGE = b"\r\nMSXAI resident trace enabled.\r\n$"
 LABEL_LINE = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*):\s*equ\s+\$([0-9A-Fa-f]+)\s*$")
 REQUIRED_LABELS = (
     "port_helper_start",
     "port_helper_end",
+    "port_helper_trace_mode_dispatch",
+    "port_helper_trace_only_success_ei",
+    "print_message",
+    "terminate_with_code",
     "parse_port_argument",
+    "parse_trace_only_complete",
     "find_memman_agent",
     "memman_tsr_name",
     "memman_tsr_name_end",
@@ -42,6 +49,9 @@ REQUIRED_LABELS = (
     "trace_request",
     "trace_request_status",
     "trace_requested",
+    "trace_only_requested",
+    "message_trace_success",
+    "message_trace_success_end",
     "port_value",
 )
 REQUIRED_CONSTANTS = {
@@ -139,6 +149,9 @@ def validate_port_helper_image(
             "port_helper_end does not match the assembled image length")
     if not data:
         raise PortHelperBuildError("assembler emitted an empty COM image")
+    if len(data) != EXPECTED_IMAGE_SIZE:
+        raise PortHelperBuildError(
+            f"MP.COM is {len(data)} bytes, expected {EXPECTED_IMAGE_SIZE}")
     if labels["port_helper_end"] > PAGE_1_START:
         raise PortHelperBuildError(
             "MP.COM extends into page 1 and is not a minimal COM helper")
@@ -220,6 +233,52 @@ def validate_port_helper_image(
     if trace_data[5] != 0xFF or any(trace_data[6:]):
         raise PortHelperBuildError(
             "A8 trace request output/reserved bytes are not initialized")
+
+    trace_flag = labels["trace_requested"]
+    trace_only_flag = labels["trace_only_requested"]
+    if trace_only_flag != trace_flag + 1:
+        raise PortHelperBuildError(
+            "trace-only state is not adjacent to trace-requested state")
+    for name in ("trace_requested", "trace_only_requested"):
+        offset = labels[name] - ORIGIN
+        if not 0 <= offset < len(data) or data[offset] != 0:
+            raise PortHelperBuildError(
+                f"{name} is outside MP.COM or is not initialized to zero")
+
+    # Once A8 reports success, MP/T must branch directly to its foreground
+    # success path. The fall-through remains the established guarded A7 path
+    # used by decimal and compact hexadecimal port forms.
+    dispatch = labels["port_helper_trace_mode_dispatch"]
+    success = labels["port_helper_trace_only_success_ei"]
+    displacement = success - (dispatch + 6)
+    if not -128 <= displacement <= 127:
+        raise PortHelperBuildError(
+            "trace-only dispatch cannot reach its success path")
+    expected_dispatch = (
+        b"\x3A" + trace_only_flag.to_bytes(2, "little")
+        + b"\xB7\x20" + bytes((displacement & 0xFF,))
+    )
+    first = dispatch - ORIGIN
+    if data[first:first + len(expected_dispatch)] != expected_dispatch:
+        raise PortHelperBuildError(
+            "MP/T does not branch around the A7 UNAPI configuration path")
+
+    message = _slice(
+        data, labels, "message_trace_success", "message_trace_success_end")
+    if message != TRACE_SUCCESS_MESSAGE:
+        raise PortHelperBuildError(
+            "MP/T success message is not the pinned trace-only message")
+    expected_success = (
+        b"\xFB\x11"
+        + labels["message_trace_success"].to_bytes(2, "little")
+        + b"\xCD" + labels["print_message"].to_bytes(2, "little")
+        + b"\xAF\xC3"
+        + labels["terminate_with_code"].to_bytes(2, "little")
+    )
+    first = success - ORIGIN
+    if data[first:first + len(expected_success)] != expected_success:
+        raise PortHelperBuildError(
+            "MP/T success path performs work other than EI, print, and exit")
 
 
 def assemble_port_helper(

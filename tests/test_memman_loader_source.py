@@ -47,10 +47,10 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertRegex(
             self.source, r"(?m)^TK_FILE_SIZE:\s+equ\s+00580h")
         self.assertRegex(
-            self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+00426h")
+            self.source, r"(?m)^MP_FILE_SIZE:\s+equ\s+00498h")
         self.assertRegex(
             self.source, r"(?m)^TU_FILE_SIZE:\s+equ\s+0040Bh")
-        self.assertIn("1062-byte guarded-stack trace/port helper", self.source)
+        self.assertIn("1176-byte guarded-stack trace/port helper", self.source)
         self.assertIn("1035-byte pre-TL UNAPI helper", self.source)
 
     def test_resident_lifecycle_creates_no_temporary_files(self):
@@ -103,6 +103,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld a,(loader_uart16c550_divisor)", select_16c550)
         self.assertIn("cp UART16C550_DIVISOR_115200", select_16c550)
         self.assertIn("ld de,suite_mcp115k_tsr_path", select_16c550)
+        self.assertIn("ld a,(loader_trace_enabled)", select_16c550)
+        self.assertIn("ld (suite_trace_helper_required),a", select_16c550)
         validate = self.source.split(
             "suite_validate_selected_tsr:", 1)[1].split(
                 "suite_close_preserving_error:", 1)[0]
@@ -133,6 +135,7 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld a,'@'", command_builder)
         self.assertIn("cp MEMMAN_COMMAND_MAX + 1", command_builder)
         self.assertIn('db "MP/"', self.source)
+        self.assertIn('db "MP/T@"', self.source)
         self.assertEqual(
             command_builder.count("call suite_build_install_command_hex_nibble"),
             4,
@@ -146,6 +149,8 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP8251@"), 39)
         self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP16550@"), 39)
         self.assertLessEqual(len(" _SYSTEM@@TL A:\\MSXAI\\MCP115K@"), 39)
+        self.assertLessEqual(
+            len(" _SYSTEM@@TL A:\\MSXAI\\MCP16550@MP/T@"), 39)
         self.assertEqual(
             len(" _SYSTEM@@TU A:\\MSXAI\\MCPUNAPI@MP/19CB@"), 39)
         self.assertEqual(
@@ -175,13 +180,14 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("cp '/'", resolver)
         self.assertIn("ld a,ERR_INVALID_PARAMETER", resolver)
 
-    def test_tu_and_mp_are_validated_only_for_first_unapi_install(self):
+    def test_tu_and_mp_validation_matches_first_install_handoffs(self):
         selection = self.source.split("preflight_select_8251:", 1)[1].split(
             "preflight_install_selected:", 1)[0]
         unapi = selection.split("preflight_select_unapi:", 1)[1]
         uart = selection.split("preflight_select_unapi:", 1)[0]
         self.assertIn("ld (suite_port_helper_required),a", unapi)
         self.assertNotIn("suite_port_helper_required", uart)
+        self.assertIn("ld (suite_trace_helper_required),a", uart)
 
         install = self.source.split("preflight_install_selected:", 1)[1].split(
             "preflight_select_uninstall:", 1)[0]
@@ -194,6 +200,9 @@ class MemManLoaderSourceTests(unittest.TestCase):
         self.assertIn("ld hl,TU_FILE_SIZE", conditional)
         self.assertIn("ld de,suite_mp_path", conditional)
         self.assertIn("ld hl,MP_FILE_SIZE", conditional)
+        self.assertIn("preflight_maybe_trace_helper:", conditional)
+        self.assertIn("ld a,(suite_trace_helper_required)", conditional)
+        self.assertIn("preflight_validate_mp:", conditional)
         self.assertEqual(
             conditional.count("call suite_validate_regular_file"), 2)
 

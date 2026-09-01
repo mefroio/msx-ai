@@ -63,7 +63,7 @@
       "id": "getting-started",
       "path": "getting-started.md",
       "title": "Getting started",
-      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal workflows for direct, simulated-agent, physical-agent, non-persistent BaDCaT initialization, and resident BLOAD targets.",
+      "summary": "Portable MCP client setup, host-aware openMSX preflight, and minimal workflows for direct, simulated-agent, physical-agent, non-persistent reverse BaDCaT initialization, and resident BLOAD targets.",
       "license": "GPL-3.0-or-later",
       "authored_by": "MSX-AI project",
       "origin": "project-authored",
@@ -75,6 +75,7 @@
           "TECHNICAL.md",
           "agent/README.md",
           "agent/msx_badcat_init.asm",
+          "agent/transports/msx_transport_fossil.inc",
           "pyproject.toml",
           "server/mcp_runtime.py",
           "server/msx_application.py",
@@ -98,6 +99,7 @@
         "connection",
         "configuration",
         "badcat",
+        "fossil",
         "baud",
         "applications",
         "bload"
@@ -112,7 +114,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "f9a4382d1868a2ce3b0ff49c52884759c471854c0b1b086d0582d1b67ce5a104",
+      "sha256": "2c6a96af2ba66a76889d097ea09e1e8f099a5893030fd1f7db9d7352db6a0fc3",
       "external_references": [
         {
           "url": "https://github.com/mefroio/msx-ai.git",
@@ -251,7 +253,7 @@
         "agent-physical"
       ],
       "reviewed_at": "2026-08-10",
-      "sha256": "55082b256e9f6fbc8ea8ce4eecf27befc80f45ca373acb9c7e8f5542f931ebf5",
+      "sha256": "344b609ab1045914d4dc40acaf0ae059f201dbdae3c70027fb2289086afa9740",
       "external_references": []
     },
     {
