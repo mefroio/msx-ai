@@ -36,12 +36,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.build_version_include import read_project_version  # noqa: E402
+
 RELEASE = "v0.9.7"
 RELEASE_URL = "https://github.com/antxiko/openMSXnet/releases/tag/v0.9.7"
 RELEASE_DOWNLOAD_BASE = (
     "https://github.com/antxiko/openMSXnet/releases/download/v0.9.7"
 )
 DEFAULT_TEST_PORT = 43123
+AGENT_VERSION = read_project_version(ROOT)
+AGENT_AUTHOR_LINE = "Author: Rodrigo Galhardi M. Garcia"
 DEFAULT_FAULT_CYCLES = 3
 STEADY_STATE_ROUND_TRIPS = 64
 AUTO_RELISTEN_WAIT_SECONDS = 3.0
@@ -1249,8 +1253,29 @@ def _assert_command_screen(command: str, screen: str, *, prompt: bool) -> None:
 
 
 _MCP_LISTENING_LINE = re.compile(
-    r"(?im)^MCP listening at: "
+    r"(?im)^[ \t]*MCP listening at: "
     r"(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<port>[0-9]{1,5})\s*$")
+
+
+def _assert_agent_identity_screen(screen: str, *, cleared: bool) -> None:
+    identity = f"MSX-AI MCP Agent {AGENT_VERSION}"
+    identity_at = screen.find(identity)
+    author_at = screen.find(AGENT_AUTHOR_LINE)
+    if identity_at < 0 or author_at < 0:
+        raise ValidationError(
+            "resident startup did not display the agent identity and author:\n"
+            + screen)
+    if author_at < identity_at:
+        raise ValidationError(
+            "resident startup displayed the author before the agent identity:\n"
+            + screen)
+    if cleared:
+        visible_lines = [line.strip() for line in screen.splitlines()
+                         if line.strip()]
+        if visible_lines[:2] != [identity, AGENT_AUTHOR_LINE]:
+            raise ValidationError(
+                "MP.COM did not clear the screen before the agent identity:\n"
+                + screen)
 
 
 def _assert_mcp_listening_screen(screen: str, port: int) -> str:
@@ -2249,6 +2274,7 @@ def run_validation(settings: Settings, *,
                     screen = machine.screen_text()
                 try:
                     _assert_command_screen(commands[3], screen, prompt=True)
+                    _assert_agent_identity_screen(screen, cleared=True)
                     _assert_mcp_listening_screen(screen, settings.port)
                 except ValidationError as install_error:
                     if not trace_validation:

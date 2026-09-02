@@ -580,6 +580,12 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
             harness._assert_mcp_listening_screen(screen, 43123),
             "192.168.0.62",
         )
+        self.assertEqual(
+            harness._assert_mcp_listening_screen(
+                "  MCP listening at: 192.168.0.62:43123\nA:\\>",
+                43123),
+            "192.168.0.62",
+        )
         with self.assertRaisesRegex(
                 harness.ValidationError, "expected 43123"):
             harness._assert_mcp_listening_screen(
@@ -595,6 +601,25 @@ class OpenMSXUNAPIHarnessUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 harness.ValidationError, "did not display"):
             harness._assert_mcp_listening_screen("A:\\>", 43123)
+
+    def test_screen_check_requires_identity_author_and_mp_clear(self):
+        identity = f"MSX-AI MCP Agent {harness.AGENT_VERSION}"
+        screen = (
+            f"{identity}\n{harness.AGENT_AUTHOR_LINE}\n\n"
+            "MCP listening at: 192.168.0.62:43123\nA:\\>")
+        harness._assert_agent_identity_screen(screen, cleared=True)
+
+        with self.assertRaisesRegex(
+                harness.ValidationError, "did not clear"):
+            harness._assert_agent_identity_screen(
+                "A:\\>MSXAI /DRIVER:UNAPI\n" + screen, cleared=True)
+        with self.assertRaisesRegex(
+                harness.ValidationError, "identity and author"):
+            harness._assert_agent_identity_screen(identity, cleared=True)
+        with self.assertRaisesRegex(
+                harness.ValidationError, "author before"):
+            harness._assert_agent_identity_screen(
+                f"{harness.AGENT_AUTHOR_LINE}\n{identity}", cleared=False)
 
     def _fake_inputs(self, root: pathlib.Path):
         archive = root / "openmsx-macos-arm64.zip"

@@ -301,12 +301,12 @@ class PortHelperTest(unittest.TestCase):
         second = assemble_port_helper()
         self.assertEqual(first.data, second.data)
         self.assertEqual(first.sha256, second.sha256)
-        self.assertEqual(len(first.data), 1242)
+        self.assertEqual(len(first.data), 1320)
         self.assertLess(first.labels["port_helper_end"], 0x4000)
 
         loader = (ROOT / "agent" / "msx_memman_loader.asm").read_text(
             encoding="utf-8")
-        self.assertIn("MP_FILE_SIZE:            equ 004DAh", loader)
+        self.assertIn("MP_FILE_SIZE:            equ 00528h", loader)
 
         with tempfile.TemporaryDirectory() as directory:
             output = pathlib.Path(directory) / "MP.COM"
@@ -479,7 +479,24 @@ class PortHelperTest(unittest.TestCase):
             r"unapi_request_target:\s+db MSXAI_TRANSPORT_UNAPI\s+"
             r"unapi_request_16c550_divisor:\s+db 0\s+"
             r"unapi_request_local_ip:\s+ds 4,0")
-        self.assertIn('db 13,10,"MCP listening at: $"', source)
+        self.assertIn('db "MCP listening at: $"', source)
+
+        success = source.split("port_helper_success:", 1)[1].split(
+            "port_helper_bad_version:", 1)[0]
+        self.assertRegex(
+            success,
+            r"(?s)^\s*ei\s+call port_helper_clear_screen\s+"
+            r"ld de,port_helper_success_banner\s+call print_message\s+"
+            r"ld de,mcp_listening_prefix.*call mcp_endpoint_print")
+        clear = source.split("port_helper_clear_screen:", 1)[1].split(
+            "require_dos2:", 1)[0]
+        self.assertRegex(
+            clear,
+            r"(?s)ld e,12\s+ld c,2\s+jp 00005h")
+        banner = source.split("port_helper_success_banner:", 1)[1].split(
+            "port_helper_success_banner_end:", 1)[0]
+        self.assertIn("include 'agent/msx_version.inc'", banner)
+        self.assertIn("Author: Rodrigo Galhardi M. Garcia", banner)
 
         prepare = source.split("prepare_unapi_request:", 1)[1].split(
             "verify_unapi_guards:", 1)[0]

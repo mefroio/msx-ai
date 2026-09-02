@@ -10,11 +10,18 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping
 
 
 REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
+if str(REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY))
+
+from tools.build_version_include import materialize_version_include  # noqa: E402
+
+
 DEFAULT_SOURCE = REPOSITORY / "agent" / "msx_port_helper.asm"
 DEFAULT_OUTPUT = REPOSITORY / "work" / "agent" / "MP.COM"
 ORIGIN = 0x0100
@@ -44,6 +51,8 @@ REQUIRED_LABELS = (
     "trace_request_status",
     "trace_requested",
     "port_value",
+    "port_helper_success_banner",
+    "port_helper_success_banner_end",
 )
 REQUIRED_CONSTANTS = {
     "EXTBIO": 0xFFCA,
@@ -145,6 +154,20 @@ def validate_port_helper_image(
         raise PortHelperBuildError(
             "MP.COM extends into page 1 and is not a minimal COM helper")
 
+    success_banner = _slice(
+        data, labels, "port_helper_success_banner",
+        "port_helper_success_banner_end")
+    if re.fullmatch(
+            rb"MSX-AI MCP Agent "
+            rb"(?:0|[1-9][0-9]*)\."
+            rb"(?:0|[1-9][0-9]*)\."
+            rb"(?:0|[1-9][0-9]*)\r\n"
+            rb"Author: Rodrigo Galhardi M\. Garcia\r\n\r\n\$",
+            success_banner) is None:
+        raise PortHelperBuildError(
+            "MP.COM success banner does not contain the canonical agent "
+            "identity and project author")
+
     for name, expected in REQUIRED_CONSTANTS.items():
         if labels[name] != expected:
             raise PortHelperBuildError(
@@ -237,6 +260,7 @@ def assemble_port_helper(
 
     repository = repository.resolve()
     source = source.resolve()
+    materialize_version_include(repository)
     with tempfile.TemporaryDirectory(prefix="msx-port-helper-") as directory:
         binary = pathlib.Path(directory) / "MP.COM"
         try:

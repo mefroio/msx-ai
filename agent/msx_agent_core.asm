@@ -555,7 +555,9 @@ loader_resident_message_exit:
     jp 0005h
 
 install_banner:
-    db 13,10,"MSX-AI universal MCP agent",13,10,"$"
+    db 13,10
+    include 'agent/msx_version.inc'
+    db "Author: Rodrigo Galhardi M. Garcia",13,10,"$"
 transport_8251_banner:
     db "Driver: 8251-compatible MSX RS-232",13,10,"$"
 transport_16c550_57600_banner:

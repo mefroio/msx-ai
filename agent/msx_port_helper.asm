@@ -55,7 +55,7 @@ port_helper_start:
     jr c,port_helper_bad_argument
 
     call find_memman_agent
-    jr c,port_helper_agent_missing
+    jp c,port_helper_agent_missing
 
     ; Preserve MemMan's opaque ID while constructing the A7 request. The
     ; resident moves lifecycle work to this process's guarded page-2 stack and
@@ -101,7 +101,11 @@ port_helper_trace_ready:
     ld a,(unapi_call_result)
     cp MSXAI_TRANSPORT_UNAPI
     jr nz,port_helper_reconfigure_error_ei
+port_helper_success:
     ei
+    call port_helper_clear_screen
+    ld de,port_helper_success_banner
+    call print_message
 
     ld de,mcp_listening_prefix
     ld hl,unapi_request_local_ip
@@ -146,6 +150,14 @@ terminate_with_code:
 
 print_message:
     ld c,9
+    jp 00005h
+
+; MSX-DOS routes form feed through the console driver as clear-screen-and-home.
+; Keep this on the fully validated success path so every failure remains
+; visible.
+port_helper_clear_screen:
+    ld e,12
+    ld c,2
     jp 00005h
 
 require_dos2:
@@ -617,7 +629,11 @@ exit_code:
     db 0
 
 mcp_listening_prefix:
-    db 13,10,"MCP listening at: $"
+    db "MCP listening at: $"
+port_helper_success_banner:
+    include 'agent/msx_version.inc'
+    db "Author: Rodrigo Galhardi M. Garcia",13,10,13,10,"$"
+port_helper_success_banner_end:
 message_usage:
     db 13,10,"MP: usage: MP <1..65534>",13,10,"$"
 message_bad_version:

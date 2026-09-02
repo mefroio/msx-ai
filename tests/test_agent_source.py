@@ -1179,6 +1179,11 @@ class ResidentAgentSourceTests(unittest.TestCase):
             r"ld hl,unapi_local_ip\s+ld bc,4\s+ldir")
 
         self.assertIn('db "MCP listening at: $"', self.source)
+        install_banner = self.source.split("install_banner:", 1)[1].split(
+            "transport_8251_banner:", 1)[0]
+        self.assertIn("include 'agent/msx_version.inc'", install_banner)
+        self.assertIn(
+            "Author: Rodrigo Galhardi M. Garcia", install_banner)
         monitor_ready = self.source.split(
             "install_monitor_ready:", 1)[1].split(
                 "install_enter_monitor:", 1)[0]
@@ -1186,6 +1191,7 @@ class ResidentAgentSourceTests(unittest.TestCase):
             monitor_ready,
             r"(?s)cp UNAPI_ID.*ld hl,unapi_local_ip.*"
             r"ld bc,\(unapi_listen_port\).*call mcp_endpoint_print")
+        self.assertNotIn("ld e,12", monitor_ready)
 
         inner = safe.split("tsr_talk_unapi_port_inner:", 1)[1]
         self.assertRegex(

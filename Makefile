@@ -125,7 +125,9 @@ agent-tsr: server/_version.py tools/build_version_include.py
 port-helper: $(AGENT_PORT_COM)
 	@test -s $(AGENT_PORT_COM)
 
-$(AGENT_PORT_COM): $(AGENT_PORT_SRC) $(AGENT_ENDPOINT_PRINT) tools/build_port_helper.py
+$(AGENT_PORT_COM): $(AGENT_PORT_SRC) $(AGENT_ENDPOINT_PRINT) \
+		$(AGENT_VERSION_INCLUDE) server/_version.py tools/build_version_include.py \
+		tools/build_port_helper.py
 	"$(PYTHON)" tools/build_port_helper.py --assembler "$(Z80ASM)" \
 		--source $(AGENT_PORT_SRC) --output $(AGENT_PORT_COM)
 
@@ -171,7 +173,9 @@ $(AGENT_XFER_COM) $(AGENT_TRACE_XFER_COM): $(AGENT_XFER_ENGINE) $(AGENT_XFER_PRO
 	$(Z80ASM) $(AGENT_XFER_SRC) -o $@
 	"$(PYTHON)" tools/check_msx_com_size.py $@ $(MSX_XFER_PAGE0_COM_MAX)
 
-$(AGENT_TRACE_PORT_COM): $(AGENT_PORT_SRC) $(AGENT_ENDPOINT_PRINT) tools/build_port_helper.py
+$(AGENT_TRACE_PORT_COM): $(AGENT_PORT_SRC) $(AGENT_ENDPOINT_PRINT) \
+		$(AGENT_VERSION_INCLUDE) server/_version.py tools/build_version_include.py \
+		tools/build_port_helper.py
 	"$(PYTHON)" tools/build_port_helper.py --assembler "$(Z80ASM)" \
 		--source $(AGENT_PORT_SRC) --output $(AGENT_TRACE_PORT_COM)
 

@@ -607,7 +607,12 @@ mailbox: dw 0
         self.assertTrue(status["debug"])
         self.assertIn("run", status["capabilities"])
         self.assertIn("cpu-snapshot-v1", status["features"])
-        self.assertIn("[71]", machine.screen_text())
+        monitor_screen = machine.screen_text()
+        self.assertIn(
+            f"MSX-AI MCP Agent {msx_mcp_server.SERVER_VERSION}",
+            monitor_screen)
+        self.assertIn("Author: Rodrigo Galhardi M. Garcia", monitor_screen)
+        self.assertIn("[71]", monitor_screen)
 
         idle_snapshot = self.tool_result("msx_agent_cpu_snapshot")
         self.assertTrue(idle_snapshot.get("isError"))
